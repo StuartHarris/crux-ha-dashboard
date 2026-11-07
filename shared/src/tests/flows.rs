@@ -93,9 +93,10 @@ fn on_the_stand_the_dashboard_shows_live_state_and_controls_lights() {
         texts(&shell),
         [
             tile("All lights", TileState::On, "On 100%"),
-            tile("Weather", TileState::Value, "Cloudy, 14.2 °C"),
+            tile("Weather", TileState::Value, "14.2 °C"),
         ]
     );
+    assert_eq!(view.tiles[1].detail, "Cloudy");
 
     shell.send(Event::NextPage);
     assert_eq!(
@@ -138,7 +139,8 @@ fn on_battery_the_dashboard_wakes_syncs_accepts_taps_then_sleeps() {
 
     shell.send(start_at(PowerSource::Battery, Some("/room/dining_room")));
     assert_eq!(shell.timers(), [IDLE_TIMEOUT]);
-    assert_eq!(shell.view().tiles[4].text, "19.5° (set 21°)");
+    assert_eq!(shell.view().tiles[4].text, "19.5°");
+    assert_eq!(shell.view().tiles[4].detail, "Set 21°");
 
     shell.send(Event::TileTapped(1));
     assert_eq!(
@@ -201,9 +203,10 @@ fn a_battery_wake_shows_the_changes_from_while_it_slept() {
         texts(&shell),
         [
             tile("All lights", TileState::Off, "Off"),
-            tile("Weather", TileState::Value, "Sunny, 14.2 °C"),
+            tile("Weather", TileState::Value, "14.2 °C"),
         ]
     );
+    assert_eq!(shell.view().tiles[1].detail, "Sunny");
 
     shell.fire_timers();
     assert_eq!(shell.view().updated, "Updated 10:42");

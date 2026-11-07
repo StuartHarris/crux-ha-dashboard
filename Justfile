@@ -53,10 +53,22 @@ test:
     @echo '{{ style("command") }}test:{{ NORMAL }}'
     cargo nextest run --workspace
 
-# Run the desktop simulator, which writes panel.png
-sim:
+# For the options and the keys, run `cargo run -p sim -- --help`.
+# Run the live simulator in a window, connected to the MQTT broker
+sim *args:
     @echo '{{ style("command") }}sim:{{ NORMAL }}'
-    cargo run -p sim
+    cargo run --release -p sim -- {{ args }}
+
+# Draw a page with fixed entity states to panel.png, with no window and no broker
+sim-png *args:
+    @echo '{{ style("command") }}sim-png:{{ NORMAL }}'
+    cargo run -p sim -- --png panel.png {{ args }}
+
+# Examine the new images in ui/tests/golden before you commit them.
+# Make the reference images of the ui golden tests again
+golden:
+    @echo '{{ style("command") }}golden:{{ NORMAL }}'
+    UPDATE_GOLDEN=1 cargo nextest run -p ui --test golden
 
 # Report which tools are installed (does not fail)
 [script('bash')]
