@@ -16,12 +16,14 @@ fix:
     cargo fmt --all
 
 # Check formatting, types and lints, and check that the core and the ui build without std
-check:
-    @echo '{{ style("command") }}check:{{ NORMAL }}'
+check: check-host check-nostd
+
+# Check formatting, types and lints on the host
+check-host:
+    @echo '{{ style("command") }}check-host:{{ NORMAL }}'
     cargo fmt --all --check
     cargo check --workspace --all-targets
     cargo clippy --workspace --all-targets -- --no-deps -Dclippy::pedantic -Dclippy::nursery -Dwarnings
-    @just check-nostd
 
 # Check that the core and the ui build for a no_std target.
 # The firmware turns on `crux_core/critical-section`, so this check does the same.
