@@ -77,6 +77,15 @@ impl Anchor {
         }
     }
 
+    /// The point is at the vertical centre of the text, on its left.
+    pub const fn center_left(point: Point) -> Self {
+        Self {
+            point,
+            vertical: VerticalPosition::Center,
+            horizontal: HorizontalAlignment::Left,
+        }
+    }
+
     /// The point is on the baseline at the right of the text.
     pub const fn baseline_right(point: Point) -> Self {
         Self {

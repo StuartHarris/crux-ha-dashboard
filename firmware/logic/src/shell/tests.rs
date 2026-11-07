@@ -145,7 +145,7 @@ fn a_second_wifi_answer_is_ignored() {
 #[test]
 fn a_message_on_the_stream_redraws_a_visible_tile() {
     let mut shell = online(true);
-    let tile = shell.view().tiles[0].entity_id.clone();
+    let tile = shell.view().tiles()[0].entity_id.clone();
     let (domain, object) = tile.split_once('.').unwrap();
     let topic = alloc::format!("homeassistant/statestream/{domain}/{object}/state");
     let message = |payload: &[u8]| Signal::Mqtt {
@@ -343,7 +343,7 @@ fn a_batch_has_at_most_one_render_with_the_last_view() {
         })
         .collect();
     assert_eq!(renders.len(), 1);
-    assert_eq!(*renders[0], shell.view());
+    assert_eq!(**renders[0], shell.view());
 }
 
 #[test]

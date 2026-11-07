@@ -51,9 +51,12 @@ static RESOURCES: StaticCell<StackResources<SOCKETS>> = StaticCell::new();
 
 /// The signals for the core task.
 pub static SIGNALS: Lane<Signal> = Lane::new();
-/// The newest view model to draw. A newer view model replaces one that the
-/// display task did not draw yet.
-pub static RENDER: Latest<CriticalSectionRawMutex, ViewModel> = Latest::new();
+/// The newest view model to draw.
+///
+/// A newer view model replaces one that the display task did not draw yet.
+/// The view model stays in its box from the
+/// core task to the display task, so it is not copied on the stack.
+pub static RENDER: Latest<CriticalSectionRawMutex, alloc::boxed::Box<ViewModel>> = Latest::new();
 /// The work of the timer task.
 pub static TIMERS: Lane<timers::Request> = Lane::new();
 /// The work of the MQTT task, with the id of the connection.

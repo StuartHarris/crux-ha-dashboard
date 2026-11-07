@@ -8,6 +8,7 @@
 //! - [`capabilities`] has the custom effects: MQTT, network and power.
 //! - [`view`] makes the view model, which has all the text that the `ui`
 //!   crate draws.
+//! - [`summary`] makes the summary of each room on the index page.
 //! - [`pages`] is the layout data. Edit it to change the dashboard.
 //! - [`local_time`] gives the UK time, with summer time, for each time that
 //!   the view shows.
@@ -30,6 +31,7 @@ pub mod layout;
 pub mod local_time;
 pub mod pages;
 pub mod route;
+pub mod summary;
 pub mod view;
 
 #[cfg(test)]
@@ -40,4 +42,7 @@ pub use capabilities::power::PowerSource;
 pub use crux_core::Core;
 pub use layout::TileKind;
 pub use route::Route;
-pub use view::{Connection, Description, SceneView, TileState, TileView, ViewModel};
+pub use view::{
+    Connection, Description, IndexView, LightState, PageView, RoomSummary, RoomView, SceneView,
+    TileState, TileView, ViewModel,
+};

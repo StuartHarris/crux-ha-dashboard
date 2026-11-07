@@ -1,15 +1,17 @@
 //! Tests of the rooms feature: pages, routes and taps.
 
+use alloc::vec::Vec;
+
 use crux_core::App;
 
 use super::{
     ExpectFullRefreshTimer,
     connection::{drive_to_connected, drive_to_connecting},
-    start_at, tap_scene, tap_tile,
+    start_at, tap_all_lights, tap_room, tap_scene, tap_tile,
 };
 use crate::{
     Control, Dashboard, EffectTestExt, Event, Model, PowerSource, Route, capabilities::mqtt::Qos,
-    features::connection::Link,
+    features::connection::Link, view::LightState,
 };
 
 #[test]
@@ -38,8 +40,8 @@ fn next_page_and_previous_page_wrap_around() {
     assert_eq!(view.path, "/room/living_room");
     assert_eq!(view.page_index, 1);
     assert_eq!(view.page_count, count);
-    assert_eq!(view.scenes.len(), 3);
-    assert_eq!(view.scenes[0].label, "Bright");
+    assert_eq!(view.scenes().len(), 3);
+    assert_eq!(view.scenes()[0].label, "Bright");
 }
 
 #[test]
@@ -134,9 +136,9 @@ fn a_tap_on_a_sensor_climate_or_weather_tile_or_outside_the_grid_does_nothing() 
     let app = Dashboard;
     let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Stand);
 
-    // The weather tile on the home page.
+    // The index page has no tiles and no scenes.
+    app.update(tap_tile(0), &mut model).expect_no_effects();
     app.update(tap_tile(1), &mut model).expect_no_effects();
-    // The home page has no scenes.
     app.update(tap_scene(0), &mut model).expect_no_effects();
 
     model.route = Route::room("dining_room");
@@ -152,7 +154,7 @@ fn a_tap_before_the_connection_opens_waits_in_the_outbox() {
     let (mut model, mut cmd, mut request) = drive_to_connecting(PowerSource::Stand);
 
     // The connection is starting, so there is nothing more to ask for.
-    app.update(tap_tile(0), &mut model).expect_no_effects();
+    app.update(tap_all_lights(), &mut model).expect_no_effects();
     assert_eq!(model.connection.outbox.len(), 1);
 
     request
@@ -200,7 +202,7 @@ fn a_tap_in_a_dry_run_before_the_connection_opens_is_not_kept() {
     let (mut model, _cmd, _request) = drive_to_connecting(PowerSource::Stand);
     let _ = app.update(Event::SetReadOnly(true), &mut model);
 
-    app.update(tap_tile(0), &mut model).expect_no_effects();
+    app.update(tap_all_lights(), &mut model).expect_no_effects();
     assert_eq!(model.connection.outbox.len(), 0);
 }
 
@@ -216,12 +218,12 @@ fn set_read_only_changes_the_view_and_the_next_tap() {
     // The same value again changes nothing.
     app.update(Event::SetReadOnly(true), &mut model)
         .expect_no_effects();
-    app.update(tap_tile(0), &mut model).expect_no_effects();
+    app.update(tap_all_lights(), &mut model).expect_no_effects();
 
     app.update(Event::SetReadOnly(false), &mut model)
         .expect_only_render();
     assert!(!app.view(&model).read_only);
-    app.update(tap_tile(0), &mut model)
+    app.update(tap_all_lights(), &mut model)
         .expect_only_mqtt_publish();
 }
 
@@ -304,5 +306,114 @@ fn a_tap_on_no_control_changes_nothing_while_awake() {
     let app = Dashboard;
     let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Stand);
     app.update(Event::Tapped(None), &mut model)
+        .expect_no_effects();
+}
+
+#[test]
+fn a_tap_on_a_room_button_shows_the_room() {
+    let app = Dashboard;
+    let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Stand);
+
+    // The rooms are the pages after the home page, in order.
+    app.update(tap_room(7), &mut model)
+        .expect_render()
+        .expect_full_refresh_timer();
+    let view = app.view(&model);
+    assert_eq!(view.path, "/room/loft");
+    assert_eq!(view.title, "Loft");
+    assert_eq!(view.full_refresh_seq, 2);
+    assert_eq!(view.index(), None);
+    assert_eq!(view.tiles().len(), 4);
+}
+
+#[test]
+fn a_room_button_that_the_index_does_not_have_does_nothing() {
+    let app = Dashboard;
+    let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Stand);
+    app.update(tap_room(9), &mut model).expect_no_effects();
+    assert_eq!(model.route, Route::Home);
+}
+
+#[test]
+fn a_tap_on_all_lights_publishes_a_toggle() {
+    let app = Dashboard;
+    let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Stand);
+    app.update(tap_all_lights(), &mut model)
+        .expect_mqtt_publish_with(|publish| {
+            assert_eq!(publish.topic, "dashboard/hall/cmd");
+            assert_eq!(
+                publish.payload,
+                br#"{"service":"light.toggle","entity_id":"light.all_lights"}"#
+            );
+        })
+        .expect_no_effects();
+}
+
+#[test]
+fn the_index_shows_each_room_and_the_header_of_the_home_page() {
+    let app = Dashboard;
+    let model = Model::default();
+    let view = app.view(&model);
+    let index = view.index().unwrap();
+    let titles: Vec<&str> = index.rooms.iter().map(|room| room.title.as_str()).collect();
+    assert_eq!(
+        titles,
+        [
+            "Living Room",
+            "Dining Room",
+            "Kitchen",
+            "Hall",
+            "Landing",
+            "Main bedroom",
+            "Guest bedroom",
+            "Loft",
+            "Outside",
+        ]
+    );
+    assert_eq!(
+        index.all_lights.as_ref().unwrap().entity_id,
+        "light.all_lights"
+    );
+    assert_eq!(index.weather.as_ref().unwrap().entity_id, "weather.home");
+    // With no state, each light is unavailable and no room is on.
+    assert!(index.rooms.iter().all(|room| {
+        !room.any_on
+            && room
+                .lights
+                .iter()
+                .all(|light| *light == LightState::Unavailable)
+    }));
+    assert_eq!(view.tiles(), []);
+    assert_eq!(view.scenes(), []);
+}
+
+#[test]
+fn the_all_lights_toggle_shows_and_toggles_the_same_tile() {
+    use crate::layout::{Page, home, light, room, switch, weather};
+    const PAGES: &[Page] = &[
+        home(
+            "Home",
+            &[
+                weather("Weather", "weather.home"),
+                switch("Fan", "switch.fan"),
+                light("Lamp", "light.lamp"),
+            ],
+            &[],
+        ),
+        room("hall", "Hall", &[light("Hall", "light.hall")], &[]),
+    ];
+    let app = Dashboard;
+    let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Stand);
+    model.pages = PAGES;
+    let view = app.view(&model);
+    let shown = &view.index().unwrap().all_lights.as_ref().unwrap().entity_id;
+    assert_eq!(shown, "switch.fan");
+    app.update(tap_all_lights(), &mut model)
+        .expect_mqtt_publish_with(|publish| {
+            assert_eq!(
+                publish.payload,
+                br#"{"service":"switch.toggle","entity_id":"switch.fan"}"#
+            );
+        })
         .expect_no_effects();
 }

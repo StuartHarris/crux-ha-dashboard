@@ -87,6 +87,13 @@ impl Entities {
     }
 }
 
+/// Returns the entity id of a state-stream topic, or `None` if the topic is
+/// not a state-stream topic.
+#[must_use]
+pub fn entity_of(topic: &str) -> Option<String> {
+    parse_topic(topic).map(|(entity_id, _)| entity_id)
+}
+
 /// Splits a state-stream topic into the entity id and the last part of the
 /// topic (`state` or an attribute name).
 fn parse_topic(topic: &str) -> Option<(String, &str)> {
@@ -303,7 +310,7 @@ mod tests {
         let mut entities = Entities::default();
         assert_eq!(
             text(&entities, TileKind::Light, "light.lamp"),
-            (TileState::Unknown, "-".into())
+            (TileState::Unknown, "No data".into())
         );
         entities.apply(
             PAGES,

@@ -17,6 +17,7 @@ use crate::{
     },
     entities,
     features::refresh::redraw,
+    summary,
 };
 
 /// The first wait before the core connects again after a failure.
@@ -260,6 +261,9 @@ pub fn mqtt(id: u32, event: MqttEvent, model: &mut Model) -> Cmd {
         MqttEvent::Connected => connected(model),
         MqttEvent::Message(_) if model.connection.mqtt != Link::Up => Cmd::done(),
         MqttEvent::Message(message) => {
+            // A unit can change, so the check is before and after the change.
+            let shown_before = entities::entity_of(&message.topic)
+                .is_some_and(|entity_id| shows(model, &entity_id));
             let Some(entity_id) =
                 model
                     .entities
@@ -267,10 +271,7 @@ pub fn mqtt(id: u32, event: MqttEvent, model: &mut Model) -> Cmd {
             else {
                 return Cmd::done();
             };
-            let visible = model
-                .current_page()
-                .is_some_and(|page| page.tiles.iter().any(|tile| tile.entity_id == entity_id));
-            let draw = if visible {
+            let draw = if shown_before || shows(model, &entity_id) {
                 redraw(model, false)
             } else {
                 Cmd::done()
@@ -291,6 +292,20 @@ pub fn mqtt(id: u32, event: MqttEvent, model: &mut Model) -> Cmd {
             redraw(model, false).and(retry)
         }
     }
+}
+
+/// Returns `true` if the current page shows the entity `entity_id`. On a
+/// room page, the tiles of the room show entities. On the index page, the
+/// header and the summaries show entities. Refer to
+/// [`index_shows`](crate::summary::index_shows).
+fn shows(model: &Model, entity_id: &str) -> bool {
+    model.current_page().is_some_and(|page| {
+        if page.is_home() {
+            summary::index_shows(model.pages, &model.entities, entity_id)
+        } else {
+            page.tiles.iter().any(|tile| tile.entity_id == entity_id)
+        }
+    })
 }
 
 /// Reads the clock for a state message that arrived, if the time on the

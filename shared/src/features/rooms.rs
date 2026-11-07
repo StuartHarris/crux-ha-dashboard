@@ -1,5 +1,5 @@
-//! The rooms feature: the current page, page changes, and taps on tiles and
-//! scenes.
+//! The rooms feature: the current page, page changes, and taps on tiles,
+//! scenes and the controls of the index page.
 
 use serde::Serialize;
 
@@ -7,6 +7,7 @@ use crate::{
     Cmd, Control, Model,
     capabilities::mqtt::{Publish, Qos},
     features::{connection, power, refresh::redraw},
+    layout::Page,
     route::Route,
 };
 
@@ -30,6 +31,8 @@ pub fn tapped(control: Option<Control>, model: &mut Model) -> Cmd {
         Some(Control::NextPage) => turn_page(model, true),
         Some(Control::Tile(index)) => tile_tapped(index, model),
         Some(Control::Scene(index)) => scene_tapped(index, model),
+        Some(Control::AllLights) => all_lights_tapped(model),
+        Some(Control::Room(index)) => room_tapped(index, model),
     }
 }
 
@@ -64,11 +67,19 @@ pub fn turn_page(model: &mut Model, forward: bool) -> Cmd {
     redraw(model, true).and(power::restart_idle_timer(model))
 }
 
+/// Returns the current page if it is the page of a room, or `None` on the
+/// home page.
+fn current_room(model: &Model) -> Option<&'static Page> {
+    model.current_page().filter(|page| page.is_room())
+}
+
 /// Toggles the light or the switch of the tile. A tap on another kind of
 /// tile only starts the idle time again. The device is awake.
+///
+/// The index page has no tiles, so the core ignores a tile on the home page.
 fn tile_tapped(index: usize, model: &mut Model) -> Cmd {
     let idle = power::restart_idle_timer(model);
-    let Some(tile) = model.current_page().and_then(|page| page.tiles.get(index)) else {
+    let Some(tile) = current_room(model).and_then(|page| page.tiles.get(index)) else {
         return idle;
     };
     let Some(service) = tile.kind.tap_service() else {
@@ -80,10 +91,34 @@ fn tile_tapped(index: usize, model: &mut Model) -> Cmd {
 /// Turns on the scene. The device is awake.
 fn scene_tapped(index: usize, model: &mut Model) -> Cmd {
     let idle = power::restart_idle_timer(model);
-    let Some(scene) = model.current_page().and_then(|page| page.scenes.get(index)) else {
+    let Some(scene) = current_room(model).and_then(|page| page.scenes.get(index)) else {
         return idle;
     };
     call_service(model, "scene.turn_on", scene.entity_id).and(idle)
+}
+
+/// Toggles the All lights tile of the home page: its first light or switch
+/// tile. The core acts only on the home page. The device is awake.
+fn all_lights_tapped(model: &mut Model) -> Cmd {
+    let idle = power::restart_idle_timer(model);
+    let tile = model.current_page().and_then(Page::all_lights_tile);
+    let Some((tile, service)) =
+        tile.and_then(|tile| tile.kind.tap_service().map(|service| (tile, service)))
+    else {
+        return idle;
+    };
+    call_service(model, service, tile.entity_id).and(idle)
+}
+
+/// Shows the page of the room with `index` in the list of rooms. The core
+/// acts only on the home page, because only the index page has room
+/// buttons. The device is awake.
+fn room_tapped(index: usize, model: &mut Model) -> Cmd {
+    let on_index = model.current_page().is_some_and(Page::is_home);
+    match model.rooms().nth(index) {
+        Some(room) if on_index => navigate(room.route(), model),
+        _ => power::restart_idle_timer(model),
+    }
 }
 
 /// Starts or stops a dry run. The core keeps the value until the next

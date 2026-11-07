@@ -87,10 +87,24 @@ pub fn run(options: Options, out: &Path) -> Result<(), String> {
         view.title,
         out.display()
     );
-    for tile in &view.tiles {
+    let header = view
+        .index()
+        .into_iter()
+        .flat_map(|index| [&index.weather, &index.all_lights])
+        .flatten();
+    for tile in header.chain(view.tiles()) {
         eprintln!(
             "smoke:   {}: {:?} {} {}",
             tile.label, tile.state, tile.text, tile.detail
+        );
+    }
+    for room in view.index().iter().flat_map(|index| &index.rooms) {
+        eprintln!(
+            "smoke:   {}: {:?} {} (any on: {})",
+            room.title,
+            room.lights,
+            room.temperature.as_deref().unwrap_or("-"),
+            room.any_on
         );
     }
     // Stop with no disconnect packet. The broker publishes the last will.

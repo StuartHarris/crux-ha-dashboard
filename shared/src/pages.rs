@@ -1,18 +1,27 @@
 //! The dashboard layout: the pages in order, with their tiles and scenes.
 //!
+//! The first page is the home page, which is the index of the rooms. Its
+//! header shows the weather and an All lights toggle from its tiles. Refer
+//! to [`Page`]. Each other page is a room.
+//!
 //! Edit this file to change the dashboard. Each page has at most
 //! [`MAX_TILES`](crate::layout::MAX_TILES) tiles and
-//! [`MAX_SCENES`](crate::layout::MAX_SCENES) scenes. A test checks these limits
+//! [`MAX_SCENES`](crate::layout::MAX_SCENES) scenes. There are at most
+//! [`MAX_ROOMS`](crate::layout::MAX_ROOMS) rooms, and the summary of a room
+//! shows at most [`MAX_LIGHTS`](crate::layout::MAX_LIGHTS) lights and
+//! switches. A test checks these limits
 //! and the entity ids.
 
-use crate::layout::{Page, climate, home, light, room, scene, sensor, switch, weather};
+use crate::layout::{
+    Page, climate, home, light, light_group, room, scene, sensor, switch, weather,
+};
 
 /// The pages of the dashboard, in the order that the pages show.
 pub const PAGES: &[Page] = &[
     home(
         "Home",
         &[
-            light("All lights", "light.all_lights"),
+            light_group("All lights", "light.all_lights"),
             weather("Weather", "weather.home"),
         ],
         &[],
@@ -21,7 +30,7 @@ pub const PAGES: &[Page] = &[
         "living_room",
         "Living Room",
         &[
-            light("Lights", "light.living_room_lights"),
+            light_group("Lights", "light.living_room_lights"),
             light("Rocket lamp", "light.living_room_rocket_lamp"),
             light("Standard lamp", "light.living_room_standard_lamp"),
             sensor("Temperature", "sensor.living_room_thermometer_temperature"),
@@ -37,7 +46,7 @@ pub const PAGES: &[Page] = &[
         "dining_room",
         "Dining Room",
         &[
-            light("Lights", "light.dining_room_lights"),
+            light_group("Lights", "light.dining_room_lights"),
             light("Tall lamp", "light.dining_room_tall_lamp"),
             light("Candle left", "light.dining_room_candle_light_left"),
             light("Candle right", "light.dining_room_candle_light_right"),
@@ -69,7 +78,7 @@ pub const PAGES: &[Page] = &[
         "hall",
         "Hall",
         &[
-            light("Lights", "light.hall_lights"),
+            light_group("Lights", "light.hall_lights"),
             light("Hall light", "light.hall_hall_light"),
             light("Salt lamp", "light.hall_salt_lamp"),
             sensor("Salt lamp power", "sensor.hall_salt_lamp_power"),
@@ -84,7 +93,7 @@ pub const PAGES: &[Page] = &[
         "upstairs",
         "Landing",
         &[
-            light("Lights", "light.landing_lights"),
+            light_group("Lights", "light.landing_lights"),
             light("Corridor", "light.landing_corridor"),
             light("Landing light", "light.landing_landing_light"),
         ],
@@ -98,7 +107,7 @@ pub const PAGES: &[Page] = &[
         "bedroom",
         "Main bedroom",
         &[
-            light("Lights", "light.main_bedroom_lights"),
+            light_group("Lights", "light.main_bedroom_lights"),
             light("Sean's spotlight", "light.main_bedroom_sean_spotlight"),
             light("Stu's spotlight", "light.main_bedroom_stu_spotlight"),
             sensor("Temperature", "sensor.main_bedroom_thermometer_temperature"),
@@ -120,7 +129,7 @@ pub const PAGES: &[Page] = &[
         "loft",
         "Loft",
         &[
-            light("Lights", "light.loft_lights"),
+            light_group("Lights", "light.loft_lights"),
             light("Loft 1", "light.loft_loft_1"),
             light("Loft 2", "light.loft_loft_2"),
             light("Loft 3", "light.loft_loft_3"),
@@ -148,7 +157,7 @@ mod tests {
 
     use super::PAGES;
     use crate::{
-        layout::{MAX_SCENES, MAX_TILES, TileKind},
+        layout::{MAX_LIGHTS, MAX_ROOMS, MAX_SCENES, MAX_TILES, TileKind},
         route::Route,
     };
 
@@ -200,6 +209,38 @@ mod tests {
             assert_eq!(
                 Route::from_path(&page.route().to_path()),
                 Some(page.route())
+            );
+        }
+    }
+
+    #[test]
+    fn the_home_page_has_the_weather_and_all_lights_and_the_rooms_fit_the_index() {
+        let home = &PAGES[0];
+        let count = |kind| home.tiles.iter().filter(|tile| tile.kind == kind).count();
+        assert_eq!(count(TileKind::Weather), 1);
+        assert_eq!(count(TileKind::Light), 1);
+        assert_eq!(home.tiles.len(), 2);
+        assert_eq!(home.scenes, []);
+        let rooms = PAGES.iter().filter(|page| page.is_room()).count();
+        assert_eq!(rooms, PAGES.len() - 1);
+        assert!(rooms <= MAX_ROOMS);
+    }
+
+    #[test]
+    fn the_summary_of_each_room_fits_its_button() {
+        for page in PAGES.iter().filter(|page| page.is_room()) {
+            let lights = crate::summary::counted(page).count();
+            assert!(lights <= MAX_LIGHTS, "{} has too many lights", page.title);
+        }
+    }
+
+    #[test]
+    fn only_a_light_is_a_group() {
+        for tile in PAGES.iter().flat_map(|page| page.tiles) {
+            assert!(
+                !tile.group || tile.kind == TileKind::Light,
+                "{}",
+                tile.entity_id
             );
         }
     }
