@@ -11,9 +11,11 @@
 //!
 //! Run `sim --help` for the options.
 
+mod inspector;
 mod mqtt;
 mod panel;
 mod png;
+mod screen;
 mod settings;
 mod shell;
 mod smoke;

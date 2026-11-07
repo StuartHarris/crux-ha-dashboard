@@ -21,6 +21,8 @@ Modes:
   (none)              Open a window. Click to tap. Keys: S moves the device on
                       or off the stand, W wakes it, D shows the area of each
                       partial refresh, Left and Right turn the page, Q quits.
+                      The window also shows the controls, the view model,
+                      the effect log and the MQTT log.
   --png <FILE>        Draw a page with fixed entity states to a PNG file.
                       Needs no window and no broker.
   --smoke <FILE>      Connect to the broker, wait for the entity states, draw

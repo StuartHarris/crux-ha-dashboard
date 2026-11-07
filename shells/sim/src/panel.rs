@@ -83,8 +83,8 @@ impl Panel {
     }
 
     /// Returns the grey level (0 to 15) of each pixel, in rows from the top.
-    pub fn lumas(&self) -> Vec<u8> {
-        self.frame.lumas().collect()
+    pub fn lumas(&self) -> impl Iterator<Item = u8> + '_ {
+        self.frame.lumas()
     }
 
     /// Writes the image to a PNG file. Only this function uses the display
@@ -104,8 +104,30 @@ impl Panel {
     }
 }
 
+/// The number of screen pixels on each side of a panel pixel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scale {
+    /// The largest integer scale at which the panel fits.
+    Fit,
+    /// This scale, which is at least 1.
+    Fixed(u32),
+}
+
+impl Scale {
+    /// Returns the integer scale for an area of `width` × `height` screen
+    /// pixels. The scale is at least 1.
+    #[must_use]
+    pub fn resolve(self, width: u32, height: u32) -> u32 {
+        match self {
+            Self::Fit => (width / ui::WIDTH).min(height / ui::HEIGHT).max(1),
+            Self::Fixed(scale) => scale.max(1),
+        }
+    }
+}
+
 /// Where the panel is in a window: an integer scale and an offset, so that
-/// each panel pixel is a square of window pixels.
+/// each panel pixel is a square of window pixels. All the values are in
+/// screen pixels, not in egui points.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Viewport {
     /// The number of window pixels on each side of a panel pixel.
@@ -117,12 +139,12 @@ pub struct Viewport {
 }
 
 impl Viewport {
-    /// Returns the largest integer scale at which the panel fits in a window
-    /// of `width` × `height` pixels, with the panel in the centre. The scale
-    /// is at least 1.
+    /// Returns the viewport for `scale` in a window of `width` × `height`
+    /// pixels, with the panel in the centre. If the panel is larger than the
+    /// window, the panel starts at the top left.
     #[must_use]
-    pub fn fit(width: u32, height: u32) -> Self {
-        let scale = (width / ui::WIDTH).min(height / ui::HEIGHT).max(1);
+    pub fn place(scale: Scale, width: u32, height: u32) -> Self {
+        let scale = scale.resolve(width, height);
         Self {
             scale,
             left: width.saturating_sub(ui::WIDTH * scale) / 2,
@@ -155,7 +177,7 @@ mod tests {
     use embedded_graphics::{prelude::*, primitives::Rectangle};
     use shared::{Connection, PowerSource, ViewModel};
 
-    use super::{Panel, Refresh, Viewport, refresh, share};
+    use super::{Panel, Refresh, Scale, Viewport, refresh, share};
 
     #[test]
     fn the_first_image_and_a_new_sequence_number_are_full_refreshes() {
@@ -212,7 +234,7 @@ mod tests {
 
     #[test]
     fn the_viewport_on_a_retina_display() {
-        let viewport = Viewport::fit(1920, 1080);
+        let viewport = Viewport::place(Scale::Fit, 1920, 1080);
         assert_eq!(
             viewport,
             Viewport {
@@ -231,7 +253,7 @@ mod tests {
 
     #[test]
     fn the_viewport_in_a_larger_window_is_in_the_centre() {
-        let viewport = Viewport::fit(1000, 600);
+        let viewport = Viewport::place(Scale::Fit, 1000, 600);
         assert_eq!(
             viewport,
             Viewport {
@@ -243,5 +265,62 @@ mod tests {
         assert_eq!(viewport.to_panel(19.0, 30.0), None);
         assert_eq!(viewport.to_panel(20.0, 30.0), Some(Point::new(0, 0)));
         assert_eq!(viewport.to_panel(-1.0, 40.0), None);
+    }
+
+    #[test]
+    fn a_fixed_scale_maps_each_panel_pixel_to_a_square() {
+        // A window of 2100 × 1200 screen pixels.
+        let one = Viewport::place(Scale::Fixed(1), 2100, 1200);
+        assert_eq!(
+            one,
+            Viewport {
+                scale: 1,
+                left: 570,
+                top: 330
+            }
+        );
+        assert_eq!(one.to_panel(570.0, 330.0), Some(Point::new(0, 0)));
+        assert_eq!(one.to_panel(570.9, 330.9), Some(Point::new(0, 0)));
+        assert_eq!(one.to_panel(1529.5, 869.5), Some(Point::new(959, 539)));
+        assert_eq!(one.to_panel(1530.0, 869.0), None);
+        assert_eq!(one.to_panel(569.9, 400.0), None);
+
+        let two = Viewport::place(Scale::Fixed(2), 2100, 1200);
+        assert_eq!(
+            two,
+            Viewport {
+                scale: 2,
+                left: 90,
+                top: 60
+            }
+        );
+        assert_eq!(two.to_panel(90.0, 60.0), Some(Point::new(0, 0)));
+        assert_eq!(two.to_panel(91.9, 61.9), Some(Point::new(0, 0)));
+        assert_eq!(two.to_panel(92.0, 62.0), Some(Point::new(1, 1)));
+        assert_eq!(two.to_panel(2009.0, 1139.0), Some(Point::new(959, 539)));
+        assert_eq!(two.to_panel(2010.0, 1139.0), None);
+    }
+
+    #[test]
+    fn fit_chooses_the_largest_scale_that_fits() {
+        assert_eq!(Scale::Fit.resolve(2100, 1200), 2);
+        assert_eq!(Scale::Fit.resolve(2100, 1000), 1);
+        assert_eq!(Scale::Fit.resolve(100, 100), 1);
+        assert_eq!(Scale::Fit.resolve(2880, 1620), 3);
+        assert_eq!(Scale::Fixed(0).resolve(100, 100), 1);
+    }
+
+    #[test]
+    fn a_panel_larger_than_the_window_starts_at_the_top_left() {
+        let viewport = Viewport::place(Scale::Fixed(2), 1000, 600);
+        assert_eq!(
+            viewport,
+            Viewport {
+                scale: 2,
+                left: 0,
+                top: 0
+            }
+        );
+        assert_eq!(viewport.to_panel(999.0, 599.0), Some(Point::new(499, 299)));
     }
 }

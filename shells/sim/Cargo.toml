@@ -19,10 +19,10 @@ embedded-graphics-simulator = { version = "0.8.0", default-features = false }
 # The MQTT client. The broker is on the LAN with no TLS, so TLS is off.
 rumqttc = { version = "0.25", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros"] }
-# The window. Both crates load X11 or Wayland at run time, so a build on Linux
-# needs no system packages.
-softbuffer = "0.4"
-winit = "0.30"
+# The window. eframe runs egui on winit and draws with OpenGL (glow). It
+# loads X11 or Wayland at run time, so a build on Linux needs no system
+# packages.
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 
 [lints]
 workspace = true

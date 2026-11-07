@@ -10,6 +10,9 @@
 //! disconnect packet on the old connection, so the broker does not publish
 //! the last will, and the old stream ends with `Disconnected`. The core
 //! ignores the items of an older connection.
+//!
+//! The shell writes each effect and each MQTT packet to an [`Inspector`],
+//! which the window shows.
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -22,13 +25,16 @@ use crux_time::{Instant, TimerId, operation::NotifyAfter};
 use shared::{
     Core, Dashboard, Effect, Event, PowerSource, Settings, Start, ViewModel,
     capabilities::{
-        mqtt::{Connect, MqttEvent},
+        mqtt::{Connect, MqttEvent, Publish},
         network::WifiStatus,
     },
 };
 use tokio::{runtime::Handle, task::JoinHandle};
 
-use crate::mqtt::{Link, Opener};
+use crate::{
+    inspector::{Delivery, Direction, Inspector, Packet, truncate},
+    mqtt::{Link, Opener},
+};
 
 /// How often the shell checks the local offset from UTC.
 const OFFSET_CHECK: Duration = Duration::from_secs(60);
@@ -42,6 +48,8 @@ pub enum Signal {
         connection: u64,
         /// The item.
         event: MqttEvent,
+        /// `true` for a message that the broker retained.
+        retained: bool,
     },
     /// The timer with this id expired.
     Timer {
@@ -107,8 +115,14 @@ pub struct Shell {
     last_token: u64,
     read_only: bool,
     render: bool,
+    /// The offset from UTC that the shell last sent to the core.
     utc_offset_minutes: i16,
+    /// The local offset from UTC at the last check. The shell sends a new
+    /// offset only when this value changes, so an offset that the user sets
+    /// stays until the local offset changes.
+    local_offset_minutes: i16,
     offset_task: JoinHandle<()>,
+    inspector: Inspector,
 }
 
 impl Drop for Shell {
@@ -142,6 +156,7 @@ impl Shell {
                 ticker.send(Signal::CheckOffset);
             }
         });
+        let offset = local_offset_minutes();
         Self {
             core: Core::new(),
             runtime,
@@ -154,8 +169,10 @@ impl Shell {
             last_token: 0,
             read_only,
             render: false,
-            utc_offset_minutes: local_offset_minutes(),
+            utc_offset_minutes: offset,
+            local_offset_minutes: offset,
             offset_task,
+            inspector: Inspector::default(),
         }
     }
 
@@ -187,6 +204,52 @@ impl Shell {
         }
     }
 
+    /// Returns `true` if the shell does not publish service calls.
+    pub const fn read_only(&self) -> bool {
+        self.read_only
+    }
+
+    /// Starts or stops the publication of service calls. If `read_only` is
+    /// `true`, a click changes no device in the house.
+    pub const fn set_read_only(&mut self, read_only: bool) {
+        self.read_only = read_only;
+    }
+
+    /// Returns the offset from UTC, in minutes, that the core uses.
+    pub const fn utc_offset_minutes(&self) -> i16 {
+        self.utc_offset_minutes
+    }
+
+    /// Sends a new offset from UTC to the core, for example to test the
+    /// start of summer time. The offset stays until the local offset of the
+    /// computer changes.
+    pub fn set_utc_offset(&mut self, minutes: i16) {
+        if minutes != self.utc_offset_minutes {
+            self.utc_offset_minutes = minutes;
+            self.send(Event::UtcOffsetChanged(minutes));
+        }
+    }
+
+    /// Returns the number of timers that run.
+    pub fn timer_count(&self) -> usize {
+        self.timers.len()
+    }
+
+    /// Returns the id of the current MQTT connection, if there is one.
+    pub const fn current_connection(&self) -> Option<u64> {
+        self.current
+    }
+
+    /// Returns the logs of the shell.
+    pub const fn inspector(&self) -> &Inspector {
+        &self.inspector
+    }
+
+    /// Returns the logs of the shell, to clear them.
+    pub const fn inspector_mut(&mut self) -> &mut Inspector {
+        &mut self.inspector
+    }
+
     /// Returns the view of the core now.
     pub fn view(&self) -> ViewModel {
         self.core.view()
@@ -200,7 +263,11 @@ impl Shell {
     /// Gives an answer from a task to the core.
     pub fn handle(&mut self, signal: Signal) {
         match signal {
-            Signal::Mqtt { connection, event } => {
+            Signal::Mqtt {
+                connection,
+                event,
+                retained,
+            } => {
                 let Some(index) = self
                     .connections
                     .iter()
@@ -208,18 +275,7 @@ impl Shell {
                 else {
                     return;
                 };
-                let last = match &event {
-                    MqttEvent::Connected => {
-                        eprintln!("mqtt: connected");
-                        false
-                    }
-                    MqttEvent::Message(_) => false,
-                    MqttEvent::Disconnected { reason } => {
-                        let reason = reason.as_deref().unwrap_or("disconnect");
-                        eprintln!("mqtt: disconnected ({reason})");
-                        true
-                    }
-                };
+                let last = self.record_stream(connection, &event, retained);
                 let live = &mut self.connections[index];
                 let effects = resolve(&self.core, &mut live.request, event);
                 if last {
@@ -237,17 +293,78 @@ impl Shell {
                     .is_some_and(|timer| timer.token == token)
                     && let Some(mut timer) = self.timers.remove(&id)
                 {
+                    self.inspector.effect(
+                        "TimeNotifyAfter",
+                        format!("timer {}", id.0),
+                        "resolved: the timer expired",
+                    );
                     let effects = resolve(&self.core, &mut timer.request, id);
                     self.process(effects);
                 }
             }
             Signal::CheckOffset => {
-                let minutes = local_offset_minutes();
-                if minutes != self.utc_offset_minutes {
-                    eprintln!("time: the UTC offset is now {minutes} minutes");
-                    self.utc_offset_minutes = minutes;
-                    self.send(Event::UtcOffsetChanged(minutes));
-                }
+                self.check_offset(local_offset_minutes());
+            }
+        }
+    }
+
+    /// Sends the local offset from UTC to the core if it changed since the
+    /// last check.
+    fn check_offset(&mut self, minutes: i16) {
+        if minutes != self.local_offset_minutes {
+            eprintln!("time: the UTC offset is now {minutes} minutes");
+            self.local_offset_minutes = minutes;
+            self.set_utc_offset(minutes);
+        }
+    }
+
+    /// Writes an item of the stream of a connection to the logs. Returns
+    /// `true` if the item is the last one.
+    fn record_stream(&mut self, connection: u64, event: &MqttEvent, retained: bool) -> bool {
+        let stream = format!("connection {connection}");
+        match event {
+            MqttEvent::Connected => {
+                eprintln!("mqtt: connected");
+                self.inspector
+                    .effect("MqttConnect", stream, "resolved: Connected");
+                self.inspector.packet(
+                    Direction::In,
+                    Packet::ConnAck,
+                    "",
+                    String::new(),
+                    false,
+                    Delivery::Received,
+                );
+                false
+            }
+            MqttEvent::Message(message) => {
+                self.inspector.packet(
+                    Direction::In,
+                    Packet::Publish,
+                    message.topic.clone(),
+                    truncate(&message.payload),
+                    retained,
+                    Delivery::Received,
+                );
+                false
+            }
+            MqttEvent::Disconnected { reason } => {
+                let reason = reason.as_deref().unwrap_or("disconnect");
+                eprintln!("mqtt: disconnected ({reason})");
+                self.inspector.effect(
+                    "MqttConnect",
+                    stream,
+                    format!("resolved: Disconnected ({reason})"),
+                );
+                self.inspector.packet(
+                    Direction::In,
+                    Packet::Disconnect,
+                    "",
+                    reason.to_string(),
+                    false,
+                    Delivery::Received,
+                );
+                true
             }
         }
     }
@@ -264,51 +381,63 @@ impl Shell {
         match effect {
             Effect::Render(_) => {
                 self.render = true;
+                self.inspector
+                    .effect("Render", String::new(), "the window draws the view");
                 Vec::new()
             }
             Effect::MqttConnect(request) => self.connect(request),
             Effect::MqttSubscribe(request) => {
-                if let Some(live) = self.current() {
-                    let topics = &request.operation.topics;
-                    eprintln!("mqtt: subscribe to {} topics", topics.len());
-                    if let Err(error) = live.link.subscribe(topics) {
-                        eprintln!("mqtt: the subscribe failed: {error}");
-                    }
-                }
+                self.subscribe(&request.operation.topics);
                 Vec::new()
             }
             Effect::MqttPublish(request) => {
-                let publish = &request.operation;
-                let payload = String::from_utf8_lossy(&publish.payload);
-                if self.read_only && publish.topic.ends_with("/cmd") {
-                    eprintln!(
-                        "mqtt: read-only, so not published: {} {payload}",
-                        publish.topic
-                    );
-                } else if let Some(live) = self.current() {
-                    eprintln!("mqtt: publish {} {payload}", publish.topic);
-                    if let Err(error) = live.link.publish(publish) {
-                        eprintln!("mqtt: the publish failed: {error}");
-                    }
-                }
+                self.publish(&request.operation);
                 Vec::new()
             }
             Effect::MqttDisconnect(_) => {
                 self.disconnect_current();
                 Vec::new()
             }
-            Effect::WifiOn(mut request) => resolve(&self.core, &mut request, WifiStatus::Connected),
-            Effect::WifiOff(_) => Vec::new(),
+            Effect::WifiOn(mut request) => {
+                self.inspector
+                    .effect("WifiOn", String::new(), "resolved: Connected");
+                resolve(&self.core, &mut request, WifiStatus::Connected)
+            }
+            Effect::WifiOff(_) => {
+                self.inspector.effect(
+                    "WifiOff",
+                    String::new(),
+                    "nothing to do: the simulator has no Wi-Fi",
+                );
+                Vec::new()
+            }
             Effect::Sleep(_) => {
                 eprintln!("power: asleep. Click the panel or press W to wake it.");
+                self.inspector.effect(
+                    "Sleep",
+                    String::new(),
+                    "asleep: click the panel or press W to wake it",
+                );
                 Vec::new()
             }
             Effect::TimeNow(mut request) => {
-                resolve(&self.core, &mut request, Instant::from(SystemTime::now()))
+                let now = SystemTime::now();
+                let local: chrono::DateTime<chrono::Local> = now.into();
+                self.inspector.effect(
+                    "TimeNow",
+                    String::new(),
+                    format!("resolved: {}", local.format("%H:%M:%S%.3f")),
+                );
+                resolve(&self.core, &mut request, Instant::from(now))
             }
             Effect::TimeNotifyAfter(request) => {
                 let id = request.operation.id;
                 let duration = Duration::from(request.operation.duration);
+                self.inspector.effect(
+                    "TimeNotifyAfter",
+                    format!("timer {} after {} ms", id.0, duration.as_millis()),
+                    "started",
+                );
                 self.last_token += 1;
                 let token = self.last_token;
                 let notifier = self.notifier.clone();
@@ -328,9 +457,14 @@ impl Shell {
             }
             Effect::TimeClear(mut request) => {
                 let id = request.operation.id;
-                if let Some(timer) = self.timers.remove(&id) {
+                let outcome = if let Some(timer) = self.timers.remove(&id) {
                     timer.task.abort();
-                }
+                    "resolved: stopped"
+                } else {
+                    "resolved: the timer did not run"
+                };
+                self.inspector
+                    .effect("TimeClear", format!("timer {}", id.0), outcome);
                 resolve(&self.core, &mut request, id)
             }
         }
@@ -343,14 +477,69 @@ impl Shell {
         self.connections.iter().find(|live| live.id == current)
     }
 
+    /// Subscribes to `topics` on the current connection.
+    fn subscribe(&mut self, topics: &[String]) {
+        let delivery = self.current().map_or(Delivery::NoConnection, |live| {
+            eprintln!("mqtt: subscribe to {} topics", topics.len());
+            delivery("subscribe", live.link.subscribe(topics))
+        });
+        self.inspector.effect(
+            "MqttSubscribe",
+            format!("{} topics", topics.len()),
+            outcome(&delivery),
+        );
+        self.inspector.subscribe(topics, delivery);
+    }
+
+    /// Publishes a message on the current connection. If the shell is
+    /// read-only, it does not publish a service call.
+    fn publish(&mut self, publish: &Publish) {
+        let payload = String::from_utf8_lossy(&publish.payload);
+        let delivery = if self.read_only && publish.topic.ends_with("/cmd") {
+            eprintln!(
+                "mqtt: read-only, so not published: {} {payload}",
+                publish.topic
+            );
+            Delivery::NotSent
+        } else if let Some(live) = self.current() {
+            eprintln!("mqtt: publish {} {payload}", publish.topic);
+            delivery("publish", live.link.publish(publish))
+        } else {
+            Delivery::NoConnection
+        };
+        self.inspector
+            .effect("MqttPublish", publish.topic.clone(), outcome(&delivery));
+        self.inspector.packet(
+            Direction::Out,
+            Packet::Publish,
+            publish.topic.clone(),
+            truncate(&publish.payload),
+            publish.retain,
+            delivery,
+        );
+    }
+
     /// Sends a disconnect packet on the current connection. Its stream ends
     /// later with `Disconnected`.
     fn disconnect_current(&mut self) {
-        if let Some(live) = self.current() {
+        let delivery = self.current().map_or(Delivery::NoConnection, |live| {
             eprintln!("mqtt: disconnect");
-            if let Err(error) = live.link.disconnect() {
-                eprintln!("mqtt: the disconnect failed: {error}");
-            }
+            delivery("disconnect", live.link.disconnect())
+        });
+        if let Some(current) = self.current {
+            self.inspector.effect(
+                "MqttDisconnect",
+                format!("connection {current}"),
+                outcome(&delivery),
+            );
+            self.inspector.packet(
+                Direction::Out,
+                Packet::Disconnect,
+                "",
+                String::new(),
+                false,
+                delivery,
+            );
         }
         self.current = None;
     }
@@ -362,23 +551,59 @@ impl Shell {
         self.last_connection += 1;
         let id = self.last_connection;
         let connect = &request.operation;
-        eprintln!(
-            "mqtt: connect to {}:{} as {}",
-            connect.host, connect.port, connect.client_id
+        // Do not log the credentials of the request.
+        let target = format!("{}:{} as {}", connect.host, connect.port, connect.client_id);
+        eprintln!("mqtt: connect to {target}");
+        self.inspector.effect(
+            "MqttConnect",
+            target.clone(),
+            format!("opened connection {id}"),
+        );
+        self.inspector.packet(
+            Direction::Out,
+            Packet::Connect,
+            "",
+            target,
+            false,
+            Delivery::Sent,
         );
         let notifier = self.notifier.clone();
         let link = (self.open)(
             connect,
-            Box::new(move |event| {
+            Box::new(move |event, retained| {
                 notifier.send(Signal::Mqtt {
                     connection: id,
                     event,
+                    retained,
                 });
             }),
         );
         self.connections.push(Live { id, request, link });
         self.current = Some(id);
         Vec::new()
+    }
+}
+
+/// Converts the result of a request to the client to a delivery. Logs an
+/// error.
+fn delivery(request: &str, result: Result<(), String>) -> Delivery {
+    match result {
+        Ok(()) => Delivery::Sent,
+        Err(error) => {
+            eprintln!("mqtt: the {request} failed: {error}");
+            Delivery::Failed(error)
+        }
+    }
+}
+
+/// Returns the text of the effect log for a delivery.
+fn outcome(delivery: &Delivery) -> String {
+    match delivery {
+        Delivery::Received => "received".into(),
+        Delivery::Sent => "sent".into(),
+        Delivery::NotSent => "not sent: read-only".into(),
+        Delivery::NoConnection => "not sent: no connection".into(),
+        Delivery::Failed(error) => format!("failed: {error}"),
     }
 }
 
@@ -410,12 +635,15 @@ mod tests {
 
     use shared::{
         Event, PowerSource, Settings,
-        capabilities::mqtt::{Connect, MqttEvent, Publish},
+        capabilities::mqtt::{Connect, Credentials, Message, MqttEvent, Publish},
     };
     use tokio::runtime::Runtime;
 
     use super::{Notifier, Shell, Signal};
-    use crate::mqtt::{Link, Opener, Sink};
+    use crate::{
+        inspector::{Delivery, Direction, MqttEntry, Packet},
+        mqtt::{Link, Opener, Sink},
+    };
 
     type Log = Arc<Mutex<Vec<String>>>;
 
@@ -502,18 +730,26 @@ mod tests {
         }
 
         fn start(&mut self, power: PowerSource) {
+            self.start_with(power, None);
+        }
+
+        fn start_with(&mut self, power: PowerSource, credentials: Option<Credentials>) {
             let settings = Settings {
                 device_id: "test".into(),
                 host: "localhost".into(),
                 port: 1883,
-                credentials: None,
+                credentials,
             };
             self.shell()
                 .start(settings, power, Some("/room/living_room".into()));
         }
 
         fn mqtt(&mut self, connection: u64, event: MqttEvent) {
-            self.shell().handle(Signal::Mqtt { connection, event });
+            self.shell().handle(Signal::Mqtt {
+                connection,
+                event,
+                retained: false,
+            });
         }
 
         /// Fires the timer that runs, with its token.
@@ -624,5 +860,190 @@ mod tests {
             .runtime
             .block_on(async { tokio::time::sleep(Duration::from_millis(20)).await });
         assert!(tasks.iter().all(tokio::task::AbortHandle::is_finished));
+    }
+
+    /// Returns the MQTT log entries with a topic that ends in `/cmd`.
+    fn commands(shell: &Shell) -> Vec<MqttEntry> {
+        shell
+            .inspector()
+            .mqtt
+            .iter()
+            .filter(|entry| entry.topic.ends_with("/cmd"))
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn read_only_can_change_while_the_shell_runs() {
+        let mut fixture = Fixture::new(false);
+        fixture.start(PowerSource::Stand);
+        fixture.mqtt(1, MqttEvent::Connected);
+        fixture.take_log();
+
+        fixture.shell().set_read_only(true);
+        assert!(fixture.shell().read_only());
+        fixture.shell().send(Event::TileTapped(0));
+        assert_eq!(fixture.take_log(), Vec::<String>::new());
+
+        fixture.shell().set_read_only(false);
+        fixture.shell().send(Event::TileTapped(0));
+        assert_eq!(fixture.take_log(), ["publish dashboard/test/cmd 1"]);
+
+        // The newest entry is first.
+        let deliveries: Vec<_> = commands(fixture.shell())
+            .into_iter()
+            .map(|entry| (entry.direction, entry.packet, entry.delivery))
+            .collect();
+        assert_eq!(
+            deliveries,
+            [
+                (Direction::Out, Packet::Publish, Delivery::Sent),
+                (Direction::Out, Packet::Publish, Delivery::NotSent),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_service_call_in_read_only_mode_is_in_the_logs_as_not_sent() {
+        let mut fixture = Fixture::new(true);
+        fixture.start(PowerSource::Stand);
+        fixture.mqtt(1, MqttEvent::Connected);
+        fixture.shell().send(Event::TileTapped(0));
+
+        let [entry] = commands(fixture.shell()).try_into().unwrap();
+        assert_eq!(entry.delivery, Delivery::NotSent);
+        assert_ne!(entry.payload, "");
+        let effect = fixture.shell().inspector().effects.iter().next().unwrap();
+        assert_eq!(effect.effect, "MqttPublish");
+        assert_eq!(effect.request, "dashboard/test/cmd");
+        assert_eq!(effect.outcome, "not sent: read-only");
+    }
+
+    #[test]
+    fn the_mqtt_log_has_the_messages_in_and_out() {
+        let mut fixture = Fixture::new(true);
+        fixture.start(PowerSource::Stand);
+        fixture.mqtt(1, MqttEvent::Connected);
+        let topic = "homeassistant/statestream/light/kitchen/state";
+        fixture.shell().handle(Signal::Mqtt {
+            connection: 1,
+            event: MqttEvent::Message(Message {
+                topic: topic.into(),
+                payload: b"on".to_vec(),
+            }),
+            retained: true,
+        });
+
+        let log = &fixture.shell().inspector().mqtt;
+        let newest = log.iter().next().unwrap();
+        assert_eq!(
+            (newest.direction, newest.packet, newest.topic.as_str()),
+            (Direction::In, Packet::Publish, topic)
+        );
+        assert_eq!(newest.payload, "on");
+        assert!(newest.retained);
+        assert_eq!(newest.delivery, Delivery::Received);
+
+        let packets: Vec<_> = log.iter().map(|entry| entry.packet).collect();
+        assert_eq!(packets.last(), Some(&Packet::Connect));
+        assert!(packets.contains(&Packet::ConnAck));
+        // One subscribe request is one entry, with all its topics.
+        let subscribes: Vec<_> = log
+            .iter()
+            .filter(|entry| entry.packet == Packet::Subscribe)
+            .collect();
+        assert_eq!(subscribes.len(), 1);
+        assert_eq!(
+            subscribes[0].topic,
+            format!("{} topics", subscribes[0].topics.len())
+        );
+        assert!(subscribes[0].topics.len() > 1);
+        // A message is not an effect, so the effect log does not have it.
+        assert!(
+            fixture
+                .shell()
+                .inspector()
+                .effects
+                .iter()
+                .all(|entry| !entry.request.contains(topic))
+        );
+    }
+
+    #[test]
+    fn the_logs_do_not_show_the_password() {
+        let mut fixture = Fixture::new(true);
+        fixture.start_with(
+            PowerSource::Stand,
+            Some(Credentials {
+                username: "dashboard".into(),
+                password: "secret-password".into(),
+            }),
+        );
+        fixture.mqtt(1, MqttEvent::Connected);
+        let inspector = fixture.shell().inspector();
+        let effects = inspector
+            .effects
+            .iter()
+            .map(|entry| format!("{} {} {}", entry.effect, entry.request, entry.outcome));
+        let packets = inspector
+            .mqtt
+            .iter()
+            .map(|entry| format!("{} {}", entry.topic, entry.payload));
+        let text: Vec<String> = effects.chain(packets).collect();
+        assert!(text.iter().any(|line| line.contains("localhost:1883")));
+        assert!(text.iter().all(|line| !line.contains("secret-password")));
+    }
+
+    #[test]
+    fn the_effect_log_has_the_effects_and_their_answers() {
+        let mut fixture = Fixture::new(true);
+        fixture.start(PowerSource::Battery);
+        fixture.mqtt(1, MqttEvent::Connected);
+        fixture.fire_timer();
+        let effects: Vec<_> = fixture
+            .shell()
+            .inspector()
+            .effects
+            .iter()
+            .map(|entry| entry.effect)
+            .collect();
+        for name in [
+            "Render",
+            "WifiOn",
+            "MqttConnect",
+            "MqttSubscribe",
+            "MqttPublish",
+            "TimeNotifyAfter",
+            "MqttDisconnect",
+            "Sleep",
+        ] {
+            assert!(effects.contains(&name), "{name} is not in {effects:?}");
+        }
+        let expired = fixture
+            .shell()
+            .inspector()
+            .effects
+            .iter()
+            .any(|entry| entry.outcome == "resolved: the timer expired");
+        assert!(expired);
+    }
+
+    #[test]
+    fn an_offset_that_the_user_sets_stays_until_the_local_offset_changes() {
+        let mut fixture = Fixture::new(true);
+        fixture.start(PowerSource::Stand);
+        let local = fixture.shell().utc_offset_minutes();
+
+        let summer = local + 60;
+        fixture.shell().set_utc_offset(summer);
+        assert_eq!(fixture.shell().utc_offset_minutes(), summer);
+
+        // The local offset did not change, so the check keeps the offset.
+        fixture.shell().check_offset(local);
+        assert_eq!(fixture.shell().utc_offset_minutes(), summer);
+
+        // The local offset changed, so the shell sends it.
+        fixture.shell().check_offset(local - 60);
+        assert_eq!(fixture.shell().utc_offset_minutes(), local - 60);
     }
 }
