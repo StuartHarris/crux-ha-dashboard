@@ -74,9 +74,9 @@ pub struct Start {
     pub path: Option<String>,
     /// The local offset from UTC in minutes, for example 60 for BST.
     pub utc_offset_minutes: i16,
-    /// The time of the last update, in seconds since the Unix epoch, from
-    /// [`ViewModel::last_sync`]. After a deep sleep, the shell gives the
-    /// value that it kept in RTC memory.
+    /// The time at which the last state message arrived, in seconds since
+    /// the Unix epoch, from [`ViewModel::last_sync`]. After a deep sleep, the
+    /// shell gives the value that it kept in RTC memory.
     pub last_sync: Option<u64>,
 }
 
@@ -129,11 +129,15 @@ pub enum Event {
         /// The item from the stream.
         event: MqttEvent,
     },
-    /// The connection stopped at this time. The time is `None` if the shell
-    /// gave a time that is not valid.
+    /// The clock gave this time after a state message arrived. The time is
+    /// `None` if the shell gave a time that is not valid.
     #[serde(skip)]
     #[facet(skip)]
-    Synced(#[facet(opaque)] Option<DateTime<Utc>>),
+    MessageTime(#[facet(opaque)] Option<DateTime<Utc>>),
+    /// The minute timer with this id expired.
+    #[serde(skip)]
+    #[facet(skip)]
+    MinutePassed(u32),
     /// The wait before the reconnect with this id is over.
     #[serde(skip)]
     #[facet(skip)]
@@ -142,18 +146,6 @@ pub enum Event {
     #[serde(skip)]
     #[facet(skip)]
     IdleTimeout(u32),
-    /// The core read the clock before it sleeps, after the idle timer with
-    /// this id expired.
-    #[serde(skip)]
-    #[facet(skip)]
-    ReadyToSleep {
-        /// The id of the idle timer.
-        idle: u32,
-        /// The time now, or `None` if the shell gave a time that is not
-        /// valid.
-        #[facet(opaque)]
-        now: Option<DateTime<Utc>>,
-    },
 }
 
 /// The effects that the core asks the shell to do.
@@ -199,7 +191,10 @@ pub struct Model {
     pub connection: connection::State,
     /// The power source and the sleep state.
     pub power: power::State,
-    /// The time at which the last connection stopped.
+    /// The time at which the last state message arrived. The core reads
+    /// the clock at most once a minute, so the time can be up to one minute
+    /// before the arrival of the last message. Refer to
+    /// [`connection::read_message_time`].
     pub last_sync: Option<DateTime<Utc>>,
     /// The local offset from UTC in minutes.
     pub utc_offset_minutes: i16,
@@ -282,10 +277,10 @@ impl App for Dashboard {
             }
             Event::Wifi { request, status } => connection::wifi(request, status, model),
             Event::Mqtt { connection, event } => connection::mqtt(connection, event, model),
-            Event::Synced(now) => connection::synced(now, model),
+            Event::MessageTime(now) => connection::message_time(now, model),
+            Event::MinutePassed(id) => connection::minute_passed(id, model),
             Event::Reconnect(id) => connection::reconnect(id, model),
             Event::IdleTimeout(id) => power::idle_timeout(id, model),
-            Event::ReadyToSleep { idle, now } => power::sleep(idle, now, model),
         }
     }
 

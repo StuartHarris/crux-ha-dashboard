@@ -266,6 +266,9 @@ impl App {
         if pressed(Key::W) {
             self.shell.wake();
         }
+        if pressed(Key::Z) {
+            self.shell.sleep_now();
+        }
         if pressed(Key::D) {
             self.show_outline = !self.show_outline;
         }
@@ -419,6 +422,7 @@ impl App {
             {
                 self.shell.wake();
             }
+            self.sleep_now_control(ui, view);
         });
         ui.label(format!("Connection: {:?}", view.connection));
 
@@ -471,11 +475,36 @@ impl App {
         ui.separator();
         ui.label(
             RichText::new(
-                "Keys (when no text box has the focus): S stand/battery, W wake, D outline, \
-                 Left/Right page, Q quit",
+                "Keys (when no text box has the focus): S stand/battery, W wake, \
+                 Z sleep now, D outline, Left/Right page, Q quit",
             )
             .small(),
         );
+    }
+
+    /// Shows the "Sleep now" button. The button ends the idle time of the
+    /// core now. The core then decides to sleep, as after a real idle
+    /// timeout.
+    fn sleep_now_control(&mut self, ui: &mut Ui, view: &ViewModel) {
+        let enabled = self.shell.can_sleep_now();
+        let reason = if view.power == PowerSource::Stand {
+            "The device does not sleep on the stand."
+        } else if view.asleep {
+            "The device is asleep."
+        } else {
+            "No idle timer runs."
+        };
+        let clicked = ui
+            .add_enabled(enabled, egui::Button::new("Sleep now (Z)"))
+            .on_hover_text(
+                "Ends the idle time now. The core then sleeps as after the idle timeout. \
+                 If taps wait to be sent, the core first waits one more idle period.",
+            )
+            .on_disabled_hover_text(reason)
+            .clicked();
+        if clicked {
+            self.shell.sleep_now();
+        }
     }
 
     /// Shows if a tap switches real devices. The switch from a dry run to

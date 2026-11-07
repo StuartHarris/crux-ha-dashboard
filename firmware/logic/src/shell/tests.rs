@@ -141,13 +141,21 @@ fn a_message_on_the_stream_redraws_a_visible_tile() {
     let tile = shell.view().tiles[0].entity_id.clone();
     let (domain, object) = tile.split_once('.').unwrap();
     let topic = alloc::format!("homeassistant/statestream/{domain}/{object}/state");
-    let jobs = shell.handle(Signal::Mqtt {
+    let message = |payload: &[u8]| Signal::Mqtt {
         connection: 1,
         event: MqttEvent::Message(Message {
-            topic,
-            payload: b"on".to_vec(),
+            topic: topic.clone(),
+            payload: payload.to_vec(),
         }),
-    });
+    };
+    // The first message also reads the clock, and the core starts the
+    // minute timer.
+    let jobs = shell.handle(message(b"on"));
+    assert_eq!(names(&jobs), ["render", "start timer 1"]);
+    assert_eq!(shell.view().updated, "Live · 12:00");
+
+    // Within the minute, the core does not read the clock again.
+    let jobs = shell.handle(message(b"off"));
     assert_eq!(names(&jobs), ["render"]);
 }
 

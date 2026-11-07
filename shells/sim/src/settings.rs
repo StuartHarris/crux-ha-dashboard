@@ -19,8 +19,10 @@ Runs the dashboard core in a window, connected to the MQTT broker.
 
 Modes:
   (none)              Open a window. Click to tap. Keys: S moves the device on
-                      or off the stand, W wakes it, D shows the area of each
-                      partial refresh, Left and Right turn the page, Q quits.
+                      or off the stand, W wakes it, Z ends the idle time on
+                      battery so that the core sleeps, D shows the area of
+                      each partial refresh, Left and Right turn the page, Q
+                      quits.
                       The window also shows the controls, the view model,
                       the effect log and the MQTT log.
   --png <FILE>        Draw a page with fixed entity states to a PNG file.
