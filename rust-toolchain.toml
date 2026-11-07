@@ -1,0 +1,7 @@
+# The root workspace (core, ui and desktop shells). The firmware has its own
+# toolchain file, because it needs the `esp` toolchain for Xtensa.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+# A no_std target with CAS atomics, to check that the core builds without std.
+targets = ["thumbv7em-none-eabihf"]

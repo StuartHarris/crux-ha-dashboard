@@ -1,0 +1,17 @@
+[package]
+name = "sim"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Desktop simulator: runs the core and draws the panel with the same code as the firmware."
+
+[dependencies]
+shared.workspace = true
+ui.workspace = true
+embedded-graphics.workspace = true
+# Without SDL, the simulator writes a PNG. Phase 4 adds a window.
+embedded-graphics-simulator = { version = "0.8.0", default-features = false }
+
+[lints]
+workspace = true
