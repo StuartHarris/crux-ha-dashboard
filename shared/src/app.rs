@@ -294,15 +294,30 @@ impl App for Dashboard {
     }
 }
 
+/// The earliest time that the core accepts from the clock:
+/// 2025-01-01T00:00:00Z, in seconds since the Unix epoch.
+///
+/// A device with no RTC and no network time counts from the Unix epoch when
+/// it starts. A time before this one is such a count, not the time of day.
+pub const EARLIEST_VALID_TIME: u64 = 1_735_689_600;
+
 /// Reads the wall clock with `Time::now_instant`. The answer is `None` if the
-/// shell gives a time that is not valid.
+/// shell gives a time that is not valid, or a time before
+/// [`EARLIEST_VALID_TIME`].
 ///
 /// This function is the only place that reads the clock.
 pub(crate) fn now() -> RequestBuilder<Effect, Event, impl Future<Output = Option<DateTime<Utc>>>> {
-    Time::now_instant().map(|instant: Instant| {
-        let seconds = i64::try_from(instant.seconds()).ok()?;
-        DateTime::from_timestamp(seconds, instant.nanos())
-    })
+    Time::now_instant().map(valid_time)
+}
+
+/// Converts an instant from the clock to a time, or `None` if the instant is
+/// not a plausible time of day.
+fn valid_time(instant: Instant) -> Option<DateTime<Utc>> {
+    if instant.seconds() < EARLIEST_VALID_TIME {
+        return None;
+    }
+    let seconds = i64::try_from(instant.seconds()).ok()?;
+    DateTime::from_timestamp(seconds, instant.nanos())
 }
 
 /// Asks the shell to draw. If `full_refresh` is `true`, the core also asks
@@ -341,4 +356,24 @@ fn on_start(start: Start, model: &mut Model) -> Cmd {
     redraw(model, true)
         .and(connection::go_online(model))
         .and(power::restart_idle_timer(model))
+}
+
+#[cfg(test)]
+mod tests {
+    use crux_time::Instant;
+
+    use super::{EARLIEST_VALID_TIME, valid_time};
+
+    #[test]
+    fn a_time_since_boot_is_not_a_valid_time() {
+        // A device with no RTC: 90 seconds after the start.
+        assert_eq!(valid_time(Instant::new(90, 0)), None);
+        assert_eq!(valid_time(Instant::new(EARLIEST_VALID_TIME - 1, 0)), None);
+    }
+
+    #[test]
+    fn a_time_after_2025_is_valid() {
+        let time = valid_time(Instant::new(EARLIEST_VALID_TIME, 5)).unwrap();
+        assert_eq!(time.to_rfc3339(), "2025-01-01T00:00:00.000000005+00:00");
+    }
 }

@@ -1,0 +1,51 @@
+# Recipes for the firmware. They need the `esp` toolchain (`espup install`)
+# and `espflash`. If `~/export-esp.sh` exists, each recipe reads it first.
+# The tests of the firmware logic run on the host: `just test-firmware` in the
+# root directory.
+
+set shell := ["bash", "-c"]
+
+chip := "esp32s3"
+release := "target/xtensa-esp32s3-none-elf/release"
+env := 'if [ -f "$HOME/export-esp.sh" ]; then . "$HOME/export-esp.sh"; fi'
+
+default: build
+
+# Build the firmware and the bring-up checks (release)
+build:
+    @echo '{{ style("command") }}build:{{ NORMAL }}'
+    {{ env }} && cargo build --release
+
+# Check formatting and types
+check:
+    @echo '{{ style("command") }}check:{{ NORMAL }}'
+    cargo fmt --check
+    {{ env }} && cargo check --release --bins
+
+# Run clippy with the lint settings of the root workspace
+clippy:
+    @echo '{{ style("command") }}clippy:{{ NORMAL }}'
+    {{ env }} && cargo clippy --release --bins -- --no-deps -Dclippy::pedantic -Dclippy::nursery -Dwarnings
+
+# Format the code
+fix:
+    cargo fmt
+
+# Flash a binary and show the log (bin: dashboard or bringup)
+flash bin="dashboard":
+    @echo '{{ style("command") }}flash:{{ NORMAL }}'
+    {{ env }} && cargo run --release --bin {{ bin }}
+
+# Show the log of the board without a flash
+monitor:
+    espflash monitor --chip {{ chip }}
+
+# Flash the hardware checks and show their log
+bringup: (flash "bringup")
+
+# Show the size of the image and of each memory section
+[script('bash')]
+size bin="dashboard": build
+    if [ -f "$HOME/export-esp.sh" ]; then . "$HOME/export-esp.sh"; fi
+    xtensa-esp32s3-elf-size -A {{ release }}/{{ bin }} | grep -Ev '^\.(debug|xtensa|comment)'
+    espflash save-image --chip {{ chip }} {{ release }}/{{ bin }} {{ release }}/{{ bin }}.bin

@@ -1,0 +1,29 @@
+# The build-time configuration of the firmware.
+#
+# Copy this file to `cfg.toml` and put the real values in the copy.
+# `cfg.toml` is in `.gitignore`. Do not commit it, because it has passwords.
+# If a password has a backslash, put it in single quotes.
+
+[wifi]
+# 1 to 32 bytes.
+ssid = "your-network"
+# 8 to 63 bytes. Leave it out for an open network.
+password = "your-wifi-password"
+# "wpa2" (the default), "wpa_wpa2" or "open". The Wi-Fi driver cannot join a
+# WPA3 network.
+auth = "wpa2"
+
+[mqtt]
+host = "192.168.1.109"
+port = 1883
+username = "dashboard"
+password = "your-broker-password"
+
+[device]
+# The id of the dashboard in MQTT topics, for example `dashboard/hall/cmd`.
+id = "hall"
+# The local offset from UTC in minutes, for example 60 for BST.
+utc_offset_minutes = 0
+# If true, a tap does not publish a service call, so no device in the house
+# changes. Set it to false when the dashboard works.
+read_only = true

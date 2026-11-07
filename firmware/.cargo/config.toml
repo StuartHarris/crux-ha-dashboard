@@ -1,0 +1,20 @@
+[build]
+target = "xtensa-esp32s3-none-elf"
+
+[target.xtensa-esp32s3-none-elf]
+# Flash the image and show the log. espflash finds the USB-Serial-JTAG port.
+runner = "espflash flash --chip esp32s3 --monitor"
+rustflags = [
+  "-C", "link-arg=-Wl,-Tlinkall.x",
+  "-C", "link-arg=-nostartfiles",
+  # The ESP32-S3 memory map has segments that are both writable and
+  # executable, so this linker warning is expected.
+  "-C", "link-arg=-Wl,--no-warn-rwx-segments",
+]
+
+[env]
+# The level of the log. The firmware reads it at build time.
+ESP_LOG = "info"
+
+[unstable]
+build-std = ["alloc", "core"]

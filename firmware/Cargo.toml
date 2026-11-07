@@ -1,0 +1,98 @@
+[package]
+name = "dashboard-firmware"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+description = "The firmware of the dashboard for the LilyGo T5 E-Paper S3 Pro Lite"
+# The `panel` module is a copy of part of `lilygo-t5s3paperpro`, which is GPL-3.0.
+license = "GPL-3.0-only"
+
+# The firmware is its own workspace. It builds for `xtensa-esp32s3-none-elf`,
+# and feature unification with the std shells of the root workspace would pull
+# std into the firmware. The `logic` crate is a member of the root workspace,
+# so its host tests run with `just test` there.
+[workspace]
+exclude = ["logic"]
+
+[[bin]]
+name = "dashboard"
+path = "src/bin/dashboard/main.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "bringup"
+path = "src/bin/bringup.rs"
+test = false
+bench = false
+
+[lib]
+test = false
+bench = false
+
+[dependencies]
+# The Crux core, the renderer and the shell logic, without std.
+shared = { path = "../shared", default-features = false }
+ui = { path = "../ui" }
+logic = { path = "logic", package = "firmware-logic" }
+# Without std, the locks in crux_core are critical sections. esp-hal provides
+# the implementation of `critical-section`.
+crux_core = { git = "https://github.com/redbadger/crux", rev = "890ab0e17e818addb74a5bd70f51db2d606d314a", default-features = false, features = ["critical-section"] }
+crux_time = { git = "https://github.com/redbadger/crux", rev = "890ab0e17e818addb74a5bd70f51db2d606d314a", default-features = false }
+embedded-graphics = "0.8.2"
+
+esp-hal = { version = "=1.2.2", features = ["esp32s3", "unstable", "log-04"] }
+esp-rtos = { version = "0.4.0", features = ["esp32s3", "embassy", "esp-radio", "esp-alloc", "log-04"] }
+esp-radio = { version = "=1.0.0-beta.1", features = ["esp32s3", "wifi", "esp-alloc", "log-04", "unstable"] }
+esp-alloc = { version = "0.11.0", features = ["esp32s3"] }
+# Lets the panel driver put its waveform table in PSRAM.
+allocator-api2 = { version = "0.3.0", default-features = false, features = ["alloc"] }
+esp-bootloader-esp-idf = { version = "0.6.0", features = ["esp32s3"] }
+# The log goes to the USB-Serial-JTAG port. UART0 (GPIO43 and GPIO44) goes to
+# the GPS header on this board.
+esp-println = { version = "0.18.0", default-features = false, features = ["esp32s3", "jtag-serial", "log-04", "critical-section", "colors"] }
+esp-backtrace = { version = "0.20.0", features = ["esp32s3", "panic-handler", "println"] }
+
+embassy-executor = "0.10.0"
+embassy-time = "0.5.1"
+embassy-sync = "0.8.0"
+embassy-futures = "0.1.2"
+embassy-net = { version = "0.9.1", features = ["dhcpv4", "medium-ethernet", "tcp", "dns", "proto-ipv4"] }
+embedded-io-async = "0.7"
+rust-mqtt = { version = "0.6.0", default-features = false, features = ["v5", "alloc", "log"] }
+static_cell = "2.1.1"
+log = "0.4.28"
+
+[lints.rust]
+# The macros of esp-alloc (`heap_allocator!`, `psram_allocator!`) expand to
+# `unsafe` blocks in the firmware, so it does not copy
+# `unsafe_code = "forbid"` from the root workspace. The firmware has no
+# `unsafe` block of its own.
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+
+[profile.dev]
+# A debug build without optimisation is too slow to drive the panel.
+opt-level = "s"
+
+[profile.dev.package.esp-hal]
+opt-level = 3
+
+# The Wi-Fi driver and the scheduler need optimisation, also in a debug build.
+[profile.dev.package.esp-radio]
+opt-level = 3
+
+[profile.dev.package.esp-rtos]
+opt-level = 3
+
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+# Symbols go in the ELF only, not in the flashed image.
+debug = 2
+incremental = false
