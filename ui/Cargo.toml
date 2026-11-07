@@ -8,7 +8,7 @@ description = "Draws the view model with embedded-graphics. The simulator and th
 
 [dependencies]
 embedded-graphics.workspace = true
-shared = { workspace = true, default-features = false }
+shared.workspace = true
 
 [lints]
 workspace = true

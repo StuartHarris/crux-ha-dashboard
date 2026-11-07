@@ -7,7 +7,7 @@ publish.workspace = true
 description = "Desktop simulator: runs the core and draws the panel with the same code as the firmware."
 
 [dependencies]
-shared.workspace = true
+shared = { workspace = true, features = ["std"] }
 ui.workspace = true
 embedded-graphics.workspace = true
 # Without SDL, the simulator writes a PNG. Phase 4 adds a window.

@@ -25,5 +25,6 @@ facet = { version = "=0.46.5", default-features = false, features = ["alloc"] }
 serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
 embedded-graphics = "0.8.2"
 
-shared = { path = "shared" }
+# Members opt in to `std`. The `ui` crate must never turn it on.
+shared = { path = "shared", default-features = false }
 ui = { path = "ui" }

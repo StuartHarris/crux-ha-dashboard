@@ -1,7 +1,9 @@
 # Recipes cover the host workspace. The firmware has its own workspace and recipes later.
 
-# `thumbv7em-none-eabihf` stands in for the ESP32-S3 until the esp toolchain is installed.
-nostd_target := "thumbv7em-none-eabihf"
+# The no_std check targets the ESP32-S3 with the `esp` toolchain.
+# If that toolchain is missing, the check uses `thumbv7em-none-eabihf` instead.
+esp_target := "xtensa-esp32s3-none-elf"
+fallback_target := "thumbv7em-none-eabihf"
 
 default: dev
 
@@ -23,9 +25,21 @@ check:
 
 # Check that the core and the ui build for a no_std target.
 # The firmware turns on `crux_core/critical-section`, so this check does the same.
+# The check needs the `esp` toolchain and `~/export-esp.sh`. Without the toolchain, it uses the fallback target.
+[script('bash')]
 check-nostd:
-    @echo '{{ style("command") }}check-nostd:{{ NORMAL }}'
-    cargo check -p shared -p ui --no-default-features --features crux_core/critical-section --target {{ nostd_target }}
+    echo '{{ style("command") }}check-nostd:{{ NORMAL }}'
+    set -e
+    flags="-p shared -p ui --no-default-features --features crux_core/critical-section"
+    if rustup toolchain list | grep -q '^esp'; then
+        if [ -f "$HOME/export-esp.sh" ]; then
+            . "$HOME/export-esp.sh"
+        fi
+        cargo +esp check $flags --target {{ esp_target }} -Zbuild-std=core,alloc
+    else
+        echo "note: the esp toolchain is not installed, so this check uses {{ fallback_target }}"
+        cargo check $flags --target {{ fallback_target }}
+    fi
 
 # Build the workspace
 build:
@@ -56,4 +70,9 @@ doctor:
     check cargo "https://rustup.rs"
     check cargo-nextest "cargo install cargo-nextest --locked"
     check espup "cargo install espup --locked"
+    if rustup toolchain list | grep -q '^esp'; then
+        echo "  ✓ esp toolchain"
+    else
+        echo "  {{ style("error") }}✗ esp toolchain{{ NORMAL }}: install with: espup install"
+    fi
     check espflash "cargo install espflash --locked"
