@@ -3,22 +3,24 @@
 //! - On the stand, the device stays awake and connected.
 //! - On battery, the device connects when it wakes. After [`IDLE_TIMEOUT`]
 //!   without a touch, it disconnects, turns Wi-Fi off, draws the last image
-//!   with the time of the last update, and sleeps until a touch.
+//!   with the time of the last state message, and sleeps until a touch.
 
 use alloc::vec;
 use core::time::Duration;
 
-use chrono::{DateTime, Utc};
 use crux_time::clock::Time;
 
 use crate::{
     Cmd, Event, Model,
-    app::{now, redraw},
+    app::redraw,
     capabilities::power::{Power, PowerSource, WakeSource},
     features::connection,
 };
 
 /// On battery, the time without a touch after which the device sleeps.
+///
+/// No other timer of the core waits for this time, so a shell can find the
+/// idle timer by its duration, for example to end the idle time early.
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The power source and the sleep state.
@@ -79,7 +81,7 @@ pub fn restart_idle_timer(model: &mut Model) -> Cmd {
     timer.then_send(move |_| Event::IdleTimeout(id))
 }
 
-/// The idle timer expired: read the clock, then sleep.
+/// The idle timer expired: sleep.
 ///
 /// If service calls wait in the outbox, the core first waits one more idle
 /// period for the connection.
@@ -92,21 +94,14 @@ pub fn idle_timeout(id: u32, model: &mut Model) -> Cmd {
         model.power.extended = true;
         return timer;
     }
-    now().then_send(move |now| Event::ReadyToSleep { idle: id, now })
+    sleep(model)
 }
 
 /// Disconnects, turns Wi-Fi off, draws the last image and sleeps.
 ///
-/// A touch after the idle timer expired cancels the sleep. The core drops the
-/// service calls that wait in the outbox, and the view shows how many.
-pub fn sleep(idle: u32, now: Option<DateTime<Utc>>, model: &mut Model) -> Cmd {
-    if idle != model.power.idle || model.power.source != PowerSource::Battery || model.power.asleep
-    {
-        return Cmd::done();
-    }
-    if model.connection.mqtt == connection::Link::Up {
-        model.last_sync = now.or(model.last_sync);
-    }
+/// The core drops the service calls that wait in the outbox, and the view
+/// shows how many. The last image shows the time of the last state message.
+fn sleep(model: &mut Model) -> Cmd {
     model.power.asleep = true;
     model.unsent += model.connection.outbox.len();
     connection::go_offline(model)

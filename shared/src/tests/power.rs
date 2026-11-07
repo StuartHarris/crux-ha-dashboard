@@ -4,7 +4,7 @@ use core::time::Duration;
 
 use crux_core::App;
 
-use super::{connection::drive_to_connected, instant, start};
+use super::{connection::drive_to_connected, start};
 use crate::{
     Connection, Dashboard, EffectTestExt, Event, Model, PowerSource,
     capabilities::{network::WifiStatus, power::WakeSource},
@@ -26,16 +26,14 @@ fn start_on_battery_also_starts_the_idle_timer() {
 }
 
 #[test]
-fn the_idle_timeout_reads_the_clock_then_disconnects_and_sleeps() {
+fn the_idle_timeout_disconnects_and_sleeps() {
     let app = Dashboard;
     let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Battery);
+    model.last_sync = chrono::DateTime::from_timestamp(super::NOW.cast_signed(), 0);
 
-    let event = app
-        .update(Event::IdleTimeout(model.power.idle), &mut model)
-        .resolve_time_now(|_| instant(super::NOW))
-        .expect_event();
-
-    app.update(event, &mut model)
+    // The core does not read the clock. The last image shows the time of the
+    // last state message.
+    app.update(Event::IdleTimeout(model.power.idle), &mut model)
         .expect_mqtt_publish_with(|publish| {
             assert_eq!(publish.topic, "dashboard/hall/status");
             assert_eq!(publish.payload, b"asleep");
@@ -72,21 +70,6 @@ fn a_tap_restarts_the_idle_timer_and_the_old_timer_is_ignored() {
 }
 
 #[test]
-fn a_tap_while_the_core_reads_the_clock_cancels_the_sleep() {
-    let app = Dashboard;
-    let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Battery);
-
-    let event = app
-        .update(Event::IdleTimeout(model.power.idle), &mut model)
-        .resolve_time_now(|_| instant(super::NOW))
-        .expect_event();
-    let _ = app.update(Event::NextPage, &mut model);
-
-    app.update(event, &mut model).expect_no_effects();
-    assert!(!model.power.asleep);
-}
-
-#[test]
 fn on_the_stand_there_is_no_idle_timer() {
     let app = Dashboard;
     let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Stand);
@@ -111,11 +94,7 @@ fn off_the_stand_starts_the_idle_timer() {
 fn on_the_stand_while_asleep_wakes_and_connects() {
     let app = Dashboard;
     let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Battery);
-    let event = app
-        .update(Event::IdleTimeout(model.power.idle), &mut model)
-        .resolve_time_now(|_| instant(super::NOW))
-        .expect_event();
-    let _ = app.update(event, &mut model);
+    let _ = app.update(Event::IdleTimeout(model.power.idle), &mut model);
     assert!(model.power.asleep);
 
     let event = app
@@ -166,4 +145,17 @@ fn taps_while_asleep_do_nothing() {
     ] {
         app.update(event, &mut model).expect_no_effects();
     }
+}
+
+#[test]
+fn no_other_timer_waits_for_the_idle_timeout() {
+    use crate::features::connection::{CLOCK_INTERVAL, RECONNECT_MAX, RECONNECT_MIN};
+
+    assert_ne!(CLOCK_INTERVAL, IDLE_TIMEOUT);
+    let mut wait = RECONNECT_MIN;
+    while wait < RECONNECT_MAX {
+        assert_ne!(wait, IDLE_TIMEOUT);
+        wait *= 2;
+    }
+    assert_ne!(RECONNECT_MAX, IDLE_TIMEOUT);
 }

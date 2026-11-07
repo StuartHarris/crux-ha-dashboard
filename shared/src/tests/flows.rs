@@ -9,7 +9,7 @@ use crate::{
     Connection, Event, PowerSource, Route, TileState,
     capabilities::power::WakeSource,
     features::{
-        connection::{RECONNECT_MAX, RECONNECT_MIN},
+        connection::{CLOCK_INTERVAL, RECONNECT_MAX, RECONNECT_MIN},
         power::IDLE_TIMEOUT,
     },
 };
@@ -62,6 +62,11 @@ fn tile(label: &str, state: TileState, text: &str) -> (String, TileState, String
     (label.into(), state, text.into())
 }
 
+/// Returns the number of times that `effect` is in `log`.
+fn count(log: &[String], effect: &str) -> usize {
+    log.iter().filter(|entry| *entry == effect).count()
+}
+
 #[test]
 fn on_the_stand_the_dashboard_shows_live_state_and_controls_lights() {
     let mut shell = house();
@@ -88,7 +93,10 @@ fn on_the_stand_the_dashboard_shows_live_state_and_controls_lights() {
     assert_eq!(unwanted, [] as [&String; 0]);
     let view = shell.view();
     assert_eq!(view.connection, Connection::Online);
-    assert_eq!(view.updated, "Live");
+    // The retained messages arrive at once. The core reads the clock once
+    // for all of them.
+    assert_eq!(view.updated, "Live · 09:41");
+    assert_eq!(count(&shell.take_log(), "TimeNow"), 1);
     assert_eq!(
         texts(&shell),
         [
@@ -128,8 +136,8 @@ fn on_the_stand_the_dashboard_shows_live_state_and_controls_lights() {
     assert_eq!(call.service, "scene.turn_on");
     assert_eq!(call.entity_id, "scene.living_room_living_room_dimmed");
 
-    // On the stand nothing sleeps.
-    assert_eq!(shell.timers().len(), 0);
+    // On the stand nothing sleeps. Only the minute timer runs.
+    assert_eq!(shell.timers(), [CLOCK_INTERVAL]);
     assert_eq!(shell.sleep, None);
 }
 
@@ -138,7 +146,7 @@ fn on_battery_the_dashboard_wakes_syncs_accepts_taps_then_sleeps() {
     let mut shell = house();
 
     shell.send(start_at(PowerSource::Battery, Some("/room/dining_room")));
-    assert_eq!(shell.timers(), [IDLE_TIMEOUT]);
+    assert_eq!(shell.timers(), [IDLE_TIMEOUT, CLOCK_INTERVAL]);
     assert_eq!(shell.view().tiles[4].text, "19.5°");
     assert_eq!(shell.view().tiles[4].detail, "Set 21°");
 
@@ -148,16 +156,19 @@ fn on_battery_the_dashboard_wakes_syncs_accepts_taps_then_sleeps() {
         Some("on")
     );
     assert_eq!(shell.view().tiles[1].text, "On");
-    // The tap restarted the idle timer. The first timer is now stale.
-    assert_eq!(shell.timers(), [IDLE_TIMEOUT, IDLE_TIMEOUT]);
+    // The tap restarted the idle timer. The first timer is now stale. The
+    // new state of the lamp arrived within the minute, so the core did not
+    // read the clock again.
+    assert_eq!(shell.timers(), [IDLE_TIMEOUT, CLOCK_INTERVAL, IDLE_TIMEOUT]);
 
     shell.take_log();
     shell.fire_timers();
 
+    // The core does not read the clock: the last image shows the time of
+    // the last state message.
     assert_eq!(
         shell.take_log(),
         [
-            "TimeNow",
             "MqttPublish dashboard/hall/status asleep",
             "MqttDisconnect",
             "WifiOff",
@@ -234,10 +245,10 @@ fn a_move_to_the_stand_while_asleep_connects_and_stays_awake() {
 fn a_move_off_the_stand_sleeps_after_the_idle_timeout() {
     let mut shell = house();
     shell.send(start(PowerSource::Stand));
-    assert_eq!(shell.timers().len(), 0);
+    assert!(!shell.timers().contains(&IDLE_TIMEOUT));
 
     shell.send(Event::PowerSourceChanged(PowerSource::Battery));
-    assert_eq!(shell.timers(), [IDLE_TIMEOUT]);
+    assert_eq!(shell.timers(), [CLOCK_INTERVAL, IDLE_TIMEOUT]);
     assert!(shell.broker.is_connected());
 
     shell.fire_timers();
@@ -271,19 +282,23 @@ fn on_the_stand_a_lost_connection_reconnects_after_a_backoff() {
     let view = shell.view();
     assert_eq!(view.connection, Connection::Connecting);
     assert_eq!(view.updated, "Updated 09:41");
-    assert_eq!(shell.timers(), [RECONNECT_MIN]);
+    assert_eq!(shell.timers(), [CLOCK_INTERVAL, RECONNECT_MIN]);
 
     // While the dashboard is offline, Home Assistant changes a light.
     shell.broker.set_state("light.all_lights", "off", &[]);
 
-    shell.fire_timers();
+    // The reconnect is within the minute, but a new connection reads the
+    // clock for its first message.
+    shell.take_log();
+    shell.fire_shortest_timers();
     assert!(shell.broker.is_connected());
     assert_eq!(
         shell.broker.retained("dashboard/hall/status"),
         Some("online")
     );
     assert_eq!(shell.view().tiles[0].text, "Off");
-    assert_eq!(shell.view().updated, "Live");
+    assert_eq!(count(&shell.take_log(), "TimeNow"), 1);
+    assert_eq!(shell.view().updated, "Live · 09:41");
 }
 
 #[test]
@@ -485,8 +500,10 @@ fn after_a_deep_sleep_the_view_shows_the_last_update_that_the_shell_kept() {
     let mut shell = house();
     shell.send(start(PowerSource::Battery));
     shell.fire_timers();
+    // The shell keeps the time of the last state message, not the time of
+    // the sleep.
     let kept = shell.view().last_sync;
-    assert_eq!(kept, Some(super::NOW + 30));
+    assert_eq!(kept, Some(super::NOW));
 
     // A deep sleep loses the core. The shell starts a new core with the
     // values that it kept, and the broker is not there.
@@ -504,4 +521,39 @@ fn start_parts(power: PowerSource) -> crate::Start {
         unreachable!()
     };
     start
+}
+
+#[test]
+fn the_footer_shows_the_time_of_the_last_message_not_a_clock() {
+    let mut shell = house();
+    shell.send(start(PowerSource::Stand));
+    assert_eq!(shell.view().updated, "Live · 09:41");
+
+    // Time passes with no message: nothing changes on the screen.
+    let frames = shell.frames.len();
+    shell.clock += 600;
+    shell.fire_timers();
+    assert_eq!(shell.frames.len(), frames);
+    assert_eq!(shell.view().updated, "Live · 09:41");
+
+    // A message after the minute reads the clock again.
+    shell.take_log();
+    shell.broker.set_state("light.all_lights", "off", &[]);
+    shell.run();
+    assert_eq!(count(&shell.take_log(), "TimeNow"), 1);
+    assert_eq!(shell.view().updated, "Live · 09:52");
+
+    // Another message within the minute does not read the clock.
+    shell.clock += 30;
+    shell.broker.set_state("light.all_lights", "on", &[]);
+    shell.run();
+    assert_eq!(count(&shell.take_log(), "TimeNow"), 0);
+
+    // After a lost connection, the time is the time of the last message
+    // that the core read, not the time of the disconnect.
+    shell.clock += 600;
+    shell.broker.drop_connection();
+    shell.run();
+    assert_eq!(shell.view().updated, "Updated 09:52");
+    assert_eq!(shell.view().last_sync, Some(super::NOW + 660));
 }

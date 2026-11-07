@@ -90,7 +90,7 @@ fn each_page_matches_its_reference_image() {
             let shell = FixedShell::start(PowerSource::Stand, &path);
             let view = shell.view();
             assert_eq!(view.path, path);
-            assert_eq!(view.updated, "Live");
+            assert_eq!(view.updated, "Live · 10:41");
             let slug = page.area.unwrap_or("home");
             check(&format!("page-{index:02}-{slug}"), &view)
         })

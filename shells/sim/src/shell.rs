@@ -28,6 +28,7 @@ use shared::{
         mqtt::{Connect, MqttEvent, Publish},
         network::WifiStatus,
     },
+    features::power::IDLE_TIMEOUT,
 };
 use tokio::{runtime::Handle, task::JoinHandle};
 
@@ -97,6 +98,14 @@ struct Timer {
     request: Request<NotifyAfter>,
     task: JoinHandle<()>,
     token: u64,
+}
+
+impl Timer {
+    /// Returns `true` if the timer is an idle timer of the core. No other
+    /// timer of the core waits for [`IDLE_TIMEOUT`].
+    fn is_idle(&self) -> bool {
+        Duration::from(self.request.operation.duration) == IDLE_TIMEOUT
+    }
 }
 
 /// The shell.
@@ -202,6 +211,52 @@ impl Shell {
             eprintln!("power: woke");
             self.send(Event::Woke);
         }
+    }
+
+    /// Returns `true` if "Sleep now" can work: the device is on battery and
+    /// awake, and an idle timer runs.
+    pub fn can_sleep_now(&self) -> bool {
+        let view = self.view();
+        view.power == PowerSource::Battery
+            && !view.asleep
+            && self.timers.values().any(Timer::is_idle)
+    }
+
+    /// Fires the idle timers of the core now, as if the idle time passed.
+    /// Returns `false` if [`Shell::can_sleep_now`] is `false`, and then does
+    /// nothing.
+    ///
+    /// The shell does not make the device sleep. The core decides, as after
+    /// a real idle timeout. If taps wait to be sent, the core first waits one
+    /// more idle period, and a second "Sleep now" ends that period.
+    ///
+    /// The core starts a new idle timer after each tap and ignores the older
+    /// timers, so the shell fires all the idle timers. The other timers
+    /// continue to run.
+    pub fn sleep_now(&mut self) -> bool {
+        if !self.can_sleep_now() {
+            return false;
+        }
+        let ids: Vec<TimerId> = self
+            .timers
+            .iter()
+            .filter(|(_, timer)| timer.is_idle())
+            .map(|(id, _)| *id)
+            .collect();
+        eprintln!("power: sleep now");
+        for id in ids {
+            if let Some(mut timer) = self.timers.remove(&id) {
+                timer.task.abort();
+                self.inspector.effect(
+                    "TimeNotifyAfter",
+                    format!("timer {}", id.0),
+                    "resolved early: Sleep now",
+                );
+                let effects = resolve(&self.core, &mut timer.request, id);
+                self.process(effects);
+            }
+        }
+        true
     }
 
     /// Returns `true` if the shell does not publish service calls.
@@ -636,10 +691,11 @@ mod tests {
     use shared::{
         Event, PowerSource, Settings,
         capabilities::mqtt::{Connect, Credentials, Message, MqttEvent, Publish},
+        features::connection::CLOCK_INTERVAL,
     };
     use tokio::runtime::Runtime;
 
-    use super::{Notifier, Shell, Signal};
+    use super::{IDLE_TIMEOUT, Notifier, Shell, Signal};
     use crate::{
         inspector::{Delivery, Direction, MqttEntry, Packet},
         mqtt::{Link, Opener, Sink},
@@ -1045,5 +1101,96 @@ mod tests {
         // The local offset changed, so the shell sends it.
         fixture.shell().check_offset(local - 60);
         assert_eq!(fixture.shell().utc_offset_minutes(), local - 60);
+    }
+
+    /// Returns the durations of the timers that run.
+    fn durations(shell: &Shell) -> Vec<Duration> {
+        shell
+            .timers
+            .values()
+            .map(|timer| Duration::from(timer.request.operation.duration))
+            .collect()
+    }
+
+    #[test]
+    fn sleep_now_fires_the_idle_timer_and_the_core_sleeps() {
+        let mut fixture = Fixture::new(true);
+        fixture.start(PowerSource::Battery);
+        fixture.mqtt(1, MqttEvent::Connected);
+        fixture.take_log();
+        assert!(fixture.shell().can_sleep_now());
+
+        assert!(fixture.shell().sleep_now());
+        // The core goes through its normal path to sleep.
+        assert!(fixture.shell().view().asleep);
+        assert_eq!(
+            fixture.take_log(),
+            ["publish dashboard/test/status 1", "disconnect 1"]
+        );
+        let effects: Vec<_> = fixture
+            .shell()
+            .inspector()
+            .effects
+            .iter()
+            .map(|entry| entry.effect)
+            .collect();
+        for name in ["WifiOff", "Render", "Sleep"] {
+            assert!(effects.contains(&name), "{name} is not in {effects:?}");
+        }
+        assert!(!fixture.shell().can_sleep_now());
+    }
+
+    #[test]
+    fn sleep_now_does_nothing_on_the_stand() {
+        let mut fixture = Fixture::new(true);
+        fixture.start(PowerSource::Stand);
+        fixture.mqtt(1, MqttEvent::Connected);
+        fixture.take_log();
+
+        assert!(!fixture.shell().can_sleep_now());
+        assert!(!fixture.shell().sleep_now());
+        assert!(!fixture.shell().view().asleep);
+        assert_eq!(fixture.take_log(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn sleep_now_does_not_fire_the_other_timers() {
+        let mut fixture = Fixture::new(true);
+        fixture.start(PowerSource::Battery);
+        fixture.mqtt(1, MqttEvent::Connected);
+        // A state message reads the clock, and the core starts the minute
+        // timer.
+        fixture.mqtt(
+            1,
+            MqttEvent::Message(Message {
+                topic: "homeassistant/statestream/light/all_lights/state".into(),
+                payload: b"on".to_vec(),
+            }),
+        );
+        let mut running = durations(fixture.shell());
+        running.sort();
+        assert_eq!(running, [IDLE_TIMEOUT, CLOCK_INTERVAL]);
+
+        assert!(fixture.shell().sleep_now());
+        assert!(fixture.shell().view().asleep);
+        assert_eq!(durations(fixture.shell()), [CLOCK_INTERVAL]);
+    }
+
+    #[test]
+    fn sleep_now_with_a_tap_that_waits_extends_the_idle_time_once() {
+        let mut fixture = Fixture::new(true);
+        fixture.start(PowerSource::Battery);
+        // The connection is not open, so the tap waits in the outbox.
+        fixture.shell().send(Event::TileTapped(0));
+
+        // As after a real idle timeout, the core waits one more idle period.
+        assert!(fixture.shell().sleep_now());
+        assert!(!fixture.shell().view().asleep);
+        assert!(fixture.shell().can_sleep_now());
+
+        assert!(fixture.shell().sleep_now());
+        let view = fixture.shell().view();
+        assert!(view.asleep);
+        assert_eq!(view.status, "Asleep, on battery, 1 tap not sent");
     }
 }

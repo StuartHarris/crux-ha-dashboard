@@ -49,8 +49,8 @@ cannot block each other. This is the pattern of the `cpb` example in Crux.
 device sleeps, so the next tap sends `Woke`. Deep sleep comes in phase 6.
 
 `TimeNow` gives the time since the start, from the Unix epoch. The core treats a time
-before 2025 as not valid, so the view shows no "Updated HH:MM" text until the firmware
-reads the RTC (refer to the TODO list). The log says at the start that the clock is not
+before 2025 as not valid, so the view shows only "Live", and no "Updated HH:MM" text,
+until the firmware reads the RTC (refer to the TODO list). The log says at the start that the clock is not
 set.
 
 The second binary, `bringup`, runs the hardware checks for a new board.

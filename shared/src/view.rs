@@ -1,6 +1,8 @@
-//! The view model and the presentation decisions: the text and the state of
-//! each tile, the connection indicator and the "Updated HH:MM" text. The `ui`
-//! crate only draws what this module gives it.
+//! The view model and the presentation decisions.
+//!
+//! The decisions are the text and the state of each tile, the connection
+//! indicator and the "Live · HH:MM" or "Updated HH:MM" text. The `ui` crate
+//! only draws what this module gives it.
 
 use alloc::{format, string::String, vec::Vec};
 
@@ -42,12 +44,20 @@ pub struct ViewModel {
     pub status: String,
     /// The device is asleep. The panel keeps this image until the device wakes.
     pub asleep: bool,
-    /// The time of the last update, in seconds since the Unix epoch. The
-    /// shell keeps it during a deep sleep and gives it back in `Start`.
+    /// The time at which the last state message arrived, in seconds since
+    /// the Unix epoch. The shell keeps it during a deep sleep and gives it
+    /// back in `Start`.
     pub last_sync: Option<u64>,
-    /// `Live` while the dashboard is connected, then `Updated HH:MM` with the
-    /// local time of the last connection. The text is empty before the first
-    /// connection.
+    /// The freshness of the data, with the local time of the last state
+    /// message as `HH:MM`.
+    ///
+    /// - While the dashboard is connected, the text is `Live · HH:MM`, or
+    ///   `Live` if the time is not known.
+    /// - Without a connection, the text is `Updated HH:MM`, or empty if the
+    ///   time is not known.
+    ///
+    /// The time is not a clock. It changes only when a message arrives in a
+    /// new minute, so the panel does not refresh each minute.
     pub updated: String,
     /// A number that the core increases each time that the panel needs a
     /// full refresh, to clear ghost images.
@@ -120,7 +130,10 @@ pub fn view(model: &Model) -> ViewModel {
         Connection::Offline
     };
     let updated = match (connection, model.last_sync) {
-        (Connection::Online, _) => "Live".into(),
+        (Connection::Online, Some(time)) => {
+            format!("Live · {}", local_time(time, model.utc_offset_minutes))
+        }
+        (Connection::Online, None) => "Live".into(),
         (_, Some(time)) => format!("Updated {}", local_time(time, model.utc_offset_minutes)),
         (_, None) => String::new(),
     };

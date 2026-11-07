@@ -27,6 +27,9 @@ pub const RECONNECT_MAX: Duration = Duration::from_secs(60);
 pub const OUTBOX_LIMIT: usize = 8;
 /// The MQTT keep-alive interval in seconds.
 pub const KEEP_ALIVE_SECS: u16 = 60;
+/// The shortest time between two clock reads for state messages. Refer to
+/// [`read_message_time`].
+pub const CLOCK_INTERVAL: Duration = Duration::from_secs(60);
 
 /// The status payload while the dashboard is connected.
 pub const STATUS_ONLINE: &str = "online";
@@ -64,6 +67,14 @@ pub struct State {
     pub backoff: Duration,
     /// The service calls that wait for a connection.
     pub outbox: Vec<Publish>,
+    /// The core asked the clock for the time of a state message, and waits
+    /// for the answer.
+    pub clock_pending: bool,
+    /// The minute timer runs. Until it expires, the core does not read the
+    /// clock for a state message.
+    pub clock_fresh: bool,
+    /// The id of the newest minute timer.
+    pub minute: u32,
 }
 
 impl Default for State {
@@ -76,6 +87,9 @@ impl Default for State {
             reconnect: 0,
             backoff: RECONNECT_MIN,
             outbox: Vec::new(),
+            clock_pending: false,
+            clock_fresh: false,
+            minute: 0,
         }
     }
 }
@@ -255,14 +269,14 @@ pub fn mqtt(id: u32, event: MqttEvent, model: &mut Model) -> Cmd {
             let visible = model
                 .current_page()
                 .is_some_and(|page| page.tiles.iter().any(|tile| tile.entity_id == entity_id));
-            if visible {
+            let draw = if visible {
                 redraw(model, false)
             } else {
                 Cmd::done()
-            }
+            };
+            draw.and(read_message_time(model))
         }
         MqttEvent::Disconnected { .. } => {
-            let was_up = model.connection.mqtt == Link::Up;
             model.connection.mqtt = Link::Down;
             // Wi-Fi can be the cause, so the reconnect asks for Wi-Fi again.
             // If Wi-Fi is on, the shell answers at once.
@@ -273,20 +287,79 @@ pub fn mqtt(id: u32, event: MqttEvent, model: &mut Model) -> Cmd {
             } else {
                 Cmd::done()
             };
-            let clock = if was_up {
-                now().then_send(Event::Synced)
-            } else {
-                Cmd::done()
-            };
-            redraw(model, false).and(clock).and(retry)
+            redraw(model, false).and(retry)
         }
     }
 }
 
-/// Records the time at which the connection stopped.
-pub fn synced(now: Option<DateTime<Utc>>, model: &mut Model) -> Cmd {
+/// Reads the clock for a state message that arrived, if the time on the
+/// screen can be out of date.
+///
+/// The core reads the clock at most once a minute, because a clock read
+/// costs an effect on the device. The rule is as follows:
+///
+/// - If a clock read waits for its answer, the core does not read again.
+/// - If the minute timer runs, the core does not read again. The core starts
+///   this timer of [`CLOCK_INTERVAL`] when the answer arrives, also when the
+///   time is not valid.
+/// - Otherwise, the core reads the clock.
+///
+/// Each new connection reads the clock for its first message.
+///
+/// The time on the screen is therefore the time of a message that arrived
+/// less than one minute before the last message.
+pub fn read_message_time(model: &mut Model) -> Cmd {
+    let state = &mut model.connection;
+    if state.clock_pending || state.clock_fresh {
+        return Cmd::done();
+    }
+    state.clock_pending = true;
+    now().then_send(Event::MessageTime)
+}
+
+/// Records the time of a state message as the time of the last update, and
+/// starts the minute timer.
+///
+/// The core asks the shell to draw only if the minute of the time changed,
+/// because only the minute shows on the screen.
+pub fn message_time(now: Option<DateTime<Utc>>, model: &mut Model) -> Cmd {
+    let before = model.last_sync.map(minute_of);
     model.last_sync = now.or(model.last_sync);
-    redraw(model, false)
+    let changed = model.last_sync.map(minute_of) != before;
+
+    let state = &mut model.connection;
+    state.clock_pending = false;
+    state.minute = state.minute.wrapping_add(1);
+    state.clock_fresh = state.mqtt == Link::Up;
+    let timer = if state.clock_fresh {
+        let id = state.minute;
+        let (timer, _handle) = Time::notify_after(CLOCK_INTERVAL);
+        timer.then_send(move |_| Event::MinutePassed(id))
+    } else {
+        Cmd::done()
+    };
+    let draw = if changed {
+        redraw(model, false)
+    } else {
+        Cmd::done()
+    };
+    draw.and(timer)
+}
+
+/// The minute timer `id` expired, so the next state message reads the clock
+/// again. The core ignores an older timer.
+pub fn minute_passed(id: u32, model: &mut Model) -> Cmd {
+    if id == model.connection.minute {
+        model.connection.clock_fresh = false;
+    }
+    Cmd::done()
+}
+
+/// Returns the number of whole minutes since the Unix epoch. The UTC offset
+/// is a whole number of minutes, so two times with the same number show the
+/// same `HH:MM`.
+const fn minute_of(time: DateTime<Utc>) -> i64 {
+    time.timestamp().div_euclid(60)
 }
 
 fn connected(model: &mut Model) -> Cmd {
@@ -301,6 +374,10 @@ fn connected(model: &mut Model) -> Cmd {
     };
     model.connection.mqtt = Link::Up;
     model.connection.backoff = RECONNECT_MIN;
+    // The first message of each connection reads the clock. The core ignores
+    // a minute timer from before.
+    model.connection.clock_fresh = false;
+    model.connection.minute = model.connection.minute.wrapping_add(1);
     model.unsent = 0;
 
     let mut commands = alloc::vec![
