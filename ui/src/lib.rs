@@ -36,5 +36,5 @@ pub use refresh::{Refresh, Refresher, has_grey};
 
 #[cfg(test)]
 mod tests {
-    pub use crate::draw::tests::view;
+    pub use crate::draw::tests::{index_view, view};
 }

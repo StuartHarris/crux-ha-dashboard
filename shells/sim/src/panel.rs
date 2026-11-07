@@ -144,7 +144,7 @@ impl Viewport {
 #[cfg(test)]
 mod tests {
     use embedded_graphics::{prelude::*, primitives::Rectangle};
-    use shared::{Connection, PowerSource, ViewModel};
+    use shared::{Connection, IndexView, PageView, PowerSource, ViewModel};
 
     use ui::Refresh;
 
@@ -165,8 +165,11 @@ mod tests {
             page_index: 0,
             page_count: 1,
             page_label: "1 / 1".into(),
-            tiles: Vec::new(),
-            scenes: Vec::new(),
+            page: PageView::Index(IndexView {
+                weather: None,
+                all_lights: None,
+                rooms: Vec::new(),
+            }),
             connection: Connection::Online,
             power: PowerSource::Stand,
             status: status.into(),

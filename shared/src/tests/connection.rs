@@ -7,12 +7,13 @@ use crux_core::{App, Request};
 
 use super::{ExpectFullRefreshTimer, instant, start};
 use crate::{
-    Cmd, Connection, Dashboard, Effect, EffectTestExt, Event, Model, PowerSource, TileState,
+    Cmd, Connection, Dashboard, Effect, EffectTestExt, Event, Model, PowerSource, Route, TileState,
     capabilities::{
         mqtt::{Connect, Message, MqttEvent, Qos},
         network::WifiStatus,
     },
     features::connection::{CLOCK_INTERVAL, Link, RECONNECT_MAX, RECONNECT_MIN},
+    view::LightState::{On, Unavailable},
 };
 
 /// Drives the core from the start to an MQTT connection request. Returns the
@@ -149,9 +150,10 @@ fn a_message_for_a_visible_tile_draws_the_new_state() {
     app.update(event, &mut model).expect_only_render();
 
     let view = app.view(&model);
-    assert_eq!(view.tiles[0].label, "All lights");
-    assert_eq!(view.tiles[0].state, TileState::On);
-    assert_eq!(view.tiles[0].text, "On 25%");
+    let all_lights = view.index().unwrap().all_lights.as_ref().unwrap();
+    assert_eq!(all_lights.label, "All lights");
+    assert_eq!(all_lights.state, TileState::On);
+    assert_eq!(all_lights.text, "On 25%");
     // A partial redraw does not ask for a full refresh.
     assert_eq!(view.full_refresh_seq, 1);
 }
@@ -160,6 +162,8 @@ fn a_message_for_a_visible_tile_draws_the_new_state() {
 fn a_message_for_another_page_changes_the_state_but_does_not_draw() {
     let app = Dashboard;
     let (mut model, mut cmd, mut request) = drive_to_connected(PowerSource::Stand);
+    let mut navigate = app.update(Event::Navigate(Route::room("living_room")), &mut model);
+    let _effects: Vec<_> = navigate.effects().collect();
 
     request
         .resolve(message(
@@ -194,6 +198,42 @@ fn a_message_for_another_page_changes_the_state_but_does_not_draw() {
             .as_deref(),
         Some("on")
     );
+}
+
+#[test]
+fn on_the_index_a_message_draws_only_if_a_summary_changes() {
+    let app = Dashboard;
+    let (mut model, mut cmd, mut request) = drive_to_connected(PowerSource::Stand);
+    let lights = |model: &Model| app.view(model).index().unwrap().rooms[7].lights.clone();
+    assert_eq!(lights(&model), [Unavailable; 3]);
+
+    // The summary of the Loft shows the new state with a partial redraw.
+    request
+        .resolve(message(
+            "homeassistant/statestream/light/loft_loft_1/state",
+            "on",
+        ))
+        .unwrap();
+    let event = cmd.expect_one_event();
+    let _time = app
+        .update(event, &mut model)
+        .expect_render()
+        .expect_one_effect()
+        .expect_time_now();
+    assert_eq!(lights(&model), [On, Unavailable, Unavailable]);
+    assert_eq!(app.view(&model).full_refresh_seq, 1);
+
+    // No summary shows the group of the Loft, because the Loft has the
+    // members of the group. The core does not draw.
+    request
+        .resolve(message(
+            "homeassistant/statestream/light/loft_lights/state",
+            "on",
+        ))
+        .unwrap();
+    let event = cmd.expect_one_event();
+    app.update(event, &mut model).expect_no_effects();
+    assert_eq!(lights(&model), [On, Unavailable, Unavailable]);
 }
 
 #[test]
@@ -353,11 +393,14 @@ fn the_view_shows_the_state_of_a_tile_from_the_statestream() {
     }
 
     let view = app.view(&model);
-    assert_eq!(view.tiles[0].state, TileState::Unavailable);
-    assert_eq!(view.tiles[0].text, "Unavailable");
-    assert_eq!(view.tiles[1].state, TileState::Value);
-    assert_eq!(view.tiles[1].text, "11.5 °C");
-    assert_eq!(view.tiles[1].detail, "Rainy");
+    let index = view.index().unwrap();
+    let all_lights = index.all_lights.as_ref().unwrap();
+    assert_eq!(all_lights.state, TileState::Unavailable);
+    assert_eq!(all_lights.text, "Unavailable");
+    let weather = index.weather.as_ref().unwrap();
+    assert_eq!(weather.state, TileState::Value);
+    assert_eq!(weather.text, "11.5 °C");
+    assert_eq!(weather.detail, "Rainy");
 }
 
 #[test]
@@ -399,10 +442,11 @@ fn a_message_before_connected_is_ignored() {
     assert_eq!(model.entities.get("light.all_lights"), None);
 }
 
-/// The topic of a state message for the first tile on the home page.
+/// The topic of a state message for the All lights toggle on the index page.
 const VISIBLE: &str = "homeassistant/statestream/light/all_lights/state";
-/// The topic of a state message for a tile on another page.
-const HIDDEN: &str = "homeassistant/statestream/light/loft_loft_1/state";
+/// The topic of a state message for a tile that the index page does not
+/// show: no summary of a room shows the humidity.
+const HIDDEN: &str = "homeassistant/statestream/sensor/living_room_thermometer_humidity/state";
 
 /// Sends a state message for a tile on another page, so the message itself
 /// does not draw. If the core reads the clock, the clock gives `time` (in
@@ -418,7 +462,7 @@ fn deliver(
     // Each call changes the state, so that the core does not ignore it.
     let payload = if model
         .entities
-        .get("light.loft_loft_1")
+        .get("sensor.living_room_thermometer_humidity")
         .is_some_and(|entity| entity.state.as_deref() == Some("on"))
     {
         "off"

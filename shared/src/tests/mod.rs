@@ -65,6 +65,16 @@ const fn tap_scene(index: usize) -> Event {
     Event::Tapped(Some(Control::Scene(index)))
 }
 
+/// A tap on the All lights toggle of the index page.
+const fn tap_all_lights() -> Event {
+    Event::Tapped(Some(Control::AllLights))
+}
+
+/// A tap on the button of the room with `index` on the index page.
+const fn tap_room(index: usize) -> Event {
+    Event::Tapped(Some(Control::Room(index)))
+}
+
 /// Expects the effect that starts the full-refresh timer.
 trait ExpectFullRefreshTimer {
     /// Expects the next effect to start the timer of

@@ -37,7 +37,8 @@ Options (each has an environment variable):
   --password-file <FILE>
                       The file with the MQTT password (DASHBOARD_PASSWORD_FILE,
                       default ~/.config/crux-ha-dashboard/mqtt)
-  --device <ID>       The device id in MQTT topics (DASHBOARD_DEVICE, default sim)
+  --device <ID>       The device id in MQTT topics (DASHBOARD_DEVICE, default sim,
+                      or smoke in the --smoke mode)
   --battery           Start off the stand (DASHBOARD_POWER=battery)
   --page <PATH>       The page to show first, for example /room/kitchen
                       (DASHBOARD_PAGE)
@@ -56,6 +57,10 @@ pub const DEFAULT_PORT: u16 = 1883;
 pub const DEFAULT_USER: &str = "dashboard";
 /// The default device id.
 pub const DEFAULT_DEVICE: &str = "sim";
+/// The default device id in the `--smoke` mode. It is not the id of the
+/// window, so a smoke test and a window can connect at the same time. The
+/// broker closes the older connection of two clients with the same id.
+pub const DEFAULT_SMOKE_DEVICE: &str = "smoke";
 /// The default password file, relative to the home directory.
 pub const DEFAULT_PASSWORD_FILE: &str = ".config/crux-ha-dashboard/mqtt";
 
@@ -106,7 +111,7 @@ pub fn parse(
     let mut host = env("DASHBOARD_HOST").unwrap_or_else(|| DEFAULT_HOST.into());
     let mut port = env("DASHBOARD_PORT");
     let mut user = env("DASHBOARD_USER").unwrap_or_else(|| DEFAULT_USER.into());
-    let mut device = env("DASHBOARD_DEVICE").unwrap_or_else(|| DEFAULT_DEVICE.into());
+    let mut device = env("DASHBOARD_DEVICE");
     let mut password_file = env("DASHBOARD_PASSWORD_FILE").map(PathBuf::from);
     let mut power = match env("DASHBOARD_POWER").as_deref() {
         None | Some("stand") => PowerSource::Stand,
@@ -155,7 +160,7 @@ pub fn parse(
             "--port" => port = Some(value()?),
             "--user" => user = value()?,
             "--password-file" => password_file = Some(value()?.into()),
-            "--device" => device = value()?,
+            "--device" => device = Some(value()?),
             "--page" => path = Some(value()?),
             "--battery" => power = PowerSource::Battery,
             "--read-only" => read_only = true,
@@ -171,6 +176,7 @@ pub fn parse(
     };
 
     let mode = mode.unwrap_or(Mode::Window);
+    let device = device.unwrap_or_else(|| default_device(&mode).into());
     let credentials = match mode {
         Mode::Png(_) | Mode::Help => None,
         Mode::Window | Mode::Smoke(_) => {
@@ -203,6 +209,14 @@ pub fn parse(
         power,
         path,
     })
+}
+
+/// Returns the default device id of `mode`.
+const fn default_device(mode: &Mode) -> &'static str {
+    match mode {
+        Mode::Smoke(_) => DEFAULT_SMOKE_DEVICE,
+        Mode::Window | Mode::Png(_) | Mode::Help => DEFAULT_DEVICE,
+    }
 }
 
 #[cfg(test)]
@@ -284,6 +298,17 @@ mod tests {
         assert_eq!(options.settings.host, "arg-host");
         assert_eq!(options.settings.port, 1885);
         assert_eq!(options.path.as_deref(), Some("/room/kitchen"));
+    }
+
+    #[test]
+    fn the_smoke_mode_has_its_own_default_device_id() {
+        let options = parse_ok("--smoke out.png", no_env);
+        assert_eq!(options.settings.device_id, "smoke");
+        let options = parse_ok("--smoke out.png --device hall", no_env);
+        assert_eq!(options.settings.device_id, "hall");
+        let env = |name: &str| (name == "DASHBOARD_DEVICE").then(|| "kitchen".into());
+        let options = parse_ok("--smoke out.png", env);
+        assert_eq!(options.settings.device_id, "kitchen");
     }
 
     #[test]

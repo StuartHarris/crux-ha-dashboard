@@ -139,7 +139,7 @@ async fn main(spawner: Spawner) -> ! {
         .send(Event::Start(start))
         .into_iter()
         .find_map(|job| match job {
-            Job::Render(view) => Some(view),
+            Job::Render(view) => Some(*view),
             _ => None,
         })
         .unwrap_or_else(|| shell.view());

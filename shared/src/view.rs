@@ -1,8 +1,9 @@
 //! The view model and the presentation decisions.
 //!
-//! The decisions are the text and the state of each tile, the connection
-//! indicator and the "Live · HH:MM" or "Updated HH:MM" text. The `ui` crate
-//! only draws what this module gives it.
+//! The decisions are the text and the state of each tile, the summary of
+//! each room on the index page, the connection indicator and the
+//! "Live · HH:MM" or "Updated HH:MM" text. The `ui` crate only draws what
+//! this module gives it.
 
 use alloc::{format, string::String, vec::Vec};
 
@@ -11,8 +12,13 @@ use facet::Facet;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Model, capabilities::power::PowerSource, entities::EntityState, features::connection::Link,
-    layout::TileKind, local_time::uk_time,
+    Model,
+    capabilities::power::PowerSource,
+    entities::{Entities, EntityState},
+    features::connection::Link,
+    layout::{Page, Tile, TileKind},
+    local_time::uk_time,
+    summary::summarise,
 };
 
 /// The data that a shell needs to draw the screen.
@@ -29,10 +35,8 @@ pub struct ViewModel {
     pub page_count: usize,
     /// The page number as text, for example `2 / 10`.
     pub page_label: String,
-    /// The tiles on the current page, in reading order.
-    pub tiles: Vec<TileView>,
-    /// The scene buttons on the current page, in reading order.
-    pub scenes: Vec<SceneView>,
+    /// The content of the current page: the index or a room.
+    pub page: PageView,
     /// The connection to Home Assistant.
     pub connection: Connection,
     /// The power source.
@@ -79,6 +83,104 @@ pub struct ViewModel {
     /// another reason only if the panel cannot draw the change with a
     /// partial refresh, for example grey pixels. Refer to `ui::Refresher`.
     pub full_refresh_seq: u32,
+}
+
+impl ViewModel {
+    /// Returns the tiles of a room page, or no tiles on the index page.
+    #[must_use]
+    pub fn tiles(&self) -> &[TileView] {
+        match &self.page {
+            PageView::Index(_) => &[],
+            PageView::Room(room) => &room.tiles,
+        }
+    }
+
+    /// Returns the scene buttons of a room page, or no buttons on the index
+    /// page.
+    #[must_use]
+    pub fn scenes(&self) -> &[SceneView] {
+        match &self.page {
+            PageView::Index(_) => &[],
+            PageView::Room(room) => &room.scenes,
+        }
+    }
+
+    /// Returns the index page, or `None` on a room page.
+    #[must_use]
+    pub const fn index(&self) -> Option<&IndexView> {
+        match &self.page {
+            PageView::Index(index) => Some(index),
+            PageView::Room(_) => None,
+        }
+    }
+}
+
+/// The content of a page.
+#[derive(Facet, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub enum PageView {
+    /// The home page: the index of the rooms.
+    Index(IndexView),
+    /// The page of one room.
+    Room(RoomView),
+}
+
+/// What a renderer needs to draw the index page.
+#[derive(Facet, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct IndexView {
+    /// The weather, from the first weather tile of the home page, or `None`
+    /// if the home page has no weather tile. The text is the temperature and
+    /// the detail is the condition.
+    pub weather: Option<TileView>,
+    /// The All lights toggle, from the first light or switch tile of the
+    /// home page, or `None` if the home page has no such tile. A tap on it
+    /// sends `Control::AllLights`.
+    pub all_lights: Option<TileView>,
+    /// A button for each room, in the order of the pages. A tap on a button
+    /// sends `Control::Room` with its index in this list.
+    pub rooms: Vec<RoomSummary>,
+}
+
+/// What a renderer needs to draw the button of one room on the index page.
+/// Refer to [`summarise`](crate::summary::summarise).
+#[derive(Facet, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct RoomSummary {
+    /// The name of the room.
+    pub title: String,
+    /// The state of each light and switch of the room, in the order of its
+    /// tiles. A renderer draws one dot for each. The list does not have a
+    /// group light if the room has other lights or switches. Refer to
+    /// [`lights`](crate::summary::lights).
+    pub lights: Vec<LightState>,
+    /// The temperature of the room, for example `20.4°`, or `None` if the
+    /// room has no temperature. Refer to
+    /// [`temperature`](crate::summary::temperature).
+    pub temperature: Option<String>,
+    /// At least one light or switch of the room is on. A renderer draws the
+    /// button black, as a light tile that is on.
+    pub any_on: bool,
+}
+
+/// The state of one light or switch in the summary of a room.
+#[derive(Facet, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub enum LightState {
+    /// The light or switch is on.
+    On,
+    /// The light or switch is off.
+    Off,
+    /// The state is not `on` or `off`: for example, Home Assistant cannot
+    /// reach the light, or the core has no state for it yet.
+    Unavailable,
+}
+
+/// What a renderer needs to draw the page of one room.
+#[derive(Facet, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct RoomView {
+    /// The tiles on the page, in reading order.
+    pub tiles: Vec<TileView>,
+    /// The scene buttons on the page, in reading order.
+    pub scenes: Vec<SceneView>,
 }
 
 /// What a renderer needs to draw one tile.
@@ -128,8 +230,6 @@ pub enum Connection {
 pub fn view(model: &Model) -> ViewModel {
     let index = model.page_index();
     let page = model.pages.get(index);
-    let tiles = page.map_or(&[][..], |page| page.tiles);
-    let scenes = page.map_or(&[][..], |page| page.scenes);
 
     let connection = if model.connection.mqtt == Link::Up {
         Connection::Online
@@ -158,31 +258,15 @@ pub fn view(model: &Model) -> ViewModel {
         page_index: index,
         page_count: model.pages.len(),
         page_label: format!("{} / {}", index + 1, model.pages.len()),
-        tiles: tiles
-            .iter()
-            .map(|tile| {
-                let Description {
-                    state,
-                    text,
-                    detail,
-                } = describe(tile.kind, model.entities.get(tile.entity_id));
-                TileView {
-                    label: tile.label.into(),
-                    entity_id: tile.entity_id.into(),
-                    kind: tile.kind,
-                    state,
-                    text,
-                    detail,
-                }
-            })
-            .collect(),
-        scenes: scenes
-            .iter()
-            .map(|scene| SceneView {
-                label: scene.label.into(),
-                entity_id: scene.entity_id.into(),
-            })
-            .collect(),
+        page: page.map_or_else(
+            || {
+                PageView::Room(RoomView {
+                    tiles: Vec::new(),
+                    scenes: Vec::new(),
+                })
+            },
+            |page| page_view(page, model),
+        ),
         connection,
         power: model.power.source,
         status: status(
@@ -199,6 +283,53 @@ pub fn view(model: &Model) -> ViewModel {
         read_only,
         updated,
         full_refresh_seq: model.full_refresh_seq,
+    }
+}
+
+/// Makes the content of `page`. The home page is the index of the rooms.
+fn page_view(page: &Page, model: &Model) -> PageView {
+    let entities = &model.entities;
+    if page.is_room() {
+        return PageView::Room(RoomView {
+            tiles: page
+                .tiles
+                .iter()
+                .map(|tile| tile_view(tile, entities))
+                .collect(),
+            scenes: page
+                .scenes
+                .iter()
+                .map(|scene| SceneView {
+                    label: scene.label.into(),
+                    entity_id: scene.entity_id.into(),
+                })
+                .collect(),
+        });
+    }
+    PageView::Index(IndexView {
+        weather: page.weather_tile().map(|tile| tile_view(tile, entities)),
+        all_lights: page.all_lights_tile().map(|tile| tile_view(tile, entities)),
+        rooms: model
+            .rooms()
+            .map(|page| summarise(page, entities))
+            .collect(),
+    })
+}
+
+/// Makes the view of one tile.
+fn tile_view(tile: &Tile, entities: &Entities) -> TileView {
+    let Description {
+        state,
+        text,
+        detail,
+    } = describe(tile.kind, entities.get(tile.entity_id));
+    TileView {
+        label: tile.label.into(),
+        entity_id: tile.entity_id.into(),
+        kind: tile.kind,
+        state,
+        text,
+        detail,
     }
 }
 
@@ -291,11 +422,11 @@ pub fn describe(kind: TileKind, entity: Option<&EntityState>) -> Description {
     let Some((entity, state)) =
         entity.and_then(|entity| entity.state.as_deref().map(|state| (entity, state)))
     else {
-        return Description::new(TileState::Unknown, "-");
+        return Description::new(TileState::Unknown, "No data");
     };
     match state {
         "unavailable" => return Description::new(TileState::Unavailable, "Unavailable"),
-        "unknown" => return Description::new(TileState::Unknown, "-"),
+        "unknown" => return Description::new(TileState::Unknown, "No data"),
         _ => {}
     }
 

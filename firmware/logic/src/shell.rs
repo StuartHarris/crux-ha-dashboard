@@ -19,7 +19,7 @@
 //!   at the end of the batch. It is at the place of the last `Render` effect,
 //!   so it stays before a `Sleep` that follows it.
 
-use alloc::{string::String, vec::Vec};
+use alloc::{boxed::Box, string::String, vec::Vec};
 
 use crux_core::{Request, capability::Operation};
 use crux_time::{
@@ -105,8 +105,9 @@ pub enum TimerOp {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Job {
     /// Draw the view model on the panel. The shell decides this job, so no
-    /// core operation is behind it.
-    Render(ViewModel),
+    /// core operation is behind it. The view model is in a box, because it
+    /// is much larger than the other jobs.
+    Render(Box<ViewModel>),
     /// Do an operation on an MQTT connection.
     Mqtt {
         /// The id of the connection.
@@ -267,7 +268,7 @@ impl Shell {
             }
         }
         if let Some(index) = render {
-            jobs.insert(index, Job::Render(self.view()));
+            jobs.insert(index, Job::Render(Box::new(self.view())));
         }
         jobs
     }

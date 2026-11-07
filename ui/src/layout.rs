@@ -3,11 +3,15 @@
 //! [`draw`](crate::draw) and [`hit_test`](crate::hit_test) both use these
 //! functions, so a control is where the touch goes.
 //!
+//! A room page has the header, a grid of tiles, a row of scene buttons and
+//! the footer. The index page has a taller header, with the weather and the
+//! All lights toggle, then a grid of room buttons and the same footer.
+//!
 //! The panel has about 234 pixels for each inch, so 9 pixels are about 1 mm.
 //! Each control that a finger taps is at least 72 pixels (about 8 mm) high.
 
 use embedded_graphics::{prelude::*, primitives::Rectangle};
-use shared::layout::{MAX_SCENES, MAX_TILES};
+use shared::layout::{MAX_ROOMS, MAX_SCENES, MAX_TILES};
 
 /// The panel width in pixels.
 pub const WIDTH: u32 = 960;
@@ -45,11 +49,32 @@ pub const FOOTER_HEIGHT: u32 = HEIGHT - MARGIN - FOOTER_TOP;
 /// The width of a navigation button.
 pub const NAV_WIDTH: u32 = 160;
 
+/// The height of the header of the index page. Below the title and the
+/// status, it has the weather and the All lights toggle.
+pub const INDEX_HEADER_HEIGHT: u32 = 144;
+/// The height of the All lights toggle.
+pub const ALL_LIGHTS_HEIGHT: u32 = 72;
+/// The number of rows of room buttons on the index page. The grid has
+/// [`COLUMNS`] columns.
+pub const ROOM_ROWS: u32 = 3;
+/// The top of the grid of room buttons.
+pub const ROOMS_TOP: u32 = INDEX_HEADER_HEIGHT + GAP;
+/// The height of a room button. The grid of room buttons ends one gap
+/// before the footer.
+pub const ROOM_HEIGHT: u32 = (FOOTER_TOP - GAP - ROOMS_TOP - (ROOM_ROWS - 1) * GAP) / ROOM_ROWS;
+
 // The grid has a cell for each tile and each scene that a page can have.
 const _: () = assert!((COLUMNS * ROWS) as usize == MAX_TILES);
 const _: () = assert!(COLUMNS as usize == MAX_SCENES);
-// The footer buttons are large enough for a finger.
+// The index grid has a cell for each room.
+const _: () = assert!((COLUMNS * ROOM_ROWS) as usize == MAX_ROOMS);
+// The footer buttons, the room buttons and the All lights toggle are large
+// enough for a finger.
 const _: () = assert!(FOOTER_HEIGHT >= 72);
+const _: () = assert!(ROOM_HEIGHT >= 72);
+const _: () = assert!(ALL_LIGHTS_HEIGHT >= 72);
+// The All lights toggle ends before the line at the bottom of the header.
+const _: () = assert!(HEADER_HEIGHT + ALL_LIGHTS_HEIGHT + 6 <= INDEX_HEADER_HEIGHT);
 // The scene row ends before the footer.
 const _: () = assert!(SCENES_TOP + SCENE_HEIGHT <= FOOTER_TOP);
 
@@ -57,6 +82,50 @@ const _: () = assert!(SCENES_TOP + SCENE_HEIGHT <= FOOTER_TOP);
 #[must_use]
 pub const fn header() -> Rectangle {
     rect(0, 0, WIDTH, HEADER_HEIGHT)
+}
+
+/// Returns the area of the header of the index page.
+#[must_use]
+pub const fn index_header() -> Rectangle {
+    rect(0, 0, WIDTH, INDEX_HEADER_HEIGHT)
+}
+
+/// Returns the area of the weather in the header of the index page: the
+/// first two columns below the title. A tap in it does nothing.
+#[must_use]
+pub const fn weather() -> Rectangle {
+    rect(
+        MARGIN,
+        HEADER_HEIGHT,
+        2 * CELL_WIDTH + GAP,
+        ALL_LIGHTS_HEIGHT,
+    )
+}
+
+/// Returns the area of the All lights toggle in the header of the index
+/// page: the last column below the status.
+#[must_use]
+pub const fn all_lights() -> Rectangle {
+    rect(
+        MARGIN + 2 * (CELL_WIDTH + GAP),
+        HEADER_HEIGHT,
+        CELL_WIDTH,
+        ALL_LIGHTS_HEIGHT,
+    )
+}
+
+/// Returns the area of the room button with this index on the index page,
+/// or `None` if the grid has no cell for the index.
+#[must_use]
+pub const fn room(index: usize) -> Option<Rectangle> {
+    if index >= MAX_ROOMS {
+        return None;
+    }
+    #[allow(clippy::cast_possible_truncation, reason = "the index is less than 9")]
+    let index = index as u32;
+    let left = MARGIN + (index % COLUMNS) * (CELL_WIDTH + GAP);
+    let top = ROOMS_TOP + (index / COLUMNS) * (ROOM_HEIGHT + GAP);
+    Some(rect(left, top, CELL_WIDTH, ROOM_HEIGHT))
 }
 
 /// Returns the area of the tile with this index, or `None` if the grid has no
@@ -160,8 +229,32 @@ mod tests {
     }
 
     #[test]
-    fn the_grid_has_no_cell_after_the_last_tile_or_scene() {
+    fn the_areas_of_the_index_do_not_overlap_and_fit_on_the_panel() {
+        let panel = Rectangle::new(Point::zero(), Size::new(WIDTH, HEIGHT));
+        let mut areas = vec![index_header(), previous(), home(), next(), footer_text()];
+        areas.extend((0..MAX_ROOMS).filter_map(room));
+        for (index, area) in areas.iter().enumerate() {
+            assert_eq!(panel.intersection(area), *area, "{area:?} is off the panel");
+            for other in &areas[index + 1..] {
+                assert!(
+                    area.intersection(other).is_zero_sized(),
+                    "{area:?} overlaps {other:?}"
+                );
+            }
+        }
+        // The weather and the toggle are in the header, below the title.
+        for area in [weather(), all_lights()] {
+            assert_eq!(index_header().intersection(&area), area);
+            assert!(area.top_left.y.unsigned_abs() >= HEADER_HEIGHT);
+        }
+        assert!(weather().intersection(&all_lights()).is_zero_sized());
+        assert!(bottom(room(MAX_ROOMS - 1).unwrap()) + GAP <= FOOTER_TOP);
+    }
+
+    #[test]
+    fn the_grid_has_no_cell_after_the_last_tile_scene_or_room() {
         assert_eq!(tile(MAX_TILES), None);
         assert_eq!(scene(MAX_SCENES), None);
+        assert_eq!(room(MAX_ROOMS), None);
     }
 }

@@ -12,8 +12,21 @@ use crate::route::Route;
 pub const MAX_TILES: usize = 6;
 /// The largest number of scene buttons on one page.
 pub const MAX_SCENES: usize = 3;
+/// The largest number of lights and switches that the summary of one room
+/// shows. The `ui` room button has a dot for each. Refer to
+/// [`counted`](crate::summary::counted).
+pub const MAX_LIGHTS: usize = 4;
+/// The largest number of rooms. The index page has a button for each room,
+/// and the `ui` grid of room buttons has this many cells.
+pub const MAX_ROOMS: usize = 9;
 
 /// One page of the dashboard: the home page or a room.
+///
+/// The home page is the index. It shows a button for each room. The tiles of
+/// the home page are not in a grid. The header of the index shows them:
+///
+/// - The first weather tile gives the weather.
+/// - The first light or switch tile is the All lights toggle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Page {
     /// The Home Assistant area id of the room, or `None` for the home page.
@@ -35,6 +48,11 @@ pub struct Tile {
     pub entity_id: &'static str,
     /// How the tile shows the entity and what a tap does.
     pub kind: TileKind,
+    /// The light is a Home Assistant light group, for example all the
+    /// lights of a room. The summary of a room on the index does not count
+    /// a group if the room has other lights or switches, because the group
+    /// and its members are the same lights.
+    pub group: bool,
 }
 
 /// A button that turns on a Home Assistant scene.
@@ -91,6 +109,40 @@ impl TileKind {
 }
 
 impl Page {
+    /// Returns `true` if the page is the home page, which is the index.
+    #[must_use]
+    pub const fn is_home(&self) -> bool {
+        self.area.is_none()
+    }
+
+    /// Returns `true` if the page is the page of a room.
+    #[must_use]
+    pub const fn is_room(&self) -> bool {
+        self.area.is_some()
+    }
+
+    /// Returns the All lights tile of the home page: its first light or
+    /// switch tile. Returns `None` if the page is a room or has no such tile.
+    #[must_use]
+    pub fn all_lights_tile(&self) -> Option<&'static Tile> {
+        let tiles: &'static [Tile] = self.tiles;
+        tiles
+            .iter()
+            .filter(|_| self.is_home())
+            .find(|tile| matches!(tile.kind, TileKind::Light | TileKind::Switch))
+    }
+
+    /// Returns the weather tile of the home page: its first weather tile.
+    /// Returns `None` if the page is a room or has no such tile.
+    #[must_use]
+    pub fn weather_tile(&self) -> Option<&'static Tile> {
+        let tiles: &'static [Tile] = self.tiles;
+        tiles
+            .iter()
+            .filter(|_| self.is_home())
+            .find(|tile| tile.kind == TileKind::Weather)
+    }
+
     /// Returns the route of the page.
     #[must_use]
     pub fn route(&self) -> Route {
@@ -142,6 +194,19 @@ pub const fn light(label: &'static str, entity_id: &'static str) -> Tile {
         label,
         entity_id,
         kind: TileKind::Light,
+        group: false,
+    }
+}
+
+/// Makes a light tile for a Home Assistant light group. Refer to
+/// [`Tile::group`].
+#[must_use]
+pub const fn light_group(label: &'static str, entity_id: &'static str) -> Tile {
+    Tile {
+        label,
+        entity_id,
+        kind: TileKind::Light,
+        group: true,
     }
 }
 
@@ -152,6 +217,7 @@ pub const fn switch(label: &'static str, entity_id: &'static str) -> Tile {
         label,
         entity_id,
         kind: TileKind::Switch,
+        group: false,
     }
 }
 
@@ -162,6 +228,7 @@ pub const fn sensor(label: &'static str, entity_id: &'static str) -> Tile {
         label,
         entity_id,
         kind: TileKind::Sensor,
+        group: false,
     }
 }
 
@@ -172,6 +239,7 @@ pub const fn climate(label: &'static str, entity_id: &'static str) -> Tile {
         label,
         entity_id,
         kind: TileKind::Climate,
+        group: false,
     }
 }
 
@@ -182,6 +250,7 @@ pub const fn weather(label: &'static str, entity_id: &'static str) -> Tile {
         label,
         entity_id,
         kind: TileKind::Weather,
+        group: false,
     }
 }
 

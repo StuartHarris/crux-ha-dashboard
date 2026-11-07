@@ -4,14 +4,18 @@ use embedded_graphics::{
     pixelcolor::Gray4,
     prelude::*,
     primitives::{
-        Circle, PrimitiveStyle, PrimitiveStyleBuilder, Rectangle, RoundedRectangle,
+        Circle, Line, PrimitiveStyle, PrimitiveStyleBuilder, Rectangle, RoundedRectangle,
         StrokeAlignment, Triangle,
     },
 };
-use shared::{SceneView, TileKind, TileState, TileView, ViewModel, layout::MAX_SCENES};
+use shared::{
+    IndexView, LightState, PageView, RoomSummary, SceneView, TileKind, TileState, TileView,
+    ViewModel,
+    layout::{MAX_LIGHTS, MAX_SCENES},
+};
 
 use crate::{
-    layout::{self, HEADER_HEIGHT, MARGIN, WIDTH},
+    layout::{self, MARGIN, WIDTH},
     text::{self, Anchor, BUTTON, DETAIL, LABEL, TITLE, VALUE_LARGE, VALUE_MEDIUM, VALUE_SMALL},
 };
 
@@ -28,10 +32,24 @@ const INDICATOR: u32 = 26;
 const DASH: u32 = 14;
 /// The width of the status text in the header.
 const STATUS_WIDTH: u32 = 400;
+/// The diameter of a light dot on a room button.
+const DOT: u32 = 18;
+/// The distance between the centres of two light dots.
+const DOT_STEP: u32 = DOT + 10;
+/// The largest number of light dots on a room button. A test in `shared`
+/// checks that no room in the layout has more. If a room has more, the
+/// button shows `+N` for the rest.
+const MAX_DOTS: usize = MAX_LIGHTS;
+/// The distance from the bottom of a room button to the baseline of its
+/// second line.
+const ROOM_BASELINE: u32 = 18;
+/// The distance from the bottom of a room button to the centre of its
+/// light dots.
+const DOT_MIDDLE: u32 = 26;
 
 /// Draws the view model on the display.
 ///
-/// The screen has these areas, from the top:
+/// A room page has these areas, from the top:
 ///
 /// - The header: the page title on the left and the status on the right.
 /// - The tiles, in a grid of three columns and two rows.
@@ -39,9 +57,19 @@ const STATUS_WIDTH: u32 = 400;
 /// - The footer: the previous, home and next buttons, the page number and
 ///   the time of the last update.
 ///
+/// The index page has these areas, from the top:
+///
+/// - The header: the page title and the status, as on a room page. Below
+///   them are the weather on the left and the All lights toggle on the
+///   right.
+/// - The room buttons, in a grid of three columns and three rows. Each
+///   button has the name of the room and its summary.
+/// - The footer, as on a room page.
+///
 /// The screen is black and white, so a partial refresh of the panel is clean.
 /// A light or a switch that is on is a black tile with white text. A tile
-/// that Home Assistant cannot reach has a dashed border.
+/// that Home Assistant cannot reach has a dashed border. The All lights
+/// toggle uses the same rules.
 ///
 /// # Errors
 ///
@@ -51,21 +79,31 @@ where
     D: DrawTarget<Color = Gray4>,
 {
     display.clear(WHITE)?;
-    draw_header(view, display)?;
-    for (index, tile) in view.tiles.iter().enumerate() {
-        if let Some(area) = layout::tile(index) {
-            draw_tile(tile, area, display)?;
+    match &view.page {
+        PageView::Index(index) => {
+            draw_header(view, layout::index_header(), display)?;
+            draw_index(index, display)?;
         }
-    }
-    for (index, scene) in view.scenes.iter().enumerate().take(MAX_SCENES) {
-        if let Some(area) = layout::scene(index) {
-            draw_scene(scene, area, display)?;
+        PageView::Room(room) => {
+            draw_header(view, layout::header(), display)?;
+            for (index, tile) in room.tiles.iter().enumerate() {
+                if let Some(area) = layout::tile(index) {
+                    draw_tile(tile, area, display)?;
+                }
+            }
+            for (index, scene) in room.scenes.iter().enumerate().take(MAX_SCENES) {
+                if let Some(area) = layout::scene(index) {
+                    draw_scene(scene, area, display)?;
+                }
+            }
         }
     }
     draw_footer(view, display)
 }
 
-fn draw_header<D>(view: &ViewModel, display: &mut D) -> Result<(), D::Error>
+/// Draws the title and the status at the top of `area`, and a line at the
+/// bottom of `area`.
+fn draw_header<D>(view: &ViewModel, area: Rectangle, display: &mut D) -> Result<(), D::Error>
 where
     D: DrawTarget<Color = Gray4>,
 {
@@ -88,11 +126,260 @@ where
         BLACK,
     )?;
     Rectangle::new(
-        point(MARGIN, HEADER_HEIGHT - 3),
+        point(MARGIN, area.size.height - 3),
         Size::new(WIDTH - 2 * MARGIN, 2),
     )
     .into_styled(PrimitiveStyle::with_fill(BLACK))
     .draw(display)
+}
+
+/// Draws the weather, the All lights toggle and the room buttons of the
+/// index page.
+fn draw_index<D>(index: &IndexView, display: &mut D) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Gray4>,
+{
+    if let Some(weather) = &index.weather {
+        draw_weather(weather, layout::weather(), display)?;
+    }
+    if let Some(all_lights) = &index.all_lights {
+        draw_toggle(all_lights, layout::all_lights(), display)?;
+    }
+    for (number, room) in index.rooms.iter().enumerate() {
+        if let Some(area) = layout::room(number) {
+            draw_room(room, area, display)?;
+        }
+    }
+    Ok(())
+}
+
+/// Draws the temperature in a large font, and the condition after it.
+fn draw_weather<D>(weather: &TileView, area: Rectangle, display: &mut D) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Gray4>,
+{
+    let left = area.top_left.x.unsigned_abs();
+    let baseline = area.center().y.unsigned_abs() + 14;
+    let width = area.size.width;
+    let fonts: &[_] = if weather.state == TileState::Value {
+        &[&VALUE_MEDIUM, &VALUE_SMALL]
+    } else {
+        &[&LABEL]
+    };
+    text::draw_fitted(
+        display,
+        fonts,
+        &weather.text,
+        Anchor::baseline_left(point(left, baseline)),
+        width,
+        BLACK,
+    )?;
+    if weather.detail.is_empty() {
+        return Ok(());
+    }
+    // The width of the text in the font that `draw_fitted` used.
+    let font = fonts
+        .iter()
+        .find(|font| text::width(font, &weather.text) <= width)
+        .or_else(|| fonts.last())
+        .copied();
+    let used = font.map_or(width, |font| text::width(font, &weather.text).min(width)) + PADDING;
+    text::draw_fitted(
+        display,
+        &[&LABEL, &DETAIL],
+        &weather.detail,
+        Anchor::baseline_left(point(left + used, baseline)),
+        width.saturating_sub(used),
+        BLACK,
+    )
+}
+
+/// Draws a toggle button: the label on the left and the on/off indicator on
+/// the right. The button is black when the light is on, and has a dashed
+/// border when Home Assistant cannot reach the light. A light with no state
+/// yet has a thin border.
+fn draw_toggle<D>(toggle: &TileView, area: Rectangle, display: &mut D) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Gray4>,
+{
+    let on = toggle.state == TileState::On;
+    let ink = if on { WHITE } else { BLACK };
+    let shape = RoundedRectangle::with_equal_corners(area, Size::new(RADIUS, RADIUS));
+    match toggle.state {
+        TileState::On => shape
+            .into_styled(PrimitiveStyle::with_fill(BLACK))
+            .draw(display)?,
+        TileState::Unavailable => draw_dashed_border(area, display)?,
+        TileState::Unknown => shape.into_styled(border(2)).draw(display)?,
+        _ => shape.into_styled(border(4)).draw(display)?,
+    }
+
+    let left = area.top_left.x.unsigned_abs() + PADDING;
+    let inner = area.size.width - 2 * PADDING;
+    let middle = area.center().y.unsigned_abs();
+    text::draw_fitted(
+        display,
+        &[&BUTTON, &DETAIL],
+        &toggle.label,
+        Anchor::center_left(point(left, middle)),
+        inner - INDICATOR - PADDING,
+        ink,
+    )?;
+    let indicator = Circle::new(
+        point(left + inner - INDICATOR, middle - INDICATOR / 2),
+        INDICATOR,
+    );
+    draw_indicator(toggle.state, indicator, display)
+}
+
+/// Draws the indicator of a toggle in `circle`: a white dot if the toggle is
+/// on, a ring if it is off, and a cross if its state is unknown or
+/// unavailable. The toggle is black when it is on, so the dot is white.
+fn draw_indicator<D>(state: TileState, circle: Circle, display: &mut D) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Gray4>,
+{
+    match state {
+        TileState::On => circle
+            .into_styled(PrimitiveStyle::with_fill(WHITE))
+            .draw(display),
+        TileState::Unknown | TileState::Unavailable => {
+            draw_cross(circle.center(), circle.diameter, BLACK, display)
+        }
+        _ => circle
+            .into_styled(PrimitiveStyle::with_stroke(BLACK, 3))
+            .draw(display),
+    }
+}
+
+/// Draws a cross in `ink` that fits in a circle of `diameter` at `center`.
+fn draw_cross<D>(center: Point, diameter: u32, ink: Gray4, display: &mut D) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Gray4>,
+{
+    let half = (diameter / 2 - 2).cast_signed();
+    let style = PrimitiveStyle::with_stroke(ink, 3);
+    Line::new(
+        center - Point::new(half, half),
+        center + Point::new(half, half),
+    )
+    .into_styled(style)
+    .draw(display)?;
+    Line::new(
+        center + Point::new(-half, half),
+        center + Point::new(half, -half),
+    )
+    .into_styled(style)
+    .draw(display)
+}
+
+/// Draws the button of a room.
+///
+/// The name of the room is at the top. Below it are a dot for each light
+/// and switch on the left, and the temperature on the right. A dot is
+/// filled if the light is on, and empty if it is off. A light that is
+/// unavailable is a cross. If at least one light is on, the button is black
+/// with white text and dots, as a light tile that is on.
+fn draw_room<D>(room: &RoomSummary, area: Rectangle, display: &mut D) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Gray4>,
+{
+    let shape = RoundedRectangle::with_equal_corners(area, Size::new(RADIUS, RADIUS));
+    let ink = if room.any_on {
+        shape
+            .into_styled(PrimitiveStyle::with_fill(BLACK))
+            .draw(display)?;
+        WHITE
+    } else {
+        shape.into_styled(border(3)).draw(display)?;
+        BLACK
+    };
+    let left = area.top_left.x.unsigned_abs() + PADDING;
+    let top = area.top_left.y.unsigned_abs();
+    let inner = area.size.width - 2 * PADDING;
+    let baseline = top + area.size.height - ROOM_BASELINE;
+    text::draw_fitted(
+        display,
+        &[&BUTTON],
+        &room.title,
+        Anchor::top_left(point(left, top + 12)),
+        inner,
+        ink,
+    )?;
+
+    let (shown, more) = dots(room.lights.len());
+    for (index, light) in room.lights.iter().take(shown).enumerate() {
+        draw_dot(*light, dot_center(area, index), ink, display)?;
+    }
+    let mut used = u32::try_from(shown).map_or(inner, |shown| shown * DOT_STEP);
+    if more > 0 {
+        let extra = alloc::format!("+{more}");
+        let start = point(left + used, baseline);
+        text::draw(
+            display,
+            &LABEL,
+            extra.as_str(),
+            Anchor::baseline_left(start),
+            ink,
+        )?;
+        used += text::width(&LABEL, &extra) + PADDING;
+    }
+    if let Some(temperature) = &room.temperature {
+        text::draw_fitted(
+            display,
+            &[&LABEL, &DETAIL],
+            temperature,
+            Anchor::baseline_right(point(left + inner, baseline)),
+            inner.saturating_sub(used),
+            ink,
+        )?;
+    }
+    Ok(())
+}
+
+/// Returns the number of light dots to draw for `count` lights, and the
+/// number of lights that have no dot.
+///
+/// If the lights do not fit in [`MAX_DOTS`] dots, the last dot gives its
+/// place to the text `+N`, where `N` is the number of lights with no dot.
+const fn dots(count: usize) -> (usize, usize) {
+    if count <= MAX_DOTS {
+        (count, 0)
+    } else {
+        (MAX_DOTS - 1, count - (MAX_DOTS - 1))
+    }
+}
+
+/// Returns the centre of the light dot with `index` on the room button in
+/// `area`.
+fn dot_center(area: Rectangle, index: usize) -> Point {
+    let index = u32::try_from(index.min(MAX_DOTS)).unwrap_or(0);
+    let x = area.top_left.x.unsigned_abs() + PADDING + DOT / 2 + index * DOT_STEP;
+    let y = area.top_left.y.unsigned_abs() + area.size.height - DOT_MIDDLE;
+    point(x, y)
+}
+
+/// Draws one light dot in `ink`: filled if the light is on, a ring if it is
+/// off, and a cross if it is unavailable.
+fn draw_dot<D>(
+    light: LightState,
+    center: Point,
+    ink: Gray4,
+    display: &mut D,
+) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Gray4>,
+{
+    let circle = Circle::with_center(center, DOT);
+    match light {
+        LightState::On => circle
+            .into_styled(PrimitiveStyle::with_fill(ink))
+            .draw(display),
+        LightState::Off => circle
+            .into_styled(PrimitiveStyle::with_stroke(ink, 3))
+            .draw(display),
+        LightState::Unavailable => draw_cross(center, DOT, ink, display),
+    }
 }
 
 fn draw_tile<D>(tile: &TileView, area: Rectangle, display: &mut D) -> Result<(), D::Error>
@@ -110,7 +397,11 @@ where
             .draw(display)?,
         TileState::Unavailable => draw_dashed_border(area, display)?,
         _ => shape
-            .into_styled(border(if toggle { 4 } else { 2 }))
+            .into_styled(border(if toggle && tile.state != TileState::Unknown {
+                4
+            } else {
+                2
+            }))
             .draw(display)?,
     }
 
@@ -132,14 +423,9 @@ where
         ink,
     )?;
 
-    if toggle && tile.state != TileState::Unavailable {
+    if toggle {
         let indicator = Circle::new(point(left + inner - INDICATOR, top + 12), INDICATOR);
-        let style = if on {
-            PrimitiveStyle::with_fill(WHITE)
-        } else {
-            PrimitiveStyle::with_stroke(BLACK, 3)
-        };
-        indicator.into_styled(style).draw(display)?;
+        draw_indicator(tile.state, indicator, display)?;
     }
 
     // A value with a detail line uses a smaller font, so both lines fit.
@@ -314,8 +600,14 @@ const fn point(x: u32, y: u32) -> Point {
 #[cfg(test)]
 pub mod tests {
     use embedded_graphics::{pixelcolor::Gray4, prelude::*};
-    use shared::{Connection, PowerSource, SceneView, TileKind, TileState, TileView, ViewModel};
+    use shared::{
+        Connection, IndexView, LightState,
+        LightState::{Off, On, Unavailable},
+        PageView, PowerSource, RoomSummary, RoomView, SceneView, TileKind, TileState, TileView,
+        ViewModel,
+    };
 
+    use super::{dot_center, dots};
     use crate::{Framebuffer, draw, layout};
 
     fn tile(label: &str, kind: TileKind, state: TileState, text: &str) -> TileView {
@@ -338,28 +630,30 @@ pub mod tests {
             page_index: 1,
             page_count: 10,
             page_label: "2 / 10".into(),
-            tiles: vec![
-                tile("Lights", TileKind::Light, TileState::On, "On 75%"),
-                tile("Rocket lamp", TileKind::Light, TileState::Off, "Off"),
-                tile(
-                    "Standard lamp",
-                    TileKind::Light,
-                    TileState::Unavailable,
-                    "Unavailable",
-                ),
-                tile("Temperature", TileKind::Sensor, TileState::Value, "21.4 °C"),
-                climate,
-                tile(
-                    "A label that is much too long for the tile",
-                    TileKind::Sensor,
-                    TileState::Value,
-                    "A value that is much too long for the tile",
-                ),
-            ],
-            scenes: vec![SceneView {
-                label: "Bright".into(),
-                entity_id: "scene.bright".into(),
-            }],
+            page: PageView::Room(RoomView {
+                tiles: vec![
+                    tile("Lights", TileKind::Light, TileState::On, "On 75%"),
+                    tile("Rocket lamp", TileKind::Light, TileState::Off, "Off"),
+                    tile(
+                        "Standard lamp",
+                        TileKind::Light,
+                        TileState::Unavailable,
+                        "Unavailable",
+                    ),
+                    tile("Temperature", TileKind::Sensor, TileState::Value, "21.4 °C"),
+                    climate,
+                    tile(
+                        "A label that is much too long for the tile",
+                        TileKind::Sensor,
+                        TileState::Value,
+                        "A value that is much too long for the tile",
+                    ),
+                ],
+                scenes: vec![SceneView {
+                    label: "Bright".into(),
+                    entity_id: "scene.bright".into(),
+                }],
+            }),
             connection: Connection::Online,
             power: PowerSource::Stand,
             status: "Online, on stand".into(),
@@ -368,6 +662,48 @@ pub mod tests {
             last_sync: None,
             updated: "Live".into(),
             full_refresh_seq: 1,
+        }
+    }
+
+    /// Returns the view of an index page with nine rooms. The All lights
+    /// toggle is on.
+    pub fn index_view() -> ViewModel {
+        let mut weather = tile("Weather", TileKind::Weather, TileState::Value, "12.3 °C");
+        weather.detail = "Partly cloudy".into();
+        let rooms: [(&str, &[LightState], Option<&str>); 9] = [
+            ("Living Room", &[On, Off, Unavailable], Some("20.4°")),
+            ("Dining Room", &[Off, Off, Off], Some("19.5°")),
+            ("Kitchen", &[Off], None),
+            ("Hall", &[Off, On], None),
+            ("Landing", &[On, On], None),
+            ("Main bedroom", &[Off, On], Some("19.5°")),
+            ("Guest bedroom", &[], Some("18°")),
+            ("Loft", &[Unavailable; 3], None),
+            (
+                "Outside",
+                &[Off; 6],
+                Some("A temperature that is much too long"),
+            ),
+        ];
+        ViewModel {
+            path: "/".into(),
+            title: "Home".into(),
+            page_index: 0,
+            page_label: "1 / 10".into(),
+            page: PageView::Index(IndexView {
+                weather: Some(weather),
+                all_lights: Some(tile("All lights", TileKind::Light, TileState::On, "On")),
+                rooms: rooms
+                    .iter()
+                    .map(|(title, lights, temperature)| RoomSummary {
+                        title: (*title).into(),
+                        lights: lights.to_vec(),
+                        temperature: temperature.map(String::from),
+                        any_on: lights.contains(&On),
+                    })
+                    .collect(),
+            }),
+            ..view()
         }
     }
 
@@ -417,6 +753,65 @@ pub mod tests {
         assert!(frame.lumas().all(|luma| luma == 0 || luma == 15));
     }
 
+    /// Returns the center of the indicator of the toggle tile in `area`.
+    fn indicator_center(area: embedded_graphics::primitives::Rectangle) -> Point {
+        Point::new(
+            area.top_left.x + area.size.width.cast_signed()
+                - (super::PADDING + super::INDICATOR / 2).cast_signed(),
+            area.top_left.y + 12 + (super::INDICATOR / 2).cast_signed(),
+        )
+    }
+
+    /// Draws a room with an off, a no-state and an unavailable light, in
+    /// that order.
+    fn toggle_frame() -> Framebuffer {
+        let mut view = view();
+        let PageView::Room(room) = &mut view.page else {
+            unreachable!()
+        };
+        room.tiles = vec![
+            tile("Off", TileKind::Light, TileState::Off, "Off"),
+            tile("None", TileKind::Light, TileState::Unknown, "No data"),
+            tile(
+                "Gone",
+                TileKind::Switch,
+                TileState::Unavailable,
+                "Unavailable",
+            ),
+        ];
+        let mut frame = Framebuffer::new();
+        let Ok(()) = draw(&view, &mut frame);
+        frame
+    }
+
+    #[test]
+    fn a_toggle_with_no_state_has_a_thin_border_and_a_cross() {
+        let frame = toggle_frame();
+        let off = layout::tile(0).unwrap();
+        let unknown = layout::tile(1).unwrap();
+        let at = |area: embedded_graphics::primitives::Rectangle, dx: i32| {
+            frame.pixel(Point::new(area.center().x, area.top_left.y + dx))
+        };
+        // The border of an off toggle is thick, and the border of a toggle
+        // with no state is thin.
+        assert_eq!(at(off, 3), Some(Gray4::BLACK));
+        assert_eq!(at(unknown, 1), Some(Gray4::BLACK));
+        assert_eq!(at(unknown, 3), Some(Gray4::WHITE));
+        // The center of a ring is white, and the center of a cross is black.
+        assert_eq!(frame.pixel(indicator_center(off)), Some(Gray4::WHITE));
+        assert_eq!(frame.pixel(indicator_center(unknown)), Some(Gray4::BLACK));
+    }
+
+    #[test]
+    fn an_unavailable_toggle_has_a_cross() {
+        let frame = toggle_frame();
+        let unavailable = layout::tile(2).unwrap();
+        assert_eq!(
+            frame.pixel(indicator_center(unavailable)),
+            Some(Gray4::BLACK)
+        );
+    }
+
     #[test]
     fn long_text_stays_in_its_tile() {
         let mut frame = Framebuffer::new();
@@ -444,5 +839,122 @@ pub mod tests {
         view.path = "/".into();
         let Ok(()) = draw(&view, &mut frame);
         assert_eq!(frame.pixel(point), Some(Gray4::BLACK));
+    }
+
+    #[test]
+    fn the_index_draws_in_black_and_white() {
+        let mut frame = Framebuffer::new();
+        let Ok(()) = draw(&index_view(), &mut frame);
+
+        // The All lights toggle is on, so it is black.
+        let toggle = layout::all_lights();
+        assert_eq!(frame.pixel(inside(toggle, 8)), Some(Gray4::BLACK));
+        // A room with all its lights off has a border and is white inside.
+        let room = layout::room(1).unwrap();
+        assert_eq!(
+            frame.pixel(Point::new(room.center().x, room.top_left.y + 1)),
+            Some(Gray4::BLACK)
+        );
+        assert_eq!(frame.pixel(inside(room, 6)), Some(Gray4::WHITE));
+        // A room with a light on is black.
+        assert_eq!(
+            frame.pixel(inside(layout::room(0).unwrap(), 6)),
+            Some(Gray4::BLACK)
+        );
+        // The line at the bottom of the header is below the toggle.
+        let line = layout::index_header().size.height.cast_signed() - 2;
+        assert_eq!(frame.pixel(Point::new(400, line)), Some(Gray4::BLACK));
+        assert_eq!(frame.pixel(Point::new(400, 57)), Some(Gray4::WHITE));
+        assert!(frame.lumas().all(|luma| luma == 0 || luma == 15));
+    }
+
+    #[test]
+    fn a_dot_for_each_light() {
+        let mut frame = Framebuffer::new();
+        let Ok(()) = draw(&index_view(), &mut frame);
+
+        // On a white button: the centre of a dot that is on is black, of a
+        // dot that is off is white, and of a cross is black.
+        let room = layout::room(7).unwrap();
+        let center = dot_center(room, 0);
+        assert_eq!(frame.pixel(center), Some(Gray4::BLACK));
+        // A cross has white between its arms.
+        assert_eq!(frame.pixel(center + Point::new(6, 0)), Some(Gray4::WHITE));
+        let room = layout::room(3).unwrap();
+        assert_eq!(frame.pixel(dot_center(room, 0)), Some(Gray4::BLACK));
+        assert_eq!(frame.pixel(dot_center(room, 1)), Some(Gray4::WHITE));
+        // The ring of a dot that is off.
+        assert_eq!(
+            frame.pixel(dot_center(room, 1) - Point::new(8, 0)),
+            Some(Gray4::WHITE)
+        );
+
+        // On a black button, the dots are white.
+        let room = layout::room(0).unwrap();
+        assert_eq!(frame.pixel(dot_center(room, 0)), Some(Gray4::WHITE));
+        assert_eq!(frame.pixel(dot_center(room, 1)), Some(Gray4::BLACK));
+        assert_eq!(frame.pixel(dot_center(room, 2)), Some(Gray4::WHITE));
+        // No dot after the last light.
+        assert_eq!(frame.pixel(dot_center(room, 3)), Some(Gray4::BLACK));
+    }
+
+    #[test]
+    fn more_lights_than_dots_shows_the_rest_as_a_number() {
+        assert_eq!(dots(0), (0, 0));
+        assert_eq!(dots(4), (4, 0));
+        assert_eq!(dots(5), (3, 2));
+        assert_eq!(dots(6), (3, 3));
+
+        // The Outside button has 6 lights: 3 dots, then `+3`.
+        let mut frame = Framebuffer::new();
+        let Ok(()) = draw(&index_view(), &mut frame);
+        let room = layout::room(8).unwrap();
+        for index in 0..3 {
+            let ring = dot_center(room, index) - Point::new(8, 0);
+            assert_eq!(frame.pixel(ring), Some(Gray4::BLACK), "dot {index}");
+        }
+        // The place of the fourth dot has the text, not a ring.
+        let text = embedded_graphics::primitives::Rectangle::new(
+            dot_center(room, 3) - Point::new(9, 12),
+            Size::new(40, 24),
+        );
+        assert!(
+            text.points()
+                .any(|point| frame.pixel(point) == Some(Gray4::BLACK))
+        );
+        assert_eq!(
+            frame.pixel(dot_center(room, 3) - Point::new(8, 0)),
+            Some(Gray4::WHITE)
+        );
+    }
+
+    #[test]
+    fn a_long_temperature_stays_in_its_room_button() {
+        let mut frame = Framebuffer::new();
+        let Ok(()) = draw(&index_view(), &mut frame);
+        let area = layout::room(8).unwrap();
+        let right = area.top_left.x + area.size.width.cast_signed() - 8;
+        for y in area.top_left.y + 4..area.top_left.y + area.size.height.cast_signed() - 4 {
+            assert_eq!(
+                frame.pixel(Point::new(right, y)),
+                Some(Gray4::WHITE),
+                "y = {y}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_all_lights_toggle_that_is_off_is_white() {
+        let mut view = index_view();
+        if let PageView::Index(index) = &mut view.page {
+            let toggle = index.all_lights.as_mut().unwrap();
+            toggle.state = TileState::Off;
+        }
+        let mut frame = Framebuffer::new();
+        let Ok(()) = draw(&view, &mut frame);
+        assert_eq!(
+            frame.pixel(inside(layout::all_lights(), 8)),
+            Some(Gray4::WHITE)
+        );
     }
 }

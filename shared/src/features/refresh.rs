@@ -88,7 +88,7 @@ pub struct State {
 /// [`PARTIALS_PER_FULL`] partial renders came before it. A full refresh
 /// always renders.
 pub fn redraw(model: &mut Model, full: bool) -> Cmd {
-    let next = view(model);
+    let mut next = view(model);
     let state = &mut model.refresh;
     if !full && state.last.as_ref() == Some(&next) {
         return Cmd::done();
@@ -100,7 +100,9 @@ pub fn redraw(model: &mut Model, full: bool) -> Cmd {
     }
     state.partials = 0;
     model.full_refresh_seq = model.full_refresh_seq.wrapping_add(1);
-    model.refresh.last = Some(view(model));
+    // The view is the same, except for the new number.
+    next.full_refresh_seq = model.full_refresh_seq;
+    model.refresh.last = Some(next);
     render().and(restart_timer(model))
 }
 

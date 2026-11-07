@@ -4,9 +4,11 @@
 use alloc::{string::String, vec, vec::Vec};
 use core::time::Duration;
 
-use super::{shell::Shell, start, start_at, tap_scene, tap_tile};
+use super::{shell::Shell, start, start_at, tap_all_lights, tap_room, tap_scene, tap_tile};
 use crate::{
-    Connection, Event, PowerSource, Route, TileState,
+    Connection, Event, LightState,
+    LightState::{Off, On, Unavailable},
+    PowerSource, RoomSummary, Route, TileState,
     capabilities::power::WakeSource,
     features::{
         connection::{CLOCK_INTERVAL, RECONNECT_MAX, RECONNECT_MIN},
@@ -52,10 +54,44 @@ fn house() -> Shell {
 fn texts(shell: &Shell) -> Vec<(String, TileState, String)> {
     shell
         .view()
-        .tiles
-        .into_iter()
-        .map(|tile| (tile.label, tile.state, tile.text))
+        .tiles()
+        .iter()
+        .map(|tile| (tile.label.clone(), tile.state, tile.text.clone()))
         .collect()
+}
+
+/// Returns the All lights toggle and the weather in the header of the index
+/// page.
+fn header(shell: &Shell) -> Vec<(String, TileState, String)> {
+    let view = shell.view();
+    let index = view.index().expect("the index page");
+    [&index.all_lights, &index.weather]
+        .into_iter()
+        .flatten()
+        .map(|tile| (tile.label.clone(), tile.state, tile.text.clone()))
+        .collect()
+}
+
+/// Returns the detail of the weather in the header of the index page.
+fn weather_detail(shell: &Shell) -> String {
+    let view = shell.view();
+    let index = view.index().expect("the index page");
+    index.weather.as_ref().expect("the weather").detail.clone()
+}
+
+/// Returns the summary of each room on the index page.
+fn summaries(shell: &Shell) -> Vec<RoomSummary> {
+    let view = shell.view();
+    view.index().expect("the index page").rooms.clone()
+}
+
+fn summary(title: &str, lights: &[LightState], temperature: Option<&str>) -> RoomSummary {
+    RoomSummary {
+        title: title.into(),
+        lights: lights.to_vec(),
+        temperature: temperature.map(String::from),
+        any_on: lights.contains(&On),
+    }
 }
 
 fn tile(label: &str, state: TileState, text: &str) -> (String, TileState, String) {
@@ -98,13 +134,14 @@ fn on_the_stand_the_dashboard_shows_live_state_and_controls_lights() {
     assert_eq!(view.updated, "Live · 09:41");
     assert_eq!(count(&shell.take_log(), "TimeNow"), 1);
     assert_eq!(
-        texts(&shell),
+        header(&shell),
         [
             tile("All lights", TileState::On, "On 100%"),
             tile("Weather", TileState::Value, "14.2 °C"),
         ]
     );
-    assert_eq!(view.tiles[1].detail, "Cloudy");
+    assert_eq!(weather_detail(&shell), "Cloudy");
+    assert_eq!(texts(&shell), []);
 
     shell.send(Event::NextPage);
     assert_eq!(
@@ -114,21 +151,21 @@ fn on_the_stand_the_dashboard_shows_live_state_and_controls_lights() {
             tile("Rocket lamp", TileState::On, "On 50%"),
             tile("Standard lamp", TileState::Unavailable, "Unavailable"),
             tile("Temperature", TileState::Value, "21.4 °C"),
-            tile("Humidity", TileState::Unknown, "-"),
+            tile("Humidity", TileState::Unknown, "No data"),
         ]
     );
 
     // A tap goes to Home Assistant, and its new state comes back.
     shell.send(tap_tile(0));
     assert_eq!(shell.broker.state("light.living_room_lights"), Some("on"));
-    assert_eq!(shell.view().tiles[0].state, TileState::On);
+    assert_eq!(shell.view().tiles()[0].state, TileState::On);
 
     // A change in Home Assistant shows at once.
     shell
         .broker
         .set_state("light.living_room_rocket_lamp", "off", &[]);
     shell.run();
-    assert_eq!(shell.view().tiles[1].text, "Off");
+    assert_eq!(shell.view().tiles()[1].text, "Off");
     assert!(!shell.frames.last().unwrap().full);
 
     shell.send(tap_scene(1));
@@ -147,15 +184,15 @@ fn on_battery_the_dashboard_wakes_syncs_accepts_taps_then_sleeps() {
 
     shell.send(start_at(PowerSource::Battery, Some("/room/dining_room")));
     assert_eq!(shell.timers(), [IDLE_TIMEOUT, CLOCK_INTERVAL]);
-    assert_eq!(shell.view().tiles[4].text, "19.5°");
-    assert_eq!(shell.view().tiles[4].detail, "Set 21°");
+    assert_eq!(shell.view().tiles()[4].text, "19.5°");
+    assert_eq!(shell.view().tiles()[4].detail, "Set 21°");
 
     shell.send(tap_tile(1));
     assert_eq!(
         shell.broker.state("light.dining_room_tall_lamp"),
         Some("on")
     );
-    assert_eq!(shell.view().tiles[1].text, "On");
+    assert_eq!(shell.view().tiles()[1].text, "On");
     // The tap restarted the idle timer. The first timer is now stale. The
     // new state of the lamp arrived within the minute, so the core did not
     // read the clock again.
@@ -213,13 +250,13 @@ fn a_battery_wake_shows_the_changes_from_while_it_slept() {
     assert_eq!(shell.broker.connections, 2);
     assert_eq!(shell.view().connection, Connection::Online);
     assert_eq!(
-        texts(&shell),
+        header(&shell),
         [
             tile("All lights", TileState::Off, "Off"),
             tile("Weather", TileState::Value, "14.2 °C"),
         ]
     );
-    assert_eq!(shell.view().tiles[1].detail, "Sunny");
+    assert_eq!(weather_detail(&shell), "Sunny");
 
     shell.fire_timers();
     assert_eq!(shell.view().updated, "Updated 10:42");
@@ -298,7 +335,7 @@ fn on_the_stand_a_lost_connection_reconnects_after_a_backoff() {
         shell.broker.retained("dashboard/hall/status"),
         Some("online")
     );
-    assert_eq!(shell.view().tiles[0].text, "Off");
+    assert_eq!(header(&shell)[0], tile("All lights", TileState::Off, "Off"));
     assert_eq!(count(&shell.take_log(), "TimeNow"), 1);
     assert_eq!(shell.view().updated, "Live · 09:41");
 }
@@ -342,7 +379,7 @@ fn taps_without_a_connection_are_sent_when_the_core_connects() {
     shell.broker.down = true;
     shell.send(start(PowerSource::Stand));
 
-    shell.send(tap_tile(0));
+    shell.send(tap_all_lights());
     shell.send(Event::Navigate(Route::room("loft")));
     shell.send(tap_scene(0));
     assert_eq!(shell.broker.service_calls.len(), 0);
@@ -392,7 +429,7 @@ fn a_full_refresh_is_kept_when_a_partial_redraw_follows_before_the_shell_draws()
     let mut shell = house();
     shell.send(start(PowerSource::Stand));
     assert!(shell.frames.last().unwrap().full);
-    shell.send(tap_tile(0));
+    shell.send(tap_all_lights());
     assert!(!shell.frames.last().unwrap().full);
 
     // The page changes, and a message for the new page arrives before the
@@ -406,7 +443,7 @@ fn a_full_refresh_is_kept_when_a_partial_redraw_follows_before_the_shell_draws()
     assert_eq!(shell.frames.len(), frames + 1);
     let frame = shell.frames.last().unwrap();
     assert!(frame.full);
-    assert_eq!(frame.view.tiles[0].text, "On 10%");
+    assert_eq!(frame.view.tiles()[0].text, "On 10%");
 }
 
 #[test]
@@ -434,7 +471,7 @@ fn on_battery_a_tap_that_waits_for_a_connection_delays_the_sleep_once() {
     let mut shell = house();
     shell.broker.down = true;
     shell.send(start(PowerSource::Battery));
-    shell.send(tap_tile(0));
+    shell.send(tap_all_lights());
     assert_eq!(shell.model.connection.outbox.len(), 1);
 
     // The first idle timeout waits one more idle period for the connection.
@@ -460,7 +497,7 @@ fn on_battery_a_tap_that_is_sent_before_the_extra_period_ends_is_not_lost() {
     let mut shell = house();
     shell.broker.down = true;
     shell.send(start(PowerSource::Battery));
-    shell.send(tap_tile(0));
+    shell.send(tap_all_lights());
     shell.fire_timers();
     assert_eq!(shell.sleep, None);
 
@@ -567,15 +604,15 @@ fn on_battery_a_tap_while_asleep_wakes_and_does_not_toggle_the_light() {
     shell.fire_timers();
     assert!(shell.view().asleep);
 
-    shell.send(tap_tile(0));
+    shell.send(tap_all_lights());
     assert!(!shell.view().asleep);
     assert!(shell.frames.last().unwrap().full);
     assert_eq!(shell.view().connection, Connection::Online);
     assert_eq!(shell.broker.service_calls.len(), 0);
     assert_eq!(shell.broker.state("light.all_lights"), Some("on"));
 
-    // The device is awake, so the next tap acts on the tile.
-    shell.send(tap_tile(0));
+    // The device is awake, so the next tap acts on the toggle.
+    shell.send(tap_all_lights());
     assert_eq!(shell.broker.state("light.all_lights"), Some("off"));
 }
 
@@ -590,7 +627,8 @@ fn a_dry_run_sends_no_service_call_until_it_stops() {
     assert!(shell.view().read_only);
 
     shell.take_log();
-    shell.send(tap_tile(0));
+    shell.send(tap_all_lights());
+    shell.send(Event::Navigate(Route::room("living_room")));
     shell.send(tap_scene(0));
     assert_eq!(shell.broker.service_calls.len(), 0);
     assert_eq!(shell.model.connection.outbox.len(), 0);
@@ -608,6 +646,79 @@ fn a_dry_run_sends_no_service_call_until_it_stops() {
 
     shell.send(Event::SetReadOnly(false));
     assert!(!shell.view().read_only);
-    shell.send(tap_tile(0));
+    shell.send(Event::Navigate(Route::Home));
+    shell.send(tap_all_lights());
     assert_eq!(shell.broker.state("light.all_lights"), Some("off"));
+}
+
+#[test]
+fn the_index_shows_a_summary_of_each_room_and_a_tap_shows_the_room() {
+    let mut shell = house();
+    shell.send(start(PowerSource::Stand));
+    let view = shell.view();
+    assert_eq!(view.title, "Home");
+    assert_eq!(view.path, "/");
+
+    // The Living Room has two lamps and a group of them. The group is not
+    // in the summary. The standard lamp is unavailable. The other rooms
+    // have no state yet.
+    let rooms = summaries(&shell);
+    assert_eq!(rooms.len(), 9);
+    assert_eq!(
+        rooms[..2],
+        [
+            summary("Living Room", &[On, Unavailable], Some("21.4°")),
+            summary("Dining Room", &[Unavailable; 3], Some("19.5°")),
+        ]
+    );
+    assert!(rooms[0].any_on);
+    assert_eq!(rooms[8], summary("Outside", &[Unavailable; 2], None));
+
+    // A change in Home Assistant changes the summary with a partial refresh.
+    shell.broker.set_state("light.porch_light", "on", &[]);
+    shell
+        .broker
+        .set_state("light.back_garden_garden_light", "off", &[]);
+    shell.run();
+    assert_eq!(summaries(&shell)[8], summary("Outside", &[On, Off], None));
+    assert!(!shell.frames.last().unwrap().full);
+
+    // A tap on a room shows the room with a full refresh.
+    shell.send(tap_room(8));
+    let frame = shell.frames.last().unwrap();
+    assert!(frame.full);
+    assert_eq!(frame.view.title, "Outside");
+    assert_eq!(frame.view.path, "/room/outside");
+    assert_eq!(texts(&shell)[0], tile("Porch", TileState::On, "On"));
+
+    // On a room page, the core ignores a room button and the All lights
+    // toggle. Only the index page has them.
+    let frames = shell.frames.len();
+    shell.send(tap_room(0));
+    shell.send(tap_all_lights());
+    assert_eq!(shell.frames.len(), frames);
+    assert_eq!(shell.view().path, "/room/outside");
+    assert_eq!(shell.broker.service_calls.len(), 0);
+
+    shell.send(Event::Navigate(Route::Home));
+    assert!(shell.frames.last().unwrap().full);
+    assert!(shell.view().index().is_some());
+}
+
+#[test]
+fn the_all_lights_toggle_calls_home_assistant() {
+    let mut shell = house();
+    shell.send(start(PowerSource::Stand));
+
+    shell.send(tap_all_lights());
+    let call = shell.broker.service_calls.last().unwrap();
+    assert_eq!(call.service, "light.toggle");
+    assert_eq!(call.entity_id, "light.all_lights");
+    assert_eq!(header(&shell)[0], tile("All lights", TileState::Off, "Off"));
+    assert!(!shell.frames.last().unwrap().full);
+
+    // The index has no tiles, so the core ignores a tile on the home page.
+    shell.send(tap_tile(0));
+    shell.send(tap_scene(0));
+    assert_eq!(shell.broker.service_calls.len(), 1);
 }

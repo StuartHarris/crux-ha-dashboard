@@ -179,6 +179,12 @@ pub enum Control {
     Tile(usize),
     /// The scene button with this index on the current page.
     Scene(usize),
+    /// The All lights toggle on the index page.
+    AllLights,
+    /// The button of the room with this index on the index page. The index
+    /// is the position of the room in
+    /// [`IndexView::rooms`](crate::IndexView::rooms).
+    Room(usize),
 }
 
 /// The effects that the core asks the shell to do.
@@ -275,6 +281,13 @@ impl Model {
     #[must_use]
     pub fn current_page(&self) -> Option<&'static Page> {
         self.pages.get(self.page_index())
+    }
+
+    /// Returns the pages of the rooms, in order: each page except the home
+    /// page.
+    pub fn rooms(&self) -> impl Iterator<Item = &'static Page> + use<> {
+        let pages: &'static [Page] = self.pages;
+        pages.iter().filter(|page| page.is_room())
     }
 
     /// Returns `true` if the core wants a connection: it has settings and the
