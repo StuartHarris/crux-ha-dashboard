@@ -19,10 +19,13 @@ unsafe_code = "forbid"
 
 [workspace.dependencies]
 # Crux with no_std support. Pinned to a commit on the `spike/no-std` branch.
-crux_core = { git = "https://github.com/redbadger/crux", rev = "9dbbdd26ffa0fe6b64704e8037f032b7c27f2f79", default-features = false, features = ["crux_macros"] }
-crux_time = { git = "https://github.com/redbadger/crux", rev = "9dbbdd26ffa0fe6b64704e8037f032b7c27f2f79", default-features = false }
+crux_core = { git = "https://github.com/redbadger/crux", rev = "890ab0e17e818addb74a5bd70f51db2d606d314a", default-features = false, features = ["crux_macros"] }
+crux_time = { git = "https://github.com/redbadger/crux", rev = "890ab0e17e818addb74a5bd70f51db2d606d314a", default-features = false }
+chrono = { version = "0.4", default-features = false, features = ["alloc"] }
 facet = { version = "=0.46.5", default-features = false, features = ["alloc"] }
 serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
+serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
+futures = { version = "0.3", default-features = false, features = ["alloc"] }
 embedded-graphics = "0.8.2"
 
 # Members opt in to `std`. The `ui` crate must never turn it on.
