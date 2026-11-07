@@ -1,0 +1,66 @@
+name: ci
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: short
+  CI: 1
+  # sccache stores compiled crates in the GitHub Actions cache.
+  # It cannot cache incremental builds, so turn them off.
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: sccache
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  host:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # rustup reads rust-toolchain.toml and installs stable with rustfmt,
+      # clippy and the thumbv7em target when a cargo command first runs.
+      - name: Install the toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: mozilla-actions/sccache-action@v0.0.11
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just,cargo-nextest
+
+      - name: Check, build and test
+        run: just check-host build test
+
+  esp:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # The action installs a toolchain named `esp` and exports its
+      # environment, so `just check-nostd` needs no `~/export-esp.sh`.
+      - uses: esp-rs/xtensa-toolchain@v1.7.0
+        with:
+          default: false
+          buildtargets: esp32s3
+          ldproxy: false
+
+      - uses: mozilla-actions/sccache-action@v0.0.11
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
+      - name: Check the no_std build
+        run: just check-nostd
