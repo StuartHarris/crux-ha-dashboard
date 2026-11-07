@@ -46,7 +46,6 @@ fn main() {
         mqtt_username,
         mqtt_password,
         device_id,
-        utc_offset_minutes,
         read_only,
     } = config;
     let source = format!(
@@ -60,7 +59,6 @@ fn main() {
          mqtt_username: {mqtt_username:?},\n\
          mqtt_password: {mqtt_password:?},\n\
          device_id: {device_id:?},\n\
-         utc_offset_minutes: {utc_offset_minutes},\n\
          read_only: {read_only},\n\
          }};\n"
     );

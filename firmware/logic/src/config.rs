@@ -10,8 +10,25 @@
 //! `key = value` lines. A value is a string, an integer or a boolean. A string
 //! in double quotes must not contain a backslash. For a value with a
 //! backslash, use a literal string in single quotes.
+//!
+//! An unknown section or key is an error, so a mistake in a name does not
+//! go into the firmware with no sign.
 
 use core::fmt;
+
+/// The sections of the file and their keys.
+const KEYS: &[(&str, &[&str])] = &[
+    ("wifi", &["ssid", "password", "auth"]),
+    ("mqtt", &["host", "port", "username", "password"]),
+    ("device", &["id", "read_only"]),
+];
+
+/// A key that the firmware used before, and why it is not necessary now.
+const REMOVED: &[(&str, &str, &str)] = &[(
+    "device",
+    "utc_offset_minutes",
+    "the core calculates UK time, with summer time",
+)];
 
 /// The authentication of the Wi-Fi network (`[wifi] auth`).
 ///
@@ -63,11 +80,9 @@ pub struct Config<'a> {
     pub mqtt_password: &'a str,
     /// The id of this dashboard in MQTT topics (`[device] id`).
     pub device_id: &'a str,
-    /// The local offset from UTC in minutes (`[device] utc_offset_minutes`, 0
-    /// if not set).
-    pub utc_offset_minutes: i16,
-    /// If `true`, the firmware does not publish service calls
-    /// (`[device] read_only`, `true` if not set).
+    /// If `true`, the core does a dry run and does not publish service calls
+    /// (`[device] read_only`, `true` if not set). The firmware gives it to
+    /// the core in `Settings::read_only`.
     pub read_only: bool,
 }
 
@@ -83,7 +98,6 @@ impl fmt::Debug for Config<'_> {
             .field("mqtt_username", &self.mqtt_username)
             .field("mqtt_password", &hidden(self.mqtt_password))
             .field("device_id", &self.device_id)
-            .field("utc_offset_minutes", &self.utc_offset_minutes)
             .field("read_only", &self.read_only)
             .finish()
     }
@@ -107,6 +121,23 @@ pub enum Error<'a> {
     },
     /// The file does not have a key that the firmware needs.
     Missing(&'static str),
+    /// A `[section]` line names a section that the firmware does not know.
+    UnknownSection {
+        /// The number of the line, from 1.
+        line: usize,
+        /// The name of the section.
+        section: &'a str,
+    },
+    /// A key is not a key of its section, or it is not in a section.
+    UnknownKey {
+        /// The number of the line, from 1.
+        line: usize,
+        /// The section of the key, or an empty string before the first
+        /// section.
+        section: &'a str,
+        /// The key.
+        key: &'a str,
+    },
     /// A value has the right type, but the firmware cannot use it.
     Invalid {
         /// The key, with its section, for example `wifi.ssid`.
@@ -127,6 +158,24 @@ impl fmt::Display for Error<'_> {
                  backslash, put it in single quotes"
             ),
             Self::Missing(key) => write!(f, "the key `{key}` is missing"),
+            Self::UnknownSection { line, section } => write!(
+                f,
+                "line {line}: the section `[{section}]` is not known. The sections are \
+                 `[wifi]`, `[mqtt]` and `[device]`"
+            ),
+            Self::UnknownKey { line, section, key } => {
+                write!(
+                    f,
+                    "line {line}: the key `{key}` is not known in `[{section}]`"
+                )?;
+                match REMOVED
+                    .iter()
+                    .find(|(old_section, old_key, _)| *old_section == *section && *old_key == *key)
+                {
+                    Some((_, _, reason)) => write!(f, ". Remove it, because {reason}"),
+                    None => write!(f, ". Refer to cfg.toml.example for the keys"),
+                }
+            }
             Self::Invalid { key, rule } => {
                 write!(f, "the value of `{key}` is not valid: it must {rule}")
             }
@@ -164,10 +213,19 @@ impl<'a> Config<'a> {
                 .and_then(|rest| rest.strip_suffix(']'))
             {
                 section = name.trim();
+                if !KEYS.iter().any(|(known, _)| *known == section) {
+                    return Err(Error::UnknownSection { line, section });
+                }
                 continue;
             }
             let (key, value) = content.split_once('=').ok_or(Error::Syntax { line })?;
             let key = key.trim();
+            let known = KEYS
+                .iter()
+                .any(|(known, keys)| *known == section && keys.contains(&key));
+            if !known {
+                return Err(Error::UnknownKey { line, section, key });
+            }
             let value = parse_value(value.trim()).ok_or(Error::Value { line, key })?;
             config
                 .set(section, key, value)
@@ -188,13 +246,12 @@ struct Partial<'a> {
     mqtt_username: Option<&'a str>,
     mqtt_password: Option<&'a str>,
     device_id: Option<&'a str>,
-    utc_offset_minutes: Option<i16>,
     read_only: Option<bool>,
 }
 
 impl<'a> Partial<'a> {
     /// Keeps a value. Returns `None` if the value has the wrong type. The
-    /// parser ignores a key that it does not know.
+    /// parser checks the key with [`KEYS`] first.
     fn set(&mut self, section: &str, key: &str, value: Value<'a>) -> Option<()> {
         let text = || match value {
             Value::Text(text) => Some(text),
@@ -213,9 +270,6 @@ impl<'a> Partial<'a> {
             ("mqtt", "username") => self.mqtt_username = Some(text()?),
             ("mqtt", "password") => self.mqtt_password = Some(text()?),
             ("device", "id") => self.device_id = Some(text()?),
-            ("device", "utc_offset_minutes") => {
-                self.utc_offset_minutes = Some(i16::try_from(integer()?).ok()?);
-            }
             ("device", "read_only") => match value {
                 Value::Boolean(flag) => self.read_only = Some(flag),
                 _ => return None,
@@ -263,7 +317,6 @@ impl<'a> Partial<'a> {
             mqtt_username: self.mqtt_username.unwrap_or(""),
             mqtt_password: self.mqtt_password.unwrap_or(""),
             device_id: self.device_id.ok_or(Error::Missing("device.id"))?,
-            utc_offset_minutes: self.utc_offset_minutes.unwrap_or(0),
             read_only: self.read_only.unwrap_or(true),
         })
     }
@@ -334,9 +387,7 @@ mod tests {
 
             [device]
             id = "kitchen"
-            utc_offset_minutes = -60
             read_only = false
-            unknown = 3
         "#;
         assert_eq!(
             Config::parse(text),
@@ -349,7 +400,6 @@ mod tests {
                 mqtt_username: "dashboard",
                 mqtt_password: "secret",
                 device_id: "kitchen",
-                utc_offset_minutes: -60,
                 read_only: false,
             })
         );
@@ -361,7 +411,6 @@ mod tests {
         let config = Config::parse(text).unwrap();
         assert_eq!(config.mqtt_port, 1883);
         assert_eq!(config.mqtt_username, "");
-        assert_eq!(config.utc_offset_minutes, 0);
         assert!(config.read_only);
     }
 
@@ -389,6 +438,63 @@ mod tests {
             Config::parse("[wifi]\nssid = 'a'\npassword = '12345678'\n[device]\nid = 'd'"),
             Err(Error::Missing("mqtt.host"))
         );
+    }
+
+    #[test]
+    fn an_unknown_key_is_an_error_that_names_it() {
+        let text = "[wifi]\nssid = 'a'\npassword = '12345678'\ncolour = 'red'\n";
+        let error = Config::parse(text).unwrap_err();
+        assert_eq!(
+            error,
+            Error::UnknownKey {
+                line: 4,
+                section: "wifi",
+                key: "colour"
+            }
+        );
+        let message = alloc::format!("{error}");
+        assert!(
+            message.contains("colour") && message.contains("[wifi]"),
+            "{message}"
+        );
+
+        // A key before the first section.
+        assert!(matches!(
+            Config::parse("ssid = 'a'"),
+            Err(Error::UnknownKey {
+                line: 1,
+                section: "",
+                key: "ssid"
+            })
+        ));
+        // A known key in the wrong section.
+        assert!(matches!(
+            Config::parse("[device]\nhost = 'h'"),
+            Err(Error::UnknownKey { key: "host", .. })
+        ));
+    }
+
+    #[test]
+    fn an_unknown_section_is_an_error_that_names_it() {
+        let error = Config::parse("[wifi]\nssid = 'a'\n[mqqt]\nhost = 'h'").unwrap_err();
+        assert_eq!(
+            error,
+            Error::UnknownSection {
+                line: 3,
+                section: "mqqt"
+            }
+        );
+        assert!(alloc::format!("{error}").contains("[mqqt]"));
+    }
+
+    #[test]
+    fn the_old_utc_offset_key_is_an_error_with_a_hint() {
+        let text = "[device]\nid = 'd'\nutc_offset_minutes = 60\n";
+        let error = Config::parse(text).unwrap_err();
+        let message = alloc::format!("{error}");
+        assert!(message.contains("utc_offset_minutes"), "{message}");
+        assert!(message.contains("UK time"), "{message}");
+        assert!(message.contains("Remove it"), "{message}");
     }
 
     #[test]

@@ -4,12 +4,7 @@
 use alloc::{format, string::String};
 
 use chrono::{DateTime, Utc};
-use crux_core::{
-    App, Command,
-    command::RequestBuilder,
-    macros::effect,
-    render::{RenderOperation, render},
-};
+use crux_core::{App, Command, command::RequestBuilder, macros::effect, render::RenderOperation};
 use crux_time::{Instant, clock::Time, operation as time};
 use facet::Facet;
 use serde::{Deserialize, Serialize};
@@ -21,7 +16,11 @@ use crate::{
         power::{PowerSource, Sleep},
     },
     entities::Entities,
-    features::{connection, power, rooms},
+    features::{
+        connection, power,
+        refresh::{self, redraw},
+        rooms,
+    },
     layout::Page,
     pages::PAGES,
     route::Route,
@@ -39,6 +38,10 @@ pub struct Settings {
     pub port: u16,
     /// The credentials, if the broker needs them.
     pub credentials: Option<Credentials>,
+    /// If `true`, the dashboard does a dry run: a tap on a tile or a scene
+    /// sends no service call to Home Assistant. Refer to
+    /// [`ViewModel::read_only`].
+    pub read_only: bool,
 }
 
 impl Settings {
@@ -72,8 +75,6 @@ pub struct Start {
     /// sleep, the shell gives the path that it kept in RTC memory. If the
     /// path is `None` or not valid, the core shows the first page.
     pub path: Option<String>,
-    /// The local offset from UTC in minutes, for example 60 for BST.
-    pub utc_offset_minutes: i16,
     /// The time at which the last state message arrived, in seconds since
     /// the Unix epoch, from [`ViewModel::last_sync`]. After a deep sleep, the
     /// shell gives the value that it kept in RTC memory.
@@ -91,23 +92,35 @@ pub enum Event {
     /// The shell started. On battery, the device also starts after a deep
     /// sleep.
     Start(Start),
-    /// The device woke from a light sleep, which kept the core in memory.
+    /// The device woke from a light sleep, which kept the core in memory,
+    /// for a reason that is not a tap. Examples are a timer and the Wake
+    /// button of the simulator. A tap that wakes the device is a `Tapped`
+    /// event.
     Woke,
     /// The device moved to the stand or off the stand.
     PowerSourceChanged(PowerSource),
-    /// The user tapped the tile with this index on the current page.
-    TileTapped(usize),
-    /// The user tapped the scene with this index on the current page.
-    SceneTapped(usize),
+    /// The user tapped the panel, on this control or (`None`) on no control.
+    ///
+    /// The shell sends each tap, also while the device is asleep, and gets
+    /// the control from `ui::hit_test`. The core decides what the tap does:
+    ///
+    /// - If the device is asleep, the tap wakes it. The core does not act on
+    ///   the control, because the user cannot see the controls on a panel
+    ///   that sleeps.
+    /// - If the device is awake, a tap on a control acts on it. A tap on no
+    ///   control does nothing, so a touch by accident does not keep the
+    ///   device awake.
+    Tapped(Option<Control>),
     /// The user asked for the next page.
     NextPage,
     /// The user asked for the previous page.
     PreviousPage,
     /// The user asked for a page by its route.
     Navigate(Route),
-    /// The local offset from UTC changed, for example at the start of summer
-    /// time. The value is in minutes.
-    UtcOffsetChanged(i16),
+    /// The user started a dry run (`true`) or stopped it (`false`). Refer to
+    /// [`Settings::read_only`]. Before `Start`, the core keeps a request for
+    /// a dry run. `Start` cannot then stop the dry run.
+    SetReadOnly(bool),
 
     /// The answer to a `WifiOn` request.
     #[serde(skip)]
@@ -146,6 +159,26 @@ pub enum Event {
     #[serde(skip)]
     #[facet(skip)]
     IdleTimeout(u32),
+    /// The full-refresh timer with this id expired.
+    #[serde(skip)]
+    #[facet(skip)]
+    FullRefreshDue(u32),
+}
+
+/// A control on the panel.
+#[derive(Facet, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub enum Control {
+    /// The button that shows the previous page.
+    PreviousPage,
+    /// The button that shows the home page.
+    Home,
+    /// The button that shows the next page.
+    NextPage,
+    /// The tile with this index on the current page.
+    Tile(usize),
+    /// The scene button with this index on the current page.
+    Scene(usize),
 }
 
 /// The effects that the core asks the shell to do.
@@ -183,6 +216,9 @@ pub struct Model {
     pub pages: &'static [Page],
     /// The broker and device settings. The core has none until `Start`.
     pub settings: Option<Settings>,
+    /// The user asked for a dry run before `Start`. Refer to
+    /// [`rooms::set_read_only`].
+    pub read_only_requested: bool,
     /// The current route.
     pub route: Route,
     /// The entity states from the state stream.
@@ -196,14 +232,14 @@ pub struct Model {
     /// before the arrival of the last message. Refer to
     /// [`connection::read_message_time`].
     pub last_sync: Option<DateTime<Utc>>,
-    /// The local offset from UTC in minutes.
-    pub utc_offset_minutes: i16,
     /// The number of service calls that the core dropped, because it slept
     /// before it could send them.
     pub unsent: usize,
     /// The number of full refreshes that the core asked for. See
     /// [`ViewModel::full_refresh_seq`].
     pub full_refresh_seq: u32,
+    /// The state of the refresh policy. Refer to [`refresh`].
+    pub refresh: refresh::State,
 }
 
 impl Default for Model {
@@ -211,14 +247,15 @@ impl Default for Model {
         Self {
             pages: PAGES,
             settings: None,
+            read_only_requested: false,
             route: Route::Home,
             entities: Entities::default(),
             connection: connection::State::default(),
             power: power::State::default(),
             last_sync: None,
-            utc_offset_minutes: 0,
             unsent: 0,
             full_refresh_seq: 0,
+            refresh: refresh::State::default(),
         }
     }
 }
@@ -266,21 +303,18 @@ impl App for Dashboard {
             Event::Start(start) => on_start(start, model),
             Event::Woke => power::woke(model),
             Event::PowerSourceChanged(source) => power::source_changed(source, model),
-            Event::TileTapped(index) => rooms::tile_tapped(index, model),
-            Event::SceneTapped(index) => rooms::scene_tapped(index, model),
+            Event::Tapped(control) => rooms::tapped(control, model),
             Event::NextPage => rooms::turn_page(model, true),
             Event::PreviousPage => rooms::turn_page(model, false),
             Event::Navigate(route) => rooms::navigate(route, model),
-            Event::UtcOffsetChanged(minutes) => {
-                model.utc_offset_minutes = minutes;
-                redraw(model, false)
-            }
+            Event::SetReadOnly(read_only) => rooms::set_read_only(read_only, model),
             Event::Wifi { request, status } => connection::wifi(request, status, model),
             Event::Mqtt { connection, event } => connection::mqtt(connection, event, model),
             Event::MessageTime(now) => connection::message_time(now, model),
             Event::MinutePassed(id) => connection::minute_passed(id, model),
             Event::Reconnect(id) => connection::reconnect(id, model),
             Event::IdleTimeout(id) => power::idle_timeout(id, model),
+            Event::FullRefreshDue(id) => refresh::timer_expired(id, model),
         }
     }
 
@@ -315,25 +349,19 @@ fn valid_time(instant: Instant) -> Option<DateTime<Utc>> {
     DateTime::from_timestamp(seconds, instant.nanos())
 }
 
-/// Asks the shell to draw. If `full_refresh` is `true`, the core also asks
-/// for a full refresh of the panel. A later partial redraw does not cancel it.
-pub(crate) fn redraw(model: &mut Model, full_refresh: bool) -> Cmd {
-    if full_refresh {
-        model.full_refresh_seq = model.full_refresh_seq.wrapping_add(1);
-    }
-    render()
-}
-
 fn on_start(start: Start, model: &mut Model) -> Cmd {
     let Start {
         settings,
         power: source,
         path,
-        utc_offset_minutes,
         last_sync,
     } = start;
-    model.settings = Some(settings);
-    model.utc_offset_minutes = utc_offset_minutes;
+    let read_only = settings.read_only || model.read_only_requested;
+    model.read_only_requested = false;
+    model.settings = Some(Settings {
+        read_only,
+        ..settings
+    });
     let kept = last_sync
         .and_then(|seconds| i64::try_from(seconds).ok())
         .and_then(|seconds| DateTime::from_timestamp(seconds, 0));

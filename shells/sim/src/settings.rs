@@ -41,9 +41,10 @@ Options (each has an environment variable):
   --battery           Start off the stand (DASHBOARD_POWER=battery)
   --page <PATH>       The page to show first, for example /room/kitchen
                       (DASHBOARD_PAGE)
-  --read-only         Do not publish service calls, so a click changes no
-                      device in the house (DASHBOARD_READ_ONLY=1). The
-                      --smoke mode is always read-only.
+  --read-only         Start in a dry run: the core does not publish service
+                      calls, so a click changes no device in the house
+                      (DASHBOARD_READ_ONLY=1). The window can stop and start
+                      the dry run. The --smoke mode is always a dry run.
   --help              Show this text
 ";
 
@@ -77,15 +78,12 @@ pub struct Options {
     pub mode: Mode,
     /// The broker and device settings, with the password in the
     /// credentials. The `Png` mode reads no password, so it has no
-    /// credentials.
+    /// credentials. `read_only` comes from `--read-only`.
     pub settings: Settings,
     /// The power source at the start.
     pub power: PowerSource,
     /// The path of the page to show first.
     pub path: Option<String>,
-    /// If `true`, the shell does not publish service calls, so a click
-    /// changes no device in the house.
-    pub read_only: bool,
 }
 
 /// Reads the options from `args` (without the program name) and from the
@@ -200,10 +198,10 @@ pub fn parse(
             host,
             port,
             credentials,
+            read_only,
         },
         power,
         path,
-        read_only,
     })
 }
 
@@ -333,10 +331,10 @@ mod tests {
 
     #[test]
     fn read_only_from_the_argument_or_the_environment() {
-        assert!(!parse_ok("", no_env).read_only);
-        assert!(parse_ok("--read-only", no_env).read_only);
+        assert!(!parse_ok("", no_env).settings.read_only);
+        assert!(parse_ok("--read-only", no_env).settings.read_only);
         let env = |name: &str| (name == "DASHBOARD_READ_ONLY").then(|| "1".to_string());
-        assert!(parse_ok("", env).read_only);
+        assert!(parse_ok("", env).settings.read_only);
         let env = |name: &str| (name == "DASHBOARD_READ_ONLY").then(|| "maybe".to_string());
         assert!(parse(Vec::new(), env, Some(Path::new("/h")), secret).is_err());
     }

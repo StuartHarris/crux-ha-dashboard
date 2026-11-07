@@ -62,10 +62,9 @@ pub fn run(options: Options) -> Result<(), String> {
         settings,
         power,
         path,
-        read_only,
         ..
     } = options;
-    if read_only {
+    if settings.read_only {
         eprintln!("read-only: a click does not change devices in the house");
     } else {
         eprintln!(
@@ -88,7 +87,7 @@ pub fn run(options: Options) -> Result<(), String> {
             let (sender, signals) = mpsc::channel();
             let notifier = Notifier::new(sender, Arc::new(move || context.request_repaint()));
             let open = mqtt::opener(handle.clone());
-            let mut shell = Shell::new(handle, notifier, open, read_only);
+            let mut shell = Shell::new(handle, notifier, open);
             shell.start(settings, power, path);
             Ok(Box::new(App::new(shell, signals, power)))
         }),
@@ -111,8 +110,6 @@ struct App {
     texture: Option<TextureHandle>,
     /// The image version and the flash state of the texture.
     uploaded: Option<(u64, bool)>,
-    /// The offset from UTC, in minutes, in the clock control.
-    offset: i16,
     /// The guard on the switch from a dry run to live service calls.
     live: LiveGuard,
     view_text: ViewText,
@@ -211,7 +208,6 @@ impl eframe::App for App {
 
 impl App {
     fn new(shell: Shell, signals: mpsc::Receiver<Signal>, power: PowerSource) -> Self {
-        let offset = shell.utc_offset_minutes();
         Self {
             shell,
             signals,
@@ -221,7 +217,6 @@ impl App {
             show_outline: false,
             texture: None,
             uploaded: None,
-            offset,
             live: LiveGuard::default(),
             view_text: ViewText::default(),
             hide_routine: true,
@@ -349,7 +344,7 @@ impl App {
             to_points(ui::WIDTH * viewport.scale),
             to_points(ui::HEIGHT * viewport.scale),
         );
-        let live = !self.shell.read_only();
+        let live = !view.read_only;
         let outline = self.show_outline.then(|| self.screen.outline()).flatten();
         let mut touch = None;
         ScrollArea::both().auto_shrink(false).show(ui, |ui| {
@@ -392,16 +387,7 @@ impl App {
             }
         });
         if let Some(point) = touch {
-            self.touch(point, view);
-        }
-    }
-
-    /// A touch while the device sleeps wakes it and is not a tap.
-    fn touch(&mut self, point: Point, view: &ViewModel) {
-        if view.asleep {
-            self.shell.wake();
-        } else if let Some(event) = ui::hit_test(view, point) {
-            self.shell.send(event);
+            self.shell.tap(point);
         }
     }
 
@@ -428,25 +414,7 @@ impl App {
 
         ui.separator();
         ui.heading("MQTT");
-        self.read_only_control(ui);
-
-        ui.separator();
-        ui.heading("Clock");
-        ui.label(format!(
-            "UTC offset: {} minutes",
-            self.shell.utc_offset_minutes()
-        ));
-        ui.horizontal(|ui| {
-            ui.add(
-                egui::DragValue::new(&mut self.offset)
-                    .range(-720..=840)
-                    .speed(15)
-                    .suffix(" min"),
-            );
-            if ui.button("Send").clicked() {
-                self.shell.set_utc_offset(self.offset);
-            }
-        });
+        self.read_only_control(ui, view);
 
         ui.separator();
         ui.heading("Panel");
@@ -507,11 +475,12 @@ impl App {
         }
     }
 
-    /// Shows if a tap switches real devices. The switch from a dry run to
-    /// live needs a second click to confirm. The switch back is immediate.
-    fn read_only_control(&mut self, ui: &mut Ui) {
-        if self.shell.read_only() {
-            ui.label("Dry run: taps change no device. The shell does not publish service calls.");
+    /// Shows if a tap switches real devices. The core keeps the dry run, and
+    /// the control sends `SetReadOnly`. The switch from a dry run to live
+    /// needs a second click to confirm. The switch back is immediate.
+    fn read_only_control(&mut self, ui: &mut Ui, view: &ViewModel) {
+        if view.read_only {
+            ui.label("Dry run: taps change no device. The core does not publish service calls.");
             if self.live.asking {
                 ui.colored_label(LIVE_COLOR, "Taps will switch real devices in the house.");
                 ui.horizontal(|ui| {
@@ -519,7 +488,7 @@ impl App {
                         egui::Button::new(RichText::new("Confirm: go live").color(Color32::WHITE))
                             .fill(LIVE_COLOR);
                     if ui.add(confirm).clicked() && self.live.confirm() {
-                        self.shell.set_read_only(false);
+                        self.shell.send(Event::SetReadOnly(false));
                     }
                     if ui.button("Cancel").clicked() {
                         self.live.cancel();
@@ -535,7 +504,7 @@ impl App {
                     .color(LIVE_COLOR),
             );
             if ui.button("Back to dry run").clicked() {
-                self.shell.set_read_only(true);
+                self.shell.send(Event::SetReadOnly(true));
             }
         }
     }
@@ -552,11 +521,7 @@ impl App {
             fact("Connection", format!("{:?}", view.connection));
             fact("Power", format!("{:?}", view.power));
             fact("Asleep", view.asleep.to_string());
-            fact("Read-only", self.shell.read_only().to_string());
-            fact(
-                "UTC offset",
-                format!("{} min", self.shell.utc_offset_minutes()),
-            );
+            fact("Read-only", view.read_only.to_string());
             fact(
                 "MQTT connection",
                 self.shell
@@ -630,9 +595,6 @@ impl App {
             }
             match &entry.delivery {
                 Delivery::Received | Delivery::Sent => {}
-                Delivery::NotSent => {
-                    ui.colored_label(Color32::YELLOW, "not sent");
-                }
                 Delivery::NoConnection => {
                     ui.colored_label(Color32::YELLOW, "no connection");
                 }

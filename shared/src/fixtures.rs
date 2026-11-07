@@ -29,10 +29,8 @@ use crate::{
 };
 
 /// The time of the fixed clock in seconds since the Unix epoch:
-/// 2026-07-01 09:41:00 UTC.
+/// 2026-07-01 09:41:00 UTC, which is 10:41 in British Summer Time.
 pub const NOW: u64 = 1_782_898_860;
-/// The local offset from UTC in minutes (BST).
-pub const UTC_OFFSET_MINUTES: i16 = 60;
 
 /// A shell that answers the effects of the core at once, with fixed answers.
 pub struct FixedShell {
@@ -57,10 +55,10 @@ impl FixedShell {
                 host: "localhost".into(),
                 port: 1883,
                 credentials: None,
+                read_only: false,
             },
             power,
             path: Some(path.into()),
-            utc_offset_minutes: UTC_OFFSET_MINUTES,
             last_sync: None,
         }));
         shell.run(effects);
@@ -119,6 +117,13 @@ impl FixedShell {
             };
             queue.extend(more);
         }
+    }
+
+    /// Sends `event` to the core, and answers the effects until the core
+    /// waits.
+    pub fn send(&mut self, event: Event) {
+        let effects = self.core.process_event(event);
+        self.run(effects);
     }
 
     /// Ends the MQTT connection, as if the broker went away, and answers

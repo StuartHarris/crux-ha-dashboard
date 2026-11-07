@@ -3,11 +3,14 @@
 //! The core builds without std when you turn off the `std` feature.
 //!
 //! - [`app`] is the root: the events, the effects, the model and the dispatch.
-//! - [`features`] has the logic for rooms, the connection and power.
+//! - [`features`] has the logic for rooms, the connection, power and the
+//!   refresh of the panel.
 //! - [`capabilities`] has the custom effects: MQTT, network and power.
 //! - [`view`] makes the view model, which has all the text that the `ui`
 //!   crate draws.
 //! - [`pages`] is the layout data. Edit it to change the dashboard.
+//! - [`local_time`] gives the UK time, with summer time, for each time that
+//!   the view shows.
 //! - `fixtures` (with the `fixtures` feature) is a shell with fixed answers,
 //!   for tests and pictures.
 
@@ -24,6 +27,7 @@ pub mod features;
 #[cfg(feature = "fixtures")]
 pub mod fixtures;
 pub mod layout;
+pub mod local_time;
 pub mod pages;
 pub mod route;
 pub mod view;

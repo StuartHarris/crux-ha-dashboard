@@ -3,4 +3,5 @@
 
 pub mod connection;
 pub mod power;
+pub mod refresh;
 pub mod rooms;

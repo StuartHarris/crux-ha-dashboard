@@ -1,7 +1,7 @@
 //! Connects to the broker, waits for the retained entity states, draws the
 //! page to a PNG file and stops.
 //!
-//! The shell is read-only in this mode, so it publishes no service call.
+//! The core does a dry run in this mode, so it publishes no service call.
 
 use std::{
     path::Path,
@@ -9,9 +9,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use shared::{Connection, capabilities::mqtt::MqttEvent};
+use shared::{Connection, Settings, capabilities::mqtt::MqttEvent};
 
 use crate::{
+    inspector::Direction,
     mqtt,
     panel::Panel,
     settings::Options,
@@ -35,8 +36,12 @@ pub fn run(options: Options, out: &Path) -> Result<(), String> {
     let (sender, signals) = mpsc::channel();
     let notifier = Notifier::new(sender, Arc::new(|| {}));
     let open = mqtt::opener(runtime.handle().clone());
-    let mut shell = Shell::new(runtime.handle().clone(), notifier, open, true);
-    shell.start(options.settings, options.power, options.path);
+    let mut shell = Shell::new(runtime.handle().clone(), notifier, open);
+    let settings = Settings {
+        read_only: true,
+        ..options.settings
+    };
+    shell.start(settings, options.power, options.path);
 
     let started = Instant::now();
     let mut last_message: Option<Instant> = None;
@@ -64,6 +69,14 @@ pub fn run(options: Options, out: &Path) -> Result<(), String> {
         }
     };
 
+    // The core does a dry run, so it must not ask for a service call.
+    let calls = shell
+        .inspector()
+        .mqtt
+        .iter()
+        .filter(|entry| entry.direction == Direction::Out && entry.topic.ends_with("/cmd"))
+        .count();
+
     let view = shell.view();
     let mut panel = Panel::new();
     panel.draw(&view);
@@ -83,6 +96,10 @@ pub fn run(options: Options, out: &Path) -> Result<(), String> {
     // Stop with no disconnect packet. The broker publishes the last will.
     drop(shell);
     runtime.shutdown_background();
+    if calls > 0 {
+        return Err(format!("smoke: the core published {calls} service calls"));
+    }
+    eprintln!("smoke: no service call published");
     if complete {
         Ok(())
     } else {

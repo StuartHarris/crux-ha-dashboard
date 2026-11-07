@@ -9,20 +9,24 @@ mod broker;
 mod connection;
 mod flows;
 mod power;
+mod refresh;
 mod rooms;
 
 mod shell;
 
 use alloc::string::String;
 
+use core::time::Duration;
+
 use crux_time::Instant;
 
-use crate::{PowerSource, Settings, Start, app::Event};
+use crate::{
+    Cmd, Control, EffectTestExt, PowerSource, Settings, Start, app::Event,
+    features::refresh::FULL_REFRESH_INTERVAL,
+};
 
 /// The time in the tests: 2026-07-01T08:41:00Z, which is 09:41 in BST.
 const NOW: u64 = 1_782_895_260;
-/// The UTC offset in the tests: BST.
-const BST: i16 = 60;
 
 fn settings() -> Settings {
     Settings {
@@ -30,6 +34,7 @@ fn settings() -> Settings {
         host: "broker.local".into(),
         port: 1883,
         credentials: None,
+        read_only: false,
     }
 }
 
@@ -42,11 +47,36 @@ fn start_at(power: PowerSource, path: Option<&str>) -> Event {
         settings: settings(),
         power,
         path: path.map(String::from),
-        utc_offset_minutes: BST,
         last_sync: None,
     })
 }
 
 fn instant(seconds: u64) -> Instant {
     Instant::new(seconds, 0)
+}
+
+/// A tap on the tile with `index`.
+const fn tap_tile(index: usize) -> Event {
+    Event::Tapped(Some(Control::Tile(index)))
+}
+
+/// A tap on the scene button with `index`.
+const fn tap_scene(index: usize) -> Event {
+    Event::Tapped(Some(Control::Scene(index)))
+}
+
+/// Expects the effect that starts the full-refresh timer.
+trait ExpectFullRefreshTimer {
+    /// Expects the next effect to start the timer of
+    /// [`FULL_REFRESH_INTERVAL`].
+    fn expect_full_refresh_timer(&mut self) -> &mut Self;
+}
+
+impl ExpectFullRefreshTimer for Cmd {
+    #[track_caller]
+    fn expect_full_refresh_timer(&mut self) -> &mut Self {
+        self.expect_time_notify_after_with(|notify| {
+            assert_eq!(Duration::from(notify.duration), FULL_REFRESH_INTERVAL);
+        })
+    }
 }

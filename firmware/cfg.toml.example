@@ -22,8 +22,6 @@ password = "your-broker-password"
 [device]
 # The id of the dashboard in MQTT topics, for example `dashboard/hall/cmd`.
 id = "hall"
-# The local offset from UTC in minutes, for example 60 for BST.
-utc_offset_minutes = 0
-# If true, a tap does not publish a service call, so no device in the house
-# changes. Set it to false when the dashboard works.
+# If true, the core does a dry run: a tap does not publish a service call, so
+# no device in the house changes. Set it to false when the dashboard works.
 read_only = true

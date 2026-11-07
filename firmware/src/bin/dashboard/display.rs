@@ -17,12 +17,11 @@ use embassy_time::{Duration, Instant, Timer};
 use embedded_graphics::primitives::Rectangle;
 use logic::{
     backoff::Backoff,
-    refresh::{Policy, Refresh},
     shell::Signal,
     touch::{Tapper, TouchMap},
 };
 use shared::ViewModel;
-use ui::Framebuffer;
+use ui::{Framebuffer, Refresh, Refresher};
 
 use crate::{RENDER, SIGNALS};
 
@@ -35,7 +34,7 @@ struct Frames {
     shown: Framebuffer,
     /// The frame to draw next.
     next: Framebuffer,
-    policy: Policy,
+    refresher: Refresher,
 }
 
 #[embassy_executor::task]
@@ -44,7 +43,7 @@ pub async fn task(mut panel: Panel<'static>) {
     let mut frames = Frames {
         shown: Framebuffer::new(),
         next: Framebuffer::new(),
-        policy: Policy::default(),
+        refresher: Refresher::default(),
     };
     loop {
         match select(RENDER.wait(), Timer::after(TOUCH_POLL)).await {
@@ -106,7 +105,7 @@ impl Touch {
 async fn render(panel: &mut Panel<'static>, frames: &mut Frames, view: &ViewModel) {
     let Ok(()) = ui::draw(view, &mut frames.next);
     let refresh = frames
-        .policy
+        .refresher
         .decide(view.full_refresh_seq, &frames.shown, &frames.next);
     if refresh == Refresh::None {
         return;
@@ -115,7 +114,7 @@ async fn render(panel: &mut Panel<'static>, frames: &mut Frames, view: &ViewMode
     // A failed power-on turns the high voltages off again.
     if let Err(error) = panel.power_on() {
         log::error!("panel: power on failed: {error:?}");
-        frames.policy.reset();
+        frames.refresher.reset();
         return;
     }
     let result = match refresh {
@@ -140,7 +139,7 @@ async fn render(panel: &mut Panel<'static>, frames: &mut Frames, view: &ViewMode
         }
         Err(error) => {
             log::error!("panel: refresh failed: {error:?}");
-            frames.policy.reset();
+            frames.refresher.reset();
         }
     }
 }

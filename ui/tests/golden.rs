@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use embedded_graphics::pixelcolor::Gray4;
 use embedded_graphics::prelude::*;
 use embedded_graphics_simulator::{OutputSettings, SimulatorDisplay};
-use shared::{PowerSource, ViewModel, fixtures::FixedShell, pages::PAGES};
+use shared::{Event, PowerSource, ViewModel, fixtures::FixedShell, pages::PAGES};
 
 /// Draws `view` and compares the image with the reference image `name`.
 /// Returns a description of the difference, or `None` if the images are the
@@ -117,4 +117,14 @@ fn the_offline_page_matches_its_reference_image() {
     assert!(!view.asleep);
     assert_eq!(view.updated, "Updated 10:41");
     assert_all_match(&check("offline", &view).into_iter().collect::<Vec<_>>());
+}
+
+#[test]
+fn the_dry_run_page_matches_its_reference_image() {
+    let mut shell = FixedShell::start(PowerSource::Stand, "/room/living_room");
+    shell.send(Event::SetReadOnly(true));
+    let view = shell.view();
+    assert!(view.read_only);
+    assert_eq!(view.status, "Dry run · Online, on stand");
+    assert_all_match(&check("dry-run", &view).into_iter().collect::<Vec<_>>());
 }

@@ -155,12 +155,12 @@ mod tests {
     )];
 
     fn text(entities: &Entities, kind: TileKind, entity_id: &str) -> (TileState, String) {
-        let description = describe(kind, entities.get(entity_id), 0);
+        let description = describe(kind, entities.get(entity_id));
         (description.state, description.text)
     }
 
     fn detail(entities: &Entities, kind: TileKind, entity_id: &str) -> String {
-        describe(kind, entities.get(entity_id), 0).detail
+        describe(kind, entities.get(entity_id)).detail
     }
 
     #[test]
@@ -372,13 +372,20 @@ mod tests {
     }
 
     #[test]
-    fn a_timestamp_sensor_shows_the_local_time() {
+    fn a_timestamp_sensor_shows_the_uk_time_at_that_time() {
         let mut entities = Entities::default();
         let topic = "homeassistant/statestream/sensor/temperature/state";
+        let shown = |entities: &Entities| {
+            describe(TileKind::Sensor, entities.get("sensor.temperature")).text
+        };
+        // In summer time, the UK time is UTC+1.
         entities.apply(PAGES, topic, b"2026-07-01T14:30:00+00:00");
-        assert_eq!(
-            describe(TileKind::Sensor, entities.get("sensor.temperature"), 60).text,
-            "15:30"
-        );
+        assert_eq!(shown(&entities), "15:30");
+        // In winter, the UK time is UTC.
+        entities.apply(PAGES, topic, b"2026-12-01T14:30:00+00:00");
+        assert_eq!(shown(&entities), "14:30");
+        // A time with another offset shows as UK time too.
+        entities.apply(PAGES, topic, b"2026-07-01T16:30:00+02:00");
+        assert_eq!(shown(&entities), "15:30");
     }
 }

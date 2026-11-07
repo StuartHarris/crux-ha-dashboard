@@ -19,12 +19,11 @@ with the std shells of the root workspace would pull std into it.
 
 | Module | What it does |
 | --- | --- |
-| `shell` | Owns the core. Routes each effect to a task as a `Command`, and gives each `Signal` from a task to the core. Keeps the MQTT connection ids, the timer tokens and the `WifiOn` tokens. Gives at most one `Render` for each batch of effects, with the last view. Converts a tap to an event with `ui::hit_test`, or to `Woke` while the device sleeps. Drops service calls in read-only mode. |
+| `shell` | Owns the core. Routes each effect to a task as a `Command`, and gives each `Signal` from a task to the core. Keeps the MQTT connection ids, the timer tokens and the `WifiOn` tokens. Gives at most one `Render` for each batch of effects, with the last view. Sends each tap to the core as `Tapped`, with the control from `ui::hit_test`. The core decides what a tap does while the device sleeps, and does not publish service calls in a dry run. |
 | `mqtt` | The bookkeeping of the MQTT task. The stream of each connection ends with exactly one `Disconnected` item. `supersede` removes the queued connections that a later command makes useless. `Outbox` keeps a publish while the client has no quota, and closes the connection if the publish cannot be sent. |
 | `wifi` | A `WifiOff` during a join stops the join. A `WifiOn` during a join continues it with the newer token. |
 | `backoff` | A wait that doubles from 1 s to 30 s after each failure, for the start of the touch controller. |
 | `timers` | The timers of the timer task, in milliseconds since the start. |
-| `refresh` | Decides between a full refresh, a partial refresh of the changed area, and no refresh. |
 | `touch` | Converts a GT911 point to a panel point, and touch samples to taps with a debounce. A sample is new with a finger, new with no finger (the finger lifted), or not new. Only a new sample with no finger ends a touch. |
 | `config` | Reads and checks `cfg.toml`. Its `Debug` output does not show the passwords. `build.rs` includes this file, so it uses only `core`. |
 
@@ -40,13 +39,13 @@ cannot block each other. This is the pattern of the `cpb` example in Crux.
 | --- | --- | --- |
 | core (`main`) | Owns the shell. Sends `Start` with the power source `Stand`. | |
 | `timers` | Starts and cancels the timers of the core. | `Signal::Timer` |
-| `display` | Draws the newest view model with `ui::draw`, and refreshes the panel. Reads the touch controller every 30 ms between refreshes. | `Signal::Tap` |
+| `display` | Draws the newest view model with `ui::draw`, and refreshes the panel as `ui::Refresher` decides. Reads the touch controller every 30 ms between refreshes. | `Signal::Tap` |
 | `wifi` | Joins the network and waits for DHCP, or leaves the network. | `Signal::Wifi` |
 | `mqtt` | Opens one connection at a time with `rust-mqtt` (MQTT 5) over TCP. Subscribes, publishes, sends pings, and closes. | `Signal::Mqtt` |
 | `net` | Runs the network stack. | |
 
-`Sleep` writes a line to the log, and the device stays awake. The view says that the
-device sleeps, so the next tap sends `Woke`. Deep sleep comes in phase 6.
+`Sleep` writes a line to the log, and the device stays awake. The next tap goes to the
+core as usual, and the core wakes because it sleeps. Deep sleep comes in phase 6.
 
 `TimeNow` gives the time since the start, from the Unix epoch. The core treats a time
 before 2025 as not valid, so the view shows only "Live", and no "Updated HH:MM" text,
@@ -133,13 +132,16 @@ the Wi-Fi password and the broker password, so it is in `.gitignore`.
    ```
 
 2. Put the Wi-Fi network, the broker and the device id in `firmware/cfg.toml`.
-3. Keep `read_only = true` until the dashboard works. In read-only mode, a tap publishes
-   no service call.
+3. Keep `read_only = true` until the dashboard works. The firmware gives the value to the
+   core, which then does a dry run: a tap publishes no service call.
 
 `build.rs` checks the Wi-Fi settings: the SSID has 1 to 32 bytes, `auth` is `wpa2`
 (the default), `wpa_wpa2` or `open`, and the password is empty for an open network and
-8 to 63 bytes for the others. The Wi-Fi driver cannot join a WPA3 network. An error
-names the key.
+8 to 63 bytes for the others. The Wi-Fi driver cannot join a WPA3 network. An unknown
+section or key is also an error. An error names the key.
+
+The file has no time zone setting. The dashboard shows UK time, and the core calculates
+summer time. If your `cfg.toml` has the old key `utc_offset_minutes`, remove it.
 
 `build.rs` writes the values into `target/.../out/config.rs` as one constant. Each
 binary includes it as a private module. The build
@@ -190,7 +192,7 @@ Do the steps in this order. Each step needs the steps before it.
    tiles (no states yet). Compare it with the page from `just sim-png` in the root
    directory. The layout must be the same.
 8. **Touch.** Find `step 6`. For 30 seconds, tap the four corners and some tiles. Each
-   tap writes its raw point, its panel point and its event. The top-left corner must
+   tap writes its raw point, its panel point and its control. The top-left corner must
    give a point near (0, 0), and the bottom-right corner a point near (959, 539). If
    the axes are turned or flipped, change `TouchMap::to_panel` in
    `logic/src/touch.rs` and its tests.
@@ -201,7 +203,7 @@ Do the steps in this order. Each step needs the steps before it.
     `mosquitto_sub -h localhost -u dashboard -P <password> -t 'dashboard/#' -v`
     (type the password, do not keep it in the shell history). The status topic shows
     `online`.
-11. **A tap in read-only mode.** Tap a light tile. The log shows `touch: tap`. The
+11. **A tap in a dry run.** Tap a light tile. The log shows `touch: tap`. The
     `mosquitto_sub` window shows no message on `dashboard/<id>/cmd`, and the light does
     not change.
 12. **A real tap.** Set `read_only = false`, run `just flash`, and tap a light tile. The
@@ -224,8 +226,9 @@ These choices need the board:
 - The clock starts at the Unix epoch (`src/bin/dashboard/clock.rs`). Read the PCF8563
   at the start, and set it with SNTP after the first Wi-Fi connection.
 - Measure the time of a full and of a partial refresh. The display task does not read
-  the touch controller during a refresh. The policy does a full refresh after 30
-  partial refreshes (`logic/src/refresh.rs`). Change the number if ghost images show.
+  the touch controller during a refresh. The core asks for a full refresh after 30
+  partial renders and after 30 minutes (`shared/src/features/refresh.rs`). Change the
+  numbers if ghost images show.
 - `rust-mqtt` sends one topic filter in each subscribe packet. Measure the time to get
   all retained states, and the size of the receive buffer (4096 bytes).
 

@@ -1,4 +1,5 @@
 use alloc::{string::String, vec, vec::Vec};
+use core::time::Duration;
 
 use crux_time::Instant;
 use embedded_graphics::prelude::Point;
@@ -8,6 +9,7 @@ use shared::{
         mqtt::{Message, MqttEvent},
         network::WifiStatus,
     },
+    features::power::IDLE_TIMEOUT,
 };
 
 use super::{Job, MqttOp, Shell, Signal, TimerOp, start};
@@ -22,7 +24,6 @@ const CONFIG: Config<'static> = Config {
     mqtt_username: "dashboard",
     mqtt_password: "mqtt-secret",
     device_id: "test",
-    utc_offset_minutes: 0,
     read_only: true,
 };
 
@@ -60,8 +61,12 @@ fn names(jobs: &[Job]) -> Vec<String> {
 }
 
 fn started(power: PowerSource, read_only: bool) -> (Shell, Vec<Job>) {
-    let mut shell = Shell::new(clock, read_only);
-    let start = start(&CONFIG, power, Some("/room/living_room".into()), None);
+    let mut shell = Shell::new(clock);
+    let config = Config {
+        read_only,
+        ..CONFIG
+    };
+    let start = start(&config, power, Some("/room/living_room".into()), None);
     let jobs = shell.send(Event::Start(start));
     (shell, jobs)
 }
@@ -86,12 +91,13 @@ const fn joined(token: u32) -> Signal {
     }
 }
 
+/// Returns the id and the token of the idle timer that `jobs` start.
 fn timer_of(jobs: &[Job]) -> Option<(crux_time::TimerId, u32)> {
     jobs.iter().find_map(|job| match job {
         Job::Timer {
             token,
             op: TimerOp::NotifyAfter(notify),
-        } => Some((notify.id, *token)),
+        } if Duration::from(notify.duration) == IDLE_TIMEOUT => Some((notify.id, *token)),
         _ => None,
     })
 }
@@ -99,7 +105,8 @@ fn timer_of(jobs: &[Job]) -> Option<(crux_time::TimerId, u32)> {
 #[test]
 fn start_draws_and_turns_wifi_on() {
     let (_, jobs) = started(PowerSource::Stand, true);
-    assert_eq!(names(&jobs), ["render", "wifi on 1"]);
+    // Timer 1 is the full-refresh timer of the core.
+    assert_eq!(names(&jobs), ["render", "start timer 1", "wifi on 1"]);
 }
 
 #[test]
@@ -151,7 +158,7 @@ fn a_message_on_the_stream_redraws_a_visible_tile() {
     // The first message also reads the clock, and the core starts the
     // minute timer.
     let jobs = shell.handle(message(b"on"));
-    assert_eq!(names(&jobs), ["render", "start timer 1"]);
+    assert_eq!(names(&jobs), ["render", "start timer 2"]);
     assert_eq!(shell.view().updated, "Live · 12:00");
 
     // Within the minute, the core does not read the clock again.
@@ -160,7 +167,7 @@ fn a_message_on_the_stream_redraws_a_visible_tile() {
 }
 
 #[test]
-fn read_only_does_not_publish_service_calls() {
+fn the_read_only_setting_of_the_config_makes_a_dry_run_in_the_core() {
     for (read_only, expected) in [
         (true, vec![]),
         (false, vec![String::from("publish dashboard/test/cmd 1")]),
@@ -176,8 +183,11 @@ fn read_only_does_not_publish_service_calls() {
 }
 
 #[test]
-fn a_tap_on_dead_space_does_nothing() {
+fn a_tap_on_dead_space_while_awake_does_nothing() {
+    // The shell sends the tap, and the core ignores it, also on battery.
     let mut shell = online(true);
+    assert_eq!(shell.handle(Signal::Tap(Point::new(100, 20))), Vec::new());
+    let (mut shell, _) = started(PowerSource::Battery, true);
     assert_eq!(shell.handle(Signal::Tap(Point::new(100, 20))), Vec::new());
 }
 
@@ -218,6 +228,8 @@ fn on_battery_the_idle_timer_sleeps_and_a_tap_wakes() {
     assert_eq!(
         names(&jobs),
         [
+            // The core clears the full-refresh timer before it sleeps.
+            "cancel timer 1",
             "publish dashboard/test/status 1",
             "disconnect 1",
             "wifi off",
@@ -257,7 +269,8 @@ fn a_timer_signal_with_an_old_token_is_ignored() {
         token: token.wrapping_sub(1),
     };
     assert_eq!(shell.handle(stale), Vec::new());
-    assert_eq!(shell.timer_count(), 1);
+    // The idle timer and the full-refresh timer.
+    assert_eq!(shell.timer_count(), 2);
 }
 
 #[test]
@@ -281,6 +294,7 @@ fn start_has_the_settings_of_the_config() {
     let credentials = start.settings.credentials.unwrap();
     assert_eq!(credentials.username, "dashboard");
     assert_eq!(start.last_sync, Some(5));
+    assert!(start.settings.read_only);
 
     let anonymous = Config {
         mqtt_username: "",

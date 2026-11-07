@@ -5,7 +5,7 @@ use core::time::Duration;
 
 use crux_core::{App, Request};
 
-use super::{instant, start};
+use super::{ExpectFullRefreshTimer, instant, start};
 use crate::{
     Cmd, Connection, Dashboard, Effect, EffectTestExt, Event, Model, PowerSource, TileState,
     capabilities::{
@@ -24,6 +24,7 @@ pub fn drive_to_connecting(power: PowerSource) -> (Model, Cmd, Request<Connect>)
     let mut cmd = app.update(start(power), &mut model);
     let event = cmd
         .expect_render()
+        .expect_full_refresh_timer()
         .resolve_wifi_on(|_| WifiStatus::Connected)
         .expect_event();
 
@@ -60,6 +61,7 @@ fn start_on_the_stand_draws_and_turns_wifi_on() {
 
     app.update(start(PowerSource::Stand), &mut model)
         .expect_render()
+        .expect_full_refresh_timer()
         .expect_only_wifi_on();
 
     let view = app.view(&model);
@@ -252,7 +254,7 @@ fn the_backoff_doubles_up_to_a_limit_and_resets_on_connect() {
                 },
                 &mut model,
             )
-            .expect_render()
+            // The view still shows `Connecting`, so the core does not draw.
             .resolve_time_notify_after(|notify| {
                 assert_eq!(Duration::from(notify.duration), expected);
                 notify.id
@@ -316,6 +318,7 @@ fn wifi_that_fails_is_tried_again_after_a_backoff() {
     let event = app
         .update(start(PowerSource::Stand), &mut model)
         .expect_render()
+        .expect_full_refresh_timer()
         .resolve_wifi_on(|_| WifiStatus::Failed)
         .expect_event();
     let event = app
@@ -363,13 +366,16 @@ fn an_answer_to_an_older_wifi_request_is_ignored() {
     let mut model = Model::default();
 
     let mut first = app.update(start(PowerSource::Battery), &mut model);
-    first.expect_render();
+    first.expect_render().expect_full_refresh_timer();
     let mut old = first.expect_effect().expect_wifi_on();
 
     // The shell starts again, for example after a deep sleep, and the core
     // asks for Wi-Fi again.
     let mut second = app.update(start(PowerSource::Battery), &mut model);
-    second.expect_render().expect_wifi_on();
+    second
+        .expect_render()
+        .expect_full_refresh_timer()
+        .expect_wifi_on();
 
     old.resolve(WifiStatus::Connected).unwrap();
     let stale = first.expect_event();
@@ -547,14 +553,15 @@ fn a_clock_with_no_valid_time_shows_live_and_waits_a_minute() {
 }
 
 #[test]
-fn the_time_of_the_last_message_is_a_local_time() {
+fn the_time_of_the_last_message_is_a_uk_time() {
     let app = Dashboard;
     let (mut model, mut cmd, mut request) = drive_to_connected(PowerSource::Stand);
+    // In summer, the UK time is UTC+1.
     let _ = deliver(&mut model, &mut cmd, &mut request, Some(super::NOW));
     assert_eq!(app.view(&model).updated, "Live · 09:41");
-
-    app.update(Event::UtcOffsetChanged(0), &mut model)
-        .expect_only_render();
-    assert_eq!(app.view(&model).updated, "Live · 08:41");
     assert_eq!(app.view(&model).last_sync, Some(super::NOW));
+
+    // In winter, the UK time is UTC: 2026-12-01T08:41:00Z.
+    model.last_sync = chrono::DateTime::from_timestamp(1_796_114_460, 0);
+    assert_eq!(app.view(&model).updated, "Live · 08:41");
 }

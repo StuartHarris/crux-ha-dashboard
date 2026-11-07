@@ -3,11 +3,12 @@
 use crux_core::App;
 
 use super::{
+    ExpectFullRefreshTimer,
     connection::{drive_to_connected, drive_to_connecting},
-    start_at,
+    start_at, tap_scene, tap_tile,
 };
 use crate::{
-    Dashboard, EffectTestExt, Event, Model, PowerSource, Route, capabilities::mqtt::Qos,
+    Control, Dashboard, EffectTestExt, Event, Model, PowerSource, Route, capabilities::mqtt::Qos,
     features::connection::Link,
 };
 
@@ -18,15 +19,20 @@ fn next_page_and_previous_page_wrap_around() {
     let count = model.pages.len();
 
     app.update(Event::PreviousPage, &mut model)
-        .expect_only_render();
+        .expect_render()
+        .expect_full_refresh_timer();
     let view = app.view(&model);
     assert_eq!(view.title, "Outside");
     assert_eq!(view.page_index, count - 1);
     assert_eq!(view.path, "/room/outside");
     assert_eq!(view.full_refresh_seq, 2);
 
-    app.update(Event::NextPage, &mut model).expect_only_render();
-    app.update(Event::NextPage, &mut model).expect_only_render();
+    app.update(Event::NextPage, &mut model)
+        .expect_render()
+        .expect_full_refresh_timer();
+    app.update(Event::NextPage, &mut model)
+        .expect_render()
+        .expect_full_refresh_timer();
     let view = app.view(&model);
     assert_eq!(view.title, "Living Room");
     assert_eq!(view.path, "/room/living_room");
@@ -42,7 +48,8 @@ fn navigate_shows_the_page_of_a_route() {
     let mut model = Model::default();
 
     app.update(Event::Navigate(Route::room("upstairs")), &mut model)
-        .expect_only_render();
+        .expect_render()
+        .expect_full_refresh_timer();
     assert_eq!(app.view(&model).title, "Landing");
 
     // The same route again does not draw.
@@ -79,7 +86,7 @@ fn a_tap_on_a_light_publishes_a_toggle() {
     let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Stand);
     model.route = Route::room("living_room");
 
-    app.update(Event::TileTapped(1), &mut model)
+    app.update(tap_tile(1), &mut model)
         .expect_only_mqtt_publish_with(|publish| {
             assert_eq!(publish.topic, "dashboard/hall/cmd");
             assert_eq!(
@@ -97,7 +104,7 @@ fn a_tap_on_a_switch_publishes_a_toggle() {
     let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Stand);
     model.route = Route::room("kitchen");
 
-    app.update(Event::TileTapped(0), &mut model)
+    app.update(tap_tile(0), &mut model)
         .expect_only_mqtt_publish_with(|publish| {
             assert_eq!(
                 publish.payload,
@@ -112,7 +119,7 @@ fn a_tap_on_a_scene_publishes_scene_turn_on() {
     let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Stand);
     model.route = Route::room("hall");
 
-    app.update(Event::SceneTapped(2), &mut model)
+    app.update(tap_scene(2), &mut model)
         .expect_only_mqtt_publish_with(|publish| {
             assert_eq!(publish.topic, "dashboard/hall/cmd");
             assert_eq!(
@@ -128,20 +135,15 @@ fn a_tap_on_a_sensor_climate_or_weather_tile_or_outside_the_grid_does_nothing() 
     let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Stand);
 
     // The weather tile on the home page.
-    app.update(Event::TileTapped(1), &mut model)
-        .expect_no_effects();
+    app.update(tap_tile(1), &mut model).expect_no_effects();
     // The home page has no scenes.
-    app.update(Event::SceneTapped(0), &mut model)
-        .expect_no_effects();
+    app.update(tap_scene(0), &mut model).expect_no_effects();
 
     model.route = Route::room("dining_room");
     // The thermostat and the humidity sensor.
-    app.update(Event::TileTapped(4), &mut model)
-        .expect_no_effects();
-    app.update(Event::TileTapped(5), &mut model)
-        .expect_no_effects();
-    app.update(Event::TileTapped(6), &mut model)
-        .expect_no_effects();
+    app.update(tap_tile(4), &mut model).expect_no_effects();
+    app.update(tap_tile(5), &mut model).expect_no_effects();
+    app.update(tap_tile(6), &mut model).expect_no_effects();
 }
 
 #[test]
@@ -150,8 +152,7 @@ fn a_tap_before_the_connection_opens_waits_in_the_outbox() {
     let (mut model, mut cmd, mut request) = drive_to_connecting(PowerSource::Stand);
 
     // The connection is starting, so there is nothing more to ask for.
-    app.update(Event::TileTapped(0), &mut model)
-        .expect_no_effects();
+    app.update(tap_tile(0), &mut model).expect_no_effects();
     assert_eq!(model.connection.outbox.len(), 1);
 
     request
@@ -170,4 +171,138 @@ fn a_tap_before_the_connection_opens_waits_in_the_outbox() {
         .expect_only_render();
     assert_eq!(model.connection.outbox.len(), 0);
     assert_eq!(model.connection.mqtt, Link::Up);
+}
+
+/// Drives the core to an open connection on the stand, in a dry run.
+fn connected_in_a_dry_run() -> Model {
+    let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Stand);
+    if let Some(settings) = &mut model.settings {
+        settings.read_only = true;
+    }
+    model
+}
+
+#[test]
+fn a_tap_in_a_dry_run_sends_no_service_call() {
+    let app = Dashboard;
+    let mut model = connected_in_a_dry_run();
+    model.route = Route::room("hall");
+    assert!(app.view(&model).read_only);
+
+    app.update(tap_tile(0), &mut model).expect_no_effects();
+    app.update(tap_scene(2), &mut model).expect_no_effects();
+    assert_eq!(model.connection.outbox.len(), 0);
+}
+
+#[test]
+fn a_tap_in_a_dry_run_before_the_connection_opens_is_not_kept() {
+    let app = Dashboard;
+    let (mut model, _cmd, _request) = drive_to_connecting(PowerSource::Stand);
+    let _ = app.update(Event::SetReadOnly(true), &mut model);
+
+    app.update(tap_tile(0), &mut model).expect_no_effects();
+    assert_eq!(model.connection.outbox.len(), 0);
+}
+
+#[test]
+fn set_read_only_changes_the_view_and_the_next_tap() {
+    let app = Dashboard;
+    let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Stand);
+    assert!(!app.view(&model).read_only);
+
+    app.update(Event::SetReadOnly(true), &mut model)
+        .expect_only_render();
+    assert!(app.view(&model).read_only);
+    // The same value again changes nothing.
+    app.update(Event::SetReadOnly(true), &mut model)
+        .expect_no_effects();
+    app.update(tap_tile(0), &mut model).expect_no_effects();
+
+    app.update(Event::SetReadOnly(false), &mut model)
+        .expect_only_render();
+    assert!(!app.view(&model).read_only);
+    app.update(tap_tile(0), &mut model)
+        .expect_only_mqtt_publish();
+}
+
+#[test]
+fn a_dry_run_before_the_start_is_kept() {
+    let app = Dashboard;
+    let mut model = Model::default();
+    app.update(Event::SetReadOnly(true), &mut model)
+        .expect_no_effects();
+    assert!(app.view(&model).read_only);
+
+    // The settings do not ask for a dry run, but the request wins.
+    let _ = app.update(start_at(PowerSource::Stand, None), &mut model);
+    assert!(app.view(&model).read_only);
+    assert!(model.settings.as_ref().unwrap().read_only);
+}
+
+#[test]
+fn a_request_to_stop_the_dry_run_before_the_start_does_not_stop_it() {
+    let app = Dashboard;
+    let mut model = Model::default();
+    app.update(Event::SetReadOnly(false), &mut model)
+        .expect_no_effects();
+
+    let Event::Start(mut start) = start_at(PowerSource::Stand, None) else {
+        unreachable!()
+    };
+    start.settings.read_only = true;
+    let _ = app.update(Event::Start(start), &mut model);
+    assert!(app.view(&model).read_only);
+}
+
+#[test]
+fn set_read_only_while_asleep_does_not_draw() {
+    let app = Dashboard;
+    let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Battery);
+    let _ = app.update(Event::IdleTimeout(model.power.idle), &mut model);
+    assert!(model.power.asleep);
+
+    app.update(Event::SetReadOnly(true), &mut model)
+        .expect_no_effects();
+    assert!(app.view(&model).read_only);
+    assert!(app.view(&model).status.starts_with("Dry run · Asleep"));
+}
+
+#[test]
+fn the_status_shows_the_dry_run() {
+    let app = Dashboard;
+    let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Stand);
+    assert_eq!(app.view(&model).status, "Online, on stand");
+    let _ = app.update(Event::SetReadOnly(true), &mut model);
+    assert_eq!(app.view(&model).status, "Dry run · Online, on stand");
+}
+
+#[test]
+fn a_tap_on_a_navigation_button_turns_the_page() {
+    let app = Dashboard;
+    let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Stand);
+    let count = model.pages.len();
+
+    app.update(Event::Tapped(Some(Control::NextPage)), &mut model)
+        .expect_render()
+        .expect_full_refresh_timer();
+    assert_eq!(app.view(&model).page_index, 1);
+    app.update(Event::Tapped(Some(Control::PreviousPage)), &mut model)
+        .expect_render()
+        .expect_full_refresh_timer();
+    app.update(Event::Tapped(Some(Control::PreviousPage)), &mut model)
+        .expect_render()
+        .expect_full_refresh_timer();
+    assert_eq!(app.view(&model).page_index, count - 1);
+    app.update(Event::Tapped(Some(Control::Home)), &mut model)
+        .expect_render()
+        .expect_full_refresh_timer();
+    assert_eq!(app.view(&model).path, "/");
+}
+
+#[test]
+fn a_tap_on_no_control_changes_nothing_while_awake() {
+    let app = Dashboard;
+    let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Stand);
+    app.update(Event::Tapped(None), &mut model)
+        .expect_no_effects();
 }
