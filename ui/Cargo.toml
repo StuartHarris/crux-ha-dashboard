@@ -10,5 +10,9 @@ description = "Draws the view model with embedded-graphics. The simulator and th
 embedded-graphics.workspace = true
 shared.workspace = true
 
+[dev-dependencies]
+# Tests need the `std` feature of `shared`, but the library build must not use it.
+shared = { workspace = true, features = ["std"] }
+
 [lints]
 workspace = true

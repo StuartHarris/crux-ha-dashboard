@@ -8,13 +8,24 @@ publish.workspace = true
 [features]
 default = ["std"]
 # On by default. Turn it off to build the core for the device.
-std = ["crux_core/std", "crux_time/std", "facet/std", "serde/std"]
+std = [
+    "chrono/std",
+    "crux_core/std",
+    "crux_time/std",
+    "facet/std",
+    "futures/std",
+    "serde/std",
+    "serde_json/std",
+]
 
 [dependencies]
+chrono.workspace = true
 crux_core.workspace = true
 crux_time.workspace = true
 facet.workspace = true
+futures.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 crux_core = { workspace = true, features = ["testing"] }
