@@ -36,7 +36,9 @@ pub enum WakeSource {
 ///
 /// The shell does not answer. After a deep sleep, the device starts again and
 /// the shell sends [`Event::Start`](crate::Event::Start). After a light sleep,
-/// the shell sends [`Event::Woke`](crate::Event::Woke).
+/// the shell sends the tap that woke the device as
+/// [`Event::Tapped`](crate::Event::Tapped), or
+/// [`Event::Woke`](crate::Event::Woke) for a wake that is not a tap.
 ///
 /// The core sends `Sleep` after the `Render` of the last image. The shell must
 /// finish that render on the panel before the device sleeps.

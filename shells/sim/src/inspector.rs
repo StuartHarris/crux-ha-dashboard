@@ -170,8 +170,6 @@ pub enum Delivery {
     Received,
     /// The shell gave the packet to the client.
     Sent,
-    /// The shell is read-only, so it did not send the packet.
-    NotSent,
     /// The shell has no connection, so it did not send the packet.
     NoConnection,
     /// The client refused the packet, with this message.

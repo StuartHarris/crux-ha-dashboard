@@ -128,8 +128,13 @@ async fn main(spawner: Spawner) -> ! {
     Timer::after(PAUSE).await;
 
     log::info!("step 5: a page of the dashboard");
-    let mut shell = Shell::new(|| crux_time::Instant::new(0, 0), true);
-    let start = logic::shell::start(&config::CONFIG, PowerSource::Stand, None, None);
+    let mut shell = Shell::new(|| crux_time::Instant::new(0, 0));
+    // A dry run, so the check publishes no service call.
+    let dry_run = logic::config::Config {
+        read_only: true,
+        ..config::CONFIG
+    };
+    let start = logic::shell::start(&dry_run, PowerSource::Stand, None, None);
     let view = shell
         .send(Event::Start(start))
         .into_iter()
@@ -234,8 +239,12 @@ async fn touch(panel: &mut Panel<'_>, map: TouchMap, view: &shared::ViewModel) {
                 if let (Sample::Pressed(raw), Some(tap)) =
                     (sample, tapper.sample(Instant::now().as_millis(), point))
                 {
-                    let event = ui::hit_test(view, tap);
-                    log::info!("tap raw {raw:?} panel ({}, {}) -> {event:?}", tap.x, tap.y);
+                    let control = ui::hit_test(view, tap);
+                    log::info!(
+                        "tap raw {raw:?} panel ({}, {}) -> {control:?}",
+                        tap.x,
+                        tap.y
+                    );
                 }
             }
             Err(error) => log::warn!("touch read failed: {error:?}"),

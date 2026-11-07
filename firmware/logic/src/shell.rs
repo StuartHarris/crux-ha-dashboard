@@ -63,7 +63,8 @@ pub enum Signal {
         /// The answer.
         status: WifiStatus,
     },
-    /// A tap at this point on the panel.
+    /// A tap at this point on the panel. The shell sends it to the core as
+    /// `Event::Tapped`, also on no control and while the device sleeps.
     Tap(Point),
     /// An event for the core, for example `PowerSourceChanged`.
     Event(Event),
@@ -145,7 +146,6 @@ struct Timer {
 pub struct Shell {
     core: Core<Dashboard>,
     clock: fn() -> Instant,
-    read_only: bool,
     /// The connections whose streams did not end, from the oldest.
     connections: Vec<(u32, Request<Connect>)>,
     /// The id of the connection to which subscribe, publish and disconnect
@@ -160,15 +160,12 @@ pub struct Shell {
 }
 
 impl Shell {
-    /// Makes a shell. `clock` reads the wall clock. If `read_only` is `true`,
-    /// the shell does not publish service calls (the topics that end in
-    /// `/cmd`).
+    /// Makes a shell. `clock` reads the wall clock.
     #[must_use]
-    pub fn new(clock: fn() -> Instant, read_only: bool) -> Self {
+    pub fn new(clock: fn() -> Instant) -> Self {
         Self {
             core: Core::new(),
             clock,
-            read_only,
             connections: Vec::new(),
             current: None,
             last_connection: 0,
@@ -230,14 +227,8 @@ impl Shell {
                 self.process(effects)
             }
             Signal::Tap(point) => {
-                let view = self.view();
-                if view.asleep {
-                    self.send(Event::Woke)
-                } else if let Some(event) = ui::hit_test(&view, point) {
-                    self.send(event)
-                } else {
-                    Vec::new()
-                }
+                let control = ui::hit_test(&self.view(), point);
+                self.send(Event::Tapped(control))
             }
             Signal::Event(event) => self.send(event),
         }
@@ -306,10 +297,8 @@ impl Shell {
                 Vec::new()
             }
             Effect::MqttPublish(request) => {
-                let publish = request.operation;
-                let service_call = publish.topic.ends_with("/cmd");
-                if let (Some(current), false) = (self.current, self.read_only && service_call) {
-                    jobs.push(mqtt(current, MqttOp::Publish(publish)));
+                if let Some(current) = self.current {
+                    jobs.push(mqtt(current, MqttOp::Publish(request.operation)));
                 }
                 Vec::new()
             }
@@ -388,7 +377,9 @@ fn resolve<Op: Operation>(
     core.resolve(request, output).unwrap_or_default()
 }
 
-/// Makes the `Start` event from the build-time configuration.
+/// Makes the `Start` event from the build-time configuration. The settings
+/// have `read_only` from the configuration, so the core does a dry run if
+/// it is `true`.
 ///
 /// `path` and `last_sync` are the values that the firmware kept in RTC
 /// memory during a deep sleep, or `None` after a cold start.
@@ -409,10 +400,10 @@ pub fn start(
             host: config.mqtt_host.into(),
             port: config.mqtt_port,
             credentials,
+            read_only: config.read_only,
         },
         power,
         path,
-        utc_offset_minutes: config.utc_offset_minutes,
         last_sync,
     }
 }

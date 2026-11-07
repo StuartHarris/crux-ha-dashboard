@@ -364,6 +364,7 @@ pub mod tests {
             power: PowerSource::Stand,
             status: "Online, on stand".into(),
             asleep: false,
+            read_only: false,
             last_sync: None,
             updated: "Live".into(),
             full_refresh_seq: 1,

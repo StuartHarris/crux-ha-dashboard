@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 use embedded_graphics::primitives::Rectangle;
 use shared::ViewModel;
 
-use crate::panel::{Panel, Refresh};
+use ui::Refresh;
+
+use crate::panel::Panel;
 
 /// The time for which a full refresh shows the inverted image.
 pub const FLASH: Duration = Duration::from_millis(150);
@@ -92,20 +94,19 @@ impl Screen {
 
     /// Draws `view` and simulates the refresh of the panel at `now`.
     pub fn show(&mut self, view: &ViewModel, now: Instant) {
-        let update = self.panel.draw(view);
-        match (update.refresh, update.changed) {
-            (Refresh::Full, _) => {
+        match self.panel.draw(view) {
+            Refresh::Full => {
                 self.counters.full += 1;
                 self.flash.start(now);
                 self.outline = None;
             }
-            (Refresh::Partial, Some(area)) => {
+            Refresh::Partial(area) => {
                 self.counters.partial += 1;
                 self.counters.last_partial = Some(area);
                 self.outline = Some(area);
             }
             // No pixel changed, so the panel does not refresh.
-            (Refresh::Partial, None) => return,
+            Refresh::None => return,
         }
         self.version += 1;
     }

@@ -10,12 +10,13 @@ use futures::StreamExt;
 
 use crate::{
     Cmd, Event, Model,
-    app::{now, redraw},
+    app::now,
     capabilities::{
         mqtt::{Connect, LastWill, Mqtt, MqttEvent, Publish, Qos},
         network::{Network, WifiStatus},
     },
     entities,
+    features::refresh::redraw,
 };
 
 /// The first wait before the core connects again after a failure.

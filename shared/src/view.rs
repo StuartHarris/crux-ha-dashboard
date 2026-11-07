@@ -6,13 +6,13 @@
 
 use alloc::{format, string::String, vec::Vec};
 
-use chrono::{DateTime, FixedOffset, Timelike, Utc};
+use chrono::{DateTime, Timelike, Utc};
 use facet::Facet;
 use serde::{Deserialize, Serialize};
 
 use crate::{
     Model, capabilities::power::PowerSource, entities::EntityState, features::connection::Link,
-    layout::TileKind,
+    layout::TileKind, local_time::uk_time,
 };
 
 /// The data that a shell needs to draw the screen.
@@ -40,16 +40,22 @@ pub struct ViewModel {
     /// The connection and the power source as text, for example
     /// `Online, on stand`. If the core dropped taps before it slept, the text
     /// also gives their number, for example `Asleep, on battery, 1 tap not
-    /// sent`.
+    /// sent`. In a dry run, the text starts with `Dry run · `, so the panel
+    /// shows why a tap does not change a light.
     pub status: String,
     /// The device is asleep. The panel keeps this image until the device wakes.
     pub asleep: bool,
+    /// The dashboard does a dry run: a tap on a tile or a scene sends no
+    /// service call. The status text shows it on the panel. A shell can
+    /// also show it. For example, the simulator draws a red border round the
+    /// panel when the dry run stops.
+    pub read_only: bool,
     /// The time at which the last state message arrived, in seconds since
     /// the Unix epoch. The shell keeps it during a deep sleep and gives it
     /// back in `Start`.
     pub last_sync: Option<u64>,
-    /// The freshness of the data, with the local time of the last state
-    /// message as `HH:MM`.
+    /// The freshness of the data, with the UK time of the last state message
+    /// as `HH:MM`.
     ///
     /// - While the dashboard is connected, the text is `Live · HH:MM`, or
     ///   `Live` if the time is not known.
@@ -62,13 +68,16 @@ pub struct ViewModel {
     /// A number that the core increases each time that the panel needs a
     /// full refresh, to clear ghost images.
     ///
-    /// The core asks for a full refresh when the whole screen changes: after
-    /// a start or a wake, on a page change, and before sleep. The shell keeps
-    /// the number of its last full refresh. If the number in the view is
+    /// The core asks for a full refresh when the whole screen changes, after
+    /// a number of partial renders, and after a time. Refer to
+    /// [`features::refresh`](crate::features::refresh). The shell keeps the
+    /// number of its last full refresh. If the number in the view is
     /// different, the shell does a full refresh and keeps the new number.
     /// This works also when the shell draws once for many `Render` requests.
-    /// The shell can also do a full refresh after a number of partial
-    /// refreshes.
+    ///
+    /// The shell does not count refreshes. It does a full refresh for
+    /// another reason only if the panel cannot draw the change with a
+    /// partial refresh, for example grey pixels. Refer to `ui::Refresher`.
     pub full_refresh_seq: u32,
 }
 
@@ -131,12 +140,17 @@ pub fn view(model: &Model) -> ViewModel {
     };
     let updated = match (connection, model.last_sync) {
         (Connection::Online, Some(time)) => {
-            format!("Live · {}", local_time(time, model.utc_offset_minutes))
+            format!("Live · {}", local_time(time))
         }
         (Connection::Online, None) => "Live".into(),
-        (_, Some(time)) => format!("Updated {}", local_time(time, model.utc_offset_minutes)),
+        (_, Some(time)) => format!("Updated {}", local_time(time)),
         (_, None) => String::new(),
     };
+
+    let read_only = model
+        .settings
+        .as_ref()
+        .map_or(model.read_only_requested, |settings| settings.read_only);
 
     ViewModel {
         path: model.route.to_path(),
@@ -151,11 +165,7 @@ pub fn view(model: &Model) -> ViewModel {
                     state,
                     text,
                     detail,
-                } = describe(
-                    tile.kind,
-                    model.entities.get(tile.entity_id),
-                    model.utc_offset_minutes,
-                );
+                } = describe(tile.kind, model.entities.get(tile.entity_id));
                 TileView {
                     label: tile.label.into(),
                     entity_id: tile.entity_id.into(),
@@ -180,28 +190,34 @@ pub fn view(model: &Model) -> ViewModel {
             model.power.source,
             model.power.asleep,
             model.unsent,
+            read_only,
         ),
         last_sync: model
             .last_sync
             .and_then(|time| u64::try_from(time.timestamp()).ok()),
         asleep: model.power.asleep,
+        read_only,
         updated,
         full_refresh_seq: model.full_refresh_seq,
     }
 }
 
-/// Returns the local time of day of `time` as `HH:MM`.
-fn local_time(time: DateTime<Utc>, utc_offset_minutes: i16) -> String {
-    let local = FixedOffset::east_opt(i32::from(utc_offset_minutes) * 60).map_or_else(
-        || time.naive_utc(),
-        |offset| time.with_timezone(&offset).naive_local(),
-    );
+/// Returns the UK time of day of `time` as `HH:MM`. Refer to
+/// [`uk_time`](crate::local_time::uk_time).
+fn local_time(time: DateTime<Utc>) -> String {
+    let local = uk_time(time);
     format!("{:02}:{:02}", local.hour(), local.minute())
 }
 
-/// Returns the status text: the connection, the power source and the number
-/// of taps that the core did not send.
-fn status(connection: Connection, power: PowerSource, asleep: bool, unsent: usize) -> String {
+/// Returns the status text: the dry run, the connection, the power source
+/// and the number of taps that the core did not send.
+fn status(
+    connection: Connection,
+    power: PowerSource,
+    asleep: bool,
+    unsent: usize,
+    read_only: bool,
+) -> String {
     let connection = match connection {
         _ if asleep => "Asleep",
         Connection::Online => "Online",
@@ -212,10 +228,15 @@ fn status(connection: Connection, power: PowerSource, asleep: bool, unsent: usiz
         PowerSource::Stand => "on stand",
         PowerSource::Battery => "on battery",
     };
-    match unsent {
+    let text = match unsent {
         0 => format!("{connection}, {power}"),
         1 => format!("{connection}, {power}, 1 tap not sent"),
         _ => format!("{connection}, {power}, {unsent} taps not sent"),
+    };
+    if read_only {
+        format!("Dry run · {text}")
+    } else {
+        text
     }
 }
 
@@ -264,13 +285,9 @@ impl Description {
 /// Returns how a tile of `kind` shows `entity`, and the text on the tile.
 ///
 /// The core shows a timestamp state, for example the finish time of a
-/// dishwasher, as a local time. `utc_offset_minutes` is the local offset.
+/// dishwasher, as a UK time, with the offset from UTC at that time.
 #[must_use]
-pub fn describe(
-    kind: TileKind,
-    entity: Option<&EntityState>,
-    utc_offset_minutes: i16,
-) -> Description {
+pub fn describe(kind: TileKind, entity: Option<&EntityState>) -> Description {
     let Some((entity, state)) =
         entity.and_then(|entity| entity.state.as_deref().map(|state| (entity, state)))
     else {
@@ -300,7 +317,7 @@ pub fn describe(
                 Some(unit) if !unit.is_empty() => format!("{state} {unit}"),
                 _ => DateTime::parse_from_rfc3339(state).map_or_else(
                     |_| capitalise(state),
-                    |time| local_time(time.with_timezone(&Utc), utc_offset_minutes),
+                    |time| local_time(time.with_timezone(&Utc)),
                 ),
             };
             Description::new(TileState::Value, text)

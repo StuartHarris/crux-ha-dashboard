@@ -12,9 +12,8 @@ use crux_time::clock::Time;
 
 use crate::{
     Cmd, Event, Model,
-    app::redraw,
     capabilities::power::{Power, PowerSource, WakeSource},
-    features::connection,
+    features::{connection, refresh::redraw},
 };
 
 /// On battery, the time without a touch after which the device sleeps.

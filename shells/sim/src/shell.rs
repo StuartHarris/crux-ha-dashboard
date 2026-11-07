@@ -20,6 +20,8 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use embedded_graphics::prelude::Point;
+
 use crux_core::{Request, capability::Operation};
 use crux_time::{Instant, TimerId, operation::NotifyAfter};
 use shared::{
@@ -36,9 +38,6 @@ use crate::{
     inspector::{Delivery, Direction, Inspector, Packet, truncate},
     mqtt::{Link, Opener},
 };
-
-/// How often the shell checks the local offset from UTC.
-const OFFSET_CHECK: Duration = Duration::from_secs(60);
 
 /// An answer from a task on the runtime.
 #[derive(Debug)]
@@ -61,8 +60,6 @@ pub enum Signal {
         /// with an old token.
         token: u64,
     },
-    /// Time to check the local offset from UTC.
-    CheckOffset,
 }
 
 /// Sends signals to the main thread and wakes it.
@@ -122,15 +119,7 @@ pub struct Shell {
     last_connection: u64,
     timers: HashMap<TimerId, Timer>,
     last_token: u64,
-    read_only: bool,
     render: bool,
-    /// The offset from UTC that the shell last sent to the core.
-    utc_offset_minutes: i16,
-    /// The local offset from UTC at the last check. The shell sends a new
-    /// offset only when this value changes, so an offset that the user sets
-    /// stays until the local offset changes.
-    local_offset_minutes: i16,
-    offset_task: JoinHandle<()>,
     inspector: Inspector,
 }
 
@@ -139,7 +128,6 @@ impl Drop for Shell {
     /// disconnect packet, so the broker publishes the last will, as for a
     /// device that loses power.
     fn drop(&mut self) {
-        self.offset_task.abort();
         for live in &self.connections {
             live.link.abort();
         }
@@ -152,20 +140,7 @@ impl Drop for Shell {
 impl Shell {
     /// Makes a shell. Tasks run on `runtime` and send their answers with
     /// `notifier`. `open` opens an MQTT connection.
-    ///
-    /// If `read_only` is `true`, the shell does not publish service calls
-    /// (the topics that end in `/cmd`), so no light in the house changes.
-    pub fn new(runtime: Handle, notifier: Notifier, open: Opener, read_only: bool) -> Self {
-        let ticker = notifier.clone();
-        let offset_task = runtime.spawn(async move {
-            let mut interval = tokio::time::interval(OFFSET_CHECK);
-            interval.tick().await;
-            loop {
-                interval.tick().await;
-                ticker.send(Signal::CheckOffset);
-            }
-        });
-        let offset = local_offset_minutes();
+    pub fn new(runtime: Handle, notifier: Notifier, open: Opener) -> Self {
         Self {
             core: Core::new(),
             runtime,
@@ -176,22 +151,18 @@ impl Shell {
             last_connection: 0,
             timers: HashMap::new(),
             last_token: 0,
-            read_only,
             render: false,
-            utc_offset_minutes: offset,
-            local_offset_minutes: offset,
-            offset_task,
             inspector: Inspector::default(),
         }
     }
 
-    /// Sends `Start` to the core.
+    /// Sends `Start` to the core. `settings.read_only` starts the core in
+    /// a dry run.
     pub fn start(&mut self, settings: Settings, power: PowerSource, path: Option<String>) {
         self.send(Event::Start(Start {
             settings,
             power,
             path,
-            utc_offset_minutes: self.utc_offset_minutes,
             last_sync: None,
         }));
     }
@@ -202,15 +173,23 @@ impl Shell {
         self.process(effects);
     }
 
-    /// Wakes the device if it sleeps.
+    /// Sends a tap at `point` on the panel to the core, with the control at
+    /// that point. The shell sends each tap, also on no control and while
+    /// the device is asleep. The core decides what the tap does.
+    pub fn tap(&mut self, point: Point) {
+        let control = ui::hit_test(&self.view(), point);
+        self.send(Event::Tapped(control));
+    }
+
+    /// Sends `Woke`, a wake that is not a tap, for example from the Wake
+    /// button.
     ///
     /// The core stays in memory while the simulator sleeps, as in a light
-    /// sleep, so the shell sends `Woke`.
+    /// sleep. If the device is awake, the core only starts the idle time
+    /// again.
     pub fn wake(&mut self) {
-        if self.view().asleep {
-            eprintln!("power: woke");
-            self.send(Event::Woke);
-        }
+        eprintln!("power: wake");
+        self.send(Event::Woke);
     }
 
     /// Returns `true` if "Sleep now" can work: the device is on battery and
@@ -257,32 +236,6 @@ impl Shell {
             }
         }
         true
-    }
-
-    /// Returns `true` if the shell does not publish service calls.
-    pub const fn read_only(&self) -> bool {
-        self.read_only
-    }
-
-    /// Starts or stops the publication of service calls. If `read_only` is
-    /// `true`, a click changes no device in the house.
-    pub const fn set_read_only(&mut self, read_only: bool) {
-        self.read_only = read_only;
-    }
-
-    /// Returns the offset from UTC, in minutes, that the core uses.
-    pub const fn utc_offset_minutes(&self) -> i16 {
-        self.utc_offset_minutes
-    }
-
-    /// Sends a new offset from UTC to the core, for example to test the
-    /// start of summer time. The offset stays until the local offset of the
-    /// computer changes.
-    pub fn set_utc_offset(&mut self, minutes: i16) {
-        if minutes != self.utc_offset_minutes {
-            self.utc_offset_minutes = minutes;
-            self.send(Event::UtcOffsetChanged(minutes));
-        }
     }
 
     /// Returns the number of timers that run.
@@ -357,19 +310,6 @@ impl Shell {
                     self.process(effects);
                 }
             }
-            Signal::CheckOffset => {
-                self.check_offset(local_offset_minutes());
-            }
-        }
-    }
-
-    /// Sends the local offset from UTC to the core if it changed since the
-    /// last check.
-    fn check_offset(&mut self, minutes: i16) {
-        if minutes != self.local_offset_minutes {
-            eprintln!("time: the UTC offset is now {minutes} minutes");
-            self.local_offset_minutes = minutes;
-            self.set_utc_offset(minutes);
         }
     }
 
@@ -546,22 +486,13 @@ impl Shell {
         self.inspector.subscribe(topics, delivery);
     }
 
-    /// Publishes a message on the current connection. If the shell is
-    /// read-only, it does not publish a service call.
+    /// Publishes a message on the current connection.
     fn publish(&mut self, publish: &Publish) {
         let payload = String::from_utf8_lossy(&publish.payload);
-        let delivery = if self.read_only && publish.topic.ends_with("/cmd") {
-            eprintln!(
-                "mqtt: read-only, so not published: {} {payload}",
-                publish.topic
-            );
-            Delivery::NotSent
-        } else if let Some(live) = self.current() {
+        let delivery = self.current().map_or(Delivery::NoConnection, |live| {
             eprintln!("mqtt: publish {} {payload}", publish.topic);
             delivery("publish", live.link.publish(publish))
-        } else {
-            Delivery::NoConnection
-        };
+        });
         self.inspector
             .effect("MqttPublish", publish.topic.clone(), outcome(&delivery));
         self.inspector.packet(
@@ -656,7 +587,6 @@ fn outcome(delivery: &Delivery) -> String {
     match delivery {
         Delivery::Received => "received".into(),
         Delivery::Sent => "sent".into(),
-        Delivery::NotSent => "not sent: read-only".into(),
         Delivery::NoConnection => "not sent: no connection".into(),
         Delivery::Failed(error) => format!("failed: {error}"),
     }
@@ -675,12 +605,6 @@ fn resolve<Op: Operation>(
     })
 }
 
-/// Returns the local offset from UTC now, in minutes.
-fn local_offset_minutes() -> i16 {
-    let seconds = chrono::Local::now().offset().local_minus_utc();
-    i16::try_from(seconds / 60).unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -688,16 +612,17 @@ mod tests {
         time::Duration,
     };
 
+    use embedded_graphics::prelude::Point;
     use shared::{
-        Event, PowerSource, Settings,
+        Control, Event, PowerSource, Settings,
         capabilities::mqtt::{Connect, Credentials, Message, MqttEvent, Publish},
-        features::connection::CLOCK_INTERVAL,
+        features::{connection::CLOCK_INTERVAL, refresh::FULL_REFRESH_INTERVAL},
     };
     use tokio::runtime::Runtime;
 
     use super::{IDLE_TIMEOUT, Notifier, Shell, Signal};
     use crate::{
-        inspector::{Delivery, Direction, MqttEntry, Packet},
+        inspector::{Delivery, Direction, Packet},
         mqtt::{Link, Opener, Sink},
     };
 
@@ -759,7 +684,7 @@ mod tests {
     }
 
     impl Fixture {
-        fn new(read_only: bool) -> Self {
+        fn new() -> Self {
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(1)
                 .enable_time()
@@ -768,12 +693,7 @@ mod tests {
             let (sender, _signals) = mpsc::channel();
             let notifier = Notifier::new(sender, Arc::new(|| {}));
             let log = Log::default();
-            let shell = Shell::new(
-                runtime.handle().clone(),
-                notifier,
-                fake_opener(&log),
-                read_only,
-            );
+            let shell = Shell::new(runtime.handle().clone(), notifier, fake_opener(&log));
             Self {
                 runtime,
                 shell: Some(shell),
@@ -786,15 +706,21 @@ mod tests {
         }
 
         fn start(&mut self, power: PowerSource) {
-            self.start_with(power, None);
+            self.start_with(power, None, false);
         }
 
-        fn start_with(&mut self, power: PowerSource, credentials: Option<Credentials>) {
+        fn start_with(
+            &mut self,
+            power: PowerSource,
+            credentials: Option<Credentials>,
+            read_only: bool,
+        ) {
             let settings = Settings {
                 device_id: "test".into(),
                 host: "localhost".into(),
                 port: 1883,
                 credentials,
+                read_only,
             };
             self.shell()
                 .start(settings, power, Some("/room/living_room".into()));
@@ -808,16 +734,22 @@ mod tests {
             });
         }
 
-        /// Fires the timer that runs, with its token.
+        /// Fires the idle timer, with its token.
         fn fire_timer(&mut self) {
             let (id, token) = self.timer().unwrap();
             self.shell().handle(Signal::Timer { id, token });
         }
 
+        /// Returns the id and the token of the idle timer.
         fn timer(&mut self) -> Option<(crux_time::TimerId, u64)> {
-            let timers = &self.shell().timers;
-            assert!(timers.len() <= 1);
-            timers.iter().next().map(|(id, timer)| (*id, timer.token))
+            let mut idle = self
+                .shell()
+                .timers
+                .iter()
+                .filter(|(_, timer)| timer.is_idle());
+            let found = idle.next().map(|(id, timer)| (*id, timer.token));
+            assert!(idle.next().is_none());
+            found
         }
 
         fn take_log(&self) -> Vec<String> {
@@ -827,7 +759,7 @@ mod tests {
 
     #[test]
     fn a_timer_signal_with_an_old_token_is_ignored() {
-        let mut fixture = Fixture::new(true);
+        let mut fixture = Fixture::new();
         // On battery, the core starts the idle timer.
         fixture.start(PowerSource::Battery);
         let (id, token) = fixture.timer().unwrap();
@@ -845,7 +777,7 @@ mod tests {
 
     #[test]
     fn a_new_connection_disconnects_the_old_one_and_stays_current() {
-        let mut fixture = Fixture::new(true);
+        let mut fixture = Fixture::new();
         fixture.start(PowerSource::Battery);
         fixture.mqtt(1, MqttEvent::Connected);
         assert_eq!(
@@ -862,9 +794,10 @@ mod tests {
             ["publish dashboard/test/status 1", "disconnect 1"]
         );
 
-        // A wake before the old stream ends opens a second connection. The
-        // old connection is not aborted, so its disconnect completes.
-        fixture.shell().wake();
+        // A tap before the old stream ends wakes the core, which opens a
+        // second connection. The old connection is not aborted, so its
+        // disconnect completes.
+        fixture.shell().tap(Point::new(1, 1));
         assert_eq!(fixture.take_log(), ["open 2"]);
 
         // The old stream ends. The core ignores it, and the new connection
@@ -882,23 +815,47 @@ mod tests {
     }
 
     #[test]
-    fn read_only_does_not_publish_service_calls() {
-        for (read_only, expected) in [
-            (true, vec![]),
-            (false, vec!["publish dashboard/test/cmd 1".to_string()]),
-        ] {
-            let mut fixture = Fixture::new(read_only);
-            fixture.start(PowerSource::Stand);
-            fixture.mqtt(1, MqttEvent::Connected);
-            fixture.take_log();
-            fixture.shell().send(Event::TileTapped(0));
-            assert_eq!(fixture.take_log(), expected, "read_only = {read_only}");
-        }
+    fn a_tap_on_a_tile_publishes_the_service_call_of_the_core() {
+        let mut fixture = Fixture::new();
+        fixture.start(PowerSource::Stand);
+        fixture.mqtt(1, MqttEvent::Connected);
+        fixture.take_log();
+        let tile = ui::layout::tile(0).unwrap().center();
+        fixture.shell().tap(tile);
+        assert_eq!(fixture.take_log(), ["publish dashboard/test/cmd 1"]);
+    }
+
+    #[test]
+    fn a_dry_run_in_the_settings_reaches_the_core() {
+        let mut fixture = Fixture::new();
+        fixture.start_with(PowerSource::Stand, None, true);
+        fixture.mqtt(1, MqttEvent::Connected);
+        fixture.take_log();
+        assert!(fixture.shell().view().read_only);
+
+        let tile = ui::layout::tile(0).unwrap().center();
+        fixture.shell().tap(tile);
+        assert_eq!(fixture.take_log(), Vec::<String>::new());
+
+        fixture.shell().send(Event::SetReadOnly(false));
+        fixture.shell().tap(tile);
+        assert_eq!(fixture.take_log(), ["publish dashboard/test/cmd 1"]);
+    }
+
+    #[test]
+    fn a_tap_on_no_control_while_asleep_wakes_the_core() {
+        let mut fixture = Fixture::new();
+        fixture.start(PowerSource::Battery);
+        fixture.fire_timer();
+        assert!(fixture.shell().view().asleep);
+        // The header has no control. The shell still sends the tap.
+        fixture.shell().tap(Point::new(100, 20));
+        assert!(!fixture.shell().view().asleep);
     }
 
     #[test]
     fn drop_stops_the_connections_and_the_timers() {
-        let mut fixture = Fixture::new(true);
+        let mut fixture = Fixture::new();
         fixture.start(PowerSource::Battery);
         fixture.mqtt(1, MqttEvent::Connected);
         fixture.take_log();
@@ -908,7 +865,8 @@ mod tests {
             .values()
             .map(|timer| timer.task.abort_handle())
             .collect();
-        assert_eq!(tasks.len(), 1);
+        // The idle timer and the full-refresh timer.
+        assert_eq!(tasks.len(), 2);
 
         drop(fixture.shell.take());
         assert_eq!(fixture.take_log(), ["abort 1"]);
@@ -918,66 +876,9 @@ mod tests {
         assert!(tasks.iter().all(tokio::task::AbortHandle::is_finished));
     }
 
-    /// Returns the MQTT log entries with a topic that ends in `/cmd`.
-    fn commands(shell: &Shell) -> Vec<MqttEntry> {
-        shell
-            .inspector()
-            .mqtt
-            .iter()
-            .filter(|entry| entry.topic.ends_with("/cmd"))
-            .cloned()
-            .collect()
-    }
-
-    #[test]
-    fn read_only_can_change_while_the_shell_runs() {
-        let mut fixture = Fixture::new(false);
-        fixture.start(PowerSource::Stand);
-        fixture.mqtt(1, MqttEvent::Connected);
-        fixture.take_log();
-
-        fixture.shell().set_read_only(true);
-        assert!(fixture.shell().read_only());
-        fixture.shell().send(Event::TileTapped(0));
-        assert_eq!(fixture.take_log(), Vec::<String>::new());
-
-        fixture.shell().set_read_only(false);
-        fixture.shell().send(Event::TileTapped(0));
-        assert_eq!(fixture.take_log(), ["publish dashboard/test/cmd 1"]);
-
-        // The newest entry is first.
-        let deliveries: Vec<_> = commands(fixture.shell())
-            .into_iter()
-            .map(|entry| (entry.direction, entry.packet, entry.delivery))
-            .collect();
-        assert_eq!(
-            deliveries,
-            [
-                (Direction::Out, Packet::Publish, Delivery::Sent),
-                (Direction::Out, Packet::Publish, Delivery::NotSent),
-            ]
-        );
-    }
-
-    #[test]
-    fn a_service_call_in_read_only_mode_is_in_the_logs_as_not_sent() {
-        let mut fixture = Fixture::new(true);
-        fixture.start(PowerSource::Stand);
-        fixture.mqtt(1, MqttEvent::Connected);
-        fixture.shell().send(Event::TileTapped(0));
-
-        let [entry] = commands(fixture.shell()).try_into().unwrap();
-        assert_eq!(entry.delivery, Delivery::NotSent);
-        assert_ne!(entry.payload, "");
-        let effect = fixture.shell().inspector().effects.iter().next().unwrap();
-        assert_eq!(effect.effect, "MqttPublish");
-        assert_eq!(effect.request, "dashboard/test/cmd");
-        assert_eq!(effect.outcome, "not sent: read-only");
-    }
-
     #[test]
     fn the_mqtt_log_has_the_messages_in_and_out() {
-        let mut fixture = Fixture::new(true);
+        let mut fixture = Fixture::new();
         fixture.start(PowerSource::Stand);
         fixture.mqtt(1, MqttEvent::Connected);
         let topic = "homeassistant/statestream/light/kitchen/state";
@@ -1027,13 +928,14 @@ mod tests {
 
     #[test]
     fn the_logs_do_not_show_the_password() {
-        let mut fixture = Fixture::new(true);
+        let mut fixture = Fixture::new();
         fixture.start_with(
             PowerSource::Stand,
             Some(Credentials {
                 username: "dashboard".into(),
                 password: "secret-password".into(),
             }),
+            false,
         );
         fixture.mqtt(1, MqttEvent::Connected);
         let inspector = fixture.shell().inspector();
@@ -1052,7 +954,7 @@ mod tests {
 
     #[test]
     fn the_effect_log_has_the_effects_and_their_answers() {
-        let mut fixture = Fixture::new(true);
+        let mut fixture = Fixture::new();
         fixture.start(PowerSource::Battery);
         fixture.mqtt(1, MqttEvent::Connected);
         fixture.fire_timer();
@@ -1084,25 +986,6 @@ mod tests {
         assert!(expired);
     }
 
-    #[test]
-    fn an_offset_that_the_user_sets_stays_until_the_local_offset_changes() {
-        let mut fixture = Fixture::new(true);
-        fixture.start(PowerSource::Stand);
-        let local = fixture.shell().utc_offset_minutes();
-
-        let summer = local + 60;
-        fixture.shell().set_utc_offset(summer);
-        assert_eq!(fixture.shell().utc_offset_minutes(), summer);
-
-        // The local offset did not change, so the check keeps the offset.
-        fixture.shell().check_offset(local);
-        assert_eq!(fixture.shell().utc_offset_minutes(), summer);
-
-        // The local offset changed, so the shell sends it.
-        fixture.shell().check_offset(local - 60);
-        assert_eq!(fixture.shell().utc_offset_minutes(), local - 60);
-    }
-
     /// Returns the durations of the timers that run.
     fn durations(shell: &Shell) -> Vec<Duration> {
         shell
@@ -1114,7 +997,7 @@ mod tests {
 
     #[test]
     fn sleep_now_fires_the_idle_timer_and_the_core_sleeps() {
-        let mut fixture = Fixture::new(true);
+        let mut fixture = Fixture::new();
         fixture.start(PowerSource::Battery);
         fixture.mqtt(1, MqttEvent::Connected);
         fixture.take_log();
@@ -1142,7 +1025,7 @@ mod tests {
 
     #[test]
     fn sleep_now_does_nothing_on_the_stand() {
-        let mut fixture = Fixture::new(true);
+        let mut fixture = Fixture::new();
         fixture.start(PowerSource::Stand);
         fixture.mqtt(1, MqttEvent::Connected);
         fixture.take_log();
@@ -1155,7 +1038,7 @@ mod tests {
 
     #[test]
     fn sleep_now_does_not_fire_the_other_timers() {
-        let mut fixture = Fixture::new(true);
+        let mut fixture = Fixture::new();
         fixture.start(PowerSource::Battery);
         fixture.mqtt(1, MqttEvent::Connected);
         // A state message reads the clock, and the core starts the minute
@@ -1169,19 +1052,23 @@ mod tests {
         );
         let mut running = durations(fixture.shell());
         running.sort();
-        assert_eq!(running, [IDLE_TIMEOUT, CLOCK_INTERVAL]);
+        assert_eq!(
+            running,
+            [IDLE_TIMEOUT, CLOCK_INTERVAL, FULL_REFRESH_INTERVAL]
+        );
 
         assert!(fixture.shell().sleep_now());
         assert!(fixture.shell().view().asleep);
+        // The core clears the full-refresh timer before it sleeps.
         assert_eq!(durations(fixture.shell()), [CLOCK_INTERVAL]);
     }
 
     #[test]
     fn sleep_now_with_a_tap_that_waits_extends_the_idle_time_once() {
-        let mut fixture = Fixture::new(true);
+        let mut fixture = Fixture::new();
         fixture.start(PowerSource::Battery);
         // The connection is not open, so the tap waits in the outbox.
-        fixture.shell().send(Event::TileTapped(0));
+        fixture.shell().send(Event::Tapped(Some(Control::Tile(0))));
 
         // As after a real idle timeout, the core waits one more idle period.
         assert!(fixture.shell().sleep_now());

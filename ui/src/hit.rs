@@ -1,41 +1,44 @@
-//! Converts a touch to the event that it means.
+//! Converts a touch to the control that it is on.
 
 use embedded_graphics::{prelude::*, primitives::Rectangle};
-use shared::{Event, Route, ViewModel};
+use shared::{Control, ViewModel};
 
 use crate::layout;
 
-/// Returns the event for a touch at `point`, or `None` if the touch is not
-/// on a control.
+/// Returns the control at `point`, or `None` if the point is not on a
+/// control.
+///
+/// The shell sends the result as `Event::Tapped`, also for `None` and also
+/// while the device is asleep. The core decides what the tap does.
 ///
 /// A tile or a scene button is a control only if the view has it. A tap on
-/// a sensor tile gives `TileTapped` too. The core decides that the tap does
-/// nothing.
+/// a sensor tile gives `Control::Tile` too. The core decides that the tap
+/// does nothing.
 #[must_use]
-pub fn hit_test(view: &ViewModel, point: Point) -> Option<Event> {
+pub fn hit_test(view: &ViewModel, point: Point) -> Option<Control> {
     let on = |area: Rectangle| area.contains(point);
 
     if on(layout::previous()) {
-        return Some(Event::PreviousPage);
+        return Some(Control::PreviousPage);
     }
     if on(layout::home()) {
-        return Some(Event::Navigate(Route::Home));
+        return Some(Control::Home);
     }
     if on(layout::next()) {
-        return Some(Event::NextPage);
+        return Some(Control::NextPage);
     }
     if let Some(index) = (0..view.tiles.len()).find(|index| layout::tile(*index).is_some_and(on)) {
-        return Some(Event::TileTapped(index));
+        return Some(Control::Tile(index));
     }
     (0..view.scenes.len())
         .find(|index| layout::scene(*index).is_some_and(on))
-        .map(Event::SceneTapped)
+        .map(Control::Scene)
 }
 
 #[cfg(test)]
 mod tests {
     use embedded_graphics::{prelude::*, primitives::Rectangle};
-    use shared::{Event, Route, layout::MAX_TILES};
+    use shared::{Control, layout::MAX_TILES};
 
     use super::hit_test;
     use crate::{
@@ -59,7 +62,7 @@ mod tests {
         assert_eq!(view.tiles.len(), MAX_TILES);
         for index in 0..MAX_TILES {
             for point in corners(layout::tile(index).unwrap()) {
-                assert_eq!(hit_test(&view, point), Some(Event::TileTapped(index)));
+                assert_eq!(hit_test(&view, point), Some(Control::Tile(index)));
             }
         }
     }
@@ -69,7 +72,7 @@ mod tests {
         let view = view();
         assert_eq!(view.scenes.len(), 1);
         for point in corners(layout::scene(0).unwrap()) {
-            assert_eq!(hit_test(&view, point), Some(Event::SceneTapped(0)));
+            assert_eq!(hit_test(&view, point), Some(Control::Scene(0)));
         }
     }
 
@@ -77,18 +80,18 @@ mod tests {
     fn the_navigation_buttons() {
         let view = view();
         for point in corners(layout::previous()) {
-            assert_eq!(hit_test(&view, point), Some(Event::PreviousPage));
+            assert_eq!(hit_test(&view, point), Some(Control::PreviousPage));
         }
         for point in corners(layout::home()) {
-            assert_eq!(hit_test(&view, point), Some(Event::Navigate(Route::Home)));
+            assert_eq!(hit_test(&view, point), Some(Control::Home));
         }
         for point in corners(layout::next()) {
-            assert_eq!(hit_test(&view, point), Some(Event::NextPage));
+            assert_eq!(hit_test(&view, point), Some(Control::NextPage));
         }
     }
 
     #[test]
-    fn dead_space_gives_no_event() {
+    fn dead_space_gives_no_control() {
         let mut view = view();
         view.tiles.truncate(2);
         let dead = [

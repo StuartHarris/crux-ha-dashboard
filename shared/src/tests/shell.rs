@@ -3,6 +3,11 @@
 //!
 //! Timers do not expire by themselves. A test fires them with
 //! [`Shell::fire_timers`], so the test controls the time.
+//!
+//! The full-refresh timer runs all the time while the device is awake, so the
+//! shell keeps it apart from the other timers. [`Shell::timers`] and
+//! [`Shell::fire_timers`] do not include it. A test fires it with
+//! [`Shell::fire_full_refresh_timer`].
 
 use alloc::{format, string::String, vec::Vec};
 use core::time::Duration;
@@ -14,6 +19,7 @@ use super::{broker::Broker, instant};
 use crate::{
     Cmd, Dashboard, Effect, Event, Model, ViewModel,
     capabilities::{network::WifiStatus, power::Sleep},
+    features::refresh::FULL_REFRESH_INTERVAL,
 };
 
 /// One image on the panel.
@@ -40,6 +46,8 @@ pub struct Shell {
     /// The time in seconds since the Unix epoch.
     pub clock: u64,
     timers: Vec<Request<NotifyAfter>>,
+    /// The full-refresh timers that wait.
+    refresh_timers: Vec<Request<NotifyAfter>>,
     /// The frames that the shell drew, in order.
     pub frames: Vec<Frame>,
     /// The `full_refresh_seq` of the last full refresh.
@@ -63,6 +71,7 @@ impl Shell {
             wifi_on: false,
             clock: super::NOW,
             timers: Vec::new(),
+            refresh_timers: Vec::new(),
             frames: Vec::new(),
             drawn_seq: 0,
             render_requested: false,
@@ -73,7 +82,7 @@ impl Shell {
 
     /// Sends an event to the core and answers effects until the core waits.
     pub fn send(&mut self, event: Event) {
-        if matches!(event, Event::Woke | Event::Start(_)) {
+        if matches!(event, Event::Woke | Event::Start(_) | Event::Tapped(_)) {
             self.sleep = None;
         }
         self.queue(event);
@@ -120,7 +129,24 @@ impl Shell {
         self.app.view(&self.model)
     }
 
-    /// Returns the durations of the timers that wait.
+    /// Returns the number of full-refresh timers that wait.
+    pub const fn full_refresh_timers(&self) -> usize {
+        self.refresh_timers.len()
+    }
+
+    /// Fires the full-refresh timers that wait, as if
+    /// [`FULL_REFRESH_INTERVAL`] passed. The other timers do not fire.
+    pub fn fire_full_refresh_timer(&mut self) {
+        self.clock += FULL_REFRESH_INTERVAL.as_secs();
+        for mut timer in core::mem::take(&mut self.refresh_timers) {
+            let id = timer.operation.id;
+            timer.resolve(id).expect("the core waits for the timer");
+        }
+        self.run();
+    }
+
+    /// Returns the durations of the timers that wait, other than the
+    /// full-refresh timer.
     pub fn timers(&self) -> Vec<Duration> {
         self.timers
             .iter()
@@ -128,7 +154,8 @@ impl Shell {
             .collect()
     }
 
-    /// Fires all the timers that wait, as if their time passed.
+    /// Fires all the timers that wait, other than the full-refresh timer, as
+    /// if their time passed.
     pub fn fire_timers(&mut self) {
         let longest = self.timers().into_iter().max().unwrap_or_default();
         self.clock += longest.as_secs();
@@ -213,14 +240,20 @@ impl Shell {
                     .expect("the core waits for the time");
             }
             Effect::TimeNotifyAfter(request) => {
-                let seconds = Duration::from(request.operation.duration).as_secs();
-                self.log.push(format!("TimeNotifyAfter {seconds}s"));
-                self.timers.push(request);
+                let duration = Duration::from(request.operation.duration);
+                self.log
+                    .push(format!("TimeNotifyAfter {}s", duration.as_secs()));
+                if duration == FULL_REFRESH_INTERVAL {
+                    self.refresh_timers.push(request);
+                } else {
+                    self.timers.push(request);
+                }
             }
             Effect::TimeClear(mut request) => {
                 self.log.push("TimeClear".into());
                 let id = request.operation.id;
                 self.timers.retain(|timer| timer.operation.id != id);
+                self.refresh_timers.retain(|timer| timer.operation.id != id);
                 request.resolve(id).expect("the core waits for the clear");
             }
         }

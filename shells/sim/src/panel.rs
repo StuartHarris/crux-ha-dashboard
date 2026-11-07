@@ -1,31 +1,13 @@
-//! The simulated e-paper panel: the image on it, the refresh rule, and the
-//! area that a partial refresh changes.
+//! The simulated e-paper panel: the image on it and the refresh of each new
+//! image.
+//!
+//! The panel decides each refresh with [`ui::Refresher`], as the firmware
+//! does, so the simulator shows the refresh pattern of the device.
 
 use embedded_graphics::{pixelcolor::Gray4, prelude::*, primitives::Rectangle};
 use embedded_graphics_simulator::{OutputSettings, SimulatorDisplay};
 use shared::ViewModel;
-use ui::Framebuffer;
-
-/// How the panel shows a new image.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Refresh {
-    /// All 16 greys. The panel flashes, and the flash clears ghost images.
-    Full,
-    /// Black and white only. It is fast and does not flash.
-    Partial,
-}
-
-/// Returns the refresh for a view. The panel does a full refresh if the
-/// view asks for a different full refresh than the last one that the panel
-/// did, and for the first image.
-#[must_use]
-pub fn refresh(last_full: Option<u32>, view_seq: u32) -> Refresh {
-    if last_full == Some(view_seq) {
-        Refresh::Partial
-    } else {
-        Refresh::Full
-    }
-}
+use ui::{Framebuffer, Refresh, Refresher};
 
 /// Returns the share of the panel that `area` covers, in percent.
 #[must_use]
@@ -34,23 +16,11 @@ pub fn share(area: Rectangle) -> f64 {
     f64::from(area.size.width) * f64::from(area.size.height) * 100.0 / panel
 }
 
-/// The result of a draw.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Update {
-    /// How the panel shows the new image.
-    pub refresh: Refresh,
-    /// The smallest rectangle that contains all the pixels that changed, or
-    /// `None` if no pixel changed. A partial refresh of the firmware
-    /// refreshes only this area.
-    pub changed: Option<Rectangle>,
-}
-
 /// The panel. It draws into a [`ui::Framebuffer`], the same frame that the
-/// firmware uses, and finds the changed area with
-/// [`ui::Framebuffer::changed_area`].
+/// firmware uses.
 pub struct Panel {
     frame: Framebuffer,
-    last_full: Option<u32>,
+    refresher: Refresher,
 }
 
 impl Default for Panel {
@@ -65,21 +35,20 @@ impl Panel {
     pub fn new() -> Self {
         Self {
             frame: Framebuffer::new(),
-            last_full: None,
+            refresher: Refresher::default(),
         }
     }
 
-    /// Draws `view` and returns how the panel shows it.
-    pub fn draw(&mut self, view: &ViewModel) -> Update {
+    /// Draws `view` and returns how the panel shows it. A partial refresh
+    /// gives the area that changed.
+    pub fn draw(&mut self, view: &ViewModel) -> Refresh {
         let mut next = Framebuffer::new();
         let Ok(()) = ui::draw(view, &mut next);
-        let refresh = refresh(self.last_full, view.full_refresh_seq);
-        if refresh == Refresh::Full {
-            self.last_full = Some(view.full_refresh_seq);
-        }
-        let changed = self.frame.changed_area(&next);
+        let refresh = self
+            .refresher
+            .decide(view.full_refresh_seq, &self.frame, &next);
         self.frame = next;
-        Update { refresh, changed }
+        refresh
     }
 
     /// Returns the grey level (0 to 15) of each pixel, in rows from the top.
@@ -177,15 +146,9 @@ mod tests {
     use embedded_graphics::{prelude::*, primitives::Rectangle};
     use shared::{Connection, PowerSource, ViewModel};
 
-    use super::{Panel, Refresh, Scale, Viewport, refresh, share};
+    use ui::Refresh;
 
-    #[test]
-    fn the_first_image_and_a_new_sequence_number_are_full_refreshes() {
-        assert_eq!(refresh(None, 0), Refresh::Full);
-        assert_eq!(refresh(Some(1), 1), Refresh::Partial);
-        assert_eq!(refresh(Some(1), 2), Refresh::Full);
-        assert_eq!(refresh(Some(u32::MAX), 0), Refresh::Full);
-    }
+    use super::{Panel, Scale, Viewport, share};
 
     #[test]
     fn the_share_of_the_panel() {
@@ -208,6 +171,7 @@ mod tests {
             power: PowerSource::Stand,
             status: status.into(),
             asleep: false,
+            read_only: false,
             last_sync: None,
             updated: "Live".into(),
             full_refresh_seq: seq,
@@ -218,15 +182,15 @@ mod tests {
     fn a_partial_refresh_gives_the_area_that_changed() {
         let mut panel = Panel::new();
         let first = panel.draw(&view("Online, on stand", 1));
-        assert_eq!(first.refresh, Refresh::Full);
+        assert_eq!(first, Refresh::Full);
 
         let same = panel.draw(&view("Online, on stand", 1));
-        assert_eq!(same.refresh, Refresh::Partial);
-        assert_eq!(same.changed, None);
+        assert_eq!(same, Refresh::None);
 
         let update = panel.draw(&view("Connecting, on stand", 1));
-        assert_eq!(update.refresh, Refresh::Partial);
-        let area = update.changed.unwrap();
+        let Refresh::Partial(area) = update else {
+            panic!("not a partial refresh: {update:?}");
+        };
         // Only the status text in the header changed.
         assert!(area.bottom_right().unwrap().y < 60, "{area:?}");
         assert!(area.top_left.x > 480, "{area:?}");

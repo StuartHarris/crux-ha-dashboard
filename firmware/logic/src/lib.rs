@@ -8,7 +8,6 @@
 //!   MQTT connections and the timers.
 //! - [`mqtt`] is the bookkeeping of the MQTT task.
 //! - [`timers`] keeps the timers of the timer task.
-//! - [`refresh`] decides between a full and a partial refresh of the panel.
 //! - [`touch`] converts touch samples to taps on the panel.
 //! - [`config`] reads and checks the build-time configuration.
 //! - [`backoff`] is a wait that doubles after each failure.
@@ -21,7 +20,6 @@ extern crate alloc;
 pub mod backoff;
 pub mod config;
 pub mod mqtt;
-pub mod refresh;
 pub mod shell;
 pub mod timers;
 pub mod touch;

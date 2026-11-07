@@ -4,7 +4,7 @@
 use alloc::{string::String, vec, vec::Vec};
 use core::time::Duration;
 
-use super::{shell::Shell, start, start_at};
+use super::{shell::Shell, start, start_at, tap_scene, tap_tile};
 use crate::{
     Connection, Event, PowerSource, Route, TileState,
     capabilities::power::WakeSource,
@@ -119,7 +119,7 @@ fn on_the_stand_the_dashboard_shows_live_state_and_controls_lights() {
     );
 
     // A tap goes to Home Assistant, and its new state comes back.
-    shell.send(Event::TileTapped(0));
+    shell.send(tap_tile(0));
     assert_eq!(shell.broker.state("light.living_room_lights"), Some("on"));
     assert_eq!(shell.view().tiles[0].state, TileState::On);
 
@@ -131,7 +131,7 @@ fn on_the_stand_the_dashboard_shows_live_state_and_controls_lights() {
     assert_eq!(shell.view().tiles[1].text, "Off");
     assert!(!shell.frames.last().unwrap().full);
 
-    shell.send(Event::SceneTapped(1));
+    shell.send(tap_scene(1));
     let call = shell.broker.service_calls.last().unwrap();
     assert_eq!(call.service, "scene.turn_on");
     assert_eq!(call.entity_id, "scene.living_room_living_room_dimmed");
@@ -150,7 +150,7 @@ fn on_battery_the_dashboard_wakes_syncs_accepts_taps_then_sleeps() {
     assert_eq!(shell.view().tiles[4].text, "19.5°");
     assert_eq!(shell.view().tiles[4].detail, "Set 21°");
 
-    shell.send(Event::TileTapped(1));
+    shell.send(tap_tile(1));
     assert_eq!(
         shell.broker.state("light.dining_room_tall_lamp"),
         Some("on")
@@ -169,6 +169,8 @@ fn on_battery_the_dashboard_wakes_syncs_accepts_taps_then_sleeps() {
     assert_eq!(
         shell.take_log(),
         [
+            // No full-refresh timer runs while the device sleeps.
+            "TimeClear",
             "MqttPublish dashboard/hall/status asleep",
             "MqttDisconnect",
             "WifiOff",
@@ -340,9 +342,9 @@ fn taps_without_a_connection_are_sent_when_the_core_connects() {
     shell.broker.down = true;
     shell.send(start(PowerSource::Stand));
 
-    shell.send(Event::TileTapped(0));
+    shell.send(tap_tile(0));
     shell.send(Event::Navigate(Route::room("loft")));
-    shell.send(Event::SceneTapped(0));
+    shell.send(tap_scene(0));
     assert_eq!(shell.broker.service_calls.len(), 0);
 
     shell.broker.down = false;
@@ -390,7 +392,7 @@ fn a_full_refresh_is_kept_when_a_partial_redraw_follows_before_the_shell_draws()
     let mut shell = house();
     shell.send(start(PowerSource::Stand));
     assert!(shell.frames.last().unwrap().full);
-    shell.send(Event::TileTapped(0));
+    shell.send(tap_tile(0));
     assert!(!shell.frames.last().unwrap().full);
 
     // The page changes, and a message for the new page arrives before the
@@ -432,7 +434,7 @@ fn on_battery_a_tap_that_waits_for_a_connection_delays_the_sleep_once() {
     let mut shell = house();
     shell.broker.down = true;
     shell.send(start(PowerSource::Battery));
-    shell.send(Event::TileTapped(0));
+    shell.send(tap_tile(0));
     assert_eq!(shell.model.connection.outbox.len(), 1);
 
     // The first idle timeout waits one more idle period for the connection.
@@ -458,7 +460,7 @@ fn on_battery_a_tap_that_is_sent_before_the_extra_period_ends_is_not_lost() {
     let mut shell = house();
     shell.broker.down = true;
     shell.send(start(PowerSource::Battery));
-    shell.send(Event::TileTapped(0));
+    shell.send(tap_tile(0));
     shell.fire_timers();
     assert_eq!(shell.sleep, None);
 
@@ -556,4 +558,56 @@ fn the_footer_shows_the_time_of_the_last_message_not_a_clock() {
     shell.run();
     assert_eq!(shell.view().updated, "Updated 09:52");
     assert_eq!(shell.view().last_sync, Some(super::NOW + 660));
+}
+
+#[test]
+fn on_battery_a_tap_while_asleep_wakes_and_does_not_toggle_the_light() {
+    let mut shell = house();
+    shell.send(start(PowerSource::Battery));
+    shell.fire_timers();
+    assert!(shell.view().asleep);
+
+    shell.send(tap_tile(0));
+    assert!(!shell.view().asleep);
+    assert!(shell.frames.last().unwrap().full);
+    assert_eq!(shell.view().connection, Connection::Online);
+    assert_eq!(shell.broker.service_calls.len(), 0);
+    assert_eq!(shell.broker.state("light.all_lights"), Some("on"));
+
+    // The device is awake, so the next tap acts on the tile.
+    shell.send(tap_tile(0));
+    assert_eq!(shell.broker.state("light.all_lights"), Some("off"));
+}
+
+#[test]
+fn a_dry_run_sends_no_service_call_until_it_stops() {
+    let mut shell = house();
+    let Event::Start(mut start) = start(PowerSource::Stand) else {
+        unreachable!()
+    };
+    start.settings.read_only = true;
+    shell.send(Event::Start(start));
+    assert!(shell.view().read_only);
+
+    shell.take_log();
+    shell.send(tap_tile(0));
+    shell.send(tap_scene(0));
+    assert_eq!(shell.broker.service_calls.len(), 0);
+    assert_eq!(shell.model.connection.outbox.len(), 0);
+    // The status message is not a service call, so the core still sends it.
+    assert_eq!(
+        shell.broker.retained("dashboard/hall/status"),
+        Some("online")
+    );
+    assert!(
+        !shell
+            .take_log()
+            .iter()
+            .any(|effect| effect.starts_with("MqttPublish")),
+    );
+
+    shell.send(Event::SetReadOnly(false));
+    assert!(!shell.view().read_only);
+    shell.send(tap_tile(0));
+    assert_eq!(shell.broker.state("light.all_lights"), Some("off"));
 }
