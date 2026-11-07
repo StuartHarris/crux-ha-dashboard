@@ -1,0 +1,4 @@
+# The firmware needs the `esp` toolchain, which has the Xtensa target.
+# Install it with `espup install`.
+[toolchain]
+channel = "esp"

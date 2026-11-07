@@ -2,3 +2,6 @@
 **/*.rs.bk
 .DS_Store
 panel.png
+/firmware/target
+# The firmware configuration has the Wi-Fi and broker passwords.
+/firmware/cfg.toml

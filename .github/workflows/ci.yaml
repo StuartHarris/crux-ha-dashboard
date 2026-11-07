@@ -64,3 +64,9 @@ jobs:
 
       - name: Check the no_std build
         run: just check-nostd
+
+      # The example configuration has placeholders, not real credentials.
+      - name: Build the firmware
+        env:
+          DASHBOARD_CONFIG: cfg.toml.example
+        run: just firmware build

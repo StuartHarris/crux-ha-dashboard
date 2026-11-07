@@ -1,7 +1,9 @@
 [workspace]
-members = ["shared", "ui", "shells/sim"]
+members = ["shared", "ui", "shells/sim", "firmware/logic"]
 # The firmware builds for the ESP32-S3 in its own workspace. If it were a member,
 # feature unification with the std shells would pull std into the firmware.
+# The firmware logic (`firmware/logic`) has no hardware code, so it is a member
+# here, and its tests run on the host.
 exclude = ["firmware"]
 resolver = "3"
 

@@ -1,0 +1,2 @@
+# The names of products in the docs are not code.
+doc-valid-idents = ["LilyGo", ".."]

@@ -1,0 +1,25 @@
+[package]
+name = "firmware-logic"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "The parts of the firmware shell that do not touch the hardware, so that they can be tested on the host"
+
+[lib]
+name = "logic"
+
+[dependencies]
+crux_core.workspace = true
+crux_time.workspace = true
+embedded-graphics.workspace = true
+shared.workspace = true
+ui.workspace = true
+
+[dev-dependencies]
+# Tests run on the host, so they can use the `std` feature of `shared`. The
+# library build must not use it.
+shared = { workspace = true, features = ["std"] }
+
+[lints]
+workspace = true

@@ -10,6 +10,7 @@
 //! shell does not answer them.
 
 use alloc::{string::String, vec::Vec};
+use core::fmt;
 
 use crux_core::{Command, Request, command::StreamBuilder, macros::Operation};
 use facet::Facet;
@@ -19,12 +20,24 @@ use serde::{Deserialize, Serialize};
 use super::notify;
 
 /// The user name and password for the broker.
-#[derive(Facet, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+///
+/// The `Debug` output does not show the password, so a log of a `Connect`
+/// request or of the settings is safe.
+#[derive(Facet, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct Credentials {
     /// The user name.
     pub username: String,
     /// The password.
     pub password: String,
+}
+
+impl fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Credentials")
+            .field("username", &self.username)
+            .field("password", &"***")
+            .finish()
+    }
 }
 
 /// The quality of service for a publish.
@@ -172,5 +185,36 @@ impl Mqtt {
         Event: Send + 'static,
     {
         notify(Disconnect)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::format;
+
+    use super::{Connect, Credentials, LastWill};
+
+    #[test]
+    fn debug_does_not_show_the_password() {
+        let credentials = Credentials {
+            username: "dashboard".into(),
+            password: "secret-password".into(),
+        };
+        let connect = Connect {
+            host: "broker".into(),
+            port: 1883,
+            client_id: "dashboard-hall".into(),
+            credentials: Some(credentials.clone()),
+            keep_alive_secs: 60,
+            last_will: LastWill {
+                topic: "dashboard/hall/status".into(),
+                payload: b"offline".to_vec(),
+                retain: true,
+            },
+        };
+        for text in [format!("{credentials:?}"), format!("{connect:?}")] {
+            assert!(!text.contains("secret-password"), "{text}");
+            assert!(text.contains("dashboard"), "{text}");
+        }
     }
 }
