@@ -1,0 +1,23 @@
+[package]
+name = "shared"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+default = ["std"]
+# On by default. Turn it off to build the core for the device.
+std = ["crux_core/std", "crux_time/std", "facet/std", "serde/std"]
+
+[dependencies]
+crux_core.workspace = true
+crux_time.workspace = true
+facet.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+crux_core = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true

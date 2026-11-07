@@ -1,0 +1,29 @@
+[workspace]
+members = ["shared", "ui", "shells/sim"]
+# The firmware builds for the ESP32-S3 in its own workspace. If it were a member,
+# feature unification with the std shells would pull std into the firmware.
+exclude = ["firmware"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.95"
+publish = false
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.dependencies]
+# Crux with no_std support. Pinned to a commit on the `spike/no-std` branch.
+crux_core = { git = "https://github.com/redbadger/crux", rev = "9dbbdd26ffa0fe6b64704e8037f032b7c27f2f79", default-features = false, features = ["crux_macros"] }
+crux_time = { git = "https://github.com/redbadger/crux", rev = "9dbbdd26ffa0fe6b64704e8037f032b7c27f2f79", default-features = false }
+facet = { version = "=0.46.5", default-features = false, features = ["alloc"] }
+serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
+embedded-graphics = "0.8.2"
+
+shared = { path = "shared" }
+ui = { path = "ui" }
