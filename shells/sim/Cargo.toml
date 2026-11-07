@@ -7,13 +7,22 @@ publish.workspace = true
 description = "Desktop simulator: runs the core and draws the panel with the same code as the firmware."
 
 [dependencies]
-shared = { workspace = true, features = ["std"] }
+shared = { workspace = true, features = ["std", "fixtures"] }
 ui.workspace = true
 crux_core.workspace = true
 crux_time = { workspace = true, features = ["std"] }
+chrono = { workspace = true, features = ["clock", "std"] }
 embedded-graphics.workspace = true
-# Without SDL, the simulator writes a PNG. Phase 4 adds a window.
+# The simulator uses the display of the simulator crate as the panel, for its
+# `diff` and its PNG output. It does not use SDL.
 embedded-graphics-simulator = { version = "0.8.0", default-features = false }
+# The MQTT client. The broker is on the LAN with no TLS, so TLS is off.
+rumqttc = { version = "0.25", default-features = false }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros"] }
+# The window. Both crates load X11 or Wayland at run time, so a build on Linux
+# needs no system packages.
+softbuffer = "0.4"
+winit = "0.30"
 
 [lints]
 workspace = true

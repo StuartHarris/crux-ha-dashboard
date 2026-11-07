@@ -155,7 +155,12 @@ mod tests {
     )];
 
     fn text(entities: &Entities, kind: TileKind, entity_id: &str) -> (TileState, String) {
-        describe(kind, entities.get(entity_id), 0)
+        let description = describe(kind, entities.get(entity_id), 0);
+        (description.state, description.text)
+    }
+
+    fn detail(entities: &Entities, kind: TileKind, entity_id: &str) -> String {
+        describe(kind, entities.get(entity_id), 0).detail
     }
 
     #[test]
@@ -248,7 +253,27 @@ mod tests {
         entities.apply(PAGES, &alloc::format!("{base}/temperature"), b"21");
         assert_eq!(
             text(&entities, TileKind::Climate, "climate.thermostat"),
-            (TileState::Value, "19.5° (set 21°)".into())
+            (TileState::Value, "19.5°".into())
+        );
+        assert_eq!(
+            detail(&entities, TileKind::Climate, "climate.thermostat"),
+            "Set 21°"
+        );
+    }
+
+    #[test]
+    fn a_climate_tile_with_only_a_target_shows_the_target_as_the_detail() {
+        let mut entities = Entities::default();
+        let base = "homeassistant/statestream/climate/thermostat";
+        entities.apply(PAGES, &alloc::format!("{base}/state"), b"heat");
+        entities.apply(PAGES, &alloc::format!("{base}/temperature"), b"21");
+        assert_eq!(
+            text(&entities, TileKind::Climate, "climate.thermostat"),
+            (TileState::Value, "-".into())
+        );
+        assert_eq!(
+            detail(&entities, TileKind::Climate, "climate.thermostat"),
+            "Set 21°"
         );
     }
 
@@ -265,7 +290,11 @@ mod tests {
         );
         assert_eq!(
             text(&entities, TileKind::Weather, "weather.home"),
-            (TileState::Value, "Partly cloudy, 12.3 °C".into())
+            (TileState::Value, "12.3 °C".into())
+        );
+        assert_eq!(
+            detail(&entities, TileKind::Weather, "weather.home"),
+            "Partly cloudy"
         );
     }
 
@@ -348,8 +377,8 @@ mod tests {
         let topic = "homeassistant/statestream/sensor/temperature/state";
         entities.apply(PAGES, topic, b"2026-07-01T14:30:00+00:00");
         assert_eq!(
-            describe(TileKind::Sensor, entities.get("sensor.temperature"), 60),
-            (TileState::Value, "15:30".into())
+            describe(TileKind::Sensor, entities.get("sensor.temperature"), 60).text,
+            "15:30"
         );
     }
 }

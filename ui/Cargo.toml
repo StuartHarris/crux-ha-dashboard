@@ -9,10 +9,13 @@ description = "Draws the view model with embedded-graphics. The simulator and th
 [dependencies]
 embedded-graphics.workspace = true
 shared.workspace = true
+u8g2-fonts = "0.8.0"
 
 [dev-dependencies]
 # Tests need the `std` feature of `shared`, but the library build must not use it.
-shared = { workspace = true, features = ["std"] }
+shared = { workspace = true, features = ["std", "fixtures"] }
+# The golden-image tests compare images.
+embedded-graphics-simulator = { version = "0.8.0", default-features = false }
 
 [lints]
 workspace = true

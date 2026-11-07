@@ -342,7 +342,8 @@ fn the_view_shows_the_state_of_a_tile_from_the_statestream() {
     assert_eq!(view.tiles[0].state, TileState::Unavailable);
     assert_eq!(view.tiles[0].text, "Unavailable");
     assert_eq!(view.tiles[1].state, TileState::Value);
-    assert_eq!(view.tiles[1].text, "Rainy, 11.5 °C");
+    assert_eq!(view.tiles[1].text, "11.5 °C");
+    assert_eq!(view.tiles[1].detail, "Rainy");
 }
 
 #[test]

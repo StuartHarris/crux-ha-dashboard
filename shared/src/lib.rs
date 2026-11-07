@@ -8,6 +8,8 @@
 //! - [`view`] makes the view model, which has all the text that the `ui`
 //!   crate draws.
 //! - [`pages`] is the layout data. Edit it to change the dashboard.
+//! - `fixtures` (with the `fixtures` feature) is a shell with fixed answers,
+//!   for tests and pictures.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 // The `Facet` derive generates `unsafe` code, which this lint does not expect.
@@ -19,6 +21,8 @@ pub mod app;
 pub mod capabilities;
 pub mod entities;
 pub mod features;
+#[cfg(feature = "fixtures")]
+pub mod fixtures;
 pub mod layout;
 pub mod pages;
 pub mod route;
@@ -32,4 +36,4 @@ pub use capabilities::power::PowerSource;
 pub use crux_core::Core;
 pub use layout::TileKind;
 pub use route::Route;
-pub use view::{Connection, SceneView, TileState, TileView, ViewModel};
+pub use view::{Connection, Description, SceneView, TileState, TileView, ViewModel};

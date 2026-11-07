@@ -18,6 +18,10 @@ std = [
     "serde_json/std",
 ]
 
+# A shell with fixed answers, for the golden-image tests and the PNG mode of
+# the simulator.
+fixtures = ["std"]
+
 [dependencies]
 chrono.workspace = true
 crux_core.workspace = true

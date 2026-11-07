@@ -73,8 +73,14 @@ pub struct TileView {
     pub kind: TileKind,
     /// How the tile shows the entity.
     pub state: TileState,
-    /// The state as text, for example `On 60%` or `21.5 °C`.
+    /// The main value as text, for example `On 60%` or `21.5 °C`. A renderer
+    /// shows it in a large font.
     pub text: String,
+    /// More text for the value, or an empty string. A climate tile shows the
+    /// target temperature here, for example `Set 21°`. A weather tile shows
+    /// the condition here, for example `Partly cloudy`. A renderer shows it in
+    /// a smaller font.
+    pub detail: String,
 }
 
 /// What a renderer needs to draw one scene button.
@@ -128,7 +134,11 @@ pub fn view(model: &Model) -> ViewModel {
         tiles: tiles
             .iter()
             .map(|tile| {
-                let (state, text) = describe(
+                let Description {
+                    state,
+                    text,
+                    detail,
+                } = describe(
                     tile.kind,
                     model.entities.get(tile.entity_id),
                     model.utc_offset_minutes,
@@ -139,6 +149,7 @@ pub fn view(model: &Model) -> ViewModel {
                     kind: tile.kind,
                     state,
                     text,
+                    detail,
                 }
             })
             .collect(),
@@ -211,6 +222,32 @@ pub enum TileState {
     Unknown,
 }
 
+/// How a tile shows its entity, and the text on the tile.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Description {
+    /// How the tile shows the entity.
+    pub state: TileState,
+    /// The main value, which a renderer shows in a large font.
+    pub text: String,
+    /// More text for the value, or an empty string.
+    pub detail: String,
+}
+
+impl Description {
+    fn new(state: TileState, text: impl Into<String>) -> Self {
+        Self {
+            state,
+            text: text.into(),
+            detail: String::new(),
+        }
+    }
+
+    fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = detail.into();
+        self
+    }
+}
+
 /// Returns how a tile of `kind` shows `entity`, and the text on the tile.
 ///
 /// The core shows a timestamp state, for example the finish time of a
@@ -220,16 +257,15 @@ pub fn describe(
     kind: TileKind,
     entity: Option<&EntityState>,
     utc_offset_minutes: i16,
-) -> (TileState, String) {
-    let Some(entity) = entity else {
-        return (TileState::Unknown, "-".into());
-    };
-    let Some(state) = entity.state.as_deref() else {
-        return (TileState::Unknown, "-".into());
+) -> Description {
+    let Some((entity, state)) =
+        entity.and_then(|entity| entity.state.as_deref().map(|state| (entity, state)))
+    else {
+        return Description::new(TileState::Unknown, "-");
     };
     match state {
-        "unavailable" => return (TileState::Unavailable, "Unavailable".into()),
-        "unknown" => return (TileState::Unknown, "-".into()),
+        "unavailable" => return Description::new(TileState::Unavailable, "Unavailable"),
+        "unknown" => return Description::new(TileState::Unknown, "-"),
         _ => {}
     }
 
@@ -241,10 +277,10 @@ pub fn describe(
                     .and_then(|value| value.parse::<u32>().ok())
                     .map(brightness_percent);
                 let text = percent.map_or_else(|| "On".into(), |percent| format!("On {percent}%"));
-                (TileState::On, text)
+                Description::new(TileState::On, text)
             }
-            "off" => (TileState::Off, "Off".into()),
-            other => (TileState::Value, capitalise(other)),
+            "off" => Description::new(TileState::Off, "Off"),
+            other => Description::new(TileState::Value, capitalise(other)),
         },
         TileKind::Sensor => {
             let text = match entity.attribute("unit_of_measurement") {
@@ -254,34 +290,38 @@ pub fn describe(
                     |time| local_time(time.with_timezone(&Utc), utc_offset_minutes),
                 ),
             };
-            (TileState::Value, text)
+            Description::new(TileState::Value, text)
         }
         TileKind::Climate => {
-            let current = entity.attribute("current_temperature");
-            let target = entity.attribute("temperature");
-            let text = match (current, target) {
-                (Some(current), Some(target)) => format!("{current}° (set {target}°)"),
-                (Some(current), None) => format!("{current}°"),
-                (None, Some(target)) => format!("Set {target}°"),
-                (None, None) => capitalise(state),
-            };
             let tile_state = if state == "off" {
                 TileState::Off
             } else {
                 TileState::Value
             };
-            (tile_state, text)
+            let current = entity.attribute("current_temperature");
+            let target = entity.attribute("temperature");
+            match (current, target) {
+                (Some(current), Some(target)) => {
+                    Description::new(tile_state, format!("{current}°"))
+                        .with_detail(format!("Set {target}°"))
+                }
+                (Some(current), None) => Description::new(tile_state, format!("{current}°")),
+                (None, Some(target)) => {
+                    Description::new(tile_state, "-").with_detail(format!("Set {target}°"))
+                }
+                (None, None) => Description::new(tile_state, capitalise(state)),
+            }
         }
         TileKind::Weather => {
             let condition = weather_condition(state);
-            let text = match entity.attribute("temperature") {
+            match entity.attribute("temperature") {
                 Some(temperature) => {
                     let unit = entity.attribute("temperature_unit").unwrap_or("°");
-                    format!("{condition}, {temperature} {unit}")
+                    Description::new(TileState::Value, format!("{temperature} {unit}"))
+                        .with_detail(condition)
                 }
-                None => condition,
-            };
-            (TileState::Value, text)
+                None => Description::new(TileState::Value, condition),
+            }
         }
     }
 }
