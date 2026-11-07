@@ -59,6 +59,12 @@ pub fn map_event(event: &Event) -> Step {
     }
 }
 
+/// Returns `true` if `event` is an incoming message with the retained flag.
+#[must_use]
+pub const fn retained(event: &Event) -> bool {
+    matches!(event, Event::Incoming(Incoming::Publish(publish)) if publish.retain)
+}
+
 /// Converts the error of a poll to the last item of the stream.
 #[must_use]
 pub fn map_error(error: &impl std::fmt::Display) -> MqttEvent {
@@ -117,8 +123,9 @@ pub trait Link {
     fn abort(&self);
 }
 
-/// The function that gives each item of a stream to the shell.
-pub type Sink = Box<dyn Fn(MqttEvent) + Send + 'static>;
+/// The function that gives each item of a stream to the shell. The flag is
+/// `true` for a message that the broker retained.
+pub type Sink = Box<dyn Fn(MqttEvent, bool) + Send + 'static>;
 
 /// Opens a connection for a `Connect` request, and gives each item of its
 /// stream to the sink.
@@ -180,15 +187,15 @@ async fn poll(mut event_loop: EventLoop, send: Sink) {
     loop {
         match event_loop.poll().await {
             Ok(event) => match map_event(&event) {
-                Step::Send(item) => send(item),
+                Step::Send(item) => send(item, retained(&event)),
                 Step::Stop(item) => {
-                    send(item);
+                    send(item, false);
                     return;
                 }
                 Step::Ignore => {}
             },
             Err(error) => {
-                send(map_error(&error));
+                send(map_error(&error), false);
                 return;
             }
         }
@@ -200,7 +207,7 @@ mod tests {
     use rumqttc::{ConnAck, ConnectReturnCode, Event, Incoming, Outgoing, Publish, QoS};
     use shared::capabilities::mqtt::{Connect, Credentials, LastWill, Message, MqttEvent};
 
-    use super::{Step, map_error, map_event, options};
+    use super::{Step, map_error, map_event, options, retained};
 
     #[test]
     fn a_connack_with_success_is_connected() {
@@ -241,6 +248,17 @@ mod tests {
                 payload: b"on".to_vec(),
             }))
         );
+    }
+
+    #[test]
+    fn the_retained_flag_of_a_message() {
+        let mut publish = Publish::new("dashboard/sim/status", QoS::AtLeastOnce, "online");
+        assert!(!retained(&Event::Incoming(Incoming::Publish(
+            publish.clone()
+        ))));
+        publish.retain = true;
+        assert!(retained(&Event::Incoming(Incoming::Publish(publish))));
+        assert!(!retained(&Event::Incoming(Incoming::PingResp)));
     }
 
     #[test]

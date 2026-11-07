@@ -1,48 +1,54 @@
-//! The window of the live simulator.
+//! The window of the live simulator, made with egui.
 //!
-//! The window uses `winit` and `softbuffer`. Both crates are pure Rust and
-//! load X11 or Wayland at run time, so they need no SDL and no system
-//! packages to build.
+//! The window uses `eframe` with the OpenGL renderer (`glow`). `eframe` uses
+//! `winit`, which loads X11 or Wayland at run time, so a build on Linux needs
+//! no system packages.
 //!
-//! The panel shows at an integer scale, so each panel pixel is a square of
-//! screen pixels. On a Retina display the scale is 2.
+//! The panel is in the centre. The controls are on the left, the view model
+//! is on the right, and the effect log and the MQTT log are at the bottom.
+//! The panel shows at an integer scale of screen pixels, so each panel pixel
+//! is a square of screen pixels. egui works in points, and on a Retina
+//! display a point is 2 screen pixels.
+//!
+//! The shell owns the core on the UI thread. The tasks on the tokio runtime
+//! send their signals through a channel and ask egui to repaint, so the
+//! window repaints only when something changes.
 
 use std::{
-    num::NonZeroU32,
-    rc::Rc,
-    sync::{Arc, Mutex, mpsc},
-    time::{Duration, Instant},
+    sync::{Arc, mpsc},
+    time::Instant,
 };
 
-use embedded_graphics::{prelude::*, primitives::Rectangle};
-use shared::{Event, PowerSource, Settings};
-use softbuffer::{Context, Surface};
-use winit::{
-    application::ApplicationHandler,
-    dpi::LogicalSize,
-    event::{ElementState, KeyEvent, MouseButton, StartCause, WindowEvent},
-    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
-    keyboard::{KeyCode, PhysicalKey},
-    window::{Window, WindowId},
+use eframe::egui::{
+    self, CentralPanel, Color32, ColorImage, Context, Key, Label, Modifiers, Panel, Pos2, Rect,
+    RichText, ScrollArea, Sense, Stroke, StrokeKind, TextEdit, TextStyle, TextureHandle,
+    TextureOptions, Ui, Vec2, ViewportCommand,
 };
+use embedded_graphics::{prelude::*, primitives::Rectangle};
+use shared::{Event, PowerSource, ViewModel};
 
 use crate::{
+    inspector::{Delivery, Direction, Inspector, Log, ROUTINE_EFFECTS},
     mqtt,
-    panel::{Panel, Refresh, Viewport, share},
+    panel::{Scale, Viewport, share},
+    screen::Screen,
     settings::Options,
     shell::{Notifier, Shell, Signal},
 };
 
-/// The time for which a full refresh shows the inverted image.
-const FLASH: Duration = Duration::from_millis(150);
-/// The time for which the outline of a partial refresh shows.
-const OUTLINE: Duration = Duration::from_millis(500);
-/// The colour around the panel.
-const BACKGROUND: u32 = 0x0030_3030;
-/// The colour of the outline of a partial refresh.
-const OUTLINE_COLOR: u32 = 0x00FF_0000;
 /// The window title.
 const TITLE: &str = "Dashboard simulator";
+/// The colour of the outline of a partial refresh.
+const OUTLINE_COLOR: Color32 = Color32::RED;
+/// The format of the time of a log entry.
+const TIME: &str = "%H:%M:%S%.3f";
+/// The colour of the warning that taps switch real devices.
+const LIVE_COLOR: Color32 = Color32::from_rgb(0xD0, 0x20, 0x20);
+/// The width, in points, of the border round the panel while the shell is
+/// live.
+const LIVE_BORDER: f32 = 4.0;
+/// The colour around the panel.
+const BACKGROUND: Color32 = Color32::from_gray(0x30);
 
 /// Opens the window, starts the core and runs until the user quits.
 ///
@@ -51,18 +57,7 @@ const TITLE: &str = "Dashboard simulator";
 /// Returns a message if the window or the runtime cannot start.
 pub fn run(options: Options) -> Result<(), String> {
     let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
-    let event_loop = EventLoop::new().map_err(|error| error.to_string())?;
-    let proxy = Mutex::new(event_loop.create_proxy());
-    let (sender, signals) = mpsc::channel();
-    let notifier = Notifier::new(
-        sender,
-        Arc::new(move || {
-            if let Ok(proxy) = proxy.lock() {
-                // If the event loop stopped, there is nothing to wake.
-                let _ = proxy.send_event(());
-            }
-        }),
-    );
+    let handle = runtime.handle().clone();
     let Options {
         settings,
         power,
@@ -77,324 +72,757 @@ pub fn run(options: Options) -> Result<(), String> {
             "warning: a click switches real devices in the house. Give --read-only to prevent this."
         );
     }
-    let open = mqtt::opener(runtime.handle().clone());
-    let mut app = App {
-        shell: Shell::new(runtime.handle().clone(), notifier, open, read_only),
-        signals,
-        panel: Panel::new(),
-        lumas: Vec::new(),
-        start: Some((settings, path)),
-        power,
-        window: None,
-        surface: None,
-        cursor: None,
-        flash_until: None,
-        outline: None,
-        show_outline: false,
+    let native = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title(TITLE)
+            .with_inner_size([1600.0, 1000.0]),
+        ..Default::default()
     };
-    eprintln!("keys: S stand/battery, W wake, D show refresh areas, Left/Right page, Q quit");
-    let result = event_loop.run_app(&mut app);
-    // Stop the tasks with no disconnect packet. The broker publishes the
-    // last will, as for a device that loses power.
-    drop(app);
+    let result = eframe::run_native(
+        TITLE,
+        native,
+        Box::new(move |creation| {
+            // A task asks egui to repaint after it sends a signal, so the
+            // window does not repaint all the time.
+            let context = creation.egui_ctx.clone();
+            let (sender, signals) = mpsc::channel();
+            let notifier = Notifier::new(sender, Arc::new(move || context.request_repaint()));
+            let open = mqtt::opener(handle.clone());
+            let mut shell = Shell::new(handle, notifier, open, read_only);
+            shell.start(settings, power, path);
+            Ok(Box::new(App::new(shell, signals, power)))
+        }),
+    );
+    // eframe dropped the app and its shell. The tasks stopped with no
+    // disconnect packet, so the broker publishes the last will, as for a
+    // device that loses power.
     runtime.shutdown_background();
     result.map_err(|error| error.to_string())
 }
 
+/// The state of the window.
 struct App {
     shell: Shell,
     signals: mpsc::Receiver<Signal>,
-    panel: Panel,
-    /// The grey level of each panel pixel, from the last draw.
-    lumas: Vec<u8>,
-    start: Option<(Settings, Option<String>)>,
+    screen: Screen,
     power: PowerSource,
-    window: Option<Rc<Window>>,
-    surface: Option<Surface<Rc<Window>, Rc<Window>>>,
-    cursor: Option<(f64, f64)>,
-    flash_until: Option<Instant>,
-    outline: Option<(Rectangle, Instant)>,
+    scale: Scale,
     show_outline: bool,
+    texture: Option<TextureHandle>,
+    /// The image version and the flash state of the texture.
+    uploaded: Option<(u64, bool)>,
+    /// The offset from UTC, in minutes, in the clock control.
+    offset: i16,
+    /// The guard on the switch from a dry run to live service calls.
+    live: LiveGuard,
+    view_text: ViewText,
+    hide_routine: bool,
+    effect_filter: String,
+    mqtt_filter: String,
 }
 
-impl ApplicationHandler for App {
-    fn new_events(&mut self, _: &ActiveEventLoop, cause: StartCause) {
-        if let StartCause::ResumeTimeReached { .. } = cause {
-            let now = Instant::now();
-            if self.flash_until.is_some_and(|until| until <= now) {
-                self.flash_until = None;
-            }
-            if self.outline.is_some_and(|(_, until)| until <= now) {
-                self.outline = None;
-            }
-            self.request_redraw();
-        }
+/// The guard on the switch from a dry run to live service calls. The user
+/// must ask and then confirm, so one click cannot switch real devices.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct LiveGuard {
+    asking: bool,
+}
+
+impl LiveGuard {
+    /// The user asked to go live. The window shows a confirm button.
+    const fn ask(&mut self) {
+        self.asking = true;
     }
 
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_some() {
-            return;
-        }
-        let attributes = Window::default_attributes()
-            .with_title(TITLE)
-            .with_inner_size(LogicalSize::new(
-                f64::from(ui::WIDTH),
-                f64::from(ui::HEIGHT),
-            ));
-        let window = match event_loop.create_window(attributes) {
-            Ok(window) => Rc::new(window),
-            Err(error) => {
-                eprintln!("cannot open the window: {error}");
-                event_loop.exit();
-                return;
-            }
-        };
-        let surface =
-            Context::new(window.clone()).and_then(|context| Surface::new(&context, window.clone()));
-        match surface {
-            Ok(surface) => self.surface = Some(surface),
-            Err(error) => {
-                eprintln!("cannot draw in the window: {error}");
-                event_loop.exit();
-                return;
-            }
-        }
-        self.window = Some(window);
-        // Start the core after the window exists, so the first render has
-        // somewhere to go.
-        if let Some((settings, path)) = self.start.take() {
-            self.shell.start(settings, self.power, path);
-        }
-        self.after_events();
+    /// The user cancelled the request.
+    const fn cancel(&mut self) {
+        self.asking = false;
     }
 
-    fn user_event(&mut self, _: &ActiveEventLoop, (): ()) {
+    /// The user confirmed. Returns `true` if the user asked first, and
+    /// the shell must then go live.
+    const fn confirm(&mut self) -> bool {
+        std::mem::replace(&mut self.asking, false)
+    }
+}
+
+/// The pretty `Debug` text of the view model. It is made again only when the
+/// view model changes.
+#[derive(Default)]
+struct ViewText {
+    view: Option<ViewModel>,
+    text: String,
+    /// The number of times that the text was made.
+    made: u64,
+}
+
+impl ViewText {
+    /// Returns the text of `view`.
+    fn text(&mut self, view: &ViewModel) -> &str {
+        if self.view.as_ref() != Some(view) {
+            self.text = format!("{view:#?}");
+            self.view = Some(view.clone());
+            self.made += 1;
+        }
+        &self.text
+    }
+}
+
+impl eframe::App for App {
+    fn logic(&mut self, ctx: &Context, _: &mut eframe::Frame) {
         while let Ok(signal) = self.signals.try_recv() {
             self.shell.handle(signal);
         }
-        self.after_events();
+        self.refresh(ctx);
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
-        match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::RedrawRequested => self.paint(),
-            WindowEvent::Resized(_) => self.request_redraw(),
-            WindowEvent::CursorMoved { position, .. } => {
-                self.cursor = Some((position.x, position.y));
-            }
-            WindowEvent::CursorLeft { .. } => self.cursor = None,
-            WindowEvent::MouseInput {
-                state: ElementState::Pressed,
-                button: MouseButton::Left,
-                ..
-            } => self.click(),
-            WindowEvent::KeyboardInput {
-                event:
-                    KeyEvent {
-                        physical_key: PhysicalKey::Code(code),
-                        state: ElementState::Pressed,
-                        repeat: false,
-                        ..
-                    },
-                ..
-            } => self.key(code, event_loop),
-            _ => {}
-        }
-        self.after_events();
-    }
-
-    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        let deadline = [self.flash_until, self.outline.map(|(_, until)| until)]
-            .into_iter()
-            .flatten()
-            .min();
-        event_loop.set_control_flow(deadline.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
+    fn ui(&mut self, ui: &mut Ui, _: &mut eframe::Frame) {
+        // `logic` also runs while the window is hidden, with the input of the
+        // last frame, so the keys are read here.
+        self.keys(ui.ctx());
+        let view = self.shell.view();
+        Panel::left("controls")
+            .resizable(true)
+            .default_size(260.0)
+            .show(ui, |ui| {
+                ScrollArea::vertical().show(ui, |ui| self.controls(ui, &view));
+            });
+        Panel::right("inspector")
+            .resizable(true)
+            .default_size(320.0)
+            .show(ui, |ui| self.view_model(ui, &view));
+        Panel::bottom("logs")
+            .resizable(true)
+            .default_size(280.0)
+            .show(ui, |ui| {
+                ui.columns(2, |columns| {
+                    self.effect_log(&mut columns[0]);
+                    self.mqtt_log(&mut columns[1]);
+                });
+            });
+        CentralPanel::no_frame()
+            .frame(egui::Frame::NONE.fill(BACKGROUND))
+            .show(ui, |ui| self.panel(ui, &view));
+        // A control can make the core ask for a render. Draw it now and
+        // paint it in the next frame.
+        self.refresh(ui.ctx());
     }
 }
 
 impl App {
-    /// A click is a touch. A touch while the device sleeps wakes it and is
-    /// not a tap.
-    fn click(&mut self) {
-        let Some(window) = &self.window else {
+    fn new(shell: Shell, signals: mpsc::Receiver<Signal>, power: PowerSource) -> Self {
+        let offset = shell.utc_offset_minutes();
+        Self {
+            shell,
+            signals,
+            screen: Screen::new(),
+            power,
+            scale: Scale::Fit,
+            show_outline: false,
+            texture: None,
+            uploaded: None,
+            offset,
+            live: LiveGuard::default(),
+            view_text: ViewText::default(),
+            hide_routine: true,
+            effect_filter: String::new(),
+            mqtt_filter: String::new(),
+        }
+    }
+
+    /// Draws the view if the core asked for a render, and asks for a repaint
+    /// at the end of a flash.
+    fn refresh(&mut self, ctx: &Context) {
+        let now = Instant::now();
+        if self.shell.take_render() {
+            self.screen.show(&self.shell.view(), now);
+            ctx.request_repaint();
+        }
+        let flash = self.screen.flash();
+        if flash.is_on(now)
+            && let Some(remaining) = flash.remaining(now)
+        {
+            ctx.request_repaint_after(remaining);
+        }
+    }
+
+    /// The keys work when no text box has the focus. The window takes each
+    /// key that it uses, so egui does not also act on it.
+    fn keys(&mut self, ctx: &Context) {
+        if ctx.egui_wants_keyboard_input() {
             return;
+        }
+        let pressed = |key| ctx.input_mut(|input| input.consume_key(Modifiers::NONE, key));
+        if pressed(Key::Q) {
+            ctx.send_viewport_cmd(ViewportCommand::Close);
+        }
+        if pressed(Key::S) {
+            let power = match self.power {
+                PowerSource::Stand => PowerSource::Battery,
+                PowerSource::Battery => PowerSource::Stand,
+            };
+            self.set_power(power);
+        }
+        if pressed(Key::W) {
+            self.shell.wake();
+        }
+        if pressed(Key::D) {
+            self.show_outline = !self.show_outline;
+        }
+        let previous = pressed(Key::ArrowLeft);
+        let next = pressed(Key::ArrowRight);
+        if previous {
+            self.shell.send(Event::PreviousPage);
+        }
+        if next {
+            self.shell.send(Event::NextPage);
+        }
+        if previous || next {
+            // egui can also move the focus with an arrow key, so remove the
+            // focus from the controls.
+            ctx.memory_mut(|memory| {
+                if let Some(id) = memory.focused() {
+                    memory.surrender_focus(id);
+                }
+            });
+        }
+    }
+
+    fn set_power(&mut self, power: PowerSource) {
+        if power != self.power {
+            self.power = power;
+            eprintln!("power: {power:?}");
+            self.shell.send(Event::PowerSourceChanged(power));
+        }
+    }
+
+    /// Uploads the image to the texture if the image or the flash changed.
+    fn texture(&mut self, ctx: &Context) -> egui::TextureId {
+        let flash = self.screen.flash().is_on(Instant::now());
+        let key = (self.screen.version(), flash);
+        if self.uploaded != Some(key) || self.texture.is_none() {
+            let size = [ui::WIDTH as usize, ui::HEIGHT as usize];
+            let image = ColorImage::from_gray_iter(size, self.screen.levels(flash));
+            match &mut self.texture {
+                Some(texture) => texture.set(image, TextureOptions::NEAREST),
+                None => {
+                    self.texture = Some(ctx.load_texture("panel", image, TextureOptions::NEAREST));
+                }
+            }
+            self.uploaded = Some(key);
+        }
+        self.texture
+            .as_ref()
+            .map_or_else(egui::TextureId::default, TextureHandle::id)
+    }
+
+    /// Shows the panel at an integer scale in a scroll area. A click is a
+    /// touch. While the shell is live, a red border is round the panel.
+    fn panel(&mut self, ui: &mut Ui, view: &ViewModel) {
+        let texture = self.texture(ui.ctx());
+        let pixels_per_point = ui.ctx().pixels_per_point();
+        let area = ui.available_rect_before_wrap();
+        let to_pixels = |points: f32| {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "the window is smaller than u32::MAX pixels"
+            )]
+            let pixels = (points * pixels_per_point).floor().max(0.0) as u32;
+            pixels
         };
-        let Some((x, y)) = self.cursor else {
-            return;
-        };
-        let size = window.inner_size();
-        let Some(point) = Viewport::fit(size.width, size.height).to_panel(x, y) else {
-            return;
-        };
-        let view = self.shell.view();
+        let viewport = Viewport::place(
+            self.scale,
+            to_pixels(area.width()),
+            to_pixels(area.height()),
+        );
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "the values are much smaller than 2^24"
+        )]
+        let to_points = |pixels: u32| pixels as f32 / pixels_per_point;
+        let offset = Vec2::new(to_points(viewport.left), to_points(viewport.top));
+        let size = Vec2::new(
+            to_points(ui::WIDTH * viewport.scale),
+            to_points(ui::HEIGHT * viewport.scale),
+        );
+        let live = !self.shell.read_only();
+        let outline = self.show_outline.then(|| self.screen.outline()).flatten();
+        let mut touch = None;
+        ScrollArea::both().auto_shrink(false).show(ui, |ui| {
+            let (space, response) = ui.allocate_exact_size(offset + size, Sense::click());
+            // Round the top left of the panel to a screen pixel.
+            let min = (space.min + offset) * pixels_per_point;
+            let min = Pos2::new(min.x.round(), min.y.round()) / pixels_per_point;
+            let rect = Rect::from_min_size(min, size);
+            let painter = ui.painter();
+            let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+            painter.image(texture, rect, uv, Color32::WHITE);
+            if let Some(changed) = outline {
+                let outline = outline_rect(changed, rect.min, viewport.scale, pixels_per_point);
+                painter.rect_stroke(
+                    outline,
+                    0.0,
+                    Stroke::new(1.0, OUTLINE_COLOR),
+                    StrokeKind::Inside,
+                );
+            }
+            if live {
+                painter.rect_stroke(
+                    rect,
+                    0.0,
+                    Stroke::new(LIVE_BORDER, LIVE_COLOR),
+                    StrokeKind::Inside,
+                );
+            }
+            if response.clicked() {
+                let visible = ui.clip_rect();
+                touch = response.interact_pointer_pos().and_then(|position| {
+                    visible_panel_point(
+                        position,
+                        visible,
+                        rect.min,
+                        viewport.scale,
+                        pixels_per_point,
+                    )
+                });
+            }
+        });
+        if let Some(point) = touch {
+            self.touch(point, view);
+        }
+    }
+
+    /// A touch while the device sleeps wakes it and is not a tap.
+    fn touch(&mut self, point: Point, view: &ViewModel) {
         if view.asleep {
             self.shell.wake();
-        } else if let Some(event) = ui::hit_test(&view, point) {
+        } else if let Some(event) = ui::hit_test(view, point) {
             self.shell.send(event);
         }
     }
 
-    fn key(&mut self, code: KeyCode, event_loop: &ActiveEventLoop) {
-        match code {
-            KeyCode::KeyQ | KeyCode::Escape => event_loop.exit(),
-            KeyCode::KeyS => {
-                self.power = match self.power {
-                    PowerSource::Stand => PowerSource::Battery,
-                    PowerSource::Battery => PowerSource::Stand,
-                };
-                eprintln!("power: {:?}", self.power);
-                self.shell.send(Event::PowerSourceChanged(self.power));
+    fn controls(&mut self, ui: &mut Ui, view: &ViewModel) {
+        ui.heading("Device");
+        ui.label("Power source");
+        let mut power = self.power;
+        ui.horizontal(|ui| {
+            ui.radio_value(&mut power, PowerSource::Stand, "Stand");
+            ui.radio_value(&mut power, PowerSource::Battery, "Battery");
+        });
+        self.set_power(power);
+        ui.horizontal(|ui| {
+            ui.label(if view.asleep { "Asleep" } else { "Awake" });
+            if ui
+                .add_enabled(view.asleep, egui::Button::new("Wake"))
+                .clicked()
+            {
+                self.shell.wake();
             }
-            KeyCode::KeyW => self.shell.wake(),
-            KeyCode::KeyD => {
-                self.show_outline = !self.show_outline;
-                let state = if self.show_outline { "on" } else { "off" };
-                eprintln!("panel: the outline of each partial refresh is {state}");
-            }
-            KeyCode::ArrowLeft => self.shell.send(Event::PreviousPage),
-            KeyCode::ArrowRight => self.shell.send(Event::NextPage),
-            _ => {}
-        }
-    }
+        });
+        ui.label(format!("Connection: {:?}", view.connection));
 
-    /// Draws the view if the core asked for a render, and simulates the
-    /// refresh of the panel.
-    fn after_events(&mut self) {
-        if !self.shell.take_render() {
-            return;
-        }
-        let view = self.shell.view();
-        let update = self.panel.draw(&view);
-        self.lumas = self.panel.lumas();
-        let now = Instant::now();
-        match (update.refresh, update.changed) {
-            (Refresh::Full, _) => {
-                eprintln!("panel: full refresh");
-                self.flash_until = Some(now + FLASH);
-                self.outline = None;
-            }
-            (Refresh::Partial, Some(area)) => {
-                eprintln!(
-                    "panel: partial refresh of {}x{} at ({}, {}), {:.1}% of the panel",
-                    area.size.width,
-                    area.size.height,
-                    area.top_left.x,
-                    area.top_left.y,
-                    share(area)
-                );
-                if self.show_outline {
-                    self.outline = Some((area, now + OUTLINE));
-                }
-            }
-            (Refresh::Partial, None) => {}
-        }
-        if let Some(window) = &self.window {
-            if view.asleep {
-                window.set_title(&format!("{TITLE} (asleep: click or press W to wake)"));
-            } else {
-                window.set_title(TITLE);
-            }
-        }
-        self.request_redraw();
-    }
+        ui.separator();
+        ui.heading("MQTT");
+        self.read_only_control(ui);
 
-    fn request_redraw(&self) {
-        if let Some(window) = &self.window {
-            window.request_redraw();
-        }
-    }
+        ui.separator();
+        ui.heading("Clock");
+        ui.label(format!(
+            "UTC offset: {} minutes",
+            self.shell.utc_offset_minutes()
+        ));
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::DragValue::new(&mut self.offset)
+                    .range(-720..=840)
+                    .speed(15)
+                    .suffix(" min"),
+            );
+            if ui.button("Send").clicked() {
+                self.shell.set_utc_offset(self.offset);
+            }
+        });
 
-    /// Copies the panel to the window at an integer scale.
-    fn paint(&mut self) {
-        let (Some(window), Some(surface)) = (&self.window, &mut self.surface) else {
-            return;
+        ui.separator();
+        ui.heading("Panel");
+        ui.label("Scale (screen pixels for each panel pixel)");
+        ui.horizontal(|ui| {
+            ui.radio_value(&mut self.scale, Scale::Fit, "Fit");
+            ui.radio_value(&mut self.scale, Scale::Fixed(1), "1×");
+            ui.radio_value(&mut self.scale, Scale::Fixed(2), "2×");
+        });
+        ui.checkbox(&mut self.show_outline, "Outline of the partial refresh (D)");
+        let counters = self.screen.counters();
+        ui.label(format!("Full refreshes: {}", counters.full));
+        ui.label(format!("Partial refreshes: {}", counters.partial));
+        match counters.last_partial {
+            Some(area) => ui.label(format!(
+                "Last partial: {}×{} at ({}, {}), {:.1}% of the panel",
+                area.size.width,
+                area.size.height,
+                area.top_left.x,
+                area.top_left.y,
+                share(area)
+            )),
+            None => ui.label("Last partial: none"),
         };
-        let size = window.inner_size();
-        let (Some(width), Some(height)) =
-            (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
-        else {
-            return;
-        };
-        if surface.resize(width, height).is_err() {
-            return;
-        }
-        let Ok(mut buffer) = surface.buffer_mut() else {
-            return;
-        };
-        let viewport = Viewport::fit(size.width, size.height);
-        let flash = self.flash_until.is_some_and(|until| Instant::now() < until);
-        paint_panel(&mut buffer, size.width, viewport, &self.lumas, flash);
-        if let Some((area, _)) = self.outline {
-            paint_outline(&mut buffer, size.width, viewport, area);
-        }
-        if let Err(error) = buffer.present() {
-            eprintln!("cannot show the frame: {error}");
+
+        ui.separator();
+        ui.label(
+            RichText::new(
+                "Keys (when no text box has the focus): S stand/battery, W wake, D outline, \
+                 Left/Right page, Q quit",
+            )
+            .small(),
+        );
+    }
+
+    /// Shows if a tap switches real devices. The switch from a dry run to
+    /// live needs a second click to confirm. The switch back is immediate.
+    fn read_only_control(&mut self, ui: &mut Ui) {
+        if self.shell.read_only() {
+            ui.label("Dry run: taps change no device. The shell does not publish service calls.");
+            if self.live.asking {
+                ui.colored_label(LIVE_COLOR, "Taps will switch real devices in the house.");
+                ui.horizontal(|ui| {
+                    let confirm =
+                        egui::Button::new(RichText::new("Confirm: go live").color(Color32::WHITE))
+                            .fill(LIVE_COLOR);
+                    if ui.add(confirm).clicked() && self.live.confirm() {
+                        self.shell.set_read_only(false);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.live.cancel();
+                    }
+                });
+            } else if ui.button("Go live…").clicked() {
+                self.live.ask();
+            }
+        } else {
+            ui.label(
+                RichText::new("LIVE: taps switch real devices")
+                    .strong()
+                    .color(LIVE_COLOR),
+            );
+            if ui.button("Back to dry run").clicked() {
+                self.shell.set_read_only(true);
+            }
         }
     }
-}
 
-/// Fills `buffer` (rows of `width` pixels) with the panel image. If `flash`
-/// is `true`, inverts the image, as a full refresh of the panel does.
-fn paint_panel(buffer: &mut [u32], width: u32, viewport: Viewport, lumas: &[u8], flash: bool) {
-    let panel_width = ui::WIDTH as usize;
-    let Viewport { scale, left, top } = viewport;
-    let row_length = width as usize;
-    for (y, row) in (0_u32..).zip(buffer.chunks_mut(row_length)) {
-        let panel_y = y
-            .checked_sub(top)
-            .map(|y| y / scale)
-            .filter(|y| *y < ui::HEIGHT);
-        for (x, pixel) in (0_u32..).zip(row.iter_mut()) {
-            let panel_x = x
-                .checked_sub(left)
-                .map(|x| x / scale)
-                .filter(|x| *x < ui::WIDTH);
-            *pixel = match (panel_x, panel_y) {
-                (Some(px), Some(py)) => {
-                    let index = py as usize * panel_width + px as usize;
-                    let luma = lumas.get(index).copied().unwrap_or(15);
-                    let luma = if flash { 15 - luma } else { luma };
-                    let level = u32::from(luma) * 17;
-                    level << 16 | level << 8 | level
-                }
-                _ => BACKGROUND,
+    fn view_model(&mut self, ui: &mut Ui, view: &ViewModel) {
+        ui.heading("Shell and model");
+        egui::Grid::new("facts").num_columns(2).show(ui, |ui| {
+            let mut fact = |name: &str, value: String| {
+                ui.label(name);
+                ui.monospace(value);
+                ui.end_row();
             };
-        }
+            fact("Route", view.path.clone());
+            fact("Connection", format!("{:?}", view.connection));
+            fact("Power", format!("{:?}", view.power));
+            fact("Asleep", view.asleep.to_string());
+            fact("Read-only", self.shell.read_only().to_string());
+            fact(
+                "UTC offset",
+                format!("{} min", self.shell.utc_offset_minutes()),
+            );
+            fact(
+                "MQTT connection",
+                self.shell
+                    .current_connection()
+                    .map_or_else(|| "none".into(), |id| id.to_string()),
+            );
+            fact("Timers", self.shell.timer_count().to_string());
+            fact("Full refresh seq", view.full_refresh_seq.to_string());
+        });
+        ui.separator();
+        egui::CollapsingHeader::new("View model")
+            .default_open(true)
+            .show(ui, |ui| {
+                let text = self.view_text.text(view);
+                ScrollArea::both().show(ui, |ui| {
+                    ui.monospace(text);
+                });
+            });
+    }
+
+    fn effect_log(&mut self, ui: &mut Ui) {
+        let header = log_header("Effects", &self.shell.inspector().effects);
+        ui.horizontal(|ui| {
+            ui.heading(header);
+            ui.add(TextEdit::singleline(&mut self.effect_filter).hint_text("Filter"));
+            if ui.button("Clear").clicked() {
+                self.shell.inspector_mut().effects.clear();
+            }
+        });
+        ui.checkbox(
+            &mut self.hide_routine,
+            format!("Hide routine effects ({})", ROUTINE_EFFECTS.join(", ")),
+        );
+        let inspector: &Inspector = self.shell.inspector();
+        let entries: Vec<_> = inspector
+            .effects
+            .shown(&self.effect_filter, self.hide_routine)
+            .collect();
+        rows(ui, "effect log", entries.len(), |ui, index| {
+            let entry = entries[index];
+            ui.monospace(entry.time.format(TIME).to_string());
+            ui.monospace(RichText::new(entry.effect).strong());
+            if !entry.request.is_empty() {
+                ui.monospace(&entry.request);
+            }
+            ui.add(Label::new(&entry.outcome).truncate());
+        });
+    }
+
+    fn mqtt_log(&mut self, ui: &mut Ui) {
+        let header = log_header("MQTT", &self.shell.inspector().mqtt);
+        ui.horizontal(|ui| {
+            ui.heading(header);
+            ui.add(TextEdit::singleline(&mut self.mqtt_filter).hint_text("Topic filter"));
+            if ui.button("Clear").clicked() {
+                self.shell.inspector_mut().mqtt.clear();
+            }
+        });
+        let inspector: &Inspector = self.shell.inspector();
+        let entries: Vec<_> = inspector.mqtt.filtered(&self.mqtt_filter).collect();
+        rows(ui, "mqtt log", entries.len(), |ui, index| {
+            let entry = entries[index];
+            ui.monospace(entry.time.format(TIME).to_string());
+            ui.monospace(match entry.direction {
+                Direction::In => "in ",
+                Direction::Out => "out",
+            });
+            ui.monospace(format!("{:?}", entry.packet));
+            if entry.retained {
+                ui.monospace("retained");
+            }
+            match &entry.delivery {
+                Delivery::Received | Delivery::Sent => {}
+                Delivery::NotSent => {
+                    ui.colored_label(Color32::YELLOW, "not sent");
+                }
+                Delivery::NoConnection => {
+                    ui.colored_label(Color32::YELLOW, "no connection");
+                }
+                Delivery::Failed(error) => {
+                    ui.colored_label(Color32::RED, format!("failed: {error}"));
+                }
+            }
+            let topic = ui.monospace(&entry.topic);
+            if !entry.topics.is_empty() {
+                topic.on_hover_text(entry.topics.join("\n"));
+            }
+            ui.add(Label::new(&entry.payload).truncate());
+        });
     }
 }
 
-/// Draws a line of one panel pixel around `area`.
-fn paint_outline(buffer: &mut [u32], width: u32, viewport: Viewport, area: Rectangle) {
-    let Some(bottom_right) = area.bottom_right() else {
+/// Returns the header of a log: its name, the number of entries, and the
+/// number of entries that the log dropped because it was full.
+fn log_header<T>(name: &str, log: &Log<T>) -> String {
+    match log.dropped() {
+        0 => format!("{name} ({})", log.len()),
+        dropped => format!("{name} ({}, {dropped} dropped)", log.len()),
+    }
+}
+
+/// Shows `count` rows of a log in a scroll area. Draws only the rows that
+/// are visible. `row` draws the row with an index.
+fn rows(ui: &mut Ui, id: &str, count: usize, mut row: impl FnMut(&mut Ui, usize)) {
+    if count == 0 {
+        ui.label("No entries");
         return;
+    }
+    let height = ui
+        .text_style_height(&TextStyle::Monospace)
+        .max(ui.text_style_height(&TextStyle::Body));
+    ScrollArea::both()
+        .id_salt(id)
+        .auto_shrink(false)
+        .show_rows(ui, height, count, |ui, range| {
+            for index in range {
+                ui.horizontal(|ui| row(ui, index));
+            }
+        });
+}
+
+/// Converts a position in the window to a point on the panel, or `None` if
+/// the position is not on the panel. The top left of the panel is at
+/// `origin`, and each panel pixel is `scale` screen pixels wide. Both
+/// positions are in egui points.
+fn panel_point(position: Pos2, origin: Pos2, scale: u32, pixels_per_point: f32) -> Option<Point> {
+    let x = f64::from((position.x - origin.x) * pixels_per_point);
+    let y = f64::from((position.y - origin.y) * pixels_per_point);
+    let viewport = Viewport {
+        scale,
+        left: 0,
+        top: 0,
     };
-    let Viewport { scale, left, top } = viewport;
-    let to_window = |point: Point| {
-        (
-            left + point.x.unsigned_abs() * scale,
-            top + point.y.unsigned_abs() * scale,
-        )
-    };
-    let (x0, y0) = to_window(area.top_left);
-    let (x1, y1) = to_window(bottom_right + Point::new(1, 1));
-    let mut set = |x: u32, y: u32| {
-        // A pixel past the right edge is not in this row, so skip it.
-        if x >= width {
-            return;
-        }
-        if let Some(pixel) = buffer.get_mut(y as usize * width as usize + x as usize) {
-            *pixel = OUTLINE_COLOR;
-        }
-    };
-    for t in 0..scale {
-        for x in x0..x1 {
-            set(x, y0 + t);
-            set(x, y1 - 1 - t);
-        }
-        for y in y0..y1 {
-            set(x0 + t, y);
-            set(x1 - 1 - t, y);
-        }
+    viewport.to_panel(x, y)
+}
+
+/// Converts a position in the window to a point on the panel, as
+/// [`panel_point`] does, but only if the position is in `visible`, the part
+/// of the scroll area that shows.
+fn visible_panel_point(
+    position: Pos2,
+    visible: Rect,
+    origin: Pos2,
+    scale: u32,
+    pixels_per_point: f32,
+) -> Option<Point> {
+    if visible.contains(position) {
+        panel_point(position, origin, scale, pixels_per_point)
+    } else {
+        None
+    }
+}
+
+/// Returns the outline of `area` in egui points, for a panel whose top left
+/// is at `origin` and whose pixels are `scale` screen pixels wide.
+fn outline_rect(area: Rectangle, origin: Pos2, scale: u32, pixels_per_point: f32) -> Rect {
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "the values are much smaller than 2^24"
+    )]
+    let to_points = |value: i64| value as f32 * scale as f32 / pixels_per_point;
+    let left = to_points(i64::from(area.top_left.x));
+    let top = to_points(i64::from(area.top_left.y));
+    let width = to_points(i64::from(area.size.width));
+    let height = to_points(i64::from(area.size.height));
+    Rect::from_min_size(origin + Vec2::new(left, top), Vec2::new(width, height))
+}
+
+#[cfg(test)]
+mod tests {
+    use eframe::egui::{Pos2, Rect, Vec2};
+    use embedded_graphics::{prelude::*, primitives::Rectangle};
+
+    use shared::{PowerSource, fixtures::FixedShell};
+
+    use super::{LiveGuard, ViewText, log_header, outline_rect, panel_point, visible_panel_point};
+    use crate::inspector::Log;
+
+    #[test]
+    fn a_click_maps_to_the_panel_at_each_scale() {
+        let origin = Pos2::new(100.0, 50.0);
+        // One screen pixel for each point, scale 1.
+        assert_eq!(
+            panel_point(Pos2::new(100.0, 50.0), origin, 1, 1.0),
+            Some(Point::new(0, 0))
+        );
+        assert_eq!(
+            panel_point(Pos2::new(1059.5, 589.5), origin, 1, 1.0),
+            Some(Point::new(959, 539))
+        );
+        assert_eq!(panel_point(Pos2::new(1060.0, 60.0), origin, 1, 1.0), None);
+        assert_eq!(panel_point(Pos2::new(99.0, 60.0), origin, 1, 1.0), None);
+
+        // A Retina display at scale 1: a panel pixel is half a point.
+        assert_eq!(
+            panel_point(Pos2::new(110.0, 60.0), origin, 1, 2.0),
+            Some(Point::new(20, 20))
+        );
+        assert_eq!(
+            panel_point(Pos2::new(579.75, 319.75), origin, 1, 2.0),
+            Some(Point::new(959, 539))
+        );
+        assert_eq!(panel_point(Pos2::new(580.0, 60.0), origin, 1, 2.0), None);
+
+        // A Retina display at scale 2: a panel pixel is one point.
+        assert_eq!(
+            panel_point(Pos2::new(110.5, 60.5), origin, 2, 2.0),
+            Some(Point::new(10, 10))
+        );
+        assert_eq!(
+            panel_point(Pos2::new(1059.5, 589.5), origin, 2, 2.0),
+            Some(Point::new(959, 539))
+        );
+        assert_eq!(panel_point(Pos2::new(1060.0, 60.0), origin, 2, 2.0), None);
+
+        // Scale 2 with one screen pixel for each point.
+        assert_eq!(
+            panel_point(Pos2::new(103.0, 55.0), origin, 2, 1.0),
+            Some(Point::new(1, 2))
+        );
+    }
+
+    #[test]
+    fn the_outline_covers_the_area_in_points() {
+        let area = Rectangle::new(Point::new(10, 20), Size::new(30, 40));
+        let origin = Pos2::new(100.0, 50.0);
+        assert_eq!(
+            outline_rect(area, origin, 2, 1.0),
+            Rect::from_min_size(Pos2::new(120.0, 90.0), Vec2::new(60.0, 80.0))
+        );
+        assert_eq!(
+            outline_rect(area, origin, 1, 2.0),
+            Rect::from_min_size(Pos2::new(105.0, 60.0), Vec2::new(15.0, 20.0))
+        );
+    }
+
+    #[test]
+    fn a_click_maps_only_in_the_visible_part_of_a_scrolled_panel() {
+        // The scroll area shows 400 × 300 points from (300, 100). The user
+        // scrolled 500 points right and 200 down, so the panel at 2 screen
+        // pixels for each panel pixel starts above and left of the area.
+        let visible = Rect::from_min_size(Pos2::new(300.0, 100.0), Vec2::new(400.0, 300.0));
+        let origin = Pos2::new(300.0 - 500.0, 100.0 - 200.0);
+        assert_eq!(
+            visible_panel_point(Pos2::new(300.0, 100.0), visible, origin, 2, 1.0),
+            Some(Point::new(250, 100))
+        );
+        assert_eq!(
+            visible_panel_point(Pos2::new(699.0, 399.0), visible, origin, 2, 1.0),
+            Some(Point::new(449, 249))
+        );
+        // A position on the panel but out of the visible part is not a touch.
+        assert_eq!(
+            visible_panel_point(Pos2::new(299.0, 150.0), visible, origin, 2, 1.0),
+            None
+        );
+        assert_eq!(
+            visible_panel_point(Pos2::new(500.0, 401.0), visible, origin, 2, 1.0),
+            None
+        );
+    }
+
+    #[test]
+    fn going_live_needs_a_request_and_a_confirmation() {
+        let mut guard = LiveGuard::default();
+        assert!(!guard.confirm(), "a confirm with no request does nothing");
+        guard.ask();
+        guard.cancel();
+        assert!(!guard.confirm());
+        guard.ask();
+        assert!(guard.confirm());
+        assert!(!guard.confirm(), "each request allows one switch");
+    }
+
+    #[test]
+    fn the_view_text_is_made_again_only_when_the_view_changes() {
+        let mut shell = FixedShell::start(PowerSource::Stand, "/room/living_room");
+        let mut text = ViewText::default();
+        let view = shell.view();
+        assert!(text.text(&view).contains("living"));
+        text.text(&view);
+        text.text(&shell.view());
+        assert_eq!(text.made, 1);
+        shell.drop_connection();
+        text.text(&shell.view());
+        assert_eq!(text.made, 2);
+    }
+
+    #[test]
+    fn the_log_header_shows_the_dropped_entries() {
+        let mut log = Log::new(2);
+        log.push(1);
+        assert_eq!(log_header("MQTT", &log), "MQTT (1)");
+        log.push(2);
+        log.push(3);
+        assert_eq!(log_header("MQTT", &log), "MQTT (2, 1 dropped)");
     }
 }
