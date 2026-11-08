@@ -25,3 +25,6 @@ id = "hall"
 # If true, the core does a dry run: a tap does not publish a service call, so
 # no device in the house changes. Set it to false when the dashboard works.
 read_only = true
+# The SNTP server that sets the clock: a host name or an IPv4 address. If you
+# leave it out, the firmware uses "pool.ntp.org".
+ntp_server = "pool.ntp.org"

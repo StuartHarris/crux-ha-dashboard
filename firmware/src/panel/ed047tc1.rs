@@ -543,6 +543,21 @@ impl<'a> Ed047tc1<'a> {
         self.cfg_writer.scan(found)
     }
 
+    /// Reads `buffer.len()` registers of `device` from `register` on. The
+    /// other devices on the bus (for example the RTC) use this function.
+    pub fn read_registers(&mut self, device: u8, register: u8, buffer: &mut [u8]) -> Result<()> {
+        self.cfg_writer
+            .i2c
+            .write_read(device, &[register], buffer)
+            .map_err(Error::I2c)
+    }
+
+    /// Writes `payload` (the first register, then the values) to `device`.
+    /// The other devices on the bus (for example the RTC) use this function.
+    pub fn write_registers(&mut self, device: u8, payload: &[u8]) -> Result<()> {
+        self.cfg_writer.write_register(device, payload)
+    }
+
     pub fn frame_start(&mut self) -> Result<()> {
         self.cfg_writer.config.mode = true;
         self.cfg_writer.write()?;

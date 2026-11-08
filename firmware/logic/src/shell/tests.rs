@@ -25,9 +25,10 @@ const CONFIG: Config<'static> = Config {
     mqtt_password: "mqtt-secret",
     device_id: "test",
     read_only: true,
+    ntp_server: "pool.ntp.org",
 };
 
-/// 2026-11-07 12:00:00 UTC.
+/// 2026-11-06 12:00:00 UTC.
 fn clock() -> Instant {
     Instant::new(1_793_966_400, 0)
 }

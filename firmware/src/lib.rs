@@ -9,6 +9,7 @@
 //! - [`panel`] drives the panel and reads the touch controller.
 //! - [`lane`] is a queue between two tasks.
 //! - [`network`] makes the configuration of the Wi-Fi driver.
+//! - [`rtc`] reads and writes the PCF8563 RTC through the bus of the panel.
 //!
 //! Each binary includes the build-time configuration from `cfg.toml`
 //! (`$OUT_DIR/config.rs`) as its own private module, so the passwords are
@@ -28,3 +29,4 @@ pub mod board;
 pub mod lane;
 pub mod network;
 pub mod panel;
+pub mod rtc;
