@@ -24,7 +24,6 @@ const CONFIG: Config<'static> = Config {
     mqtt_password: "mqtt-secret",
     device_id: "test",
     read_only: true,
-    ntp_server: "pool.ntp.org",
 };
 
 /// A short name for each job, to compare lists of jobs.

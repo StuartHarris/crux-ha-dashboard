@@ -29,7 +29,8 @@
 //! - A failed power-on turns the high voltages off again.
 //! - It has no SD card, battery, RTC, rotation or deep sleep code. The
 //!   caller reads and writes the other devices on the I2C bus, for example
-//!   the RTC, with [`Panel::read_registers`] and [`Panel::write_registers`].
+//!   the BQ25896 charger, with [`Panel::read_registers`] and
+//!   [`Panel::write_registers`].
 //!
 //! The code stays close to upstream, to make a diff easy. For this reason,
 //! the pedantic lints are off in this module.
@@ -216,7 +217,7 @@ impl<'a> Panel<'a> {
 
     /// Reads `buffer.len()` registers of the I2C device at `address`, from
     /// `register` on. The panel owns the I2C bus, so the other devices on the
-    /// bus (for example the PCF8563 RTC) use this function.
+    /// bus (for example the BQ25896 charger) use this function.
     pub fn read_registers(&mut self, address: u8, register: u8, buffer: &mut [u8]) -> Result<()> {
         self.epd.read_registers(address, register, buffer)
     }

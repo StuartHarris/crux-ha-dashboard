@@ -346,15 +346,6 @@ impl App for Dashboard {
     }
 }
 
-/// The earliest valid time of day: 2025-01-01T00:00:00Z, in seconds since
-/// the Unix epoch.
-///
-/// A device with no RTC and no network time counts from the Unix epoch when
-/// it starts. A time before this one is such a count, not the time of day.
-/// The core does not read the clock of the device. The footer times come
-/// from Home Assistant. The firmware uses this value for its own clock.
-pub const EARLIEST_VALID_TIME: u64 = 1_735_689_600;
-
 fn on_start(start: Start, model: &mut Model) -> Cmd {
     let Start {
         settings,

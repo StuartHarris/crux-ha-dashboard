@@ -256,9 +256,8 @@ async fn session(
     }
 }
 
-/// Finds the address of a host, for example the broker. The host is an IPv4
-/// address or a name.
-pub async fn resolve(stack: Stack<'static>, host: &str) -> Result<IpAddress, String> {
+/// Finds the address of the broker. The host is an IPv4 address or a name.
+async fn resolve(stack: Stack<'static>, host: &str) -> Result<IpAddress, String> {
     if let Ok(address) = Ipv4Addr::from_str(host) {
         return Ok(IpAddress::Ipv4(address));
     }

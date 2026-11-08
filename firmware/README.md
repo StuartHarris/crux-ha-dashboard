@@ -25,7 +25,6 @@ with the std shells of the root workspace would pull std into it.
 | `backoff` | A wait that doubles from 1 s to 30 s after each failure, for the start of the touch controller. |
 | `timers` | The timers of the timer task, in milliseconds since the start. |
 | `touch` | Converts a GT911 point to a panel point, and touch samples to taps with a debounce. A sample is new with a finger, new with no finger (the finger lifted), or not new. Only a new sample with no finger ends a touch. |
-| `clock` | Decodes and encodes the time registers of the PCF8563 RTC. Makes the SNTP request and checks the reply. Calculates the time of the start from the RTC or from SNTP, decides when to write the RTC, and decides when to send the next SNTP request. |
 | `config` | Reads and checks `cfg.toml`. Its `Debug` output does not show the passwords. `build.rs` includes this file, so it uses only `core`. |
 
 ## The hardware binary
@@ -40,33 +39,13 @@ cannot block each other. This is the pattern of the `cpb` example in Crux.
 | --- | --- | --- |
 | core (`main`) | Owns the shell. Sends `Start` with the power source `Stand`. | |
 | `timers` | Starts and cancels the timers of the core. | `Signal::Timer` |
-| `display` | Draws the newest view model with `ui::draw`, and refreshes the panel as `ui::Refresher` decides. Reads the touch controller every 30 ms between refreshes. Writes the RTC after SNTP sets the clock. | `Signal::Tap` |
+| `display` | Draws the newest view model with `ui::draw`, and refreshes the panel as `ui::Refresher` decides. Reads the touch controller every 30 ms between refreshes. | `Signal::Tap` |
 | `wifi` | Joins the network and waits for DHCP, or leaves the network. | `Signal::Wifi` |
 | `mqtt` | Opens one connection at a time with `rust-mqtt` (MQTT 5) over TCP. Subscribes, publishes, sends pings, and closes. | `Signal::Mqtt` |
-| `sntp` | Sets the clock from the SNTP server. | |
 | `net` | Runs the network stack. | |
 
 `Sleep` writes a line to the log, and the device stays awake. The next tap goes to the
 core as usual, and the core wakes because it sleeps. Deep sleep comes in phase 6.
-
-The wall clock is the time of the start plus the time since the start. At boot, before the
-core starts, the firmware reads the time of the PCF8563 RTC through the I2C bus of the
-panel. After the device has a network address, the `sntp` task asks the SNTP server
-(`ntp_server` in `cfg.toml`), sets the clock, and then asks again each 12 hours. After a
-failure, it tries again after 1, 2, 4 and 8 seconds, and then after 1 hour. If the
-network goes down before or during a request, the request is not a failure. The task
-waits for the network and sends the request again. When SNTP sets the clock, the display
-task (which owns the I2C bus) writes the time to the RTC if the RTC time is more than 2
-seconds wrong. It writes at the start of a second, because the RTC starts to count when
-it is written. It tries a failed write 3 times. The log shows `clock: set from the RTC`
-or `clock: set from SNTP`.
-
-A time before 2025 is not valid. If neither source gives a valid time, the clock starts
-at the Unix epoch, and the log says at the start that the clock is not set.
-
-The core does not read the wall clock. The footer text "Last changed HH:MM" comes from
-the `last_updated` time that Home Assistant publishes for each entity. The wall clock
-keeps the RTC correct.
 
 The second binary, `bringup`, runs the hardware checks for a new board.
 
@@ -156,11 +135,10 @@ the Wi-Fi password and the broker password, so it is in `.gitignore`.
 8 to 63 bytes for the others. The Wi-Fi driver cannot join a WPA3 network. An unknown
 section or key is also an error. An error names the key.
 
-`ntp_server` in `[device]` is the SNTP server, a host name or an IPv4 address. The
-default is `pool.ntp.org`.
-
 The file has no time zone setting. The dashboard shows UK time, and the core calculates
-summer time. If your `cfg.toml` has the old key `utc_offset_minutes`, remove it.
+summer time. If your `cfg.toml` has the old key `utc_offset_minutes` or `ntp_server`,
+remove it. The firmware has no clock of its own. The footer text "Last changed HH:MM"
+comes from the `last_updated` time that Home Assistant publishes for each entity.
 
 `build.rs` writes the values into `target/.../out/config.rs` as one constant. Each
 binary includes it as a private module. The build
@@ -202,8 +180,7 @@ Do the steps in this order. Each step needs the steps before it.
    does not start, set `PsramMode::Auto` in `src/board.rs` and try again.
 4. **I2C.** Find `step 2`. It must find 0x20 (PCA9535), 0x51 (PCF8563), 0x55
    (BQ27220), 0x5D (GT911), 0x68 (TPS65185) and 0x6B (BQ25896). The GT911 can be at
-   0x14 if INT was high at reset. The line `step 2: RTC time` shows the time of the
-   RTC, or a warning if the RTC has no valid time.
+   0x14 if INT was high at reset. The firmware does not use the PCF8563.
 5. **Panel clear and test pattern.** Find `step 3`. The panel flashes, then shows 16
    bars from black to white. Write down the time of the full refresh.
 6. **Partial refresh.** Find `step 4`. A black rectangle shows in the middle with no
@@ -230,14 +207,7 @@ Do the steps in this order. Each step needs the steps before it.
     not change.
 12. **A real tap.** Set `read_only = false`, run `just flash`, and tap a light tile. The
     `cmd` topic shows the service call, and the light changes.
-13. **The clock.** Run `just flash`. After the Wi-Fi connection, the log shows
-    `clock: set from SNTP` with the UTC time, and `rtc: set to` the same time. Press
-    RST. Before the Wi-Fi connection, the log must show `clock: set from the RTC` with
-    the correct time. After SNTP, the log must show
-    a change of at most 2 s and no `rtc: set to` line. Then disconnect USB for one minute
-    with the battery connected, connect it again, and do the same check. If the RTC has
-    no valid time after a restart, examine the supply of the RTC.
-14. **The − and + buttons.** The automation `dashboard_commands` on the Pi must accept
+13. **The − and + buttons.** The automation `dashboard_commands` on the Pi must accept
     `light.turn_on` (refer to `docs/mqtt.md`). Keep `read_only = false`. On a few dimmable
     light tiles, tap each corner of the − and the + button with a finger. A tap on a
     button changes the brightness on the tile. A tap that misses a button toggles the
@@ -261,10 +231,6 @@ These choices need the board:
   gives one tap, and the next touch gives no tap.
 - The touch map turns a portrait controller (540 × 960) to landscape, as upstream does
   (`logic/src/touch.rs`). Check it with step 6.
-- The clock (`src/bin/dashboard/clock.rs`): make sure that the PCF8563 answers at 0x51
-  and keeps the time with no USB power, that a read and a write of the RTC do not
-  disturb the GT911 on the same bus, and that SNTP gets a reply through the router.
-  Use step 13.
 - Measure the time of a full and of a partial refresh. The display task does not read
   the touch controller during a refresh. The core asks for a full refresh after 30
   partial renders and after 30 minutes (`shared/src/features/refresh.rs`). Change the
