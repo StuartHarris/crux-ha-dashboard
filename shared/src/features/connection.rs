@@ -271,12 +271,15 @@ pub fn mqtt(id: u32, event: MqttEvent, model: &mut Model) -> Cmd {
             else {
                 return Cmd::done();
             };
-            let draw = if shown_before || shows(model, &entity_id) {
-                redraw(model, false)
+            if !(shown_before || shows(model, &entity_id)) {
+                return Cmd::done();
+            }
+            if needs_clock(model) {
+                // The draw happens when the answer arrives.
+                read_message_time(model)
             } else {
-                Cmd::done()
-            };
-            draw.and(read_message_time(model))
+                redraw(model, false)
+            }
         }
         MqttEvent::Disconnected { .. } => {
             model.connection.mqtt = Link::Down;
@@ -308,8 +311,8 @@ fn shows(model: &Model, entity_id: &str) -> bool {
     })
 }
 
-/// Reads the clock for a state message that arrived, if the time on the
-/// screen can be out of date.
+/// Returns `true` if the core must read the clock for a change that the page
+/// shows.
 ///
 /// The core reads the clock at most once a minute, because a clock read
 /// costs an effect on the device. The rule is as follows:
@@ -318,30 +321,39 @@ fn shows(model: &Model, entity_id: &str) -> bool {
 /// - If the minute timer runs, the core does not read again. The core starts
 ///   this timer of [`CLOCK_INTERVAL`] when the answer arrives, also when the
 ///   time is not valid.
-/// - Otherwise, the core reads the clock.
+/// - Otherwise, the core must read the clock.
 ///
-/// Each new connection reads the clock for its first message.
+/// Each new connection reads the clock for its first change that the page
+/// shows.
+const fn needs_clock(model: &Model) -> bool {
+    !model.connection.clock_pending && !model.connection.clock_fresh
+}
+
+/// Reads the clock for a change that the current page shows.
 ///
-/// The time on the screen is therefore the time of a message that arrived
-/// less than one minute before the last message.
+/// The core calls this function only if [`needs_clock`] is `true`. The
+/// core does not draw now. [`message_time`] draws when the answer arrives,
+/// so one change gives one draw. The core does not read the clock for an
+/// entity that the page does not show.
 pub fn read_message_time(model: &mut Model) -> Cmd {
-    let state = &mut model.connection;
-    if state.clock_pending || state.clock_fresh {
-        return Cmd::done();
-    }
-    state.clock_pending = true;
+    model.connection.clock_pending = true;
     now().then_send(Event::MessageTime)
 }
 
-/// Records the time of a state message as the time of the last update, and
-/// starts the minute timer.
+/// Records the time of the last change that the page shows as `last_sync`,
+/// starts the minute timer, and draws.
 ///
-/// The core asks the shell to draw only if the minute of the time changed,
-/// because only the minute shows on the screen.
+/// If the time is not valid, `last_sync` keeps its value, and the draw still
+/// shows the change. The core always calls `redraw`. If the view is the same
+/// as the last view, `redraw` asks the shell to draw nothing. Only the minute
+/// shows on the screen, so the core keeps the start of the minute. Thus an
+/// answer in the same minute does not change the view and gives no extra
+/// draw.
+///
+/// `last_sync` is one value for all pages. After a page turn, the footer
+/// shows the time of the last change that any page showed.
 pub fn message_time(now: Option<DateTime<Utc>>, model: &mut Model) -> Cmd {
-    let before = model.last_sync.map(minute_of);
-    model.last_sync = now.or(model.last_sync);
-    let changed = model.last_sync.map(minute_of) != before;
+    model.last_sync = now.map(start_of_minute).or(model.last_sync);
 
     let state = &mut model.connection;
     state.clock_pending = false;
@@ -354,12 +366,7 @@ pub fn message_time(now: Option<DateTime<Utc>>, model: &mut Model) -> Cmd {
     } else {
         Cmd::done()
     };
-    let draw = if changed {
-        redraw(model, false)
-    } else {
-        Cmd::done()
-    };
-    draw.and(timer)
+    redraw(model, false).and(timer)
 }
 
 /// The minute timer `id` expired, so the next state message reads the clock
@@ -371,11 +378,11 @@ pub fn minute_passed(id: u32, model: &mut Model) -> Cmd {
     Cmd::done()
 }
 
-/// Returns the number of whole minutes since the Unix epoch. The UTC offset
-/// is a whole number of minutes, so two times with the same number show the
-/// same `HH:MM`.
-const fn minute_of(time: DateTime<Utc>) -> i64 {
-    time.timestamp().div_euclid(60)
+/// Returns the start of the minute of `time`. The UTC offset is a whole
+/// number of minutes, so the start of the minute shows the same `HH:MM`.
+fn start_of_minute(time: DateTime<Utc>) -> DateTime<Utc> {
+    let seconds = time.timestamp().div_euclid(60) * 60;
+    DateTime::from_timestamp(seconds, 0).unwrap_or(time)
 }
 
 fn connected(model: &mut Model) -> Cmd {

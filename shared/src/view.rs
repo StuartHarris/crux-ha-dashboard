@@ -54,20 +54,25 @@ pub struct ViewModel {
     /// also show it. For example, the simulator draws a red border round the
     /// panel when the dry run stops.
     pub read_only: bool,
-    /// The time at which the last state message arrived, in seconds since
+    /// The time of the last change that the page showed, in seconds since
     /// the Unix epoch. The shell keeps it during a deep sleep and gives it
     /// back in `Start`.
+    ///
+    /// This is one value for all pages. After a page turn, it is the time of
+    /// the last change that any page showed.
     pub last_sync: Option<u64>,
-    /// The freshness of the data, with the UK time of the last state message
-    /// as `HH:MM`.
+    /// The freshness of the data, with the UK time of the last change that the
+    /// page showed, as `HH:MM`. After a page turn, this is the time of the last
+    /// change that any page showed.
     ///
     /// - While the dashboard is connected, the text is `Live · HH:MM`, or
     ///   `Live` if the time is not known.
     /// - Without a connection, the text is `Updated HH:MM`, or empty if the
     ///   time is not known.
     ///
-    /// The time is not a clock. It changes only when a message arrives in a
-    /// new minute, so the panel does not refresh each minute.
+    /// The time is not a clock. It changes only when a change that the page
+    /// shows arrives in a new minute. A change that the page does not show
+    /// does not change it, so the panel does not refresh each minute.
     pub updated: String,
     /// A number that the core increases each time that the panel needs a
     /// full refresh, to clear ghost images.

@@ -1098,12 +1098,12 @@ mod tests {
         let mut fixture = Fixture::new();
         fixture.start(PowerSource::Battery);
         fixture.mqtt(1, MqttEvent::Connected);
-        // A state message reads the clock, and the core starts the minute
-        // timer.
+        // A state message for a tile on the page (the living room) reads the
+        // clock, and the core starts the minute timer.
         fixture.mqtt(
             1,
             MqttEvent::Message(Message {
-                topic: "homeassistant/statestream/light/all_lights/state".into(),
+                topic: "homeassistant/statestream/light/living_room_lights/state".into(),
                 payload: b"on".to_vec(),
             }),
         );
@@ -1138,12 +1138,13 @@ mod tests {
         assert_eq!(view.status, "Asleep, on battery, 1 tap not sent");
     }
 
-    /// A state message: the core reads the clock and sets `last_sync`.
+    /// A state message for a tile on the living room page: the core reads the
+    /// clock and sets `last_sync`.
     fn state_message(fixture: &mut Fixture, connection: u64) {
         fixture.mqtt(
             connection,
             MqttEvent::Message(Message {
-                topic: "homeassistant/statestream/light/all_lights/state".into(),
+                topic: "homeassistant/statestream/light/living_room_lights/state".into(),
                 payload: b"on".to_vec(),
             }),
         );

@@ -130,16 +130,17 @@ fn a_message_for_a_visible_tile_draws_the_new_state() {
         ))
         .unwrap();
     let event = cmd.expect_one_event();
+    // The clock is stale, so the core only reads the clock. The answer draws.
     let time = app
         .update(event, &mut model)
-        .expect_render()
         .resolve_time_now(|_| instant(super::NOW))
         .expect_event();
     app.update(time, &mut model)
         .expect_render()
         .expect_only_time_notify_after();
 
-    // The minute timer runs, so the core does not read the clock again.
+    // The minute timer runs, so the core does not read the clock again and
+    // draws at once.
     request
         .resolve(message(
             "homeassistant/statestream/light/all_lights/brightness",
@@ -184,11 +185,9 @@ fn a_message_for_another_page_changes_the_state_but_does_not_draw() {
         ))
         .unwrap();
     let event = cmd.expect_one_event();
-    // The state changed but does not show, so the core only reads the clock.
-    let _time = app
-        .update(event, &mut model)
-        .expect_one_effect()
-        .expect_time_now();
+    // The state changed but does not show, so the core does not draw and
+    // does not read the clock.
+    app.update(event, &mut model).expect_no_effects();
     assert_eq!(
         model
             .entities
@@ -207,7 +206,8 @@ fn on_the_index_a_message_draws_only_if_a_summary_changes() {
     let lights = |model: &Model| app.view(model).index().unwrap().rooms[7].lights.clone();
     assert_eq!(lights(&model), [Unavailable; 3]);
 
-    // The summary of the Loft shows the new state with a partial redraw.
+    // The summary of the Loft shows the new state. The clock is stale, so
+    // the core reads the clock, and the answer draws once.
     request
         .resolve(message(
             "homeassistant/statestream/light/loft_loft_1/state",
@@ -215,11 +215,13 @@ fn on_the_index_a_message_draws_only_if_a_summary_changes() {
         ))
         .unwrap();
     let event = cmd.expect_one_event();
-    let _time = app
+    let time = app
         .update(event, &mut model)
+        .resolve_time_now(|_| instant(super::NOW))
+        .expect_event();
+    app.update(time, &mut model)
         .expect_render()
-        .expect_one_effect()
-        .expect_time_now();
+        .expect_only_time_notify_after();
     assert_eq!(lights(&model), [On, Unavailable, Unavailable]);
     assert_eq!(app.view(&model).full_refresh_seq, 1);
 
@@ -448,11 +450,10 @@ const VISIBLE: &str = "homeassistant/statestream/light/all_lights/state";
 /// show: no summary of a room shows the humidity.
 const HIDDEN: &str = "homeassistant/statestream/sensor/living_room_thermometer_humidity/state";
 
-/// Sends a state message for a tile on another page, so the message itself
-/// does not draw. If the core reads the clock, the clock gives `time` (in
-/// seconds since the Unix epoch, or `None` for a clock with no valid time).
-/// Returns the command of the clock answer, or `None` if the core did not
-/// read the clock.
+/// Sends a state message for a tile that the index page shows. If the core
+/// reads the clock, the clock gives `time` (in seconds since the Unix epoch,
+/// or `None` for a clock with no valid time). Returns the command of the
+/// clock answer, or `None` if the core did not read the clock.
 fn deliver(
     model: &mut Model,
     cmd: &mut Cmd,
@@ -462,18 +463,23 @@ fn deliver(
     // Each call changes the state, so that the core does not ignore it.
     let payload = if model
         .entities
-        .get("sensor.living_room_thermometer_humidity")
+        .get("light.all_lights")
         .is_some_and(|entity| entity.state.as_deref() == Some("on"))
     {
         "off"
     } else {
         "on"
     };
-    request.resolve(message(HIDDEN, payload)).unwrap();
+    request.resolve(message(VISIBLE, payload)).unwrap();
     let event = cmd.expect_one_event();
     let mut update = Dashboard.update(event, model);
     let mut effects: Vec<_> = update.effects().collect();
+    // Without a clock read, the change draws at once.
     let effect = effects.pop()?;
+    if matches!(effect, Effect::Render(_)) {
+        assert!(effects.is_empty());
+        return None;
+    }
     assert!(effects.is_empty());
     let mut now = effect.expect_time_now();
     // A time before 2025 is not valid: 90 seconds after the start.
@@ -490,24 +496,23 @@ fn a_burst_of_messages_reads_the_clock_once() {
     request.resolve(message(VISIBLE, "on")).unwrap();
     let event = cmd.expect_one_event();
     let mut first = app.update(event, &mut model);
-    first.expect_render();
+    // The core only reads the clock. The answer draws.
     let mut now = first.expect_one_effect().expect_time_now();
 
     // More messages arrive while the core waits for the answer, so they do
-    // not read the clock.
-    for (topic, payload) in [
-        (HIDDEN, "on"),
-        ("homeassistant/statestream/weather/home/state", "rainy"),
-    ] {
-        request.resolve(message(topic, payload)).unwrap();
-        let event = cmd.expect_one_event();
-        let reads = app
-            .update(event, &mut model)
-            .effects()
-            .filter(|effect| matches!(effect, Effect::TimeNow(_)))
-            .count();
-        assert_eq!(reads, 0, "{topic}");
-    }
+    // not read the clock. A message for a tile that the page shows draws at
+    // once. A message for another tile does nothing.
+    request.resolve(message(HIDDEN, "on")).unwrap();
+    let event = cmd.expect_one_event();
+    app.update(event, &mut model).expect_no_effects();
+    request
+        .resolve(message(
+            "homeassistant/statestream/weather/home/state",
+            "rainy",
+        ))
+        .unwrap();
+    let event = cmd.expect_one_event();
+    app.update(event, &mut model).expect_only_render();
     assert_eq!(app.view(&model).updated, "Live");
 
     now.resolve(instant(super::NOW)).unwrap();
@@ -552,7 +557,7 @@ fn a_message_reads_the_clock_again_only_after_the_minute_timer() {
 }
 
 #[test]
-fn a_new_time_in_the_same_minute_does_not_draw() {
+fn a_new_time_in_the_same_minute_draws_only_the_change() {
     let app = Dashboard;
     let (mut model, mut cmd, mut request) = drive_to_connected(PowerSource::Stand);
     let _ = deliver(&mut model, &mut cmd, &mut request, Some(super::NOW + 5));
@@ -561,8 +566,50 @@ fn a_new_time_in_the_same_minute_does_not_draw() {
         .expect_no_effects();
 
     let later = Some(super::NOW + 59);
-    deliver(&mut model, &mut cmd, &mut request, later)
-        .unwrap()
+    // The entity change draws once. The time in the text stays the same.
+    let mut answer = deliver(&mut model, &mut cmd, &mut request, later).unwrap();
+    let effects: Vec<_> = answer.effects().collect();
+    assert_eq!(effects.len(), 2, "one render and the minute timer");
+    assert_eq!(
+        effects
+            .iter()
+            .filter(|effect| matches!(effect, Effect::Render(_)))
+            .count(),
+        1
+    );
+    assert_eq!(app.view(&model).updated, "Live · 09:41");
+}
+
+#[test]
+fn a_clock_answer_in_the_same_minute_after_a_draw_does_not_draw_again() {
+    let app = Dashboard;
+    let (mut model, mut cmd, mut request) = drive_to_connected(PowerSource::Stand);
+    let _ = deliver(&mut model, &mut cmd, &mut request, Some(super::NOW + 5));
+    let id = model.connection.minute;
+    app.update(Event::MinutePassed(id), &mut model)
+        .expect_no_effects();
+
+    // The first change only reads the clock. `deliver` turned the light on.
+    request.resolve(message(VISIBLE, "off")).unwrap();
+    let event = cmd.expect_one_event();
+    let mut first = app.update(event, &mut model);
+    let mut now = first.expect_one_effect().expect_time_now();
+
+    // A second change arrives while the core waits, so it draws at once. The
+    // draw shows both changes.
+    request
+        .resolve(message(
+            "homeassistant/statestream/weather/home/state",
+            "rainy",
+        ))
+        .unwrap();
+    let event = cmd.expect_one_event();
+    app.update(event, &mut model).expect_only_render();
+
+    // The answer is in the same minute, so the view does not change.
+    now.resolve(instant(super::NOW + 30)).unwrap();
+    let answer = first.expect_one_event();
+    app.update(answer, &mut model)
         .expect_only_time_notify_after();
     assert_eq!(app.view(&model).updated, "Live · 09:41");
 }
@@ -585,9 +632,10 @@ fn a_clock_with_no_valid_time_shows_live_and_waits_a_minute() {
     let (mut model, mut cmd, mut request) = drive_to_connected(PowerSource::Stand);
 
     // A device with no network time yet: 90 seconds after the start. The
-    // text stays the same, so the core does not draw.
+    // text stays the same, but the entity change still draws.
     deliver(&mut model, &mut cmd, &mut request, None)
         .unwrap()
+        .expect_render()
         .expect_only_time_notify_after();
     assert_eq!(app.view(&model).updated, "Live");
     assert_eq!(app.view(&model).last_sync, None);
@@ -608,4 +656,55 @@ fn the_time_of_the_last_message_is_a_uk_time() {
     // In winter, the UK time is UTC: 2026-12-01T08:41:00Z.
     model.last_sync = chrono::DateTime::from_timestamp(1_796_114_460, 0);
     assert_eq!(app.view(&model).updated, "Live · 08:41");
+}
+
+#[test]
+fn a_hidden_change_with_a_stale_clock_gives_no_effects() {
+    let app = Dashboard;
+    let (mut model, mut cmd, mut request) = drive_to_connected(PowerSource::Stand);
+    assert!(!model.connection.clock_fresh);
+
+    request.resolve(message(HIDDEN, "on")).unwrap();
+    let event = cmd.expect_one_event();
+    app.update(event, &mut model).expect_no_effects();
+    // The state changed, but the clock was not read.
+    assert!(!model.connection.clock_pending);
+    assert_eq!(model.last_sync, None);
+    assert_eq!(app.view(&model).updated, "Live");
+}
+
+#[test]
+fn a_visible_change_with_a_stale_clock_draws_once_after_the_clock_answers() {
+    let app = Dashboard;
+    let (mut model, mut cmd, mut request) = drive_to_connected(PowerSource::Stand);
+
+    request.resolve(message(VISIBLE, "on")).unwrap();
+    let event = cmd.expect_one_event();
+    // Step 1: only the clock read. No draw yet.
+    let mut update = app.update(event, &mut model);
+    let mut now = update.expect_one_effect().expect_time_now();
+
+    // Step 2: the answer gives one render, and starts the minute timer.
+    now.resolve(instant(super::NOW)).unwrap();
+    let answer = update.expect_one_event();
+    let mut draw = app.update(answer, &mut model);
+    let effects: Vec<_> = draw.effects().collect();
+    assert_eq!(effects.len(), 2, "one render and the minute timer");
+    assert!(matches!(effects[0], Effect::Render(_)));
+    assert!(matches!(effects[1], Effect::TimeNotifyAfter(_)));
+    assert_eq!(app.view(&model).updated, "Live · 09:41");
+}
+
+#[test]
+fn a_visible_change_with_a_fresh_clock_draws_at_once() {
+    let app = Dashboard;
+    let (mut model, mut cmd, mut request) = drive_to_connected(PowerSource::Stand);
+    let _ = deliver(&mut model, &mut cmd, &mut request, Some(super::NOW));
+    assert!(model.connection.clock_fresh);
+
+    request.resolve(message(VISIBLE, "unavailable")).unwrap();
+    let event = cmd.expect_one_event();
+    app.update(event, &mut model).expect_only_render();
+    // The time is the time of the last read.
+    assert_eq!(app.view(&model).updated, "Live · 09:41");
 }

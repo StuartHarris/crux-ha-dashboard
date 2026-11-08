@@ -249,9 +249,10 @@ pub struct Model {
     pub connection: connection::State,
     /// The power source and the sleep state.
     pub power: power::State,
-    /// The time at which the last state message arrived. The core reads
-    /// the clock at most once a minute, so the time can be up to one minute
-    /// before the arrival of the last message. Refer to
+    /// The time of the last change that the current page showed. The core
+    /// reads the clock at most once a minute, so the time can be up to one
+    /// minute before that change. After a page turn, it is the time of the
+    /// last change that any page showed. Refer to
     /// [`connection::read_message_time`].
     pub last_sync: Option<DateTime<Utc>>,
     /// The number of service calls that the core dropped, because it slept

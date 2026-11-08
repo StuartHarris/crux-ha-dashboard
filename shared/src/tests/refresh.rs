@@ -191,7 +191,8 @@ fn many_state_messages_give_a_full_refresh_after_the_partial_renders() {
     shell.send(start(PowerSource::Stand));
     let first = shell.frames.len();
 
-    // Each message for a visible tile draws once.
+    // Each message for a visible tile draws once, with no extra draw for the
+    // time.
     for index in 0..=PARTIALS_PER_FULL {
         let state = if index % 2 == 0 { "on" } else { "off" };
         shell.broker.set_state("light.all_lights", state, &[]);
@@ -202,4 +203,33 @@ fn many_state_messages_give_a_full_refresh_after_the_partial_renders() {
         .filter(|frame| frame.full)
         .count();
     assert_eq!(full, 1);
+}
+
+#[test]
+fn changes_for_another_room_over_many_minutes_draw_nothing() {
+    let mut shell = Shell::new();
+    shell.send(start(PowerSource::Stand));
+    // The index page does not show the humidity of a room.
+    shell
+        .broker
+        .set_state("sensor.living_room_thermometer_humidity", "40", &[]);
+    shell.run();
+    let frames = shell.frames.len();
+    shell.take_log();
+
+    // More than a minute passes with changes at the start and the end.
+    for (humidity, minutes) in [("41", 0), ("42", 1), ("43", 2)] {
+        for _ in 0..minutes {
+            shell.fire_timers();
+        }
+        shell
+            .broker
+            .set_state("sensor.living_room_thermometer_humidity", humidity, &[]);
+        shell.run();
+    }
+    assert_eq!(shell.frames.len(), frames);
+    let log = shell.take_log();
+    assert!(!log.contains(&"Render".into()), "{log:?}");
+    assert!(!log.contains(&"TimeNow".into()), "{log:?}");
+    assert_eq!(shell.view().updated, "Live");
 }
