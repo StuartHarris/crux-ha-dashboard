@@ -17,13 +17,13 @@
 use std::{
     collections::{HashMap, VecDeque},
     sync::{Arc, mpsc},
-    time::{Duration, SystemTime},
+    time::Duration,
 };
 
 use embedded_graphics::prelude::Point;
 
 use crux_core::{Request, capability::Operation};
-use crux_time::{Instant, TimerId, operation::NotifyAfter};
+use crux_time::{TimerId, operation::NotifyAfter};
 use shared::{
     Core, Dashboard, Effect, Event, PowerSource, Settings, Start, ViewModel,
     capabilities::{
@@ -472,16 +472,6 @@ impl Shell {
                 );
                 Vec::new()
             }
-            Effect::TimeNow(mut request) => {
-                let now = SystemTime::now();
-                let local: chrono::DateTime<chrono::Local> = now.into();
-                self.inspector.effect(
-                    "TimeNow",
-                    String::new(),
-                    format!("resolved: {}", local.format("%H:%M:%S%.3f")),
-                );
-                resolve(&self.core, &mut request, Instant::from(now))
-            }
             Effect::TimeNotifyAfter(request) => {
                 let id = request.operation.id;
                 let duration = Duration::from(request.operation.duration);
@@ -673,7 +663,7 @@ mod tests {
     use shared::{
         Control, Event, PowerSource, Settings,
         capabilities::mqtt::{Connect, Credentials, Message, MqttEvent, Publish},
-        features::{connection::CLOCK_INTERVAL, refresh::FULL_REFRESH_INTERVAL},
+        features::refresh::{DRAW_DELAY, FULL_REFRESH_INTERVAL},
     };
     use tokio::runtime::Runtime;
 
@@ -1098,8 +1088,8 @@ mod tests {
         let mut fixture = Fixture::new();
         fixture.start(PowerSource::Battery);
         fixture.mqtt(1, MqttEvent::Connected);
-        // A state message for a tile on the page (the living room) reads the
-        // clock, and the core starts the minute timer.
+        // A state message for a tile on the page (the living room) starts the
+        // draw timer.
         fixture.mqtt(
             1,
             MqttEvent::Message(Message {
@@ -1109,15 +1099,13 @@ mod tests {
         );
         let mut running = durations(fixture.shell());
         running.sort();
-        assert_eq!(
-            running,
-            [IDLE_TIMEOUT, CLOCK_INTERVAL, FULL_REFRESH_INTERVAL]
-        );
+        assert_eq!(running, [DRAW_DELAY, IDLE_TIMEOUT, FULL_REFRESH_INTERVAL]);
 
         assert!(fixture.shell().sleep_now());
         assert!(fixture.shell().view().asleep);
-        // The core clears the full-refresh timer before it sleeps.
-        assert_eq!(durations(fixture.shell()), [CLOCK_INTERVAL]);
+        // The core clears the full-refresh timer before it sleeps. The draw
+        // timer is now stale, and draws nothing when it fires.
+        assert_eq!(durations(fixture.shell()), [DRAW_DELAY]);
     }
 
     #[test]
@@ -1138,17 +1126,23 @@ mod tests {
         assert_eq!(view.status, "Asleep, on battery, 1 tap not sent");
     }
 
-    /// A state message for a tile on the dining room page: the core reads the
-    /// clock and gives the entity its change time. On the dining room page,
+    /// A change of a tile on the dining room page: the state, then the time
+    /// of the update from Home Assistant. On the dining room page,
     /// `last_sync` is then this time.
     fn state_message(fixture: &mut Fixture, connection: u64) {
-        fixture.mqtt(
-            connection,
-            MqttEvent::Message(Message {
-                topic: "homeassistant/statestream/light/dining_room_lights/state".into(),
-                payload: b"on".to_vec(),
-            }),
-        );
+        let base = "homeassistant/statestream/light/dining_room_lights";
+        for (key, payload) in [
+            ("state", "on"),
+            ("last_updated", "2026-11-08T14:03:21+00:00"),
+        ] {
+            fixture.mqtt(
+                connection,
+                MqttEvent::Message(Message {
+                    topic: format!("{base}/{key}"),
+                    payload: payload.as_bytes().to_vec(),
+                }),
+            );
+        }
     }
 
     #[test]

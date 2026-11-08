@@ -23,7 +23,7 @@ use alloc::{boxed::Box, string::String, vec::Vec};
 
 use crux_core::{Request, capability::Operation};
 use crux_time::{
-    Instant, TimerId,
+    TimerId,
     operation::{ClearTimer, NotifyAfter},
 };
 use embedded_graphics::prelude::Point;
@@ -146,7 +146,6 @@ struct Timer {
 /// The shell logic. One task owns it.
 pub struct Shell {
     core: Core<Dashboard>,
-    clock: fn() -> Instant,
     /// The connections whose streams did not end, from the oldest.
     connections: Vec<(u32, Request<Connect>)>,
     /// The id of the connection to which subscribe, publish and disconnect
@@ -160,13 +159,18 @@ pub struct Shell {
     last_wifi_token: u32,
 }
 
+impl Default for Shell {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Shell {
-    /// Makes a shell. `clock` reads the wall clock.
+    /// Makes a shell.
     #[must_use]
-    pub fn new(clock: fn() -> Instant) -> Self {
+    pub fn new() -> Self {
         Self {
             core: Core::new(),
-            clock,
             connections: Vec::new(),
             current: None,
             last_connection: 0,
@@ -324,10 +328,6 @@ impl Shell {
             Effect::Sleep(request) => {
                 jobs.push(Job::Sleep(request.operation));
                 Vec::new()
-            }
-            Effect::TimeNow(mut request) => {
-                let now = (self.clock)();
-                resolve(&self.core, &mut request, now)
             }
             Effect::TimeNotifyAfter(request) => {
                 let op = request.operation;

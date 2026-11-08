@@ -1,7 +1,7 @@
 //! The connection feature: Wi-Fi, the MQTT connection, reconnects, and the
 //! messages from the Home Assistant state stream.
 
-use alloc::{string::String, vec::Vec};
+use alloc::vec::Vec;
 use core::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -10,13 +10,12 @@ use futures::StreamExt;
 
 use crate::{
     Cmd, Event, Model,
-    app::now,
     capabilities::{
         mqtt::{Connect, LastWill, Mqtt, MqttEvent, Publish, Qos},
         network::{Network, WifiStatus},
     },
     entities,
-    features::refresh::redraw,
+    features::refresh::{redraw, redraw_soon},
     summary,
 };
 
@@ -29,9 +28,6 @@ pub const RECONNECT_MAX: Duration = Duration::from_secs(60);
 pub const OUTBOX_LIMIT: usize = 8;
 /// The MQTT keep-alive interval in seconds.
 pub const KEEP_ALIVE_SECS: u16 = 60;
-/// The shortest time between two clock reads for state messages. Refer to
-/// [`read_message_time`].
-pub const CLOCK_INTERVAL: Duration = Duration::from_secs(60);
 
 /// The status payload while the dashboard is connected.
 pub const STATUS_ONLINE: &str = "online";
@@ -69,21 +65,6 @@ pub struct State {
     pub backoff: Duration,
     /// The service calls that wait for a connection.
     pub outbox: Vec<Publish>,
-    /// The core asked the clock for the time of a state message, and waits
-    /// for the answer.
-    pub clock_pending: bool,
-    /// The minute timer runs. Until it expires, the core does not read the
-    /// clock for a state message. The core uses [`State::clock`] for the
-    /// change time.
-    pub clock_fresh: bool,
-    /// The time of the last valid clock answer, at the start of the minute,
-    /// or `None` if no answer was valid.
-    pub clock: Option<DateTime<Utc>>,
-    /// The entities that changed while the clock was not fresh. They get
-    /// their change time when the clock answers. Refer to [`message_time`].
-    pub unstamped: Vec<String>,
-    /// The id of the newest minute timer.
-    pub minute: u32,
 }
 
 impl Default for State {
@@ -96,11 +77,6 @@ impl Default for State {
             reconnect: 0,
             backoff: RECONNECT_MIN,
             outbox: Vec::new(),
-            clock_pending: false,
-            clock_fresh: false,
-            clock: None,
-            unstamped: Vec::new(),
-            minute: 0,
         }
     }
 }
@@ -280,30 +256,12 @@ pub fn mqtt(id: u32, event: MqttEvent, model: &mut Model) -> Cmd {
             else {
                 return Cmd::done();
             };
-            let shown = shown_before || shows(model, &entity_id);
-            if model.connection.clock_fresh {
-                // With no valid answer yet, the entity waits for the next
-                // answer.
-                if let Some(time) = model.connection.clock {
-                    model.changed_at.insert(entity_id, time);
-                } else if !model.connection.unstamped.contains(&entity_id) {
-                    model.connection.unstamped.push(entity_id);
-                }
-                return if shown {
-                    redraw(model, false)
-                } else {
-                    Cmd::done()
-                };
-            }
-            // The entity gets its time, and the page draws, when the clock
-            // answers.
-            if !model.connection.unstamped.contains(&entity_id) {
-                model.connection.unstamped.push(entity_id);
-            }
-            if model.connection.clock_pending {
-                Cmd::done()
+            // The draw waits for the other messages of the change. Refer to
+            // [`redraw_soon`].
+            if shown_before || shows(model, &entity_id) {
+                redraw_soon(model)
             } else {
-                read_message_time(model)
+                Cmd::done()
             }
         }
         MqttEvent::Disconnected { .. } => {
@@ -336,99 +294,24 @@ pub(crate) fn shows(model: &Model, entity_id: &str) -> bool {
     })
 }
 
-/// Returns the footer time of the current page: the latest change time of
-/// the entities that the page shows.
+/// Returns the footer time of the current page: the latest `last_updated`
+/// of the entities that the page shows.
 ///
-/// If no entity on the page has a change time, the time is
+/// The times come from Home Assistant, not from the clock of the device.
+/// Refer to [`entities`] for the reason that the core uses `last_updated`.
+/// If no entity on the page has a time, the footer time is
 /// [`Model::last_sync`], the time that the shell kept through a deep sleep.
 /// Each page has its own time, so a change on another page does not change
 /// the time of this page.
 #[must_use]
 pub fn page_time(model: &Model) -> Option<DateTime<Utc>> {
     model
-        .changed_at
-        .iter()
+        .entities
+        .last_updated()
         .filter(|(entity_id, _)| shows(model, entity_id))
-        .map(|(_, time)| *time)
+        .map(|(_, time)| time)
         .max()
         .or(model.last_sync)
-}
-
-/// Reads the clock for the entities in [`State::unstamped`].
-///
-/// The core calls this function only if the clock is not fresh and no clock
-/// read waits for its answer. Each changed entity gets a change time, also
-/// an entity that the page does not show. The core reads the clock at most
-/// once a minute, because a clock read costs an effect on the device. The
-/// rule is as follows:
-///
-/// - If the minute timer runs, the clock is fresh. The core gives the entity
-///   the time of the last valid answer at once, and does not read the clock.
-/// - If a clock read waits for its answer, the core does not read again.
-///   The entity waits for that answer.
-/// - Otherwise, the core reads the clock.
-///
-/// The core starts the minute timer of [`CLOCK_INTERVAL`] when the answer
-/// arrives, also when the time is not valid. Each new connection reads the
-/// clock for its first change.
-///
-/// The core does not draw now. [`message_time`] draws when the answer
-/// arrives, so one change gives one draw.
-pub fn read_message_time(model: &mut Model) -> Cmd {
-    model.connection.clock_pending = true;
-    now().then_send(Event::MessageTime)
-}
-
-/// Gives each entity that waits for the clock the time `now`, starts the
-/// minute timer, and draws.
-///
-/// The core keeps the start of the minute, because only the minute shows on
-/// the screen. If `now` is not valid, the entities get the time of the last
-/// valid answer. If no answer was valid, the entities get no time. The list
-/// of entities that wait is empty after the answer.
-///
-/// The core always calls `redraw`. If the view is the same as the last view,
-/// `redraw` asks the shell to draw nothing. Thus an answer for a change that
-/// the page does not show draws nothing. An answer in the same minute as
-/// the footer time also draws nothing, unless a tile changed.
-pub fn message_time(now: Option<DateTime<Utc>>, model: &mut Model) -> Cmd {
-    let state = &mut model.connection;
-    state.clock = now.map(start_of_minute).or(state.clock);
-    let unstamped = core::mem::take(&mut state.unstamped);
-    if let Some(time) = state.clock {
-        for entity_id in unstamped {
-            model.changed_at.insert(entity_id, time);
-        }
-    }
-
-    let state = &mut model.connection;
-    state.clock_pending = false;
-    state.minute = state.minute.wrapping_add(1);
-    state.clock_fresh = state.mqtt == Link::Up;
-    let timer = if state.clock_fresh {
-        let id = state.minute;
-        let (timer, _handle) = Time::notify_after(CLOCK_INTERVAL);
-        timer.then_send(move |_| Event::MinutePassed(id))
-    } else {
-        Cmd::done()
-    };
-    redraw(model, false).and(timer)
-}
-
-/// The minute timer `id` expired, so the clock is not fresh. The next
-/// changed entity reads the clock again. The core ignores an older timer.
-pub fn minute_passed(id: u32, model: &mut Model) -> Cmd {
-    if id == model.connection.minute {
-        model.connection.clock_fresh = false;
-    }
-    Cmd::done()
-}
-
-/// Returns the start of the minute of `time`. The UTC offset is a whole
-/// number of minutes, so the start of the minute shows the same `HH:MM`.
-fn start_of_minute(time: DateTime<Utc>) -> DateTime<Utc> {
-    let seconds = time.timestamp().div_euclid(60) * 60;
-    DateTime::from_timestamp(seconds, 0).unwrap_or(time)
 }
 
 fn connected(model: &mut Model) -> Cmd {
@@ -443,10 +326,6 @@ fn connected(model: &mut Model) -> Cmd {
     };
     model.connection.mqtt = Link::Up;
     model.connection.backoff = RECONNECT_MIN;
-    // The first change of each connection reads the clock. The core ignores
-    // a minute timer from before.
-    model.connection.clock_fresh = false;
-    model.connection.minute = model.connection.minute.wrapping_add(1);
     model.unsent = 0;
 
     let mut commands = alloc::vec![

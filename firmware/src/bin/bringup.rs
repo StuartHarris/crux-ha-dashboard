@@ -134,7 +134,7 @@ async fn main(spawner: Spawner) -> ! {
     Timer::after(PAUSE).await;
 
     log::info!("step 5: a page of the dashboard");
-    let mut shell = Shell::new(|| crux_time::Instant::new(0, 0));
+    let mut shell = Shell::new();
     // A dry run, so the check publishes no service call.
     let dry_run = logic::config::Config {
         read_only: true,

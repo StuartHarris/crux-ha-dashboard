@@ -210,11 +210,11 @@ fn page_events_while_asleep_do_nothing() {
 #[test]
 fn no_other_timer_waits_for_the_idle_timeout() {
     use crate::features::{
-        connection::{CLOCK_INTERVAL, RECONNECT_MAX, RECONNECT_MIN},
-        refresh::FULL_REFRESH_INTERVAL,
+        connection::{RECONNECT_MAX, RECONNECT_MIN},
+        refresh::{DRAW_DELAY, FULL_REFRESH_INTERVAL},
     };
 
-    assert_ne!(CLOCK_INTERVAL, IDLE_TIMEOUT);
+    assert_ne!(DRAW_DELAY, IDLE_TIMEOUT);
     assert_ne!(FULL_REFRESH_INTERVAL, IDLE_TIMEOUT);
     let mut wait = RECONNECT_MIN;
     while wait < RECONNECT_MAX {

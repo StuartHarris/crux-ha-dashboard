@@ -24,23 +24,39 @@ The Home Assistant `mqtt_statestream` integration publishes each entity on the
 | Topic | Payload |
 | --- | --- |
 | `homeassistant/statestream/<domain>/<object_id>/state` | The state as plain text, for example `on`, `21.5` or `unavailable` |
+| `homeassistant/statestream/<domain>/<object_id>/last_updated` | The time of the last update as plain ISO 8601 text from Python `datetime.isoformat()`, with no quotes, for example `2026-11-08T14:03:21.123456+00:00`. If the microseconds are 0, the text has none, for example `2026-11-08T14:03:21+00:00`. |
+| `homeassistant/statestream/<domain>/<object_id>/last_changed` | The time of the last state change, in the same format. The dashboard does not subscribe to it. |
 | `homeassistant/statestream/<domain>/<object_id>/<attribute>` | The attribute as JSON, for example `128`, `"°C"` or `null` |
+
+For each change, the integration publishes `state`, then `last_updated`, then
+`last_changed`, then each attribute.
 
 - All messages are retained, with QoS 1. When the dashboard subscribes, the broker
   sends the last state of each entity immediately. A wake on battery gets the full
   state in one connection.
-- The integration publishes all attributes of each entity. The dashboard subscribes
-  only to the attributes that its tiles show:
+- The integration publishes all attributes of each entity. For each entity, the
+  dashboard subscribes to `state`, to `last_updated`, and only to the attributes that
+  its tile shows:
 
-  | Tile kind | Attributes |
+  | Tile kind | Keys |
   | --- | --- |
-  | Light | `brightness` |
-  | Switch | none |
-  | Sensor | `unit_of_measurement` |
-  | Climate | `current_temperature`, `temperature` |
-  | Weather | `temperature`, `temperature_unit` |
+  | Light | `state`, `last_updated`, `brightness` |
+  | Switch | `state`, `last_updated` |
+  | Sensor | `state`, `last_updated`, `unit_of_measurement` |
+  | Climate | `state`, `last_updated`, `current_temperature`, `temperature` |
+  | Weather | `state`, `last_updated`, `temperature`, `temperature_unit` |
 
-- The integration does not publish timestamps (`publish_timestamps: false`).
+- The integration publishes timestamps (`publish_timestamps: true`). The footer of the
+  dashboard shows "Last changed HH:MM": the latest `last_updated` time of the entities
+  on the page, in UK time. The dashboard does not read its own clock for this time.
+- The dashboard uses `last_updated` and not `last_changed`. Home Assistant moves
+  `last_changed` only when the state changes. The current temperature of a thermostat,
+  the temperature of the weather and the brightness of a light are attributes. A
+  change to one of them moves `last_updated`, but not `last_changed`.
+- The dashboard ignores a `last_updated` payload that is not valid ISO 8601 text. It
+  keeps the time to the minute, because the footer shows only the minute.
+- The messages of one change arrive a few milliseconds apart. The dashboard waits
+  200 ms after a change that the page shows, and then draws all the changes once.
 - The integration publishes an entity only when its state or attributes change. It
   does not publish the current states when Home Assistant starts. The automation
   `dashboard_statestream_seed` publishes them (refer to "Seed the state stream").
@@ -53,6 +69,9 @@ source does: each `mqtt.async_publish` call in
 If you add an entity to `pages.rs`, add it to the `include` list on the Pi too. Add it
 to the list of entities in `dashboard_statestream_seed` too. Then restart Home
 Assistant. If you do not, the tile shows `-`.
+
+The `mqtt_statestream` configuration must have `publish_timestamps: true`. Without it,
+the footer shows no time, or the time that the dashboard kept through a deep sleep.
 
 Run `just ha-entities --statestream` to get the lines for the `include` list. Run
 `just ha-entities` to get a bare list of the entities, to compare with the Pi.
@@ -71,10 +90,12 @@ The automation runs at these times:
   dashboard gets the current states when it connects.
 
 The automation publishes to the same topics, in the same format, as the integration.
-The state is plain text. Each attribute that the dashboard reads is JSON (`brightness`,
-`unit_of_measurement`, `current_temperature`, `temperature` and `temperature_unit`).
-The automation publishes an attribute only if the entity has it. The messages are
-retained, with QoS 1. The core cannot tell which of the two publishers sent a message.
+The state is plain text. The automation also publishes `last_updated` of each entity
+as plain ISO 8601 text, with no quotes, in the same format as the integration. Each
+attribute that the dashboard reads is JSON (`brightness`, `unit_of_measurement`,
+`current_temperature`, `temperature` and `temperature_unit`). The automation publishes
+an attribute only if the entity has it. The messages are retained, with QoS 1. The
+core cannot tell which of the two publishers sent a message.
 
 The automation has its own list of entities. That list must be the same as the
 `include` list. The `rpi` runbook has a command that compares the two lists.

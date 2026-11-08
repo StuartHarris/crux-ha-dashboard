@@ -391,7 +391,8 @@ mod tests {
             };
             let id = format!("{domain}.{object_id}");
             assert!(ids.contains(&id.as_str()), "{topic}");
-            assert!(name == "state" || names.contains(&name), "{topic}");
+            let fixed = name == "state" || name == crate::entities::LAST_UPDATED;
+            assert!(fixed || names.contains(&name), "{topic}");
         }
     }
 

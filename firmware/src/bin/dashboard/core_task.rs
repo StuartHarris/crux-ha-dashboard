@@ -13,11 +13,11 @@ use shared::{
     capabilities::network::{WifiOff, WifiOn},
 };
 
-use crate::{MQTT, RENDER, SIGNALS, TIMERS, WIFI, clock, config::CONFIG, timers::Request};
+use crate::{MQTT, RENDER, SIGNALS, TIMERS, WIFI, config::CONFIG, timers::Request};
 
 /// Starts the core, then gives it each signal from the other tasks.
 pub async fn run() -> ! {
-    let mut shell = Shell::new(clock::now);
+    let mut shell = Shell::new();
     if CONFIG.read_only {
         log::info!("core: dry run, so a tap publishes no service call");
     }

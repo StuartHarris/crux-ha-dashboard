@@ -54,6 +54,9 @@ pub struct Broker {
     pub connections: usize,
     /// The topics of the messages that the broker sent to the dashboard.
     pub delivered: Vec<String>,
+    /// The clock of Home Assistant, in seconds since the Unix epoch. Home
+    /// Assistant publishes it as `last_updated` with each change.
+    pub time: u64,
 }
 
 impl Broker {
@@ -172,13 +175,17 @@ impl Broker {
         }
     }
 
-    /// Publishes an entity state and attributes as Home Assistant does.
+    /// Publishes an entity state, the time of the update and the attributes,
+    /// in this order, as Home Assistant does with `publish_timestamps: true`.
     ///
-    /// Each attribute value is JSON, for example `128` or `"°C"`.
+    /// The time of the update is [`Broker::time`], as ISO 8601 text. Each
+    /// attribute value is JSON, for example `128` or `"°C"`.
     pub fn set_state(&mut self, entity_id: &str, state: &str, attributes: &[(&str, &str)]) {
         let (domain, object_id) = entity_id.split_once('.').expect("an entity id");
         let base = format!("{STATESTREAM}/{domain}/{object_id}");
         self.publish(&format!("{base}/state"), state.as_bytes(), true);
+        let updated = iso_time(self.time);
+        self.publish(&format!("{base}/last_updated"), updated.as_bytes(), true);
         for (name, value) in attributes {
             self.publish(&format!("{base}/{name}"), value.as_bytes(), true);
         }
@@ -236,6 +243,14 @@ impl Broker {
             self.set_state(entity_id, "on", &[("brightness", &next.to_string())]);
         }
     }
+}
+
+/// Returns the time `seconds` after the Unix epoch as Python `isoformat()`
+/// gives it, for example `2026-07-01T08:41:00+00:00`.
+pub fn iso_time(seconds: u64) -> String {
+    chrono::DateTime::from_timestamp(seconds.cast_signed(), 0)
+        .expect("a valid time")
+        .to_rfc3339()
 }
 
 fn deliver(session: &mut Session, topic: &str, payload: &[u8]) {

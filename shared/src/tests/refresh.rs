@@ -8,7 +8,9 @@ use crux_core::App;
 use super::{ExpectFullRefreshTimer, connection::drive_to_connected, shell::Shell, start};
 use crate::{
     Dashboard, EffectTestExt, Event, Model, PowerSource,
-    features::refresh::{FULL_REFRESH_INTERVAL, PARTIALS_PER_FULL, redraw},
+    features::refresh::{
+        DRAW_DELAY, FULL_REFRESH_INTERVAL, PARTIALS_PER_FULL, redraw, redraw_soon,
+    },
 };
 
 /// Changes the view model: the status text shows `count` taps not sent.
@@ -191,8 +193,8 @@ fn many_state_messages_give_a_full_refresh_after_the_partial_renders() {
     shell.send(start(PowerSource::Stand));
     let first = shell.frames.len();
 
-    // Each message for a visible tile draws once, with no extra draw for the
-    // time.
+    // Each change of a visible tile draws once, with no extra draw for
+    // `last_updated`.
     for index in 0..=PARTIALS_PER_FULL {
         let state = if index % 2 == 0 { "on" } else { "off" };
         shell.broker.set_state("light.all_lights", state, &[]);
@@ -219,20 +221,125 @@ fn changes_for_another_room_over_many_minutes_draw_nothing() {
 
     // More than a minute passes with changes at the start and the end.
     for (humidity, minutes) in [("41", 0), ("42", 1), ("43", 2)] {
-        for _ in 0..minutes {
-            shell.fire_timers();
-        }
+        shell.broker.time += minutes * 60;
         shell
             .broker
             .set_state("sensor.living_room_thermometer_humidity", humidity, &[]);
         shell.run();
     }
     assert_eq!(shell.frames.len(), frames);
+    // The changes give no effects: no render and no draw timer.
     let log = shell.take_log();
-    assert!(!log.contains(&"Render".into()), "{log:?}");
-    // Each change gets a change time, so the core reads the clock once in
-    // each new minute. The answers do not draw.
-    let reads = log.iter().filter(|line| *line == "TimeNow").count();
-    assert_eq!(reads, 2, "{log:?}");
+    assert_eq!(log, [] as [&str; 0]);
     assert_eq!(shell.view().updated, "");
+
+    // The living room page shows the time of the last change: 09:44 in BST.
+    shell.send(Event::Navigate(crate::Route::room("living_room")));
+    assert_eq!(shell.view().updated, "Last changed 09:44");
+}
+
+#[test]
+fn the_retained_messages_at_a_connection_give_one_draw_timer_and_one_render() {
+    let mut shell = Shell::new();
+    shell.auto_draw = false;
+    for (entity_id, state) in [
+        ("light.all_lights", "on"),
+        ("weather.home", "rainy"),
+        ("light.loft_loft_1", "on"),
+        ("sensor.living_room_thermometer_humidity", "40"),
+    ] {
+        shell.broker.set_state(entity_id, state, &[]);
+    }
+    shell.send(start(PowerSource::Stand));
+    // The start draws, and `Connected` draws the connection. The burst of
+    // retained messages then starts one draw timer, and does not draw.
+    let frames = shell.frames.len();
+    let log = shell.take_log();
+    let draws = log
+        .iter()
+        .filter(|line| *line == "TimeNotifyAfter 200ms")
+        .count();
+    assert_eq!(draws, 1, "{log:?}");
+    assert_eq!(shell.draw_timers(), 1);
+    let renders = log.iter().filter(|line| *line == "Render").count();
+    assert_eq!(renders, 2, "{log:?}");
+
+    // The timer draws all the changes once.
+    shell.fire_draw_timers();
+    assert_eq!(shell.frames.len(), frames + 1);
+    assert_eq!(shell.take_log(), ["Render"]);
+    let view = &shell.frames.last().unwrap().view;
+    assert_eq!(view.updated, "Last changed 09:41");
+    let all_lights = view.index().unwrap().all_lights.as_ref().unwrap();
+    assert_eq!(all_lights.state, crate::TileState::On);
+}
+
+#[test]
+fn a_draw_timer_that_expires_while_the_device_sleeps_draws_nothing() {
+    let app = Dashboard;
+    let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Battery);
+    super::set_state(&mut model, "light.all_lights", "on");
+    let _timer = redraw_soon(&mut model);
+    let id = model.refresh.draw;
+    model.power.asleep = true;
+
+    app.update(Event::DrawDue(id), &mut model)
+        .expect_no_effects();
+
+    // The timer no longer waits, so the next change after the wake starts a
+    // new timer.
+    model.power.asleep = false;
+    redraw_soon(&mut model).expect_only_time_notify_after_with(|notify| {
+        assert_eq!(Duration::from(notify.duration), DRAW_DELAY);
+    });
+}
+
+#[test]
+fn a_draw_timer_that_waits_when_the_device_sleeps_draws_nothing() {
+    let mut shell = Shell::new();
+    shell.auto_draw = false;
+    shell.send(start(PowerSource::Battery));
+    shell.fire_draw_timers();
+    shell.broker.set_state("light.all_lights", "on", &[]);
+    shell.run();
+    assert_eq!(shell.draw_timers(), 1);
+
+    // The idle timeout puts the device to sleep. The last image is a full
+    // refresh with the change.
+    shell.fire_timers();
+    assert!(shell.view().asleep);
+    let frames = shell.frames.len();
+    assert!(shell.frames.last().unwrap().full);
+
+    shell.take_log();
+    shell.fire_draw_timers();
+    assert_eq!(shell.frames.len(), frames);
+    assert_eq!(shell.take_log(), [] as [&str; 0]);
+}
+
+#[test]
+fn a_draw_timer_after_a_newer_timer_draws_nothing() {
+    let app = Dashboard;
+    let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Stand);
+
+    // A change starts the first timer.
+    super::set_state(&mut model, "light.all_lights", "on");
+    let _first = redraw_soon(&mut model);
+    let first = model.refresh.draw;
+
+    // A page turn draws the whole screen, so the first timer is stale. The
+    // next change starts a newer timer.
+    let _ = app.update(Event::NextPage, &mut model);
+    super::set_state(&mut model, "light.living_room_lights", "on");
+    let _second = redraw_soon(&mut model);
+    let second = model.refresh.draw;
+    assert_ne!(first, second);
+
+    app.update(Event::DrawDue(first), &mut model)
+        .expect_no_effects();
+    app.update(Event::DrawDue(second), &mut model)
+        .expect_only_render();
+    // A timer draws only once.
+    app.update(Event::DrawDue(second), &mut model)
+        .expect_no_effects();
 }

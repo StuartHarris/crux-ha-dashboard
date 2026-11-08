@@ -6,8 +6,18 @@
 //!
 //! - `homeassistant/statestream/<domain>/<object_id>/state`: the state as plain
 //!   text, for example `on`.
+//! - `homeassistant/statestream/<domain>/<object_id>/last_updated`: the time
+//!   of the last update as plain ISO 8601 text, for example
+//!   `2026-11-08T14:03:21.123456+00:00`. Home Assistant publishes it because
+//!   the integration has `publish_timestamps: true`.
 //! - `homeassistant/statestream/<domain>/<object_id>/<attribute>`: each
 //!   attribute as JSON, for example `128` or `"°C"`.
+//!
+//! The core uses `last_updated` and not `last_changed`. Home Assistant moves
+//! `last_changed` only when the state changes. The current temperature of a
+//! thermostat, the temperature of the weather and the brightness of a light
+//! are attributes, so a change to them does not move `last_changed`. A change
+//! to the state or to an attribute moves `last_updated`.
 
 use alloc::{
     collections::BTreeMap,
@@ -16,10 +26,16 @@ use alloc::{
     vec::Vec,
 };
 
+use chrono::{DateTime, Utc};
+
 use crate::layout::Page;
 
 /// The topic prefix of the Home Assistant state stream.
 pub const STATESTREAM: &str = "homeassistant/statestream";
+
+/// The last part of the topic that gives the time of the last update of an
+/// entity. Refer to the module documentation.
+pub const LAST_UPDATED: &str = "last_updated";
 
 /// The state of one entity, as far as the dashboard needs it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -28,6 +44,11 @@ pub struct EntityState {
     pub state: Option<String>,
     /// The attributes that the tile shows, as text.
     pub attributes: BTreeMap<String, String>,
+    /// The time at which Home Assistant last updated the state or an
+    /// attribute, at the start of the minute. Only the minute shows on the
+    /// screen. Refer to the module documentation for the reason that the core
+    /// uses `last_updated` and not `last_changed`.
+    pub last_updated: Option<DateTime<Utc>>,
 }
 
 impl EntityState {
@@ -58,10 +79,20 @@ impl Entities {
         self.get(entity_id)?.state.as_deref()
     }
 
+    /// Returns each entity id with the time of its last update, for the
+    /// entities that have one.
+    pub fn last_updated(&self) -> impl Iterator<Item = (&str, DateTime<Utc>)> {
+        self.states
+            .iter()
+            .filter_map(|(entity_id, entity)| Some((entity_id.as_str(), entity.last_updated?)))
+    }
+
     /// Applies a state-stream message to the states.
     ///
-    /// The core keeps only the entities on `pages` and the attributes that
-    /// their tiles show. Returns the entity id if the message changed a state.
+    /// The core keeps only the entities on `pages`, the attributes that their
+    /// tiles show, and the time of the last update. Returns the entity id if
+    /// the message changed the state, an attribute or the minute of the last
+    /// update. The core ignores a time that is not valid ISO 8601 text.
     pub fn apply(&mut self, pages: &[Page], topic: &str, payload: &[u8]) -> Option<String> {
         let (entity_id, key) = parse_topic(topic)?;
         let kind = pages
@@ -70,10 +101,18 @@ impl Entities {
             .find(|tile| tile.entity_id == entity_id)?
             .kind;
         let is_state = key == "state";
-        if !is_state && !kind.attributes().contains(&key) {
+        if !is_state && key != LAST_UPDATED && !kind.attributes().contains(&key) {
             return None;
         }
         let text = core::str::from_utf8(payload).ok()?.trim();
+
+        if key == LAST_UPDATED {
+            let time = start_of_minute(DateTime::parse_from_rfc3339(text).ok()?.to_utc());
+            let entity = self.states.entry(entity_id.clone()).or_default();
+            let changed = entity.last_updated != Some(time);
+            entity.last_updated = Some(time);
+            return changed.then_some(entity_id);
+        }
 
         let entity = self.states.entry(entity_id.clone()).or_default();
         let changed = if is_state {
@@ -113,6 +152,14 @@ fn parse_topic(topic: &str) -> Option<(String, &str)> {
     Some((format!("{domain}.{object_id}"), key))
 }
 
+/// Returns the start of the minute of `time`. The UTC offset of the UK is a
+/// whole number of minutes, so the start of the minute shows the same
+/// `HH:MM`.
+fn start_of_minute(time: DateTime<Utc>) -> DateTime<Utc> {
+    let seconds = time.timestamp().div_euclid(60) * 60;
+    DateTime::from_timestamp(seconds, 0).unwrap_or(time)
+}
+
 /// Reads a JSON string or number as text. Returns `None` for `null` and for
 /// text that is not a JSON string or number.
 fn json_text(text: &str) -> Option<String> {
@@ -125,10 +172,11 @@ fn json_text(text: &str) -> Option<String> {
 
 /// The topics that subscribe to the entities on `pages`.
 ///
-/// For each entity, there is one topic for the state and one topic for each
-/// attribute that its tile shows. The core does not subscribe to other
-/// attributes, so a wake on battery gets only the retained messages that the
-/// dashboard uses.
+/// For each entity, there is one topic for the state, one topic for the time
+/// of the last update (`last_updated`), and one topic for each attribute that
+/// its tile shows. The core does not subscribe to other attributes or to
+/// `last_changed`, so a wake on battery gets only the retained messages that
+/// the dashboard uses.
 #[must_use]
 pub fn topics(pages: &[Page]) -> Vec<String> {
     let mut topics: Vec<String> = pages
@@ -137,7 +185,9 @@ pub fn topics(pages: &[Page]) -> Vec<String> {
         .filter_map(|tile| {
             let (domain, object_id) = tile.entity_id.split_once('.')?;
             let base = format!("{STATESTREAM}/{domain}/{object_id}");
-            let names = core::iter::once("state").chain(tile.kind.attributes().iter().copied());
+            let names = ["state", LAST_UPDATED]
+                .into_iter()
+                .chain(tile.kind.attributes().iter().copied());
             Some(names.map(move |name| format!("{base}/{name}")))
         })
         .flatten()
@@ -341,6 +391,14 @@ mod tests {
             ),
             ("homeassistant/statestream/light/lamp", "on"),
             ("homeassistant/statestream/light/lamp/state/extra", "on"),
+            (
+                "homeassistant/statestream/light/lamp/last_changed",
+                "2026-11-08T14:03:21+00:00",
+            ),
+            (
+                "homeassistant/statestream/light/other/last_updated",
+                "2026-11-08T14:03:21+00:00",
+            ),
             ("dashboard/hall/status", "online"),
         ];
         for (topic, payload) in ignored {
@@ -360,12 +418,16 @@ mod tests {
             topics(PAGES),
             vec![
                 format!("{base}/climate/thermostat/current_temperature"),
+                format!("{base}/climate/thermostat/last_updated"),
                 format!("{base}/climate/thermostat/state"),
                 format!("{base}/climate/thermostat/temperature"),
                 format!("{base}/light/lamp/brightness"),
+                format!("{base}/light/lamp/last_updated"),
                 format!("{base}/light/lamp/state"),
+                format!("{base}/sensor/temperature/last_updated"),
                 format!("{base}/sensor/temperature/state"),
                 format!("{base}/sensor/temperature/unit_of_measurement"),
+                format!("{base}/weather/home/last_updated"),
                 format!("{base}/weather/home/state"),
                 format!("{base}/weather/home/temperature"),
                 format!("{base}/weather/home/temperature_unit"),
@@ -401,5 +463,78 @@ mod tests {
         // A time with another offset shows as UK time too.
         entities.apply(PAGES, topic, b"2026-07-01T16:30:00+02:00");
         assert_eq!(shown(&entities), "15:30");
+    }
+
+    /// Returns the time of the last update of the lamp, as RFC 3339 text.
+    fn lamp_updated(entities: &Entities) -> Option<String> {
+        entities
+            .get("light.lamp")?
+            .last_updated
+            .map(|time| time.to_rfc3339())
+    }
+
+    #[test]
+    fn last_updated_keeps_the_start_of_the_minute() {
+        let mut entities = Entities::default();
+        let topic = "homeassistant/statestream/light/lamp/last_updated";
+        // Python `isoformat()` gives microseconds, or none if they are 0.
+        let changed = entities.apply(PAGES, topic, b"2026-11-08T14:03:21.123456+00:00");
+        assert_eq!(changed.as_deref(), Some("light.lamp"));
+        assert_eq!(
+            lamp_updated(&entities).as_deref(),
+            Some("2026-11-08T14:03:00+00:00")
+        );
+
+        // A later time in the same minute is not a change.
+        assert_eq!(
+            entities.apply(PAGES, topic, b"2026-11-08T14:03:59+00:00"),
+            None
+        );
+        // A time in the next minute is a change. Another offset is the same
+        // instant in UTC.
+        let changed = entities.apply(PAGES, topic, b"2026-11-08T15:04:00+01:00");
+        assert_eq!(changed.as_deref(), Some("light.lamp"));
+        assert_eq!(
+            lamp_updated(&entities).as_deref(),
+            Some("2026-11-08T14:04:00+00:00")
+        );
+    }
+
+    #[test]
+    fn a_last_updated_that_is_not_valid_is_ignored() {
+        let mut entities = Entities::default();
+        let topic = "homeassistant/statestream/light/lamp/last_updated";
+        for payload in ["", "soon", "\"2026-11-08T14:03:21+00:00\"", "null"] {
+            assert_eq!(
+                entities.apply(PAGES, topic, payload.as_bytes()),
+                None,
+                "{payload}"
+            );
+        }
+        assert_eq!(entities, Entities::default());
+
+        entities.apply(PAGES, topic, b"2026-11-08T14:03:21+00:00");
+        assert_eq!(entities.apply(PAGES, topic, b"2026-11-08T"), None);
+        assert_eq!(
+            lamp_updated(&entities).as_deref(),
+            Some("2026-11-08T14:03:00+00:00")
+        );
+    }
+
+    #[test]
+    fn each_tile_kind_keeps_last_updated() {
+        let mut entities = Entities::default();
+        for entity_id in [
+            "light.lamp",
+            "sensor.temperature",
+            "climate.thermostat",
+            "weather.home",
+        ] {
+            let (domain, object_id) = entity_id.split_once('.').unwrap();
+            let topic = format!("homeassistant/statestream/{domain}/{object_id}/last_updated");
+            let changed = entities.apply(PAGES, &topic, b"2026-11-08T14:03:21+00:00");
+            assert_eq!(changed.as_deref(), Some(entity_id));
+        }
+        assert_eq!(entities.last_updated().count(), 4);
     }
 }

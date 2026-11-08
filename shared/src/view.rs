@@ -55,8 +55,8 @@ pub struct ViewModel {
     /// panel when the dry run stops.
     pub read_only: bool,
     /// The footer time of the current page, in seconds since the Unix epoch.
-    /// This is the latest change time of the entities that the page shows.
-    /// Refer to [`page_time`](crate::features::connection::page_time). The
+    /// This is the latest `last_updated` time from Home Assistant of the
+    /// entities that the page shows. Refer to [`page_time`](crate::features::connection::page_time). The
     /// shell keeps it during a deep sleep and gives it back in `Start`.
     ///
     /// Each page has its own time. After a page turn, the value is the time
@@ -69,10 +69,10 @@ pub struct ViewModel {
     /// The text is the same for each connection state. The status text shows
     /// the connection. Refer to [`status`](Self::status).
     ///
-    /// The time is not a clock. It changes only when a change that the page
-    /// shows arrives in a new minute, or on a page turn. A change that the
-    /// page does not show does not change it, so the panel does not refresh
-    /// each minute.
+    /// The time is not a clock. It changes only when Home Assistant updates
+    /// an entity that the page shows in a new minute, or on a page turn. A
+    /// change that the page does not show does not change it, so the panel
+    /// does not refresh each minute.
     pub updated: String,
     /// A number that the core increases each time that the panel needs a
     /// full refresh, to clear ghost images.
