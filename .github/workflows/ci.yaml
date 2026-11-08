@@ -45,16 +45,41 @@ jobs:
 
   esp:
     runs-on: ubuntu-latest
+    env:
+      ESPUP_VERSION: 0.19.0
+      ESP_TOOLCHAIN: 1.97.0.0
     steps:
       - uses: actions/checkout@v7
 
-      # The action installs a toolchain named `esp` and exports its
-      # environment, so `just check-nostd` needs no `~/export-esp.sh`.
-      - uses: esp-rs/xtensa-toolchain@v1.7.0
+      # espup and the esp toolchain come from GitHub release downloads, and
+      # these downloads sometimes fail with a 504. The cache keeps the
+      # toolchain and `~/export-esp.sh` between runs, so most runs download
+      # nothing. The recipes read `~/export-esp.sh` themselves. To change a
+      # version, change `ESPUP_VERSION` or `ESP_TOOLCHAIN`, which also
+      # changes the cache key.
+      - name: Restore the esp toolchain
+        id: esp-cache
+        uses: actions/cache@v6
         with:
-          default: false
-          buildtargets: esp32s3
-          ldproxy: false
+          path: |
+            ~/.rustup/toolchains/esp
+            ~/export-esp.sh
+          key: esp-${{ runner.os }}-espup-${{ env.ESPUP_VERSION }}-${{ env.ESP_TOOLCHAIN }}-esp32s3
+
+      - name: Install the esp toolchain
+        if: steps.esp-cache.outputs.cache-hit != 'true'
+        run: |
+          curl --fail --location --retry 5 --retry-all-errors --retry-delay 15 \
+            --output espup.zip \
+            "https://github.com/esp-rs/espup/releases/download/v${ESPUP_VERSION}/espup-x86_64-unknown-linux-gnu.zip"
+          unzip -o espup.zip -d "$HOME/.cargo/bin"
+          chmod +x "$HOME/.cargo/bin/espup"
+          for attempt in 1 2 3; do
+            espup install --targets esp32s3 --toolchain-version "$ESP_TOOLCHAIN" \
+              --export-file "$HOME/export-esp.sh" && break
+            if [ "$attempt" = 3 ]; then exit 1; fi
+            sleep 30
+          done
 
       - uses: mozilla-actions/sccache-action@v0.0.11
 
