@@ -230,6 +230,9 @@ fn changes_for_another_room_over_many_minutes_draw_nothing() {
     assert_eq!(shell.frames.len(), frames);
     let log = shell.take_log();
     assert!(!log.contains(&"Render".into()), "{log:?}");
-    assert!(!log.contains(&"TimeNow".into()), "{log:?}");
-    assert_eq!(shell.view().updated, "Live");
+    // Each change gets a change time, so the core reads the clock once in
+    // each new minute. The answers do not draw.
+    let reads = log.iter().filter(|line| *line == "TimeNow").count();
+    assert_eq!(reads, 2, "{log:?}");
+    assert_eq!(shell.view().updated, "");
 }

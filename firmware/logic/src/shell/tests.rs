@@ -160,7 +160,7 @@ fn a_message_on_the_stream_redraws_a_visible_tile() {
     // minute timer.
     let jobs = shell.handle(message(b"on"));
     assert_eq!(names(&jobs), ["render", "start timer 2"]);
-    assert_eq!(shell.view().updated, "Live · 12:00");
+    assert_eq!(shell.view().updated, "Last changed 12:00");
 
     // Within the minute, the core does not read the clock again.
     let jobs = shell.handle(message(b"off"));

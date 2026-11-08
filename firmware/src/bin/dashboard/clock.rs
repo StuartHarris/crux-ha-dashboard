@@ -10,7 +10,7 @@
 //!
 //! Until one of the sources gives a valid time, the clock starts at the Unix
 //! epoch. The core treats a time before 2025 as not valid
-//! (`shared::EARLIEST_VALID_TIME`), so it shows no "Updated HH:MM" text, not
+//! (`shared::EARLIEST_VALID_TIME`), so it shows no "Last changed HH:MM" text, not
 //! a wrong one. The core asks for the time each time that it needs it, so a
 //! new time of the start has an effect at once. The timers use the
 //! monotonic clock, so a new time of the start does not change them.

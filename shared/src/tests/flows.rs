@@ -134,7 +134,7 @@ fn on_the_stand_the_dashboard_shows_live_state_and_controls_lights() {
     assert_eq!(view.connection, Connection::Online);
     // The retained messages arrive at once. The core reads the clock once
     // for all of them.
-    assert_eq!(view.updated, "Live · 09:41");
+    assert_eq!(view.updated, "Last changed 09:41");
     assert_eq!(count(&shell.take_log(), "TimeNow"), 1);
     assert_eq!(
         header(&shell),
@@ -232,7 +232,7 @@ fn on_battery_the_dashboard_wakes_syncs_accepts_taps_then_sleeps() {
     let last = &frame.view;
     assert!(last.asleep);
     assert_eq!(last.connection, Connection::Offline);
-    assert_eq!(last.updated, "Updated 09:41");
+    assert_eq!(last.updated, "Last changed 09:41");
     assert_eq!(last.path, "/room/dining_room");
     assert_eq!(shell.timers().len(), 0);
 }
@@ -262,7 +262,7 @@ fn a_battery_wake_shows_the_changes_from_while_it_slept() {
     assert_eq!(weather_detail(&shell), "Sunny");
 
     shell.fire_timers();
-    assert_eq!(shell.view().updated, "Updated 10:42");
+    assert_eq!(shell.view().updated, "Last changed 10:42");
 }
 
 #[test]
@@ -323,7 +323,7 @@ fn on_the_stand_a_lost_connection_reconnects_after_a_backoff() {
     );
     let view = shell.view();
     assert_eq!(view.connection, Connection::Connecting);
-    assert_eq!(view.updated, "Updated 09:41");
+    assert_eq!(view.updated, "Last changed 09:41");
     assert_eq!(shell.timers(), [CLOCK_INTERVAL, RECONNECT_MIN]);
 
     // While the dashboard is offline, Home Assistant changes a light.
@@ -340,7 +340,7 @@ fn on_the_stand_a_lost_connection_reconnects_after_a_backoff() {
     );
     assert_eq!(header(&shell)[0], tile("All lights", TileState::Off, "Off"));
     assert_eq!(count(&shell.take_log(), "TimeNow"), 1);
-    assert_eq!(shell.view().updated, "Live · 09:41");
+    assert_eq!(shell.view().updated, "Last changed 09:41");
 }
 
 #[test]
@@ -555,7 +555,7 @@ fn after_a_deep_sleep_the_view_shows_the_last_update_that_the_shell_kept() {
         last_sync: kept,
         ..start_parts(PowerSource::Battery)
     }));
-    assert_eq!(shell.view().updated, "Updated 09:41");
+    assert_eq!(shell.view().updated, "Last changed 09:41");
 }
 
 fn start_parts(power: PowerSource) -> crate::Start {
@@ -569,21 +569,21 @@ fn start_parts(power: PowerSource) -> crate::Start {
 fn the_footer_shows_the_time_of_the_last_message_not_a_clock() {
     let mut shell = house();
     shell.send(start(PowerSource::Stand));
-    assert_eq!(shell.view().updated, "Live · 09:41");
+    assert_eq!(shell.view().updated, "Last changed 09:41");
 
     // Time passes with no message: nothing changes on the screen.
     let frames = shell.frames.len();
     shell.clock += 600;
     shell.fire_timers();
     assert_eq!(shell.frames.len(), frames);
-    assert_eq!(shell.view().updated, "Live · 09:41");
+    assert_eq!(shell.view().updated, "Last changed 09:41");
 
     // A message after the minute reads the clock again.
     shell.take_log();
     shell.broker.set_state("light.all_lights", "off", &[]);
     shell.run();
     assert_eq!(count(&shell.take_log(), "TimeNow"), 1);
-    assert_eq!(shell.view().updated, "Live · 09:52");
+    assert_eq!(shell.view().updated, "Last changed 09:52");
 
     // Another message within the minute does not read the clock.
     shell.clock += 30;
@@ -596,7 +596,7 @@ fn the_footer_shows_the_time_of_the_last_message_not_a_clock() {
     shell.clock += 600;
     shell.broker.drop_connection();
     shell.run();
-    assert_eq!(shell.view().updated, "Updated 09:52");
+    assert_eq!(shell.view().updated, "Last changed 09:52");
     assert_eq!(shell.view().last_sync, Some(super::NOW + 660));
 }
 

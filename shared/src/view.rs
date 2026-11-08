@@ -2,8 +2,8 @@
 //!
 //! The decisions are the text and the state of each tile, the summary of
 //! each room on the index page, the connection indicator and the
-//! "Live · HH:MM" or "Updated HH:MM" text. The `ui` crate only draws what
-//! this module gives it.
+//! "Last changed HH:MM" text. The `ui` crate only draws what this module
+//! gives it.
 
 use alloc::{format, string::String, vec::Vec};
 
@@ -15,7 +15,7 @@ use crate::{
     Model,
     capabilities::power::PowerSource,
     entities::{Entities, EntityState},
-    features::connection::Link,
+    features::connection::{Link, page_time},
     layout::{Page, Tile, TileKind},
     local_time::uk_time,
     summary::summarise,
@@ -54,25 +54,25 @@ pub struct ViewModel {
     /// also show it. For example, the simulator draws a red border round the
     /// panel when the dry run stops.
     pub read_only: bool,
-    /// The time of the last change that the page showed, in seconds since
-    /// the Unix epoch. The shell keeps it during a deep sleep and gives it
-    /// back in `Start`.
+    /// The footer time of the current page, in seconds since the Unix epoch.
+    /// This is the latest change time of the entities that the page shows.
+    /// Refer to [`page_time`](crate::features::connection::page_time). The
+    /// shell keeps it during a deep sleep and gives it back in `Start`.
     ///
-    /// This is one value for all pages. After a page turn, it is the time of
-    /// the last change that any page showed.
+    /// Each page has its own time. After a page turn, the value is the time
+    /// of the new page.
     pub last_sync: Option<u64>,
-    /// The freshness of the data, with the UK time of the last change that the
-    /// page showed, as `HH:MM`. After a page turn, this is the time of the last
-    /// change that any page showed.
+    /// The freshness of the data: `Last changed HH:MM`, with the UK time of
+    /// [`last_sync`](Self::last_sync). If the time is not known, the text is
+    /// empty.
     ///
-    /// - While the dashboard is connected, the text is `Live · HH:MM`, or
-    ///   `Live` if the time is not known.
-    /// - Without a connection, the text is `Updated HH:MM`, or empty if the
-    ///   time is not known.
+    /// The text is the same for each connection state. The status text shows
+    /// the connection. Refer to [`status`](Self::status).
     ///
     /// The time is not a clock. It changes only when a change that the page
-    /// shows arrives in a new minute. A change that the page does not show
-    /// does not change it, so the panel does not refresh each minute.
+    /// shows arrives in a new minute, or on a page turn. A change that the
+    /// page does not show does not change it, so the panel does not refresh
+    /// each minute.
     pub updated: String,
     /// A number that the core increases each time that the panel needs a
     /// full refresh, to clear ghost images.
@@ -251,14 +251,10 @@ pub fn view(model: &Model) -> ViewModel {
     } else {
         Connection::Offline
     };
-    let updated = match (connection, model.last_sync) {
-        (Connection::Online, Some(time)) => {
-            format!("Live · {}", local_time(time))
-        }
-        (Connection::Online, None) => "Live".into(),
-        (_, Some(time)) => format!("Updated {}", local_time(time)),
-        (_, None) => String::new(),
-    };
+    let time = page_time(model);
+    let updated = time.map_or_else(String::new, |time| {
+        format!("Last changed {}", local_time(time))
+    });
 
     let read_only = model
         .settings
@@ -289,9 +285,7 @@ pub fn view(model: &Model) -> ViewModel {
             model.unsent,
             read_only,
         ),
-        last_sync: model
-            .last_sync
-            .and_then(|time| u64::try_from(time.timestamp()).ok()),
+        last_sync: time.and_then(|time| u64::try_from(time.timestamp()).ok()),
         asleep: model.power.asleep,
         read_only,
         updated,

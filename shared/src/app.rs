@@ -1,7 +1,7 @@
 //! The root of the app: the events, the effects, the model and the dispatch
 //! to the features.
 
-use alloc::{format, string::String};
+use alloc::{collections::BTreeMap, format, string::String};
 
 use chrono::{DateTime, Utc};
 use crux_core::{App, Command, command::RequestBuilder, macros::effect, render::RenderOperation};
@@ -75,9 +75,10 @@ pub struct Start {
     /// sleep, the shell gives the path that it kept in RTC memory. If the
     /// path is `None` or not valid, the core shows the first page.
     pub path: Option<String>,
-    /// The time at which the last state message arrived, in seconds since
-    /// the Unix epoch, from [`ViewModel::last_sync`]. After a deep sleep, the
-    /// shell gives the value that it kept in RTC memory.
+    /// The footer time of the page, in seconds since the Unix epoch, from
+    /// [`ViewModel::last_sync`]. After a deep sleep, the shell gives the
+    /// value that it kept in RTC memory. The core shows it until an entity
+    /// on the page has a change time.
     pub last_sync: Option<u64>,
 }
 
@@ -249,11 +250,16 @@ pub struct Model {
     pub connection: connection::State,
     /// The power source and the sleep state.
     pub power: power::State,
-    /// The time of the last change that the current page showed. The core
-    /// reads the clock at most once a minute, so the time can be up to one
-    /// minute before that change. After a page turn, it is the time of the
-    /// last change that any page showed. Refer to
-    /// [`connection::read_message_time`].
+    /// The time of the last change of each entity, by entity id, at the
+    /// start of the minute. The core reads the clock at most once a minute,
+    /// so a time can be up to one minute before its change. The footer of a
+    /// page shows the latest time of the entities that the page shows.
+    /// Refer to [`connection::page_time`].
+    pub changed_at: BTreeMap<String, DateTime<Utc>>,
+    /// The time that the shell kept through a deep sleep and gave back in
+    /// `Start`. The footer shows this time only if no entity on the page has
+    /// a change time, for example after a wake, before the first messages
+    /// arrive.
     pub last_sync: Option<DateTime<Utc>>,
     /// The number of service calls that the core dropped, because it slept
     /// before it could send them.
@@ -275,6 +281,7 @@ impl Default for Model {
             entities: Entities::default(),
             connection: connection::State::default(),
             power: power::State::default(),
+            changed_at: BTreeMap::new(),
             last_sync: None,
             unsent: 0,
             full_refresh_seq: 0,

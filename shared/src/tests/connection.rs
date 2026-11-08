@@ -48,6 +48,11 @@ pub fn drive_to_connected(power: PowerSource) -> (Model, Cmd, Request<Connect>) 
     (model, cmd, request)
 }
 
+/// The time `seconds` after the Unix epoch.
+fn at(seconds: u64) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::from_timestamp(seconds.cast_signed(), 0).unwrap()
+}
+
 pub fn message(topic: &str, payload: &str) -> MqttEvent {
     MqttEvent::Message(Message {
         topic: topic.into(),
@@ -115,7 +120,7 @@ fn connected_subscribes_publishes_online_and_draws() {
 
     let view = app.view(&model);
     assert_eq!(view.connection, Connection::Online);
-    assert_eq!(view.updated, "Live");
+    assert_eq!(view.updated, "");
 }
 
 #[test]
@@ -185,9 +190,18 @@ fn a_message_for_another_page_changes_the_state_but_does_not_draw() {
         ))
         .unwrap();
     let event = cmd.expect_one_event();
-    // The state changed but does not show, so the core does not draw and
-    // does not read the clock.
-    app.update(event, &mut model).expect_no_effects();
+    // The state changed but does not show, so the core does not draw. The
+    // clock is stale, so the core reads the clock for the change time. The
+    // answer draws nothing, because the view is the same.
+    let time = app
+        .update(event, &mut model)
+        .resolve_time_now(|_| instant(super::NOW))
+        .expect_event();
+    app.update(time, &mut model).expect_only_time_notify_after();
+    assert_eq!(
+        model.changed_at.get("light.loft_loft_1"),
+        Some(&at(super::NOW))
+    );
     assert_eq!(
         model
             .entities
@@ -264,7 +278,7 @@ fn a_lost_connection_shows_the_time_of_the_last_message_and_retries_after_a_back
         .expect_event();
     let view = app.view(&model);
     assert_eq!(view.connection, Connection::Connecting);
-    assert_eq!(view.updated, "Updated 09:41");
+    assert_eq!(view.updated, "Last changed 09:41");
 
     // Wi-Fi can be the cause, so the reconnect asks for Wi-Fi first.
     let event = app
@@ -449,6 +463,8 @@ const VISIBLE: &str = "homeassistant/statestream/light/all_lights/state";
 /// The topic of a state message for a tile that the index page does not
 /// show: no summary of a room shows the humidity.
 const HIDDEN: &str = "homeassistant/statestream/sensor/living_room_thermometer_humidity/state";
+/// The topic of a state message for the weather tile on the index page.
+const WEATHER: &str = "homeassistant/statestream/weather/home/state";
 
 /// Sends a state message for a tile that the index page shows. If the core
 /// reads the clock, the clock gives `time` (in seconds since the Unix epoch,
@@ -500,22 +516,16 @@ fn a_burst_of_messages_reads_the_clock_once() {
     let mut now = first.expect_one_effect().expect_time_now();
 
     // More messages arrive while the core waits for the answer, so they do
-    // not read the clock. A message for a tile that the page shows draws at
-    // once. A message for another tile does nothing.
-    request.resolve(message(HIDDEN, "on")).unwrap();
-    let event = cmd.expect_one_event();
-    app.update(event, &mut model).expect_no_effects();
-    request
-        .resolve(message(
-            "homeassistant/statestream/weather/home/state",
-            "rainy",
-        ))
-        .unwrap();
-    let event = cmd.expect_one_event();
-    app.update(event, &mut model).expect_only_render();
-    assert_eq!(app.view(&model).updated, "Live");
+    // not read the clock and do not draw. They wait for the answer.
+    for (topic, payload) in [(HIDDEN, "40"), (WEATHER, "rainy")] {
+        request.resolve(message(topic, payload)).unwrap();
+        let event = cmd.expect_one_event();
+        app.update(event, &mut model).expect_no_effects();
+    }
+    assert_eq!(app.view(&model).updated, "");
 
-    now.resolve(instant(super::NOW)).unwrap();
+    // The answer draws once, with all the changes.
+    now.resolve(instant(super::NOW + 20)).unwrap();
     let answer = first.expect_one_event();
     app.update(answer, &mut model)
         .expect_render()
@@ -523,7 +533,24 @@ fn a_burst_of_messages_reads_the_clock_once() {
             assert_eq!(Duration::from(notify.duration), CLOCK_INTERVAL);
         });
     // 08:41 UTC is 09:41 in BST.
-    assert_eq!(app.view(&model).updated, "Live · 09:41");
+    assert_eq!(app.view(&model).updated, "Last changed 09:41");
+    // Each entity that waited has the time of the answer, at the start of
+    // the minute.
+    for entity_id in [
+        "light.all_lights",
+        "sensor.living_room_thermometer_humidity",
+        "weather.home",
+    ] {
+        assert_eq!(
+            model.changed_at.get(entity_id),
+            Some(&at(super::NOW)),
+            "{entity_id}"
+        );
+    }
+    assert_eq!(
+        model.connection.unstamped,
+        Vec::<alloc::string::String>::new()
+    );
 }
 
 #[test]
@@ -545,7 +572,7 @@ fn a_message_reads_the_clock_again_only_after_the_minute_timer() {
     let passed = answer.expect_one_event();
     app.update(passed, &mut model).expect_no_effects();
     // The minute timer does not change the screen.
-    assert_eq!(app.view(&model).updated, "Live · 09:41");
+    assert_eq!(app.view(&model).updated, "Last changed 09:41");
 
     // The next message reads the clock again.
     let later = Some(super::NOW + 120);
@@ -553,7 +580,7 @@ fn a_message_reads_the_clock_again_only_after_the_minute_timer() {
         .unwrap()
         .expect_render()
         .expect_only_time_notify_after();
-    assert_eq!(app.view(&model).updated, "Live · 09:43");
+    assert_eq!(app.view(&model).updated, "Last changed 09:43");
 }
 
 #[test]
@@ -577,11 +604,11 @@ fn a_new_time_in_the_same_minute_draws_only_the_change() {
             .count(),
         1
     );
-    assert_eq!(app.view(&model).updated, "Live · 09:41");
+    assert_eq!(app.view(&model).updated, "Last changed 09:41");
 }
 
 #[test]
-fn a_clock_answer_in_the_same_minute_after_a_draw_does_not_draw_again() {
+fn changes_that_wait_for_a_clock_answer_in_the_same_minute_draw_once() {
     let app = Dashboard;
     let (mut model, mut cmd, mut request) = drive_to_connected(PowerSource::Stand);
     let _ = deliver(&mut model, &mut cmd, &mut request, Some(super::NOW + 5));
@@ -595,23 +622,19 @@ fn a_clock_answer_in_the_same_minute_after_a_draw_does_not_draw_again() {
     let mut first = app.update(event, &mut model);
     let mut now = first.expect_one_effect().expect_time_now();
 
-    // A second change arrives while the core waits, so it draws at once. The
-    // draw shows both changes.
-    request
-        .resolve(message(
-            "homeassistant/statestream/weather/home/state",
-            "rainy",
-        ))
-        .unwrap();
+    // A second change arrives while the core waits, so it waits too.
+    request.resolve(message(WEATHER, "rainy")).unwrap();
     let event = cmd.expect_one_event();
-    app.update(event, &mut model).expect_only_render();
+    app.update(event, &mut model).expect_no_effects();
 
-    // The answer is in the same minute, so the view does not change.
+    // The answer is in the same minute, so only the tiles change. The core
+    // draws once for both changes.
     now.resolve(instant(super::NOW + 30)).unwrap();
     let answer = first.expect_one_event();
     app.update(answer, &mut model)
+        .expect_render()
         .expect_only_time_notify_after();
-    assert_eq!(app.view(&model).updated, "Live · 09:41");
+    assert_eq!(app.view(&model).updated, "Last changed 09:41");
 }
 
 #[test]
@@ -627,7 +650,7 @@ fn a_stale_minute_timer_is_ignored() {
 }
 
 #[test]
-fn a_clock_with_no_valid_time_shows_live_and_waits_a_minute() {
+fn a_clock_with_no_valid_time_shows_no_time_and_waits_a_minute() {
     let app = Dashboard;
     let (mut model, mut cmd, mut request) = drive_to_connected(PowerSource::Stand);
 
@@ -637,11 +660,24 @@ fn a_clock_with_no_valid_time_shows_live_and_waits_a_minute() {
         .unwrap()
         .expect_render()
         .expect_only_time_notify_after();
-    assert_eq!(app.view(&model).updated, "Live");
+    assert_eq!(app.view(&model).updated, "");
     assert_eq!(app.view(&model).last_sync, None);
 
     // The core does not read the clock for each message.
     assert!(deliver(&mut model, &mut cmd, &mut request, None).is_none());
+
+    // A change in this minute waits for the next valid answer.
+    request.resolve(message(HIDDEN, "40")).unwrap();
+    let event = cmd.expect_one_event();
+    app.update(event, &mut model).expect_no_effects();
+    expire_minute(&mut model);
+    let _ = deliver(&mut model, &mut cmd, &mut request, Some(super::NOW));
+    assert_eq!(
+        model
+            .changed_at
+            .get("sensor.living_room_thermometer_humidity"),
+        Some(&at(super::NOW))
+    );
 }
 
 #[test]
@@ -650,27 +686,208 @@ fn the_time_of_the_last_message_is_a_uk_time() {
     let (mut model, mut cmd, mut request) = drive_to_connected(PowerSource::Stand);
     // In summer, the UK time is UTC+1.
     let _ = deliver(&mut model, &mut cmd, &mut request, Some(super::NOW));
-    assert_eq!(app.view(&model).updated, "Live · 09:41");
+    assert_eq!(app.view(&model).updated, "Last changed 09:41");
     assert_eq!(app.view(&model).last_sync, Some(super::NOW));
 
     // In winter, the UK time is UTC: 2026-12-01T08:41:00Z.
-    model.last_sync = chrono::DateTime::from_timestamp(1_796_114_460, 0);
-    assert_eq!(app.view(&model).updated, "Live · 08:41");
+    model
+        .changed_at
+        .insert("light.all_lights".into(), at(1_796_114_460));
+    assert_eq!(app.view(&model).updated, "Last changed 08:41");
 }
 
 #[test]
-fn a_hidden_change_with_a_stale_clock_gives_no_effects() {
+fn a_hidden_change_with_a_stale_clock_reads_the_clock_but_does_not_draw() {
     let app = Dashboard;
     let (mut model, mut cmd, mut request) = drive_to_connected(PowerSource::Stand);
     assert!(!model.connection.clock_fresh);
 
-    request.resolve(message(HIDDEN, "on")).unwrap();
+    request.resolve(message(HIDDEN, "40")).unwrap();
+    let event = cmd.expect_one_event();
+    // The change needs a time, so the core reads the clock. It does not draw.
+    let time = app
+        .update(event, &mut model)
+        .resolve_time_now(|_| instant(super::NOW))
+        .expect_event();
+    // The view did not change, so the answer only starts the minute timer.
+    app.update(time, &mut model).expect_only_time_notify_after();
+    assert_eq!(
+        model
+            .changed_at
+            .get("sensor.living_room_thermometer_humidity"),
+        Some(&at(super::NOW))
+    );
+    assert_eq!(app.view(&model).updated, "");
+}
+
+#[test]
+fn a_hidden_change_with_a_fresh_clock_gives_no_effects() {
+    let app = Dashboard;
+    let (mut model, mut cmd, mut request) = drive_to_connected(PowerSource::Stand);
+    let _ = deliver(&mut model, &mut cmd, &mut request, Some(super::NOW));
+    assert!(model.connection.clock_fresh);
+
+    request.resolve(message(HIDDEN, "40")).unwrap();
     let event = cmd.expect_one_event();
     app.update(event, &mut model).expect_no_effects();
-    // The state changed, but the clock was not read.
-    assert!(!model.connection.clock_pending);
-    assert_eq!(model.last_sync, None);
-    assert_eq!(app.view(&model).updated, "Live");
+    // The change has the time of the last clock answer.
+    assert_eq!(
+        model
+            .changed_at
+            .get("sensor.living_room_thermometer_humidity"),
+        Some(&at(super::NOW))
+    );
+}
+
+/// Makes the clock stale: the minute timer expires.
+fn expire_minute(model: &mut Model) {
+    let id = model.connection.minute;
+    Dashboard
+        .update(Event::MinutePassed(id), model)
+        .expect_no_effects();
+}
+
+/// Sends a state message, reads the clock and answers with `time` (in
+/// seconds since the Unix epoch). Returns the command of the clock answer.
+fn change_at(
+    model: &mut Model,
+    cmd: &mut Cmd,
+    request: &mut Request<Connect>,
+    topic: &str,
+    payload: &str,
+    time: u64,
+) -> Cmd {
+    request.resolve(message(topic, payload)).unwrap();
+    let event = cmd.expect_one_event();
+    let answer = Dashboard
+        .update(event, model)
+        .resolve_time_now(|_| instant(time))
+        .expect_event();
+    Dashboard.update(answer, model)
+}
+
+/// Goes to the page of `route`, and expects a draw.
+fn navigate(model: &mut Model, route: Route) {
+    let mut cmd = Dashboard.update(Event::Navigate(route), model);
+    let effects: Vec<_> = cmd.effects().collect();
+    assert!(
+        effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Render(_)))
+    );
+}
+
+#[test]
+fn a_change_on_another_page_shows_its_time_on_that_page() {
+    let app = Dashboard;
+    let (mut model, mut cmd, mut request) = drive_to_connected(PowerSource::Stand);
+    let _ = deliver(&mut model, &mut cmd, &mut request, Some(super::NOW));
+    expire_minute(&mut model);
+
+    // On the index page, the humidity of the living room changes two minutes
+    // later. The index page does not show it, so the core does not draw.
+    change_at(
+        &mut model,
+        &mut cmd,
+        &mut request,
+        HIDDEN,
+        "40",
+        super::NOW + 120,
+    )
+    .expect_only_time_notify_after();
+    assert_eq!(app.view(&model).updated, "Last changed 09:41");
+
+    // The living room page shows the time of that change.
+    navigate(&mut model, Route::room("living_room"));
+    assert_eq!(app.view(&model).updated, "Last changed 09:43");
+    assert_eq!(app.view(&model).last_sync, Some(super::NOW + 120));
+}
+
+#[test]
+fn a_page_keeps_its_own_older_time_after_a_page_turn() {
+    let app = Dashboard;
+    let (mut model, mut cmd, mut request) = drive_to_connected(PowerSource::Stand);
+    let _ = deliver(&mut model, &mut cmd, &mut request, Some(super::NOW));
+    navigate(&mut model, Route::room("living_room"));
+    expire_minute(&mut model);
+
+    // On the living room page, the humidity changes two minutes later.
+    change_at(
+        &mut model,
+        &mut cmd,
+        &mut request,
+        HIDDEN,
+        "40",
+        super::NOW + 120,
+    )
+    .expect_render()
+    .expect_only_time_notify_after();
+    assert_eq!(app.view(&model).updated, "Last changed 09:43");
+
+    // No entity on the index page changed, so it shows its older time.
+    navigate(&mut model, Route::Home);
+    assert_eq!(app.view(&model).updated, "Last changed 09:41");
+}
+
+#[test]
+fn the_index_time_follows_a_change_that_a_summary_shows() {
+    let app = Dashboard;
+    let (mut model, mut cmd, mut request) = drive_to_connected(PowerSource::Stand);
+    let _ = deliver(&mut model, &mut cmd, &mut request, Some(super::NOW));
+    expire_minute(&mut model);
+
+    // The summary of the Loft shows its first light.
+    change_at(
+        &mut model,
+        &mut cmd,
+        &mut request,
+        "homeassistant/statestream/light/loft_loft_1/state",
+        "on",
+        super::NOW + 120,
+    )
+    .expect_render()
+    .expect_only_time_notify_after();
+    assert_eq!(app.view(&model).updated, "Last changed 09:43");
+}
+
+#[test]
+fn an_answer_with_no_valid_time_gives_the_last_valid_time() {
+    let app = Dashboard;
+    let (mut model, mut cmd, mut request) = drive_to_connected(PowerSource::Stand);
+    let _ = deliver(&mut model, &mut cmd, &mut request, Some(super::NOW));
+    expire_minute(&mut model);
+
+    // A time before 2025 is not valid.
+    change_at(&mut model, &mut cmd, &mut request, HIDDEN, "40", 90).expect_only_time_notify_after();
+    assert_eq!(
+        model
+            .changed_at
+            .get("sensor.living_room_thermometer_humidity"),
+        Some(&at(super::NOW))
+    );
+    assert_eq!(
+        model.connection.unstamped,
+        Vec::<alloc::string::String>::new()
+    );
+    assert_eq!(app.view(&model).updated, "Last changed 09:41");
+}
+
+#[test]
+fn after_start_the_footer_shows_the_kept_time_until_a_change_on_the_page() {
+    let app = Dashboard;
+    let mut model = Model::default();
+    let Event::Start(start) = start(PowerSource::Stand) else {
+        unreachable!()
+    };
+    let start = Event::Start(crate::Start {
+        last_sync: Some(super::NOW),
+        ..start
+    });
+    let _effects: Vec<_> = app.update(start, &mut model).effects().collect();
+    // No entity has a change time, so the footer shows the kept time.
+    assert!(model.changed_at.is_empty());
+    assert_eq!(app.view(&model).updated, "Last changed 09:41");
+    assert_eq!(app.view(&model).last_sync, Some(super::NOW));
 }
 
 #[test]
@@ -692,7 +909,7 @@ fn a_visible_change_with_a_stale_clock_draws_once_after_the_clock_answers() {
     assert_eq!(effects.len(), 2, "one render and the minute timer");
     assert!(matches!(effects[0], Effect::Render(_)));
     assert!(matches!(effects[1], Effect::TimeNotifyAfter(_)));
-    assert_eq!(app.view(&model).updated, "Live · 09:41");
+    assert_eq!(app.view(&model).updated, "Last changed 09:41");
 }
 
 #[test]
@@ -706,5 +923,5 @@ fn a_visible_change_with_a_fresh_clock_draws_at_once() {
     let event = cmd.expect_one_event();
     app.update(event, &mut model).expect_only_render();
     // The time is the time of the last read.
-    assert_eq!(app.view(&model).updated, "Live · 09:41");
+    assert_eq!(app.view(&model).updated, "Last changed 09:41");
 }

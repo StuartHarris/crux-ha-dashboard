@@ -1138,13 +1138,14 @@ mod tests {
         assert_eq!(view.status, "Asleep, on battery, 1 tap not sent");
     }
 
-    /// A state message for a tile on the living room page: the core reads the
-    /// clock and sets `last_sync`.
+    /// A state message for a tile on the dining room page: the core reads the
+    /// clock and gives the entity its change time. On the dining room page,
+    /// `last_sync` is then this time.
     fn state_message(fixture: &mut Fixture, connection: u64) {
         fixture.mqtt(
             connection,
             MqttEvent::Message(Message {
-                topic: "homeassistant/statestream/light/living_room_lights/state".into(),
+                topic: "homeassistant/statestream/light/dining_room_lights/state".into(),
                 payload: b"on".to_vec(),
             }),
         );
@@ -1155,11 +1156,11 @@ mod tests {
         let mut fixture = Fixture::new();
         fixture.start(PowerSource::Battery);
         fixture.mqtt(1, MqttEvent::Connected);
-        state_message(&mut fixture, 1);
         fixture.shell().send(Event::NextPage);
+        state_message(&mut fixture, 1);
         let before = fixture.shell().view();
         assert!(before.last_sync.is_some());
-        assert_ne!(before.path, "/room/living_room");
+        assert_eq!(before.path, "/room/dining_room");
         assert!(fixture.shell().sleep_now());
         assert!(fixture.shell().can_restart());
         fixture.take_log();

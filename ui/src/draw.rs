@@ -793,7 +793,7 @@ pub mod tests {
             asleep: false,
             read_only: false,
             last_sync: None,
-            updated: "Live".into(),
+            updated: "Last changed 09:41".into(),
             full_refresh_seq: 1,
         }
     }

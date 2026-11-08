@@ -50,7 +50,7 @@ fn the_idle_timeout_disconnects_and_sleeps() {
     // The start asked for the first full refresh, and the sleep for the second.
     assert_eq!(view.full_refresh_seq, 2);
     assert_eq!(view.connection, Connection::Offline);
-    assert_eq!(view.updated, "Updated 09:41");
+    assert_eq!(view.updated, "Last changed 09:41");
     assert_eq!(model.connection.wifi, Link::Down);
 }
 

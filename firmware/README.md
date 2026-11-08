@@ -62,8 +62,8 @@ it is written. It tries a failed write 3 times. The log shows `clock: set from t
 or `clock: set from SNTP`.
 
 The core treats a time before 2025 as not valid. If neither source gives a valid time,
-the clock starts at the Unix epoch, and the view shows only "Live", and no "Updated
-HH:MM" text. The log then says at the start that the clock is not set.
+the clock starts at the Unix epoch, and the view shows no "Last changed HH:MM"
+text. The log then says at the start that the clock is not set.
 
 The second binary, `bringup`, runs the hardware checks for a new board.
 
@@ -227,7 +227,7 @@ Do the steps in this order. Each step needs the steps before it.
     `cmd` topic shows the service call, and the light changes.
 13. **The clock.** Run `just flash`. After the Wi-Fi connection, the log shows
     `clock: set from SNTP` with the UTC time, and `rtc: set to` the same time. The tiles
-    show "Updated HH:MM" in UK time. Press RST. Before the Wi-Fi connection, the log must
+    show "Last changed HH:MM" in UK time. Press RST. Before the Wi-Fi connection, the log must
     show `clock: set from the RTC` with the correct time. After SNTP, the log must show
     a change of at most 2 s and no `rtc: set to` line. Then disconnect USB for one minute
     with the battery connected, connect it again, and do the same check. If the RTC has
