@@ -27,7 +27,9 @@
 //!   panel. The start of the touch controller is a separate `async` call, so
 //!   the caller decides when to try it again.
 //! - A failed power-on turns the high voltages off again.
-//! - It has no SD card, battery, RTC, rotation or deep sleep code.
+//! - It has no SD card, battery, RTC, rotation or deep sleep code. The
+//!   caller reads and writes the other devices on the I2C bus, for example
+//!   the RTC, with [`Panel::read_registers`] and [`Panel::write_registers`].
 //!
 //! The code stays close to upstream, to make a diff easy. For this reason,
 //! the pedantic lints are off in this module.
@@ -210,6 +212,19 @@ impl<'a> Panel<'a> {
     /// number.
     pub fn scan(&mut self, found: &mut [u8; 16]) -> usize {
         self.epd.scan(found)
+    }
+
+    /// Reads `buffer.len()` registers of the I2C device at `address`, from
+    /// `register` on. The panel owns the I2C bus, so the other devices on the
+    /// bus (for example the PCF8563 RTC) use this function.
+    pub fn read_registers(&mut self, address: u8, register: u8, buffer: &mut [u8]) -> Result<()> {
+        self.epd.read_registers(address, register, buffer)
+    }
+
+    /// Writes `payload` to the I2C device at `address`. The first byte of
+    /// `payload` is the first register, and the other bytes are the values.
+    pub fn write_registers(&mut self, address: u8, payload: &[u8]) -> Result<()> {
+        self.epd.write_registers(address, payload)
     }
 
     /// Makes the whole panel white. The panel flashes.

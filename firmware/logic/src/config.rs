@@ -20,7 +20,7 @@ use core::fmt;
 const KEYS: &[(&str, &[&str])] = &[
     ("wifi", &["ssid", "password", "auth"]),
     ("mqtt", &["host", "port", "username", "password"]),
-    ("device", &["id", "read_only"]),
+    ("device", &["id", "read_only", "ntp_server"]),
 ];
 
 /// A key that the firmware used before, and why it is not necessary now.
@@ -84,7 +84,14 @@ pub struct Config<'a> {
     /// (`[device] read_only`, `true` if not set). The firmware gives it to
     /// the core in `Settings::read_only`.
     pub read_only: bool,
+    /// The host name or IPv4 address of the SNTP server (`[device]
+    /// ntp_server`, `pool.ntp.org` if not set). The firmware sets its clock
+    /// from this server after it joins the network.
+    pub ntp_server: &'a str,
 }
+
+/// The SNTP server if the file does not give one.
+pub const DEFAULT_NTP_SERVER: &str = "pool.ntp.org";
 
 impl fmt::Debug for Config<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -99,6 +106,7 @@ impl fmt::Debug for Config<'_> {
             .field("mqtt_password", &hidden(self.mqtt_password))
             .field("device_id", &self.device_id)
             .field("read_only", &self.read_only)
+            .field("ntp_server", &self.ntp_server)
             .finish()
     }
 }
@@ -247,6 +255,7 @@ struct Partial<'a> {
     mqtt_password: Option<&'a str>,
     device_id: Option<&'a str>,
     read_only: Option<bool>,
+    ntp_server: Option<&'a str>,
 }
 
 impl<'a> Partial<'a> {
@@ -270,6 +279,7 @@ impl<'a> Partial<'a> {
             ("mqtt", "username") => self.mqtt_username = Some(text()?),
             ("mqtt", "password") => self.mqtt_password = Some(text()?),
             ("device", "id") => self.device_id = Some(text()?),
+            ("device", "ntp_server") => self.ntp_server = Some(text()?),
             ("device", "read_only") => match value {
                 Value::Boolean(flag) => self.read_only = Some(flag),
                 _ => return None,
@@ -308,6 +318,13 @@ impl<'a> Partial<'a> {
                 rule,
             });
         }
+        let ntp_server = self.ntp_server.unwrap_or(DEFAULT_NTP_SERVER);
+        if ntp_server.is_empty() {
+            return Err(Error::Invalid {
+                key: "device.ntp_server",
+                rule: "not be empty",
+            });
+        }
         Ok(Config {
             wifi_ssid,
             wifi_password,
@@ -318,6 +335,7 @@ impl<'a> Partial<'a> {
             mqtt_password: self.mqtt_password.unwrap_or(""),
             device_id: self.device_id.ok_or(Error::Missing("device.id"))?,
             read_only: self.read_only.unwrap_or(true),
+            ntp_server,
         })
     }
 }
@@ -388,6 +406,7 @@ mod tests {
             [device]
             id = "kitchen"
             read_only = false
+            ntp_server = "time.example.org"
         "#;
         assert_eq!(
             Config::parse(text),
@@ -401,6 +420,7 @@ mod tests {
                 mqtt_password: "secret",
                 device_id: "kitchen",
                 read_only: false,
+                ntp_server: "time.example.org",
             })
         );
     }
@@ -412,6 +432,25 @@ mod tests {
         assert_eq!(config.mqtt_port, 1883);
         assert_eq!(config.mqtt_username, "");
         assert!(config.read_only);
+        assert_eq!(config.ntp_server, "pool.ntp.org");
+    }
+
+    #[test]
+    fn the_ntp_server_is_a_name_that_is_not_empty() {
+        let text =
+            "[wifi]\nssid = 'a'\npassword = 'password'\n[mqtt]\nhost = 'h'\n[device]\nid = 'd'\n";
+        let named = alloc::format!("{text}ntp_server = '192.168.1.1'\n");
+        assert_eq!(Config::parse(&named).unwrap().ntp_server, "192.168.1.1");
+        let empty = alloc::format!("{text}ntp_server = ''\n");
+        assert!(is_invalid(Config::parse(&empty), "device.ntp_server"));
+        let number = alloc::format!("{text}ntp_server = 123\n");
+        assert!(matches!(
+            Config::parse(&number),
+            Err(Error::Value {
+                key: "ntp_server",
+                ..
+            })
+        ));
     }
 
     #[test]

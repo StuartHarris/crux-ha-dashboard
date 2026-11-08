@@ -47,6 +47,7 @@ fn main() {
         mqtt_password,
         device_id,
         read_only,
+        ntp_server,
     } = config;
     let source = format!(
         "/// The build-time configuration, from `cfg.toml`.\n\
@@ -60,6 +61,7 @@ fn main() {
          mqtt_password: {mqtt_password:?},\n\
          device_id: {device_id:?},\n\
          read_only: {read_only},\n\
+         ntp_server: {ntp_server:?},\n\
          }};\n"
     );
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("set by cargo"));
