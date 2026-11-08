@@ -19,6 +19,10 @@ use crate::layout;
 /// - On a room page, the controls are the tiles and the scene buttons that
 ///   the view has. A tap on a sensor tile gives `Control::Tile` too. The
 ///   core decides that the tap does nothing.
+/// - A tile with steps (`TileView::steps`) also has a − and a + button at
+///   its bottom corners, which give `Control::Dimmer` and
+///   `Control::Brighter`. A tap on the rest of the tile gives
+///   `Control::Tile`.
 #[must_use]
 pub fn hit_test(view: &ViewModel, point: Point) -> Option<Control> {
     let on = |area: Rectangle| area.contains(point);
@@ -45,6 +49,14 @@ pub fn hit_test(view: &ViewModel, point: Point) -> Option<Control> {
             if let Some(tile) =
                 (0..room.tiles.len()).find(|tile| layout::tile(*tile).is_some_and(on))
             {
+                if room.tiles[tile].steps {
+                    if layout::tile_dimmer(tile).is_some_and(on) {
+                        return Some(Control::Dimmer(tile));
+                    }
+                    if layout::tile_brighter(tile).is_some_and(on) {
+                        return Some(Control::Brighter(tile));
+                    }
+                }
                 return Some(Control::Tile(tile));
             }
             (0..room.scenes.len())
@@ -58,7 +70,7 @@ pub fn hit_test(view: &ViewModel, point: Point) -> Option<Control> {
 mod tests {
     use embedded_graphics::{prelude::*, primitives::Rectangle};
     use shared::{
-        Control, PageView,
+        Control, PageView, TileKind, ViewModel,
         layout::{MAX_ROOMS, MAX_TILES},
     };
 
@@ -86,6 +98,74 @@ mod tests {
             for point in corners(layout::tile(index).unwrap()) {
                 assert_eq!(hit_test(&view, point), Some(Control::Tile(index)));
             }
+        }
+    }
+
+    /// Returns `view` with tile 1 as a light with steps and tile 4 as a light
+    /// without steps.
+    fn dimmable_view() -> ViewModel {
+        let mut view = view();
+        if let PageView::Room(room) = &mut view.page {
+            room.tiles[1].kind = TileKind::Light;
+            room.tiles[1].steps = true;
+            room.tiles[4].kind = TileKind::Light;
+            room.tiles[4].steps = false;
+        }
+        view
+    }
+
+    #[test]
+    fn the_step_buttons_of_a_dimmable_tile_give_dimmer_and_brighter() {
+        let view = dimmable_view();
+        for point in corners(layout::tile_dimmer(1).unwrap()) {
+            assert_eq!(
+                hit_test(&view, point),
+                Some(Control::Dimmer(1)),
+                "{point:?}"
+            );
+        }
+        for point in corners(layout::tile_brighter(1).unwrap()) {
+            assert_eq!(
+                hit_test(&view, point),
+                Some(Control::Brighter(1)),
+                "{point:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_rest_of_a_dimmable_tile_gives_the_toggle() {
+        let view = dimmable_view();
+        let tile = layout::tile(1).unwrap();
+        let dimmer = layout::tile_dimmer(1).unwrap();
+        let brighter = layout::tile_brighter(1).unwrap();
+        let toggle = [
+            // The label row.
+            tile.top_left,
+            Point::new(tile.center().x, tile.top_left.y + 20),
+            tile.top_left + Point::new(tile.size.width.cast_signed() - 1, 0),
+            // Just above each button.
+            dimmer.top_left - Point::new(0, 1),
+            brighter.top_left - Point::new(0, 1),
+            // The middle of the strip, between the buttons.
+            Point::new(tile.center().x, dimmer.center().y),
+            dimmer.top_left + Point::new(dimmer.size.width.cast_signed(), 0),
+            brighter.top_left - Point::new(1, 0),
+            Point::new(tile.center().x, tile.bottom_right().unwrap().y),
+        ];
+        for point in toggle {
+            assert_eq!(hit_test(&view, point), Some(Control::Tile(1)), "{point:?}");
+        }
+    }
+
+    #[test]
+    fn an_onoff_tile_gives_the_toggle_over_its_whole_area() {
+        let view = dimmable_view();
+        let mut points = corners(layout::tile(4).unwrap()).to_vec();
+        points.extend(corners(layout::tile_dimmer(4).unwrap()));
+        points.extend(corners(layout::tile_brighter(4).unwrap()));
+        for point in points {
+            assert_eq!(hit_test(&view, point), Some(Control::Tile(4)), "{point:?}");
         }
     }
 

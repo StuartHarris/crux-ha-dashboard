@@ -7,7 +7,7 @@ use crux_core::App;
 use super::{
     ExpectFullRefreshTimer,
     connection::{drive_to_connected, drive_to_connecting},
-    start_at, tap_all_lights, tap_room, tap_scene, tap_tile,
+    set_state, start_at, tap_all_lights, tap_brighter, tap_dimmer, tap_room, tap_scene, tap_tile,
 };
 use crate::{
     Control, Dashboard, EffectTestExt, Event, Model, PowerSource, Route, capabilities::mqtt::Qos,
@@ -101,6 +101,139 @@ fn a_tap_on_a_light_publishes_a_toggle() {
 }
 
 #[test]
+fn the_plus_and_minus_buttons_of_a_dimmable_light_publish_a_brightness_step() {
+    let app = Dashboard;
+    let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Stand);
+    model.route = Route::room("living_room");
+    set_state(&mut model, "light.living_room_lights", "on");
+    set_state(&mut model, "light.living_room_rocket_lamp", "on");
+
+    app.update(tap_brighter(1), &mut model)
+        .expect_only_mqtt_publish_with(|publish| {
+            assert_eq!(publish.topic, "dashboard/hall/cmd");
+            assert_eq!(
+                publish.payload,
+                br#"{"service":"light.turn_on","entity_id":"light.living_room_rocket_lamp","brightness_step_pct":25}"#
+            );
+            assert_eq!(publish.qos, Qos::AtLeastOnce);
+            assert!(!publish.retain);
+        });
+    app.update(tap_dimmer(1), &mut model)
+        .expect_only_mqtt_publish_with(|publish| {
+            assert_eq!(
+                publish.payload,
+                br#"{"service":"light.turn_on","entity_id":"light.living_room_rocket_lamp","brightness_step_pct":-25}"#
+            );
+        });
+    // A light group is dimmable too.
+    app.update(tap_dimmer(0), &mut model)
+        .expect_only_mqtt_publish_with(|publish| {
+            assert_eq!(
+                publish.payload,
+                br#"{"service":"light.turn_on","entity_id":"light.living_room_lights","brightness_step_pct":-25}"#
+            );
+        });
+}
+
+#[test]
+fn a_brightness_step_on_a_tile_that_is_not_a_dimmable_light_does_nothing() {
+    let app = Dashboard;
+    let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Stand);
+
+    // Each entity is on, so only the kind of the tile can stop the step.
+    for entity_id in [
+        "light.all_lights",
+        "light.dining_room_candle_light_left",
+        "light.dining_room_candle_light_right",
+        "climate.dining_room_thermostat",
+        "sensor.dining_room_thermostat_humidity",
+        "light.hall_salt_lamp",
+        "sensor.hall_salt_lamp_power",
+        "switch.kitchen_coffee_machine_socket",
+    ] {
+        set_state(&mut model, entity_id, "on");
+    }
+
+    // The index page has no tiles.
+    app.update(tap_brighter(0), &mut model).expect_no_effects();
+
+    // The candle lights are on/off lights. The thermostat and the humidity
+    // sensor are not lights, and the page has no tile 6.
+    model.route = Route::room("dining_room");
+    for index in [2, 3, 4, 5, 6] {
+        app.update(tap_brighter(index), &mut model)
+            .expect_no_effects();
+        app.update(tap_dimmer(index), &mut model)
+            .expect_no_effects();
+    }
+
+    // The salt lamp is an on/off light. The power sensor is not a light.
+    model.route = Route::room("hall");
+    for index in [2, 3] {
+        app.update(tap_brighter(index), &mut model)
+            .expect_no_effects();
+    }
+
+    // The coffee machine is a switch.
+    model.route = Route::room("kitchen");
+    app.update(tap_brighter(0), &mut model).expect_no_effects();
+    app.update(tap_dimmer(0), &mut model).expect_no_effects();
+    assert_eq!(model.connection.outbox.len(), 0);
+}
+
+#[test]
+fn a_minus_step_on_a_light_that_is_off_does_nothing_and_a_plus_step_turns_it_on() {
+    let app = Dashboard;
+    let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Stand);
+    model.route = Route::room("living_room");
+    set_state(&mut model, "light.living_room_rocket_lamp", "off");
+
+    app.update(tap_dimmer(1), &mut model).expect_no_effects();
+    app.update(tap_brighter(1), &mut model)
+        .expect_only_mqtt_publish_with(|publish| {
+            assert_eq!(
+                publish.payload,
+                br#"{"service":"light.turn_on","entity_id":"light.living_room_rocket_lamp","brightness_step_pct":25}"#
+            );
+        });
+}
+
+#[test]
+fn a_brightness_step_on_a_light_with_no_usable_state_does_nothing() {
+    let app = Dashboard;
+    let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Stand);
+    model.route = Route::room("living_room");
+
+    // The core has no state for the rocket lamp yet.
+    app.update(tap_brighter(1), &mut model).expect_no_effects();
+    app.update(tap_dimmer(1), &mut model).expect_no_effects();
+
+    for state in ["unavailable", "unknown"] {
+        set_state(&mut model, "light.living_room_rocket_lamp", state);
+        app.update(tap_brighter(1), &mut model).expect_no_effects();
+        app.update(tap_dimmer(1), &mut model).expect_no_effects();
+    }
+    assert_eq!(model.connection.outbox.len(), 0);
+
+    // A tap on the tile still sends the toggle, as for an on/off light.
+    app.update(tap_tile(1), &mut model)
+        .expect_only_mqtt_publish();
+}
+
+#[test]
+fn a_toggle_has_no_brightness_step() {
+    let app = Dashboard;
+    let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Stand);
+    model.route = Route::room("living_room");
+
+    app.update(tap_tile(1), &mut model)
+        .expect_only_mqtt_publish_with(|publish| {
+            let payload = core::str::from_utf8(&publish.payload).unwrap();
+            assert!(!payload.contains("brightness_step_pct"), "{payload}");
+        });
+}
+
+#[test]
 fn a_tap_on_a_switch_publishes_a_toggle() {
     let app = Dashboard;
     let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Stand);
@@ -189,10 +322,14 @@ fn a_tap_in_a_dry_run_sends_no_service_call() {
     let app = Dashboard;
     let mut model = connected_in_a_dry_run();
     model.route = Route::room("hall");
+    // The hall light is on, so only the dry run stops its steps.
+    set_state(&mut model, "light.hall_hall_light", "on");
     assert!(app.view(&model).read_only);
 
     app.update(tap_tile(0), &mut model).expect_no_effects();
     app.update(tap_scene(2), &mut model).expect_no_effects();
+    app.update(tap_brighter(1), &mut model).expect_no_effects();
+    app.update(tap_dimmer(1), &mut model).expect_no_effects();
     assert_eq!(model.connection.outbox.len(), 0);
 }
 

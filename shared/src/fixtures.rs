@@ -144,6 +144,35 @@ impl FixedShell {
         self.run(effects);
     }
 
+    /// Sends the state of an entity and its attributes, as Home Assistant
+    /// does, and answers the effects until the core waits. Each attribute
+    /// value is JSON, for example `128`. If the connection is not open, the
+    /// core gets nothing.
+    pub fn set_state(&mut self, entity_id: &str, state: &str, attributes: &[(&str, &str)]) {
+        let Some((domain, object)) = entity_id.split_once('.') else {
+            return;
+        };
+        let Some(mut request) = self.connection.take() else {
+            return;
+        };
+        let base = format!("homeassistant/statestream/{domain}/{object}");
+        let messages = core::iter::once((format!("{base}/state"), state)).chain(
+            attributes
+                .iter()
+                .map(|(name, value)| (format!("{base}/{name}"), *value)),
+        );
+        let mut effects = Vec::new();
+        for (topic, payload) in messages {
+            let message = MqttEvent::Message(Message {
+                topic,
+                payload: payload.as_bytes().to_vec(),
+            });
+            effects.extend(self.resolve(&mut request, message));
+        }
+        self.connection = Some(request);
+        self.run(effects);
+    }
+
     /// Ends the MQTT connection, as if the broker went away, and answers
     /// the effects until the core waits.
     pub fn drop_connection(&mut self) {

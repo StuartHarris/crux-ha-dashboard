@@ -152,8 +152,14 @@ fn a_tap_while_asleep_wakes_and_does_not_act_on_the_control() {
         Some(Control::NextPage),
         Some(Control::Tile(0)),
         Some(Control::Scene(0)),
+        Some(Control::Brighter(1)),
+        Some(Control::Dimmer(1)),
     ] {
         let mut model = asleep_on_battery();
+        // On this page, tile 1 is a dimmable light. While the device is
+        // awake, each control here acts.
+        model.route = crate::Route::room("living_room");
+        super::set_state(&mut model, "light.living_room_rocket_lamp", "on");
         let route = model.route.clone();
 
         // The same effects as `Woke`: draw, connect and start the idle timer.

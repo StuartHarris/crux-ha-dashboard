@@ -4,7 +4,10 @@
 use alloc::{string::String, vec, vec::Vec};
 use core::time::Duration;
 
-use super::{shell::Shell, start, start_at, tap_all_lights, tap_room, tap_scene, tap_tile};
+use super::{
+    shell::Shell, start, start_at, tap_all_lights, tap_brighter, tap_dimmer, tap_room, tap_scene,
+    tap_tile,
+};
 use crate::{
     Connection, Event, LightState,
     LightState::{Off, On, Unavailable},
@@ -617,6 +620,161 @@ fn on_battery_a_tap_while_asleep_wakes_and_does_not_toggle_the_light() {
 }
 
 #[test]
+fn the_plus_and_minus_buttons_change_the_brightness_of_a_light() {
+    let mut shell = house();
+    shell.send(start_at(PowerSource::Stand, Some("/room/living_room")));
+    assert_eq!(
+        texts(&shell)[1],
+        tile("Rocket lamp", TileState::On, "On 50%")
+    );
+    assert_eq!(shell.view().tiles()[1].detail, "50%");
+
+    // Home Assistant adds 25% (64 of 255) to the brightness, and the new
+    // brightness comes back on the state stream.
+    shell.send(tap_brighter(1));
+    let call = shell.broker.service_calls.last().unwrap();
+    assert_eq!(call.service, "light.turn_on");
+    assert_eq!(call.entity_id, "light.living_room_rocket_lamp");
+    assert_eq!(call.brightness_step_pct, Some(25));
+    assert_eq!(
+        texts(&shell)[1],
+        tile("Rocket lamp", TileState::On, "On 75%")
+    );
+    assert_eq!(shell.view().tiles()[1].detail, "75%");
+    assert!(!shell.frames.last().unwrap().full);
+
+    // Each step down takes 25% off. At 0, Home Assistant turns the light off.
+    shell.send(tap_dimmer(1));
+    shell.send(tap_dimmer(1));
+    assert_eq!(
+        texts(&shell)[1],
+        tile("Rocket lamp", TileState::On, "On 25%")
+    );
+    shell.send(tap_dimmer(1));
+    assert_eq!(texts(&shell)[1], tile("Rocket lamp", TileState::Off, "Off"));
+    assert_eq!(shell.view().tiles()[1].detail, "");
+
+    // A step up turns a light that is off on at 25%.
+    shell.send(tap_brighter(1));
+    assert_eq!(
+        texts(&shell)[1],
+        tile("Rocket lamp", TileState::On, "On 25%")
+    );
+    assert_eq!(shell.broker.service_calls.len(), 5);
+
+    // A tap on the rest of the tile still toggles the light.
+    shell.send(tap_tile(1));
+    let call = shell.broker.service_calls.last().unwrap();
+    assert_eq!(call.service, "light.toggle");
+    assert_eq!(call.brightness_step_pct, None);
+    assert_eq!(texts(&shell)[1].1, TileState::Off);
+}
+
+#[test]
+fn an_onoff_light_has_no_brightness_steps() {
+    let mut shell = house();
+    shell.broker.set_state(
+        "light.dining_room_candle_light_left",
+        "on",
+        &[("brightness", "128")],
+    );
+    shell
+        .broker
+        .set_state("light.dining_room_tall_lamp", "off", &[]);
+    shell
+        .broker
+        .set_state("light.dining_room_candle_light_right", "off", &[]);
+    shell.send(start_at(PowerSource::Stand, Some("/room/dining_room")));
+    let view = shell.view();
+    let tiles = view.tiles();
+    assert!(tiles[1].steps);
+    assert!(!tiles[2].steps);
+    assert!(!tiles[3].steps);
+    // The tile of an on/off light shows no brightness under its value.
+    assert_eq!(tiles[2].text, "On 50%");
+    assert_eq!(tiles[2].detail, "");
+
+    shell.send(tap_brighter(2));
+    shell.send(tap_dimmer(3));
+    assert_eq!(shell.broker.service_calls.len(), 0);
+
+    // A tap on the tile toggles the light.
+    shell.send(tap_tile(2));
+    assert_eq!(
+        shell.broker.state("light.dining_room_candle_light_left"),
+        Some("off")
+    );
+}
+
+#[test]
+fn a_dimmable_light_has_steps_only_while_it_is_on_or_off() {
+    let mut shell = house();
+    shell.send(start_at(PowerSource::Stand, Some("/room/living_room")));
+    let steps = |shell: &Shell| -> Vec<bool> {
+        shell.view().tiles().iter().map(|tile| tile.steps).collect()
+    };
+    // The group is off, the rocket lamp is on and the standard lamp is
+    // unavailable. The sensors are not lights.
+    assert_eq!(steps(&shell), [true, true, false, false, false]);
+    assert_eq!(
+        texts(&shell)[2],
+        tile("Standard lamp", TileState::Unavailable, "Unavailable")
+    );
+
+    // A step on the unavailable lamp does nothing.
+    shell.send(tap_brighter(2));
+    shell.send(tap_dimmer(2));
+    assert_eq!(shell.broker.service_calls.len(), 0);
+
+    // When the lamp is back, its tile has the steps again.
+    shell
+        .broker
+        .set_state("light.living_room_standard_lamp", "off", &[]);
+    shell.run();
+    assert_eq!(steps(&shell), [true, true, true, false, false]);
+
+    // A − step on a light that is off does nothing. A + step turns it on.
+    shell.send(tap_dimmer(2));
+    assert_eq!(shell.broker.service_calls.len(), 0);
+    shell.send(tap_brighter(2));
+    assert_eq!(shell.broker.service_calls.len(), 1);
+    assert_eq!(
+        texts(&shell)[2],
+        tile("Standard lamp", TileState::On, "On 25%")
+    );
+
+    // When the state is unknown, the tile has no steps.
+    shell
+        .broker
+        .set_state("light.living_room_standard_lamp", "unknown", &[]);
+    shell.run();
+    assert!(!steps(&shell)[2]);
+}
+
+#[test]
+fn on_battery_a_brightness_step_while_asleep_wakes_and_does_not_change_the_light() {
+    let mut shell = house();
+    shell.send(start_at(PowerSource::Battery, Some("/room/living_room")));
+    shell.fire_timers();
+    assert!(shell.view().asleep);
+
+    shell.send(tap_brighter(1));
+    assert!(!shell.view().asleep);
+    assert_eq!(shell.broker.service_calls.len(), 0);
+    assert_eq!(
+        texts(&shell)[1],
+        tile("Rocket lamp", TileState::On, "On 50%")
+    );
+
+    // The device is awake, so the next tap changes the brightness.
+    shell.send(tap_brighter(1));
+    assert_eq!(
+        texts(&shell)[1],
+        tile("Rocket lamp", TileState::On, "On 75%")
+    );
+}
+
+#[test]
 fn a_dry_run_sends_no_service_call_until_it_stops() {
     let mut shell = house();
     let Event::Start(mut start) = start(PowerSource::Stand) else {
@@ -630,6 +788,8 @@ fn a_dry_run_sends_no_service_call_until_it_stops() {
     shell.send(tap_all_lights());
     shell.send(Event::Navigate(Route::room("living_room")));
     shell.send(tap_scene(0));
+    shell.send(tap_brighter(1));
+    shell.send(tap_dimmer(1));
     assert_eq!(shell.broker.service_calls.len(), 0);
     assert_eq!(shell.model.connection.outbox.len(), 0);
     // The status message is not a service call, so the core still sends it.

@@ -199,9 +199,17 @@ pub struct TileView {
     pub text: String,
     /// More text for the value, or an empty string. A climate tile shows the
     /// target temperature here, for example `Set 21°`. A weather tile shows
-    /// the condition here, for example `Partly cloudy`. A renderer shows it in
-    /// a smaller font.
+    /// the condition here, for example `Partly cloudy`. A light tile with
+    /// steps (refer to [`TileView::steps`]) that is on shows its brightness
+    /// here, for example `50%`. A renderer shows
+    /// it in a smaller font.
     pub detail: String,
+    /// The tile has the − and + buttons: it is a dimmable light that is on
+    /// or off. Refer to [`Tile::has_steps`]. On a room page, a renderer
+    /// draws the buttons, and a tap on them sends `Control::Dimmer` and
+    /// `Control::Brighter`. If `steps` is `false`, a renderer draws the tile
+    /// as the tile of an on/off light.
+    pub steps: bool,
 }
 
 /// What a renderer needs to draw one scene button.
@@ -318,11 +326,17 @@ fn page_view(page: &Page, model: &Model) -> PageView {
 
 /// Makes the view of one tile.
 fn tile_view(tile: &Tile, entities: &Entities) -> TileView {
+    let entity = entities.get(tile.entity_id);
     let Description {
         state,
         text,
         detail,
-    } = describe(tile.kind, entities.get(tile.entity_id));
+    } = describe(tile.kind, entity);
+    let steps = tile.has_steps(entity.and_then(|entity| entity.state.as_deref()));
+    let detail = match entity.and_then(light_percent) {
+        Some(percent) if steps && state == TileState::On => format!("{percent}%"),
+        _ => detail,
+    };
     TileView {
         label: tile.label.into(),
         entity_id: tile.entity_id.into(),
@@ -330,6 +344,7 @@ fn tile_view(tile: &Tile, entities: &Entities) -> TileView {
         state,
         text,
         detail,
+        steps,
     }
 }
 
@@ -433,10 +448,7 @@ pub fn describe(kind: TileKind, entity: Option<&EntityState>) -> Description {
     match kind {
         TileKind::Light | TileKind::Switch => match state {
             "on" => {
-                let percent = entity
-                    .attribute("brightness")
-                    .and_then(|value| value.parse::<u32>().ok())
-                    .map(brightness_percent);
+                let percent = light_percent(entity);
                 let text = percent.map_or_else(|| "On".into(), |percent| format!("On {percent}%"));
                 Description::new(TileState::On, text)
             }
@@ -485,6 +497,15 @@ pub fn describe(kind: TileKind, entity: Option<&EntityState>) -> Description {
             }
         }
     }
+}
+
+/// Returns the brightness of a light as a percentage, or `None` if the
+/// entity has no valid `brightness` attribute.
+fn light_percent(entity: &EntityState) -> Option<u32> {
+    entity
+        .attribute("brightness")
+        .and_then(|value| value.parse::<u32>().ok())
+        .map(brightness_percent)
 }
 
 /// Converts a Home Assistant brightness (0 to 255) to a percentage.

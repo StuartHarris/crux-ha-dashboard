@@ -11,11 +11,16 @@
 //! shows at most [`MAX_LIGHTS`](crate::layout::MAX_LIGHTS) lights and
 //! switches. A test checks these limits
 //! and the entity ids.
+//!
+//! Use [`light`] for a light that can change its brightness, and
+//! [`onoff_light`] for a light that can only be on or off. Home Assistant
+//! gives the color modes of a light in its `supported_color_modes` attribute.
+//! A light with only `onoff` is an on/off light.
 
 use alloc::vec::Vec;
 
 use crate::layout::{
-    Page, climate, home, light, light_group, room, scene, sensor, switch, weather,
+    Page, climate, home, light, light_group, onoff_light, room, scene, sensor, switch, weather,
 };
 
 /// The pages of the dashboard, in the order that the pages show.
@@ -50,8 +55,8 @@ pub const PAGES: &[Page] = &[
         &[
             light_group("Lights", "light.dining_room_lights"),
             light("Tall lamp", "light.dining_room_tall_lamp"),
-            light("Candle left", "light.dining_room_candle_light_left"),
-            light("Candle right", "light.dining_room_candle_light_right"),
+            onoff_light("Candle left", "light.dining_room_candle_light_left"),
+            onoff_light("Candle right", "light.dining_room_candle_light_right"),
             climate("Thermostat", "climate.dining_room_thermostat"),
             sensor("Humidity", "sensor.dining_room_thermostat_humidity"),
         ],
@@ -82,7 +87,7 @@ pub const PAGES: &[Page] = &[
         &[
             light_group("Lights", "light.hall_lights"),
             light("Hall light", "light.hall_hall_light"),
-            light("Salt lamp", "light.hall_salt_lamp"),
+            onoff_light("Salt lamp", "light.hall_salt_lamp"),
             sensor("Salt lamp power", "sensor.hall_salt_lamp_power"),
         ],
         &[
@@ -296,6 +301,35 @@ mod tests {
                 "{}",
                 tile.entity_id
             );
+        }
+    }
+
+    #[test]
+    fn only_a_light_is_dimmable() {
+        for tile in PAGES.iter().flat_map(|page| page.tiles) {
+            assert!(
+                !tile.dimmable || tile.kind == TileKind::Light,
+                "{}",
+                tile.entity_id
+            );
+        }
+    }
+
+    #[test]
+    fn each_light_is_dimmable_except_the_onoff_lights() {
+        // Home Assistant gives only the `onoff` color mode for these lights.
+        const ONOFF: [&str; 3] = [
+            "light.dining_room_candle_light_left",
+            "light.dining_room_candle_light_right",
+            "light.hall_salt_lamp",
+        ];
+        let lights = PAGES
+            .iter()
+            .flat_map(|page| page.tiles)
+            .filter(|tile| tile.kind == TileKind::Light);
+        for tile in lights {
+            let onoff = ONOFF.contains(&tile.entity_id);
+            assert_eq!(tile.dimmable, !onoff, "{}", tile.entity_id);
         }
     }
 

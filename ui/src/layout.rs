@@ -37,6 +37,16 @@ pub const GRID_TOP: u32 = HEADER_HEIGHT + GAP;
 /// The height of a tile.
 pub const TILE_HEIGHT: u32 = 136;
 
+/// The height of the − and + buttons at the bottom of a tile with steps.
+/// It is the height of a scene button, the smallest target on the panel.
+pub const STEP_HEIGHT: u32 = 72;
+/// The width of the − and + buttons, about 10 mm.
+///
+/// The − button is at the left end of the tile and the + button is at the
+/// right end. The space between them has the brightness, and a tap in it
+/// toggles the light.
+pub const STEP_WIDTH: u32 = 96;
+
 /// The top of the row of scene buttons.
 pub const SCENES_TOP: u32 = GRID_TOP + ROWS * (TILE_HEIGHT + GAP);
 /// The height of a scene button.
@@ -73,6 +83,13 @@ const _: () = assert!((COLUMNS * ROOM_ROWS) as usize == MAX_ROOMS);
 const _: () = assert!(FOOTER_HEIGHT >= 72);
 const _: () = assert!(ROOM_HEIGHT >= 72);
 const _: () = assert!(ALL_LIGHTS_HEIGHT >= 72);
+// The − and + buttons are large enough for a finger. The label row above
+// them is at least 56 pixels high.
+const _: () = assert!(STEP_HEIGHT >= 72 && STEP_WIDTH >= 72);
+const _: () = assert!(STEP_HEIGHT + 56 <= TILE_HEIGHT);
+// The − and + buttons are far apart, so a tap that misses one button does
+// not hit the other.
+const _: () = assert!(CELL_WIDTH - 2 * STEP_WIDTH >= 96);
 // The All lights toggle ends before the line at the bottom of the header.
 const _: () = assert!(HEADER_HEIGHT + ALL_LIGHTS_HEIGHT + 6 <= INDEX_HEADER_HEIGHT);
 // The scene row ends before the footer.
@@ -140,6 +157,36 @@ pub const fn tile(index: usize) -> Option<Rectangle> {
     let left = MARGIN + (index % COLUMNS) * (CELL_WIDTH + GAP);
     let top = GRID_TOP + (index / COLUMNS) * (TILE_HEIGHT + GAP);
     Some(rect(left, top, CELL_WIDTH, TILE_HEIGHT))
+}
+
+/// Returns the area of the − button of the tile with this index, or `None`
+/// if the grid has no cell for the index.
+///
+/// The button is at the bottom left of the tile. Only a tile with steps
+/// (`TileView::steps`) has it.
+#[must_use]
+pub const fn tile_dimmer(index: usize) -> Option<Rectangle> {
+    let Some(tile) = tile(index) else {
+        return None;
+    };
+    let left = tile.top_left.x.unsigned_abs();
+    let top = tile.top_left.y.unsigned_abs() + TILE_HEIGHT - STEP_HEIGHT;
+    Some(rect(left, top, STEP_WIDTH, STEP_HEIGHT))
+}
+
+/// Returns the area of the + button of the tile with this index, or `None`
+/// if the grid has no cell for the index.
+///
+/// The button is at the bottom right of the tile. Only a tile with steps
+/// (`TileView::steps`) has it.
+#[must_use]
+pub const fn tile_brighter(index: usize) -> Option<Rectangle> {
+    let Some(tile) = tile(index) else {
+        return None;
+    };
+    let left = tile.top_left.x.unsigned_abs() + CELL_WIDTH - STEP_WIDTH;
+    let top = tile.top_left.y.unsigned_abs() + TILE_HEIGHT - STEP_HEIGHT;
+    Some(rect(left, top, STEP_WIDTH, STEP_HEIGHT))
 }
 
 /// Returns the area of the scene button with this index, or `None` if the row
@@ -249,6 +296,30 @@ mod tests {
         }
         assert!(weather().intersection(&all_lights()).is_zero_sized());
         assert!(bottom(room(MAX_ROOMS - 1).unwrap()) + GAP <= FOOTER_TOP);
+    }
+
+    #[test]
+    fn the_step_buttons_are_at_the_bottom_corners_of_their_tile() {
+        for index in 0..MAX_TILES {
+            let tile = tile(index).unwrap();
+            let dimmer = tile_dimmer(index).unwrap();
+            let brighter = tile_brighter(index).unwrap();
+            for button in [dimmer, brighter] {
+                assert_eq!(tile.intersection(&button), button);
+                assert_eq!(bottom(button), bottom(tile));
+                assert_eq!(button.size, Size::new(STEP_WIDTH, STEP_HEIGHT));
+            }
+            assert_eq!(dimmer.top_left.x, tile.top_left.x);
+            assert_eq!(
+                brighter.bottom_right().unwrap(),
+                tile.bottom_right().unwrap()
+            );
+            // The space between the two buttons is at least one button wide.
+            let gap = brighter.top_left.x - dimmer.bottom_right().unwrap().x - 1;
+            assert!(gap >= STEP_WIDTH.cast_signed(), "{gap}");
+        }
+        assert_eq!(tile_dimmer(MAX_TILES), None);
+        assert_eq!(tile_brighter(MAX_TILES), None);
     }
 
     #[test]

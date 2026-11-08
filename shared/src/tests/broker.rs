@@ -35,6 +35,8 @@ struct Session {
 pub struct ServiceCall {
     pub service: String,
     pub entity_id: String,
+    /// The change in brightness of a `light.turn_on` call, in percent.
+    pub brightness_step_pct: Option<i8>,
 }
 
 /// The fake broker.
@@ -190,6 +192,10 @@ impl Broker {
 
     /// Does a service call as Home Assistant does.
     fn home_assistant(&mut self, call: &ServiceCall) {
+        if let ("light.turn_on", Some(step)) = (call.service.as_str(), call.brightness_step_pct) {
+            self.step_brightness(&call.entity_id.clone(), step);
+            return;
+        }
         let Some((domain, action)) = call.service.split_once('.') else {
             return;
         };
@@ -203,6 +209,32 @@ impl Broker {
         };
         let entity_id = call.entity_id.clone();
         self.set_state(&entity_id, next, &[]);
+    }
+
+    /// Changes the brightness of a light by `step` percent, as
+    /// `light.turn_on` with `brightness_step_pct` does. A light that is off
+    /// has the brightness 0. If the brightness gets to 0, the light turns
+    /// off.
+    fn step_brightness(&mut self, entity_id: &str, step: i8) {
+        let Some(object_id) = entity_id.strip_prefix("light.") else {
+            return;
+        };
+        let topic = format!("{STATESTREAM}/light/{object_id}/brightness");
+        let now = match self.state(entity_id) {
+            Some("on") => self
+                .retained(&topic)
+                .and_then(|value| value.parse::<i32>().ok())
+                .unwrap_or(255),
+            _ => 0,
+        };
+        // Home Assistant rounds the step to the nearest brightness.
+        let change = i32::from(step) * 255;
+        let next = (now + (change + change.signum() * 50) / 100).clamp(0, 255);
+        if next == 0 {
+            self.set_state(entity_id, "off", &[("brightness", "null")]);
+        } else {
+            self.set_state(entity_id, "on", &[("brightness", &next.to_string())]);
+        }
     }
 }
 
