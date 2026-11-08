@@ -54,6 +54,10 @@ test:
     @echo '{{ style("command") }}test:{{ NORMAL }}'
     cargo nextest run --workspace
 
+# Print the entities of the dashboard for the Pi (options: --statestream, --seed, --help)
+ha-entities *args:
+    @./scripts/ha_entities.rs {{ args }}
+
 # Run the host tests of the firmware logic (`just test` runs them too)
 test-firmware:
     @echo '{{ style("command") }}test-firmware:{{ NORMAL }}'

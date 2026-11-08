@@ -12,6 +12,8 @@
 //! switches. A test checks these limits
 //! and the entity ids.
 
+use alloc::vec::Vec;
+
 use crate::layout::{
     Page, climate, home, light, light_group, room, scene, sensor, switch, weather,
 };
@@ -151,13 +153,65 @@ pub const PAGES: &[Page] = &[
     ),
 ];
 
+/// Returns the entity ids of the tiles and scenes of all the pages.
+///
+/// The ids are in page order, with the tiles of a page before its scenes. Each id
+/// occurs once, at its first position. Use the list for the `include` list of
+/// `mqtt_statestream` on the Pi.
+#[must_use]
+pub fn entity_ids(pages: &[Page]) -> Vec<&'static str> {
+    let mut ids: Vec<&'static str> = Vec::new();
+    for page in pages {
+        let tiles = page.tiles.iter().map(|tile| tile.entity_id);
+        let scenes = page.scenes.iter().map(|scene| scene.entity_id);
+        for id in tiles.chain(scenes) {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+    }
+    ids
+}
+
+/// Returns the entity attributes that the tiles of all the pages show.
+///
+/// The attributes are in the order in which they first occur, and each occurs once.
+#[must_use]
+pub fn attributes(pages: &[Page]) -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = Vec::new();
+    for tile in pages.iter().flat_map(|page| page.tiles) {
+        for name in tile.kind.attributes() {
+            if !names.contains(name) {
+                names.push(name);
+            }
+        }
+    }
+    names
+}
+
+/// Returns the entity ids of the dashboard, from [`PAGES`].
+#[must_use]
+pub fn dashboard_entity_ids() -> Vec<&'static str> {
+    entity_ids(PAGES)
+}
+
+/// Returns the entity attributes of the dashboard, from [`PAGES`].
+#[must_use]
+pub fn dashboard_attributes() -> Vec<&'static str> {
+    attributes(PAGES)
+}
+
 #[cfg(test)]
 mod tests {
-    use alloc::collections::BTreeSet;
+    use alloc::{collections::BTreeSet, format, vec::Vec};
 
-    use super::PAGES;
+    use super::{PAGES, attributes, dashboard_attributes, dashboard_entity_ids, entity_ids};
     use crate::{
-        layout::{MAX_LIGHTS, MAX_ROOMS, MAX_SCENES, MAX_TILES, TileKind},
+        entities::{STATESTREAM, topics},
+        layout::{
+            MAX_LIGHTS, MAX_ROOMS, MAX_SCENES, MAX_TILES, Page, TileKind, home, light_group, room,
+            scene, sensor,
+        },
         route::Route,
     };
 
@@ -251,5 +305,74 @@ mod tests {
             let ids: BTreeSet<_> = page.tiles.iter().map(|tile| tile.entity_id).collect();
             assert_eq!(ids.len(), page.tiles.len(), "{}", page.title);
         }
+    }
+
+    #[test]
+    fn the_entity_ids_have_no_repeats() {
+        let ids = dashboard_entity_ids();
+        let unique: BTreeSet<_> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len());
+    }
+
+    #[test]
+    fn the_entity_ids_have_each_tile_and_scene() {
+        let ids = dashboard_entity_ids();
+        for page in PAGES {
+            for tile in page.tiles {
+                assert!(ids.contains(&tile.entity_id), "{}", tile.entity_id);
+            }
+            for scene in page.scenes {
+                assert!(ids.contains(&scene.entity_id), "{}", scene.entity_id);
+            }
+        }
+    }
+
+    #[test]
+    fn the_first_entity_id_is_all_lights() {
+        assert_eq!(dashboard_entity_ids()[0], "light.all_lights");
+    }
+
+    #[test]
+    fn the_attributes_are_the_five_that_the_tiles_show() {
+        assert_eq!(
+            dashboard_attributes(),
+            [
+                "brightness",
+                "temperature",
+                "temperature_unit",
+                "unit_of_measurement",
+                "current_temperature"
+            ]
+        );
+    }
+
+    #[test]
+    fn each_topic_of_the_core_is_on_the_lists_for_the_pi() {
+        let ids = dashboard_entity_ids();
+        let names = dashboard_attributes();
+        for topic in topics(PAGES) {
+            let rest = topic.strip_prefix(STATESTREAM).unwrap();
+            let [domain, object_id, name] = rest[1..].split('/').collect::<Vec<_>>()[..] else {
+                panic!("{topic}");
+            };
+            let id = format!("{domain}.{object_id}");
+            assert!(ids.contains(&id.as_str()), "{topic}");
+            assert!(name == "state" || names.contains(&name), "{topic}");
+        }
+    }
+
+    #[test]
+    fn an_entity_on_two_pages_is_listed_once_and_tiles_come_before_scenes() {
+        const FIXTURE: &[Page] = &[
+            home("Home", &[light_group("All", "light.all")], &[]),
+            room(
+                "a",
+                "A",
+                &[light_group("All", "light.all"), sensor("T", "sensor.t")],
+                &[scene("S", "scene.s")],
+            ),
+        ];
+        assert_eq!(entity_ids(FIXTURE), ["light.all", "sensor.t", "scene.s"]);
+        assert_eq!(attributes(FIXTURE), ["brightness", "unit_of_measurement"]);
     }
 }

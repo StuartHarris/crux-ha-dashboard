@@ -54,6 +54,9 @@ If you add an entity to `pages.rs`, add it to the `include` list on the Pi too. 
 to the list of entities in `dashboard_statestream_seed` too. Then restart Home
 Assistant. If you do not, the tile shows `-`.
 
+Run `just ha-entities --statestream` to get the lines for the `include` list. Run
+`just ha-entities` to get a bare list of the entities, to compare with the Pi.
+
 ### Seed the state stream
 
 The Home Assistant automation `dashboard_statestream_seed` (Dashboard statestream seed)
@@ -75,6 +78,9 @@ retained, with QoS 1. The core cannot tell which of the two publishers sent a me
 
 The automation has its own list of entities. That list must be the same as the
 `include` list. The `rpi` runbook has a command that compares the two lists.
+
+Run `just ha-entities --seed` to get the `attributes` list and the `entities` list of
+the automation. Run `just ha-entities` for a bare list to compare with the Pi.
 
 ## What the dashboard publishes
 
