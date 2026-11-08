@@ -264,6 +264,9 @@ impl App {
         if pressed(Key::Z) {
             self.shell.sleep_now();
         }
+        if pressed(Key::R) {
+            self.shell.restart();
+        }
         if pressed(Key::D) {
             self.show_outline = !self.show_outline;
         }
@@ -409,6 +412,7 @@ impl App {
                 self.shell.wake();
             }
             self.sleep_now_control(ui, view);
+            self.restart_control(ui);
         });
         ui.label(format!("Connection: {:?}", view.connection));
 
@@ -444,7 +448,7 @@ impl App {
         ui.label(
             RichText::new(
                 "Keys (when no text box has the focus): S stand/battery, W wake, \
-                 Z sleep now, D outline, Left/Right page, Q quit",
+                 Z sleep now, R restart, D outline, Left/Right page, Q quit",
             )
             .small(),
         );
@@ -472,6 +476,23 @@ impl App {
             .clicked();
         if clicked {
             self.shell.sleep_now();
+        }
+    }
+
+    /// Shows the "Restart" button. The button simulates the wake from a deep
+    /// sleep: the shell makes a new core and keeps the page and the time of
+    /// the last update.
+    fn restart_control(&mut self, ui: &mut Ui) {
+        let clicked = ui
+            .add_enabled(self.shell.can_restart(), egui::Button::new("Restart (R)"))
+            .on_hover_text(
+                "Simulates the wake from a deep sleep. The shell makes a new core. \
+                 The page and the time of the last update stay.",
+            )
+            .on_disabled_hover_text("The device is awake. A restart needs a sleeping device.")
+            .clicked();
+        if clicked {
+            self.shell.restart();
         }
     }
 

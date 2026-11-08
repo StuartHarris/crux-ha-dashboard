@@ -121,6 +121,8 @@ pub struct Shell {
     last_token: u64,
     render: bool,
     inspector: Inspector,
+    /// The settings that [`Shell::start`] gave, for [`Shell::restart`].
+    settings: Option<Settings>,
 }
 
 impl Drop for Shell {
@@ -153,18 +155,73 @@ impl Shell {
             last_token: 0,
             render: false,
             inspector: Inspector::default(),
+            settings: None,
         }
     }
 
-    /// Sends `Start` to the core. `settings.read_only` starts the core in
-    /// a dry run.
+    /// Sends `Start` to the core, as the device does after a cold start.
+    /// `settings.read_only` starts the core in a dry run. The shell keeps
+    /// the settings for [`Shell::restart`]. A cold start has no
+    /// `last_sync`.
     pub fn start(&mut self, settings: Settings, power: PowerSource, path: Option<String>) {
+        self.settings = Some(settings.clone());
         self.send(Event::Start(Start {
             settings,
             power,
             path,
             last_sync: None,
         }));
+    }
+
+    /// Returns `true` if "Restart" can work: the shell started the core and
+    /// the device is asleep.
+    pub fn can_restart(&self) -> bool {
+        self.settings.is_some() && self.view().asleep
+    }
+
+    /// Simulates the wake from a deep sleep. Returns `false` if
+    /// [`Shell::can_restart`] is `false`, and then does nothing.
+    ///
+    /// A deep sleep loses the RAM, so the shell stops all the tasks, makes a
+    /// new core and sends `Start`. The `path` and `last_sync` come from the
+    /// view model of the old core. These are the two values that the
+    /// firmware keeps in RTC memory. The power source is the current one.
+    ///
+    /// The device reads `read_only` from its configuration after a deep
+    /// sleep, but the user can switch the dry run in the simulator. The
+    /// restart uses `read_only` from the settings or from the view, so a
+    /// restart never switches to live service calls.
+    ///
+    /// The inspector and the counters of connections and timers stay. A late
+    /// signal from a task of the old core finds no connection or timer, so
+    /// the shell ignores it.
+    pub fn restart(&mut self) -> bool {
+        let view = self.view();
+        let Some(mut settings) = self.settings.clone().filter(|_| view.asleep) else {
+            return false;
+        };
+        settings.read_only |= view.read_only;
+        eprintln!("power: restart after a deep sleep");
+        self.inspector.effect(
+            "Restart",
+            String::new(),
+            "deep sleep: new core, the page and the last update kept",
+        );
+        for live in self.connections.drain(..) {
+            live.link.abort();
+        }
+        for (_, timer) in self.timers.drain() {
+            timer.task.abort();
+        }
+        self.current = None;
+        self.core = Core::new();
+        self.send(Event::Start(Start {
+            settings,
+            power: view.power,
+            path: Some(view.path),
+            last_sync: view.last_sync,
+        }));
+        true
     }
 
     /// Sends an event to the core and performs the effects.
@@ -1079,5 +1136,111 @@ mod tests {
         let view = fixture.shell().view();
         assert!(view.asleep);
         assert_eq!(view.status, "Asleep, on battery, 1 tap not sent");
+    }
+
+    /// A state message: the core reads the clock and sets `last_sync`.
+    fn state_message(fixture: &mut Fixture, connection: u64) {
+        fixture.mqtt(
+            connection,
+            MqttEvent::Message(Message {
+                topic: "homeassistant/statestream/light/all_lights/state".into(),
+                payload: b"on".to_vec(),
+            }),
+        );
+    }
+
+    #[test]
+    fn restart_keeps_the_page_and_the_last_update_and_connects_again() {
+        let mut fixture = Fixture::new();
+        fixture.start(PowerSource::Battery);
+        fixture.mqtt(1, MqttEvent::Connected);
+        state_message(&mut fixture, 1);
+        fixture.shell().send(Event::NextPage);
+        let before = fixture.shell().view();
+        assert!(before.last_sync.is_some());
+        assert_ne!(before.path, "/room/living_room");
+        assert!(fixture.shell().sleep_now());
+        assert!(fixture.shell().can_restart());
+        fixture.take_log();
+
+        assert!(fixture.shell().restart());
+
+        // The shell aborts the old connection, and the new core opens a new
+        // one.
+        assert_eq!(fixture.take_log(), ["abort 1", "open 2"]);
+        let after = fixture.shell().view();
+        assert_eq!(after.path, before.path);
+        assert_eq!(after.last_sync, before.last_sync);
+        assert!(!after.asleep);
+        assert_eq!(fixture.shell().current_connection(), Some(2));
+        fixture.mqtt(2, MqttEvent::Connected);
+        assert_eq!(
+            fixture.shell().view().connection,
+            shared::Connection::Online
+        );
+    }
+
+    #[test]
+    fn restart_while_awake_does_nothing() {
+        let mut fixture = Fixture::new();
+        fixture.start(PowerSource::Battery);
+        fixture.mqtt(1, MqttEvent::Connected);
+        fixture.take_log();
+        let before = fixture.shell().view();
+
+        assert!(!fixture.shell().can_restart());
+        assert!(!fixture.shell().restart());
+        assert_eq!(fixture.shell().view(), before);
+        assert_eq!(fixture.shell().current_connection(), Some(1));
+        assert_eq!(fixture.take_log(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn restart_keeps_a_dry_run_that_the_user_switched_on() {
+        let mut fixture = Fixture::new();
+        fixture.start_with(PowerSource::Battery, None, false);
+        fixture.mqtt(1, MqttEvent::Connected);
+        fixture.shell().send(Event::SetReadOnly(true));
+        assert!(fixture.shell().view().read_only);
+        assert!(fixture.shell().sleep_now());
+
+        assert!(fixture.shell().restart());
+        assert!(fixture.shell().view().read_only);
+    }
+
+    #[test]
+    fn restart_keeps_the_dry_run_of_the_settings() {
+        let mut fixture = Fixture::new();
+        fixture.start_with(PowerSource::Battery, None, true);
+        fixture.mqtt(1, MqttEvent::Connected);
+        fixture.shell().send(Event::SetReadOnly(false));
+        assert!(fixture.shell().sleep_now());
+
+        assert!(fixture.shell().restart());
+        assert!(fixture.shell().view().read_only);
+    }
+
+    #[test]
+    fn restart_ignores_the_signals_of_the_old_core() {
+        let mut fixture = Fixture::new();
+        fixture.start(PowerSource::Battery);
+        fixture.mqtt(1, MqttEvent::Connected);
+        let (old_id, old_token) = fixture.timer().unwrap();
+        assert!(fixture.shell().sleep_now());
+        assert!(fixture.shell().restart());
+        fixture.take_log();
+        let (id, token) = fixture.timer().unwrap();
+        assert!(token > old_token);
+
+        // A late signal of the old connection does not reach the core.
+        fixture.mqtt(1, MqttEvent::Disconnected { reason: None });
+        assert_eq!(fixture.shell().current_connection(), Some(2));
+        // A late signal of the old idle timer does not fire the new one.
+        fixture.shell().handle(Signal::Timer {
+            id: old_id,
+            token: old_token,
+        });
+        assert_eq!(fixture.timer(), Some((id, token)));
+        assert!(!fixture.shell().view().asleep);
     }
 }
