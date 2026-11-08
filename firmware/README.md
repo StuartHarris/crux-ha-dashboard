@@ -49,7 +49,7 @@ cannot block each other. This is the pattern of the `cpb` example in Crux.
 `Sleep` writes a line to the log, and the device stays awake. The next tap goes to the
 core as usual, and the core wakes because it sleeps. Deep sleep comes in phase 6.
 
-`TimeNow` gives the time of the start plus the time since the start. At boot, before the
+The wall clock is the time of the start plus the time since the start. At boot, before the
 core starts, the firmware reads the time of the PCF8563 RTC through the I2C bus of the
 panel. After the device has a network address, the `sntp` task asks the SNTP server
 (`ntp_server` in `cfg.toml`), sets the clock, and then asks again each 12 hours. After a
@@ -61,9 +61,12 @@ seconds wrong. It writes at the start of a second, because the RTC starts to cou
 it is written. It tries a failed write 3 times. The log shows `clock: set from the RTC`
 or `clock: set from SNTP`.
 
-The core treats a time before 2025 as not valid. If neither source gives a valid time,
-the clock starts at the Unix epoch, and the view shows only "Live", and no "Updated
-HH:MM" text. The log then says at the start that the clock is not set.
+A time before 2025 is not valid. If neither source gives a valid time, the clock starts
+at the Unix epoch, and the log says at the start that the clock is not set.
+
+The core does not read the wall clock. The footer text "Last changed HH:MM" comes from
+the `last_updated` time that Home Assistant publishes for each entity. The wall clock
+keeps the RTC correct.
 
 The second binary, `bringup`, runs the hardware checks for a new board.
 
@@ -216,7 +219,9 @@ Do the steps in this order. Each step needs the steps before it.
 9. **Wi-Fi.** Find `step 7`. The log shows `joined` and an address.
 10. **MQTT and the retained states.** Set `read_only = true` in `cfg.toml`. Run
     `just flash`. The log shows `mqtt: connected` and `mqtt: subscribed to N topics`,
-    and the tiles show the states from Home Assistant. On the Pi, run
+    and the tiles show the states from Home Assistant. The footer shows "Last changed
+    HH:MM" in UK time: the latest `last_updated` time of the entities on the page. On the
+    Pi, run
     `mosquitto_sub -h localhost -u dashboard -P <password> -t 'dashboard/#' -v`
     (type the password, do not keep it in the shell history). The status topic shows
     `online`.
@@ -226,9 +231,9 @@ Do the steps in this order. Each step needs the steps before it.
 12. **A real tap.** Set `read_only = false`, run `just flash`, and tap a light tile. The
     `cmd` topic shows the service call, and the light changes.
 13. **The clock.** Run `just flash`. After the Wi-Fi connection, the log shows
-    `clock: set from SNTP` with the UTC time, and `rtc: set to` the same time. The tiles
-    show "Updated HH:MM" in UK time. Press RST. Before the Wi-Fi connection, the log must
-    show `clock: set from the RTC` with the correct time. After SNTP, the log must show
+    `clock: set from SNTP` with the UTC time, and `rtc: set to` the same time. Press
+    RST. Before the Wi-Fi connection, the log must show `clock: set from the RTC` with
+    the correct time. After SNTP, the log must show
     a change of at most 2 s and no `rtc: set to` line. Then disconnect USB for one minute
     with the battery connected, connect it again, and do the same check. If the RTC has
     no valid time after a restart, examine the supply of the RTC.

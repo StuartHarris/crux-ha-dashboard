@@ -108,7 +108,7 @@ pub struct EffectEntry {
 
 /// The effects that the core asks for many times. The effect log can hide
 /// them, so that the other effects stay visible.
-pub const ROUTINE_EFFECTS: [&str; 2] = ["Render", "TimeNow"];
+pub const ROUTINE_EFFECTS: [&str; 1] = ["Render"];
 
 impl EffectEntry {
     /// Returns `true` if the effect is in [`ROUTINE_EFFECTS`].
@@ -347,16 +347,16 @@ mod tests {
         let mut log = Log::new(10);
         log.push(effect("MqttPublish", "dashboard/sim/cmd"));
         log.push(effect("Render", ""));
-        log.push(effect("TimeNow", ""));
+        log.push(effect("WifiOn", ""));
         let names = |filter| {
             log.filtered(filter)
                 .map(|entry| entry.effect)
                 .collect::<Vec<_>>()
         };
-        assert_eq!(names(""), ["TimeNow", "Render", "MqttPublish"]);
+        assert_eq!(names(""), ["WifiOn", "Render", "MqttPublish"]);
         assert_eq!(names("  RENDER "), ["Render"]);
         assert_eq!(names("cmd"), ["MqttPublish"]);
-        assert_eq!(names("SENT"), ["TimeNow", "Render", "MqttPublish"]);
+        assert_eq!(names("SENT"), ["WifiOn", "Render", "MqttPublish"]);
         assert_eq!(names("nothing"), Vec::<&str>::new());
     }
 
@@ -404,7 +404,7 @@ mod tests {
     #[test]
     fn routine_effects_can_be_hidden() {
         let mut log = Log::new(10);
-        log.push(effect("TimeNow", ""));
+        log.push(effect("WifiOn", ""));
         log.push(effect("MqttPublish", "dashboard/sim/cmd"));
         log.push(effect("Render", ""));
         let names = |hide| {
@@ -412,8 +412,8 @@ mod tests {
                 .map(|entry| entry.effect)
                 .collect::<Vec<_>>()
         };
-        assert_eq!(names(true), ["MqttPublish"]);
-        assert_eq!(names(false), ["Render", "MqttPublish", "TimeNow"]);
+        assert_eq!(names(true), ["MqttPublish", "WifiOn"]);
+        assert_eq!(names(false), ["Render", "MqttPublish", "WifiOn"]);
         assert_eq!(
             log.shown("render", false).count(),
             1,

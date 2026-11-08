@@ -90,7 +90,7 @@ fn each_page_matches_its_reference_image() {
             let shell = FixedShell::start(PowerSource::Stand, &path);
             let view = shell.view();
             assert_eq!(view.path, path);
-            assert_eq!(view.updated, "Live · 10:41");
+            assert_eq!(view.updated, "Last changed 10:41");
             let slug = page.area.unwrap_or("home");
             check(&format!("page-{index:02}-{slug}"), &view)
         })
@@ -105,7 +105,7 @@ fn the_asleep_page_matches_its_reference_image() {
     shell.fire_timers();
     let view = shell.view();
     assert!(view.asleep);
-    assert_eq!(view.updated, "Updated 10:41");
+    assert_eq!(view.updated, "Last changed 10:41");
     assert_all_match(&check("asleep", &view).into_iter().collect::<Vec<_>>());
 }
 
@@ -115,7 +115,7 @@ fn the_offline_page_matches_its_reference_image() {
     shell.drop_connection();
     let view = shell.view();
     assert!(!view.asleep);
-    assert_eq!(view.updated, "Updated 10:41");
+    assert_eq!(view.updated, "Last changed 10:41");
     assert_all_match(&check("offline", &view).into_iter().collect::<Vec<_>>());
 }
 

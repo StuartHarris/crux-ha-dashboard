@@ -8,6 +8,11 @@
 //! shell keeps it apart from the other timers. [`Shell::timers`] and
 //! [`Shell::fire_timers`] do not include it. A test fires it with
 //! [`Shell::fire_full_refresh_timer`].
+//!
+//! The draw timer is short, and the steps of a test are far apart in time.
+//! Thus, by default, [`Shell::run`] fires the draw timers when the core
+//! waits, and draws. A test of the draw timer sets [`Shell::auto_draw`] to
+//! `false`, and then fires them with [`Shell::fire_draw_timers`].
 
 use alloc::{format, string::String, vec::Vec};
 use core::time::Duration;
@@ -15,11 +20,11 @@ use core::time::Duration;
 use crux_core::{App, Request};
 use crux_time::operation::NotifyAfter;
 
-use super::{broker::Broker, instant};
+use super::broker::Broker;
 use crate::{
     Cmd, Dashboard, Effect, Event, Model, ViewModel,
     capabilities::{network::WifiStatus, power::Sleep},
-    features::refresh::FULL_REFRESH_INTERVAL,
+    features::refresh::{DRAW_DELAY, FULL_REFRESH_INTERVAL},
 };
 
 /// One image on the panel.
@@ -34,6 +39,10 @@ pub struct Frame {
 ///
 /// Like an e-paper shell, it draws once at the end of [`Shell::run`], for all
 /// the `Render` requests of the run.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag is a separate fact of the fake device"
+)]
 pub struct Shell {
     app: Dashboard,
     pub model: Model,
@@ -43,11 +52,13 @@ pub struct Shell {
     pub wifi_works: bool,
     /// Wi-Fi is on.
     pub wifi_on: bool,
-    /// The time in seconds since the Unix epoch.
-    pub clock: u64,
     timers: Vec<Request<NotifyAfter>>,
     /// The full-refresh timers that wait.
     refresh_timers: Vec<Request<NotifyAfter>>,
+    /// The draw timers that wait.
+    draw_timers: Vec<Request<NotifyAfter>>,
+    /// If `true`, [`Shell::run`] fires the draw timers when the core waits.
+    pub auto_draw: bool,
     /// The frames that the shell drew, in order.
     pub frames: Vec<Frame>,
     /// The `full_refresh_seq` of the last full refresh.
@@ -62,16 +73,19 @@ pub struct Shell {
 
 impl Shell {
     pub fn new() -> Self {
+        let mut broker = Broker::default();
+        broker.time = super::NOW;
         Self {
             app: Dashboard,
             model: Model::default(),
             commands: Vec::new(),
-            broker: Broker::default(),
+            broker,
             wifi_works: true,
             wifi_on: false,
-            clock: super::NOW,
             timers: Vec::new(),
             refresh_timers: Vec::new(),
+            draw_timers: Vec::new(),
+            auto_draw: true,
             frames: Vec::new(),
             drawn_seq: 0,
             render_requested: false,
@@ -95,8 +109,21 @@ impl Shell {
         self.commands.push(command);
     }
 
-    /// Answers effects and sends events until the core waits.
+    /// Answers effects and sends events until the core waits. If
+    /// [`Shell::auto_draw`] is `true`, it then fires the draw timers and
+    /// answers the effects again.
     pub fn run(&mut self) {
+        self.settle();
+        if self.auto_draw {
+            while !self.draw_timers.is_empty() {
+                self.fire_draw_timers();
+            }
+        }
+    }
+
+    /// Answers effects and sends events until the core waits, and then
+    /// draws if the core asked for a render.
+    fn settle(&mut self) {
         loop {
             let mut effects = Vec::new();
             let mut events = Vec::new();
@@ -134,10 +161,25 @@ impl Shell {
         self.refresh_timers.len()
     }
 
+    /// Returns the number of draw timers that wait.
+    pub const fn draw_timers(&self) -> usize {
+        self.draw_timers.len()
+    }
+
+    /// Fires the draw timers that wait, in order, and answers the effects
+    /// until the core waits.
+    pub fn fire_draw_timers(&mut self) {
+        for mut timer in core::mem::take(&mut self.draw_timers) {
+            let id = timer.operation.id;
+            timer.resolve(id).expect("the core waits for the timer");
+        }
+        self.settle();
+    }
+
     /// Fires the full-refresh timers that wait, as if
     /// [`FULL_REFRESH_INTERVAL`] passed. The other timers do not fire.
     pub fn fire_full_refresh_timer(&mut self) {
-        self.clock += FULL_REFRESH_INTERVAL.as_secs();
+        self.broker.time += FULL_REFRESH_INTERVAL.as_secs();
         for mut timer in core::mem::take(&mut self.refresh_timers) {
             let id = timer.operation.id;
             timer.resolve(id).expect("the core waits for the timer");
@@ -158,7 +200,7 @@ impl Shell {
     /// if their time passed.
     pub fn fire_timers(&mut self) {
         let longest = self.timers().into_iter().max().unwrap_or_default();
-        self.clock += longest.as_secs();
+        self.broker.time += longest.as_secs();
         for mut timer in core::mem::take(&mut self.timers) {
             let id = timer.operation.id;
             timer.resolve(id).expect("the core waits for the timer");
@@ -171,7 +213,7 @@ impl Shell {
         let Some(shortest) = self.timers().into_iter().min() else {
             return;
         };
-        self.clock += shortest.as_secs();
+        self.broker.time += shortest.as_secs();
         let (due, waiting) = core::mem::take(&mut self.timers)
             .into_iter()
             .partition(|timer| Duration::from(timer.operation.duration) == shortest);
@@ -233,18 +275,14 @@ impl Shell {
                 self.log.push("Sleep".into());
                 self.sleep = Some(request.operation);
             }
-            Effect::TimeNow(mut request) => {
-                self.log.push("TimeNow".into());
-                request
-                    .resolve(instant(self.clock))
-                    .expect("the core waits for the time");
-            }
             Effect::TimeNotifyAfter(request) => {
                 let duration = Duration::from(request.operation.duration);
                 self.log
-                    .push(format!("TimeNotifyAfter {}s", duration.as_secs()));
+                    .push(format!("TimeNotifyAfter {}ms", duration.as_millis()));
                 if duration == FULL_REFRESH_INTERVAL {
                     self.refresh_timers.push(request);
+                } else if duration == DRAW_DELAY {
+                    self.draw_timers.push(request);
                 } else {
                     self.timers.push(request);
                 }
@@ -254,6 +292,7 @@ impl Shell {
                 let id = request.operation.id;
                 self.timers.retain(|timer| timer.operation.id != id);
                 self.refresh_timers.retain(|timer| timer.operation.id != id);
+                self.draw_timers.retain(|timer| timer.operation.id != id);
                 request.resolve(id).expect("the core waits for the clear");
             }
         }

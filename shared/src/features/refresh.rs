@@ -30,7 +30,27 @@
 //! next full refresh of the core then comes earlier than necessary. The
 //! panel shows black and white only, so this is rare.
 //!
-//! # The timer and sleep
+//! # The draw timer
+//!
+//! A change from the state stream does not draw at once. Home Assistant
+//! sends the state, then `last_updated`, then the attributes, a few
+//! milliseconds apart. When a dashboard connects, the broker and the seed
+//! automation send a burst of messages. The order of these messages is not
+//! certain. If each message drew at once, one change gave two or more
+//! partial refreshes. Each partial refresh leaves a ghost image and counts
+//! towards the next full refresh.
+//!
+//! Thus a change that the page shows starts the draw timer of
+//! [`DRAW_DELAY`] with [`redraw_soon`], if no draw timer waits. When the
+//! timer expires, [`draw_due`] draws once for all the changes. A change that
+//! the page does not show starts no timer.
+//!
+//! Each full refresh makes the draw timer that waits stale, because the full
+//! refresh already drew the newest view. Examples are a page turn, a wake
+//! and the image before sleep. The core ignores a stale draw timer. While
+//! the device sleeps, the draw timer draws nothing.
+//!
+//! # The full-refresh timer and sleep
 //!
 //! Each full refresh starts the timer again and clears the timer before it.
 //! Ghost images come only from partial refreshes. If no partial render
@@ -66,6 +86,14 @@ pub const PARTIALS_PER_FULL: u32 = 30;
 /// render occurred since the last full refresh.
 pub const FULL_REFRESH_INTERVAL: Duration = Duration::from_mins(30);
 
+/// The wait between a change that the page shows and its draw.
+///
+/// The changes that arrive in this time give one draw. Home Assistant sends
+/// the messages of one change a few milliseconds apart, so 200 ms is enough
+/// for them. A person does not see this short delay. Refer to the module
+/// documentation.
+pub const DRAW_DELAY: Duration = Duration::from_millis(200);
+
 /// The state of the refresh policy.
 #[derive(Debug, Default)]
 pub struct State {
@@ -77,6 +105,10 @@ pub struct State {
     handle: Option<TimerHandle>,
     /// The view of the last render that the core asked for.
     last: Option<ViewModel>,
+    /// The id of the newest draw timer.
+    pub draw: u32,
+    /// A draw timer waits, so a new change does not start another one.
+    pub draw_pending: bool,
 }
 
 /// Asks the shell to draw. If `full` is `true`, the core also asks for a
@@ -99,11 +131,51 @@ pub fn redraw(model: &mut Model, full: bool) -> Cmd {
         return render();
     }
     state.partials = 0;
+    // The full refresh draws the newest view, so the draw timer that waits
+    // is stale.
+    if state.draw_pending {
+        state.draw = state.draw.wrapping_add(1);
+        state.draw_pending = false;
+    }
     model.full_refresh_seq = model.full_refresh_seq.wrapping_add(1);
     // The view is the same, except for the new number.
     next.full_refresh_seq = model.full_refresh_seq;
     model.refresh.last = Some(next);
     render().and(restart_timer(model))
+}
+
+/// Draws after [`DRAW_DELAY`], for a change from the state stream that the
+/// page shows. If a draw timer already waits, the core does not start
+/// another one. That timer draws this change too.
+pub fn redraw_soon(model: &mut Model) -> Cmd {
+    let state = &mut model.refresh;
+    if state.draw_pending {
+        return Cmd::done();
+    }
+    state.draw = state.draw.wrapping_add(1);
+    state.draw_pending = true;
+    let id = state.draw;
+    let (timer, _handle) = Time::notify_after(DRAW_DELAY);
+    timer.then_send(move |_| Event::DrawDue(id))
+}
+
+/// The draw timer `id` expired, so the core draws the changes that arrived
+/// since the timer started. The core ignores an older timer. While the
+/// device sleeps, the core draws nothing.
+///
+/// The draw is a partial render through [`redraw`]. If the view is the same
+/// as the last view, the core asks for nothing. An example is a change of
+/// `last_updated` in the same minute as the footer time.
+pub fn draw_due(id: u32, model: &mut Model) -> Cmd {
+    let state = &mut model.refresh;
+    if id != state.draw || !state.draw_pending {
+        return Cmd::done();
+    }
+    state.draw_pending = false;
+    if model.power.asleep {
+        return Cmd::done();
+    }
+    redraw(model, false)
 }
 
 /// The full-refresh timer `id` expired. The core ignores an older timer,

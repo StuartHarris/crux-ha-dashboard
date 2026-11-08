@@ -5,14 +5,17 @@ use core::time::Duration;
 
 use crux_core::{App, Request};
 
-use super::{ExpectFullRefreshTimer, instant, start};
+use super::{ExpectFullRefreshTimer, start};
 use crate::{
     Cmd, Connection, Dashboard, Effect, EffectTestExt, Event, Model, PowerSource, Route, TileState,
     capabilities::{
         mqtt::{Connect, Message, MqttEvent, Qos},
         network::WifiStatus,
     },
-    features::connection::{CLOCK_INTERVAL, Link, RECONNECT_MAX, RECONNECT_MIN},
+    features::{
+        connection::{Link, RECONNECT_MAX, RECONNECT_MIN},
+        refresh::DRAW_DELAY,
+    },
     view::LightState::{On, Unavailable},
 };
 
@@ -46,6 +49,89 @@ pub fn drive_to_connected(power: PowerSource) -> (Model, Cmd, Request<Connect>) 
     let _effects: Vec<_> = connected.effects().collect();
     assert_eq!(model.connection.mqtt, Link::Up);
     (model, cmd, request)
+}
+
+/// The time `seconds` after the Unix epoch.
+fn at(seconds: u64) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::from_timestamp(seconds.cast_signed(), 0).unwrap()
+}
+
+/// Returns the state-stream topic of `key` for the entity `entity_id`.
+fn topic(entity_id: &str, key: &str) -> alloc::string::String {
+    let (domain, object_id) = entity_id.split_once('.').unwrap();
+    format!("homeassistant/statestream/{domain}/{object_id}/{key}")
+}
+
+/// Sends a message on the stream of the connection, and returns the command
+/// of the update.
+fn send(
+    model: &mut Model,
+    cmd: &mut Cmd,
+    request: &mut Request<Connect>,
+    topic: &str,
+    payload: &str,
+) -> Cmd {
+    request.resolve(message(topic, payload)).unwrap();
+    let event = cmd.expect_one_event();
+    Dashboard.update(event, model)
+}
+
+/// Expects the command to start only the draw timer. Fires the timer and
+/// returns its event.
+#[track_caller]
+fn expect_draw_timer(cmd: &mut Cmd) -> Event {
+    let mut timer = cmd.expect_one_effect().expect_time_notify_after();
+    assert_eq!(Duration::from(timer.operation.duration), DRAW_DELAY);
+    let id = timer.operation.id;
+    timer.resolve(id).unwrap();
+    cmd.expect_one_event()
+}
+
+/// Sends a change of `entity_id` as Home Assistant does: the state, then
+/// `last_updated` with the time `time` (in seconds since the Unix epoch).
+/// Returns the commands of the two updates.
+fn change(
+    model: &mut Model,
+    cmd: &mut Cmd,
+    request: &mut Request<Connect>,
+    entity_id: &str,
+    state: &str,
+    time: u64,
+) -> (Cmd, Cmd) {
+    let first = send(model, cmd, request, &topic(entity_id, "state"), state);
+    let updated = super::broker::iso_time(time);
+    let second = send(
+        model,
+        cmd,
+        request,
+        &topic(entity_id, "last_updated"),
+        &updated,
+    );
+    (first, second)
+}
+
+/// Sends a change of `entity_id` with [`change`]. If the page shows the
+/// entity, expects one draw timer and fires it. Returns the command of the
+/// draw, or `None` if the page does not show the entity.
+fn change_and_draw(
+    model: &mut Model,
+    cmd: &mut Cmd,
+    request: &mut Request<Connect>,
+    entity_id: &str,
+    state: &str,
+    time: u64,
+) -> Option<Cmd> {
+    let (mut first, mut second) = change(model, cmd, request, entity_id, state, time);
+    second.expect_no_effects();
+    let mut effects: Vec<_> = first.effects().collect();
+    let effect = effects.pop()?;
+    assert!(effects.is_empty());
+    let mut timer = effect.expect_time_notify_after();
+    assert_eq!(Duration::from(timer.operation.duration), DRAW_DELAY);
+    let id = timer.operation.id;
+    timer.resolve(id).unwrap();
+    let event = first.expect_one_event();
+    Some(Dashboard.update(event, model))
 }
 
 pub fn message(topic: &str, payload: &str) -> MqttEvent {
@@ -115,7 +201,7 @@ fn connected_subscribes_publishes_online_and_draws() {
 
     let view = app.view(&model);
     assert_eq!(view.connection, Connection::Online);
-    assert_eq!(view.updated, "Live");
+    assert_eq!(view.updated, "");
 }
 
 #[test]
@@ -123,31 +209,27 @@ fn a_message_for_a_visible_tile_draws_the_new_state() {
     let app = Dashboard;
     let (mut model, mut cmd, mut request) = drive_to_connected(PowerSource::Stand);
 
-    request
-        .resolve(message(
-            "homeassistant/statestream/light/all_lights/state",
-            "on",
-        ))
-        .unwrap();
-    let event = cmd.expect_one_event();
-    let time = app
-        .update(event, &mut model)
-        .expect_render()
-        .resolve_time_now(|_| instant(super::NOW))
-        .expect_event();
-    app.update(time, &mut model)
-        .expect_render()
-        .expect_only_time_notify_after();
+    // The change does not draw at once. It starts the draw timer.
+    let mut first = send(
+        &mut model,
+        &mut cmd,
+        &mut request,
+        "homeassistant/statestream/light/all_lights/state",
+        "on",
+    );
+    // The timer waits, so the next change starts no other timer.
+    send(
+        &mut model,
+        &mut cmd,
+        &mut request,
+        "homeassistant/statestream/light/all_lights/brightness",
+        "64",
+    )
+    .expect_no_effects();
 
-    // The minute timer runs, so the core does not read the clock again.
-    request
-        .resolve(message(
-            "homeassistant/statestream/light/all_lights/brightness",
-            "64",
-        ))
-        .unwrap();
-    let event = cmd.expect_one_event();
-    app.update(event, &mut model).expect_only_render();
+    // The timer draws both changes once.
+    let due = expect_draw_timer(&mut first);
+    app.update(due, &mut model).expect_only_render();
 
     let view = app.view(&model);
     let all_lights = view.index().unwrap().all_lights.as_ref().unwrap();
@@ -165,39 +247,33 @@ fn a_message_for_another_page_changes_the_state_but_does_not_draw() {
     let mut navigate = app.update(Event::Navigate(Route::room("living_room")), &mut model);
     let _effects: Vec<_> = navigate.effects().collect();
 
-    request
-        .resolve(message(
-            "homeassistant/statestream/light/loft_1/state",
-            "on",
-        ))
-        .unwrap();
-    let event = cmd.expect_one_event();
     // `light.loft_1` is not in the layout (the entity is `light.loft_loft_1`),
-    // so the core does not draw or read the clock.
-    app.update(event, &mut model).expect_no_effects();
+    // so the core keeps nothing and does not draw.
+    send(
+        &mut model,
+        &mut cmd,
+        &mut request,
+        "homeassistant/statestream/light/loft_1/state",
+        "on",
+    )
+    .expect_no_effects();
     assert_eq!(model.entities.get("light.loft_1"), None);
 
-    request
-        .resolve(message(
-            "homeassistant/statestream/light/loft_loft_1/state",
-            "on",
-        ))
-        .unwrap();
-    let event = cmd.expect_one_event();
-    // The state changed but does not show, so the core only reads the clock.
-    let _time = app
-        .update(event, &mut model)
-        .expect_one_effect()
-        .expect_time_now();
-    assert_eq!(
-        model
-            .entities
-            .get("light.loft_loft_1")
-            .unwrap()
-            .state
-            .as_deref(),
-        Some("on")
+    // The state and the time changed, but the page does not show them. The
+    // core starts no timer and does not draw.
+    let (mut first, mut second) = change(
+        &mut model,
+        &mut cmd,
+        &mut request,
+        "light.loft_loft_1",
+        "on",
+        super::NOW,
     );
+    first.expect_no_effects();
+    second.expect_no_effects();
+    let loft = model.entities.get("light.loft_loft_1").unwrap();
+    assert_eq!(loft.state.as_deref(), Some("on"));
+    assert_eq!(loft.last_updated, Some(at(super::NOW)));
 }
 
 #[test]
@@ -207,32 +283,33 @@ fn on_the_index_a_message_draws_only_if_a_summary_changes() {
     let lights = |model: &Model| app.view(model).index().unwrap().rooms[7].lights.clone();
     assert_eq!(lights(&model), [Unavailable; 3]);
 
-    // The summary of the Loft shows the new state with a partial redraw.
-    request
-        .resolve(message(
-            "homeassistant/statestream/light/loft_loft_1/state",
-            "on",
-        ))
-        .unwrap();
-    let event = cmd.expect_one_event();
-    let _time = app
-        .update(event, &mut model)
-        .expect_render()
-        .expect_one_effect()
-        .expect_time_now();
+    // The summary of the Loft shows the new state. The draw timer draws once.
+    change_and_draw(
+        &mut model,
+        &mut cmd,
+        &mut request,
+        "light.loft_loft_1",
+        "on",
+        super::NOW,
+    )
+    .unwrap()
+    .expect_only_render();
     assert_eq!(lights(&model), [On, Unavailable, Unavailable]);
     assert_eq!(app.view(&model).full_refresh_seq, 1);
 
     // No summary shows the group of the Loft, because the Loft has the
     // members of the group. The core does not draw.
-    request
-        .resolve(message(
-            "homeassistant/statestream/light/loft_lights/state",
+    assert!(
+        change_and_draw(
+            &mut model,
+            &mut cmd,
+            &mut request,
+            "light.loft_lights",
             "on",
-        ))
-        .unwrap();
-    let event = cmd.expect_one_event();
-    app.update(event, &mut model).expect_no_effects();
+            super::NOW,
+        )
+        .is_none()
+    );
     assert_eq!(lights(&model), [On, Unavailable, Unavailable]);
 }
 
@@ -240,7 +317,14 @@ fn on_the_index_a_message_draws_only_if_a_summary_changes() {
 fn a_lost_connection_shows_the_time_of_the_last_message_and_retries_after_a_backoff() {
     let app = Dashboard;
     let (mut model, mut cmd, mut request) = drive_to_connected(PowerSource::Stand);
-    let _ = deliver(&mut model, &mut cmd, &mut request, Some(super::NOW));
+    let _ = change_and_draw(
+        &mut model,
+        &mut cmd,
+        &mut request,
+        VISIBLE,
+        "on",
+        super::NOW,
+    );
 
     request
         .resolve(MqttEvent::Disconnected {
@@ -250,8 +334,8 @@ fn a_lost_connection_shows_the_time_of_the_last_message_and_retries_after_a_back
     let event = cmd.expect_one_event();
     assert!(cmd.is_done());
 
-    // The core does not read the clock: the time is the time of the last
-    // message, not the time of the disconnect.
+    // The time is the time of the last update from Home Assistant, not the
+    // time of the disconnect.
     let reconnect = app
         .update(event, &mut model)
         .expect_render()
@@ -262,7 +346,7 @@ fn a_lost_connection_shows_the_time_of_the_last_message_and_retries_after_a_back
         .expect_event();
     let view = app.view(&model);
     assert_eq!(view.connection, Connection::Connecting);
-    assert_eq!(view.updated, "Updated 09:41");
+    assert_eq!(view.updated, "Last changed 09:41");
 
     // Wi-Fi can be the cause, so the reconnect asks for Wi-Fi first.
     let event = app
@@ -442,170 +526,350 @@ fn a_message_before_connected_is_ignored() {
     assert_eq!(model.entities.get("light.all_lights"), None);
 }
 
-/// The topic of a state message for the All lights toggle on the index page.
-const VISIBLE: &str = "homeassistant/statestream/light/all_lights/state";
-/// The topic of a state message for a tile that the index page does not
-/// show: no summary of a room shows the humidity.
-const HIDDEN: &str = "homeassistant/statestream/sensor/living_room_thermometer_humidity/state";
+/// The All lights toggle on the index page.
+const VISIBLE: &str = "light.all_lights";
+/// An entity that the index page does not show: no summary of a room shows
+/// the humidity. The living room page shows it.
+const HIDDEN: &str = "sensor.living_room_thermometer_humidity";
+/// The weather tile on the index page.
+const WEATHER: &str = "weather.home";
+/// 2026-12-01T08:41:00Z, in winter, when the UK time is UTC.
+const WINTER: u64 = 1_796_114_460;
 
-/// Sends a state message for a tile on another page, so the message itself
-/// does not draw. If the core reads the clock, the clock gives `time` (in
-/// seconds since the Unix epoch, or `None` for a clock with no valid time).
-/// Returns the command of the clock answer, or `None` if the core did not
-/// read the clock.
-fn deliver(
-    model: &mut Model,
-    cmd: &mut Cmd,
-    request: &mut Request<Connect>,
-    time: Option<u64>,
-) -> Option<Cmd> {
-    // Each call changes the state, so that the core does not ignore it.
-    let payload = if model
-        .entities
-        .get("sensor.living_room_thermometer_humidity")
-        .is_some_and(|entity| entity.state.as_deref() == Some("on"))
-    {
-        "off"
-    } else {
-        "on"
-    };
-    request.resolve(message(HIDDEN, payload)).unwrap();
-    let event = cmd.expect_one_event();
-    let mut update = Dashboard.update(event, model);
-    let mut effects: Vec<_> = update.effects().collect();
-    let effect = effects.pop()?;
-    assert!(effects.is_empty());
-    let mut now = effect.expect_time_now();
-    // A time before 2025 is not valid: 90 seconds after the start.
-    now.resolve(instant(time.unwrap_or(90))).unwrap();
-    let answer = update.expect_one_event();
-    Some(Dashboard.update(answer, model))
+/// Goes to the page of `route`, and expects a draw.
+fn navigate(model: &mut Model, route: Route) {
+    let mut cmd = Dashboard.update(Event::Navigate(route), model);
+    let effects: Vec<_> = cmd.effects().collect();
+    assert!(
+        effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Render(_)))
+    );
 }
 
 #[test]
-fn a_burst_of_messages_reads_the_clock_once() {
+fn a_shown_change_gives_one_draw_with_the_time_from_home_assistant() {
     let app = Dashboard;
     let (mut model, mut cmd, mut request) = drive_to_connected(PowerSource::Stand);
 
-    request.resolve(message(VISIBLE, "on")).unwrap();
-    let event = cmd.expect_one_event();
-    let mut first = app.update(event, &mut model);
-    first.expect_render();
-    let mut now = first.expect_one_effect().expect_time_now();
+    // Home Assistant sends the state, then `last_updated`, as plain ISO
+    // 8601 text with microseconds.
+    let mut first = send(
+        &mut model,
+        &mut cmd,
+        &mut request,
+        &topic(VISIBLE, "state"),
+        "on",
+    );
+    let updated = "2026-07-01T08:41:21.123456+00:00";
+    let mut second = send(
+        &mut model,
+        &mut cmd,
+        &mut request,
+        &topic(VISIBLE, "last_updated"),
+        updated,
+    );
+    // The state only starts the draw timer, and `last_updated` gives no
+    // effects, because the timer waits.
+    second.expect_no_effects();
+    let due = expect_draw_timer(&mut first);
 
-    // More messages arrive while the core waits for the answer, so they do
-    // not read the clock.
-    for (topic, payload) in [
-        (HIDDEN, "on"),
-        ("homeassistant/statestream/weather/home/state", "rainy"),
-    ] {
-        request.resolve(message(topic, payload)).unwrap();
-        let event = cmd.expect_one_event();
-        let reads = app
-            .update(event, &mut model)
-            .effects()
-            .filter(|effect| matches!(effect, Effect::TimeNow(_)))
-            .count();
-        assert_eq!(reads, 0, "{topic}");
-    }
-    assert_eq!(app.view(&model).updated, "Live");
-
-    now.resolve(instant(super::NOW)).unwrap();
-    let answer = first.expect_one_event();
-    app.update(answer, &mut model)
-        .expect_render()
-        .expect_only_time_notify_after_with(|notify| {
-            assert_eq!(Duration::from(notify.duration), CLOCK_INTERVAL);
-        });
-    // 08:41 UTC is 09:41 in BST.
-    assert_eq!(app.view(&model).updated, "Live · 09:41");
-}
-
-#[test]
-fn a_message_reads_the_clock_again_only_after_the_minute_timer() {
-    let app = Dashboard;
-    let (mut model, mut cmd, mut request) = drive_to_connected(PowerSource::Stand);
-    let mut answer = deliver(&mut model, &mut cmd, &mut request, Some(super::NOW)).unwrap();
-    let mut timer = answer
-        .expect_render()
-        .expect_one_effect()
-        .expect_time_notify_after();
-
-    // A message within the minute does not read the clock.
-    let later = Some(super::NOW + 30);
-    assert!(deliver(&mut model, &mut cmd, &mut request, later).is_none());
-
-    let id = timer.operation.id;
-    timer.resolve(id).unwrap();
-    let passed = answer.expect_one_event();
-    app.update(passed, &mut model).expect_no_effects();
-    // The minute timer does not change the screen.
-    assert_eq!(app.view(&model).updated, "Live · 09:41");
-
-    // The next message reads the clock again.
-    let later = Some(super::NOW + 120);
-    deliver(&mut model, &mut cmd, &mut request, later)
-        .unwrap()
-        .expect_render()
-        .expect_only_time_notify_after();
-    assert_eq!(app.view(&model).updated, "Live · 09:43");
-}
-
-#[test]
-fn a_new_time_in_the_same_minute_does_not_draw() {
-    let app = Dashboard;
-    let (mut model, mut cmd, mut request) = drive_to_connected(PowerSource::Stand);
-    let _ = deliver(&mut model, &mut cmd, &mut request, Some(super::NOW + 5));
-    let id = model.connection.minute;
-    app.update(Event::MinutePassed(id), &mut model)
-        .expect_no_effects();
-
-    let later = Some(super::NOW + 59);
-    deliver(&mut model, &mut cmd, &mut request, later)
-        .unwrap()
-        .expect_only_time_notify_after();
-    assert_eq!(app.view(&model).updated, "Live · 09:41");
-}
-
-#[test]
-fn a_stale_minute_timer_is_ignored() {
-    let app = Dashboard;
-    let (mut model, mut cmd, mut request) = drive_to_connected(PowerSource::Stand);
-    let _ = deliver(&mut model, &mut cmd, &mut request, Some(super::NOW));
-    let stale = model.connection.minute.wrapping_sub(1);
-
-    app.update(Event::MinutePassed(stale), &mut model)
-        .expect_no_effects();
-    assert!(deliver(&mut model, &mut cmd, &mut request, Some(super::NOW + 90)).is_none());
-}
-
-#[test]
-fn a_clock_with_no_valid_time_shows_live_and_waits_a_minute() {
-    let app = Dashboard;
-    let (mut model, mut cmd, mut request) = drive_to_connected(PowerSource::Stand);
-
-    // A device with no network time yet: 90 seconds after the start. The
-    // text stays the same, so the core does not draw.
-    deliver(&mut model, &mut cmd, &mut request, None)
-        .unwrap()
-        .expect_only_time_notify_after();
-    assert_eq!(app.view(&model).updated, "Live");
-    assert_eq!(app.view(&model).last_sync, None);
-
-    // The core does not read the clock for each message.
-    assert!(deliver(&mut model, &mut cmd, &mut request, None).is_none());
-}
-
-#[test]
-fn the_time_of_the_last_message_is_a_uk_time() {
-    let app = Dashboard;
-    let (mut model, mut cmd, mut request) = drive_to_connected(PowerSource::Stand);
-    // In summer, the UK time is UTC+1.
-    let _ = deliver(&mut model, &mut cmd, &mut request, Some(super::NOW));
-    assert_eq!(app.view(&model).updated, "Live · 09:41");
+    // The timer gives exactly one render. 08:41 UTC is 09:41 in BST.
+    app.update(due, &mut model).expect_only_render();
+    assert_eq!(app.view(&model).updated, "Last changed 09:41");
     assert_eq!(app.view(&model).last_sync, Some(super::NOW));
+}
 
-    // In winter, the UK time is UTC: 2026-12-01T08:41:00Z.
-    model.last_sync = chrono::DateTime::from_timestamp(1_796_114_460, 0);
-    assert_eq!(app.view(&model).updated, "Live · 08:41");
+#[test]
+fn in_winter_the_footer_time_is_utc() {
+    let app = Dashboard;
+    let (mut model, mut cmd, mut request) = drive_to_connected(PowerSource::Stand);
+    change_and_draw(&mut model, &mut cmd, &mut request, VISIBLE, "on", WINTER)
+        .unwrap()
+        .expect_only_render();
+    assert_eq!(app.view(&model).updated, "Last changed 08:41");
+}
+
+#[test]
+fn a_hidden_change_gives_no_effects_and_shows_its_time_on_its_page() {
+    let app = Dashboard;
+    let (mut model, mut cmd, mut request) = drive_to_connected(PowerSource::Stand);
+    let _ = change_and_draw(
+        &mut model,
+        &mut cmd,
+        &mut request,
+        VISIBLE,
+        "on",
+        super::NOW,
+    );
+
+    // On the index page, the humidity of the living room changes two minutes
+    // later. The index page does not show it, so the core starts no timer
+    // and does not draw.
+    let (mut first, mut second) = change(
+        &mut model,
+        &mut cmd,
+        &mut request,
+        HIDDEN,
+        "40",
+        super::NOW + 120,
+    );
+    first.expect_no_effects();
+    second.expect_no_effects();
+    assert_eq!(app.view(&model).updated, "Last changed 09:41");
+
+    // The living room page shows the time of that change.
+    navigate(&mut model, Route::room("living_room"));
+    assert_eq!(app.view(&model).updated, "Last changed 09:43");
+    assert_eq!(app.view(&model).last_sync, Some(super::NOW + 120));
+}
+
+#[test]
+fn a_page_keeps_its_own_older_time_after_a_page_turn() {
+    let app = Dashboard;
+    let (mut model, mut cmd, mut request) = drive_to_connected(PowerSource::Stand);
+    let _ = change_and_draw(
+        &mut model,
+        &mut cmd,
+        &mut request,
+        VISIBLE,
+        "on",
+        super::NOW,
+    );
+    navigate(&mut model, Route::room("living_room"));
+
+    // On the living room page, the humidity changes two minutes later.
+    change_and_draw(
+        &mut model,
+        &mut cmd,
+        &mut request,
+        HIDDEN,
+        "40",
+        super::NOW + 120,
+    )
+    .unwrap()
+    .expect_only_render();
+    assert_eq!(app.view(&model).updated, "Last changed 09:43");
+
+    // No entity on the index page changed, so it shows its older time.
+    navigate(&mut model, Route::Home);
+    assert_eq!(app.view(&model).updated, "Last changed 09:41");
+}
+
+#[test]
+fn the_index_time_follows_last_updated_of_an_entity_that_a_summary_shows() {
+    let app = Dashboard;
+    let (mut model, mut cmd, mut request) = drive_to_connected(PowerSource::Stand);
+    let _ = change_and_draw(
+        &mut model,
+        &mut cmd,
+        &mut request,
+        VISIBLE,
+        "on",
+        super::NOW,
+    );
+
+    // The summary of the Loft shows its first light.
+    change_and_draw(
+        &mut model,
+        &mut cmd,
+        &mut request,
+        "light.loft_loft_1",
+        "on",
+        super::NOW + 120,
+    )
+    .unwrap()
+    .expect_only_render();
+    assert_eq!(app.view(&model).updated, "Last changed 09:43");
+
+    // Only the time of an attribute change moves, for example the
+    // temperature of the weather. The time still shows.
+    let mut first = send(
+        &mut model,
+        &mut cmd,
+        &mut request,
+        &topic(WEATHER, "last_updated"),
+        &super::broker::iso_time(super::NOW + 180),
+    );
+    let due = expect_draw_timer(&mut first);
+    app.update(due, &mut model).expect_only_render();
+    assert_eq!(app.view(&model).updated, "Last changed 09:44");
+}
+
+#[test]
+fn a_burst_of_messages_gives_one_draw_timer_and_one_render() {
+    let app = Dashboard;
+    let (mut model, mut cmd, mut request) = drive_to_connected(PowerSource::Stand);
+
+    // The seed automation sends each entity again when the dashboard
+    // connects. The first change that the page shows starts the draw timer.
+    let updated = super::broker::iso_time(super::NOW);
+    let mut first = send(
+        &mut model,
+        &mut cmd,
+        &mut request,
+        &topic(VISIBLE, "state"),
+        "on",
+    );
+    for (entity_id, key, payload) in [
+        (VISIBLE, "last_updated", updated.as_str()),
+        (HIDDEN, "state", "40"),
+        (HIDDEN, "last_updated", updated.as_str()),
+        (WEATHER, "state", "rainy"),
+        (WEATHER, "last_updated", updated.as_str()),
+        (WEATHER, "temperature", "11.5"),
+    ] {
+        send(
+            &mut model,
+            &mut cmd,
+            &mut request,
+            &topic(entity_id, key),
+            payload,
+        )
+        .expect_no_effects();
+    }
+
+    // The timer draws all the changes once.
+    let due = expect_draw_timer(&mut first);
+    app.update(due, &mut model).expect_only_render();
+    let view = app.view(&model);
+    assert_eq!(view.updated, "Last changed 09:41");
+    assert_eq!(
+        view.index().unwrap().weather.as_ref().unwrap().detail,
+        "Rainy"
+    );
+
+    // The next change starts a new timer.
+    let (mut first, _) = change(
+        &mut model,
+        &mut cmd,
+        &mut request,
+        VISIBLE,
+        "off",
+        super::NOW,
+    );
+    let _due = expect_draw_timer(&mut first);
+}
+
+#[test]
+fn a_last_updated_in_the_same_minute_as_the_page_time_draws_nothing() {
+    let app = Dashboard;
+    let (mut model, mut cmd, mut request) = drive_to_connected(PowerSource::Stand);
+    let _ = change_and_draw(
+        &mut model,
+        &mut cmd,
+        &mut request,
+        VISIBLE,
+        "on",
+        super::NOW,
+    );
+
+    // The same entity in the same minute is not a change, so the core
+    // starts no timer.
+    send(
+        &mut model,
+        &mut cmd,
+        &mut request,
+        &topic(VISIBLE, "last_updated"),
+        &super::broker::iso_time(super::NOW + 40),
+    )
+    .expect_no_effects();
+
+    // Another entity on the page gets its first time, in the same minute as
+    // the footer time. The core starts the timer, but the view is the same,
+    // so the timer draws nothing.
+    let mut first = send(
+        &mut model,
+        &mut cmd,
+        &mut request,
+        &topic(WEATHER, "last_updated"),
+        &super::broker::iso_time(super::NOW + 30),
+    );
+    let due = expect_draw_timer(&mut first);
+    app.update(due, &mut model).expect_no_effects();
+    assert_eq!(app.view(&model).updated, "Last changed 09:41");
+}
+
+#[test]
+fn a_last_updated_that_is_not_valid_is_ignored() {
+    let app = Dashboard;
+    let (mut model, mut cmd, mut request) = drive_to_connected(PowerSource::Stand);
+    let _ = change_and_draw(
+        &mut model,
+        &mut cmd,
+        &mut request,
+        VISIBLE,
+        "on",
+        super::NOW,
+    );
+
+    for payload in [
+        "",
+        "yesterday",
+        "\"2026-07-01T09:00:00+00:00\"",
+        "1782895260",
+    ] {
+        send(
+            &mut model,
+            &mut cmd,
+            &mut request,
+            &topic(VISIBLE, "last_updated"),
+            payload,
+        )
+        .expect_no_effects();
+    }
+    assert_eq!(
+        model.entities.get(VISIBLE).unwrap().last_updated,
+        Some(at(super::NOW))
+    );
+    assert_eq!(app.view(&model).updated, "Last changed 09:41");
+}
+
+#[test]
+fn the_core_does_not_subscribe_to_last_changed() {
+    let (model, _cmd, _request) = drive_to_connected(PowerSource::Stand);
+    let topics = crate::entities::topics(model.pages);
+    assert!(topics.contains(&topic(VISIBLE, "last_updated")));
+    assert!(topics.contains(&topic(HIDDEN, "last_updated")));
+    assert!(!topics.iter().any(|topic| topic.ends_with("last_changed")));
+}
+
+#[test]
+fn after_start_the_footer_shows_the_kept_time_until_a_change_on_the_page() {
+    let app = Dashboard;
+    let mut model = Model::default();
+    let Event::Start(start) = start(PowerSource::Stand) else {
+        unreachable!()
+    };
+    let start = Event::Start(crate::Start {
+        last_sync: Some(super::NOW),
+        ..start
+    });
+    let _effects: Vec<_> = app.update(start, &mut model).effects().collect();
+    // No entity has a `last_updated` time, so the footer shows the kept time.
+    assert_eq!(model.entities.last_updated().count(), 0);
+    assert_eq!(app.view(&model).updated, "Last changed 09:41");
+    assert_eq!(app.view(&model).last_sync, Some(super::NOW));
+}
+
+#[test]
+fn a_time_from_home_assistant_replaces_the_kept_time() {
+    let app = Dashboard;
+    let (mut model, mut cmd, mut request) = drive_to_connected(PowerSource::Stand);
+    model.last_sync = Some(at(super::NOW));
+    assert_eq!(app.view(&model).updated, "Last changed 09:41");
+
+    // A change on the page has an earlier time than the kept time. The
+    // footer shows the time from Home Assistant.
+    change_and_draw(
+        &mut model,
+        &mut cmd,
+        &mut request,
+        VISIBLE,
+        "on",
+        super::NOW - 600,
+    )
+    .unwrap()
+    .expect_only_render();
+    assert_eq!(app.view(&model).updated, "Last changed 09:31");
 }

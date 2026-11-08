@@ -1,4 +1,4 @@
-//! The wall clock for `TimeNow`.
+//! The wall clock of the firmware.
 //!
 //! The clock is the time since the start, plus the time of the start. The
 //! time of the start comes from two sources (`logic::clock`):
@@ -9,11 +9,13 @@
 //!    the RTC time is wrong. It tries a failed write again, up to 3 times.
 //!
 //! Until one of the sources gives a valid time, the clock starts at the Unix
-//! epoch. The core treats a time before 2025 as not valid
-//! (`shared::EARLIEST_VALID_TIME`), so it shows no "Updated HH:MM" text, not
-//! a wrong one. The core asks for the time each time that it needs it, so a
-//! new time of the start has an effect at once. The timers use the
-//! monotonic clock, so a new time of the start does not change them.
+//! epoch. A time before 2025 is not valid (`shared::EARLIEST_VALID_TIME`).
+//!
+//! The core does not read this clock. The footer time ("Last changed
+//! HH:MM") comes from the `last_updated` time that Home Assistant publishes
+//! for each entity. The timers use the monotonic clock, so a new time of the
+//! start does not change them. The clock keeps the RTC correct and writes
+//! the time to the log.
 //!
 //! TODO(5b): on the board, make sure that the RTC answers at 0x51 and keeps
 //! the time with no power from USB, that a read and a write of the RTC do
@@ -82,6 +84,6 @@ pub fn set(start: u32, source: Source) {
 /// Writes a log line if the clock is not set.
 pub fn log_not_set() {
     if !clock::is_valid(now().seconds()) {
-        log::warn!("clock: not set, so the core gets no valid time of day");
+        log::warn!("clock: not set");
     }
 }

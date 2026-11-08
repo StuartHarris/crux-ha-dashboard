@@ -2,8 +2,8 @@
 //!
 //! The feature tests drive one step at a time with the `EffectTestExt`
 //! helpers. The flow tests run the core in [`shell::Shell`], which answers the
-//! effects with a fake MQTT broker, a fake Home Assistant, Wi-Fi, timers and a
-//! clock.
+//! effects with a fake MQTT broker, a fake Home Assistant with a clock,
+//! Wi-Fi and timers.
 
 mod broker;
 mod connection;
@@ -17,8 +17,6 @@ mod shell;
 use alloc::string::String;
 
 use core::time::Duration;
-
-use crux_time::Instant;
 
 use crate::{
     Cmd, Control, EffectTestExt, PowerSource, Settings, Start, app::Event, entities::STATESTREAM,
@@ -49,10 +47,6 @@ fn start_at(power: PowerSource, path: Option<&str>) -> Event {
         path: path.map(String::from),
         last_sync: None,
     })
-}
-
-fn instant(seconds: u64) -> Instant {
-    Instant::new(seconds, 0)
 }
 
 /// A tap on the tile with `index`.

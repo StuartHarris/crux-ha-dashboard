@@ -50,7 +50,7 @@ fn the_idle_timeout_disconnects_and_sleeps() {
     // The start asked for the first full refresh, and the sleep for the second.
     assert_eq!(view.full_refresh_seq, 2);
     assert_eq!(view.connection, Connection::Offline);
-    assert_eq!(view.updated, "Updated 09:41");
+    assert_eq!(view.updated, "Last changed 09:41");
     assert_eq!(model.connection.wifi, Link::Down);
 }
 
@@ -210,11 +210,11 @@ fn page_events_while_asleep_do_nothing() {
 #[test]
 fn no_other_timer_waits_for_the_idle_timeout() {
     use crate::features::{
-        connection::{CLOCK_INTERVAL, RECONNECT_MAX, RECONNECT_MIN},
-        refresh::FULL_REFRESH_INTERVAL,
+        connection::{RECONNECT_MAX, RECONNECT_MIN},
+        refresh::{DRAW_DELAY, FULL_REFRESH_INTERVAL},
     };
 
-    assert_ne!(CLOCK_INTERVAL, IDLE_TIMEOUT);
+    assert_ne!(DRAW_DELAY, IDLE_TIMEOUT);
     assert_ne!(FULL_REFRESH_INTERVAL, IDLE_TIMEOUT);
     let mut wait = RECONNECT_MIN;
     while wait < RECONNECT_MAX {

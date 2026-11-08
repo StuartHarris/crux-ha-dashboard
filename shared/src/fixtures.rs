@@ -1,8 +1,9 @@
 //! A shell with fixed answers, for tests and pictures.
 //!
 //! [`FixedShell`] drives the real core with no clock and no network. It
-//! answers each effect at once: Wi-Fi and the connection always work, the
-//! broker sends [`states`], and the clock is always [`NOW`]. Timers expire
+//! answers each effect at once: Wi-Fi and the connection always work, and
+//! the broker sends [`states`]. Home Assistant updated each entity at
+//! [`NOW`]. Timers expire
 //! only when you call [`FixedShell::fire_timers`]. Each run gives the same
 //! views, so the golden-image tests of the `ui` crate and the PNG mode of
 //! the simulator use it.
@@ -17,7 +18,7 @@ use std::{
 };
 
 use crux_core::{Request, capability::Operation};
-use crux_time::{Instant, operation::NotifyAfter};
+use crux_time::operation::NotifyAfter;
 
 use crate::{
     Core, Dashboard, Effect, Event, PowerSource, Settings, Start, TileKind, ViewModel,
@@ -28,9 +29,12 @@ use crate::{
     pages::PAGES,
 };
 
-/// The time of the fixed clock in seconds since the Unix epoch:
-/// 2026-07-01 09:41:00 UTC, which is 10:41 in British Summer Time.
+/// The time of the last update of each entity, in seconds since the Unix
+/// epoch: 2026-07-01 09:41:00 UTC, which is 10:41 in British Summer Time.
 pub const NOW: u64 = 1_782_898_860;
+
+/// [`NOW`] as Home Assistant publishes it on a `last_updated` topic.
+pub const NOW_TEXT: &str = "2026-07-01T09:41:00+00:00";
 
 /// A shell that answers the effects of the core at once, with fixed answers.
 pub struct FixedShell {
@@ -118,7 +122,6 @@ impl FixedShell {
                     more
                 }
                 Effect::MqttDisconnect(_) => self.end_stream(),
-                Effect::TimeNow(mut request) => self.resolve(&mut request, Instant::new(NOW, 0)),
                 Effect::TimeNotifyAfter(request) => {
                     self.timers.push(request);
                     Vec::new()
@@ -144,10 +147,13 @@ impl FixedShell {
         self.run(effects);
     }
 
-    /// Sends the state of an entity and its attributes, as Home Assistant
-    /// does, and answers the effects until the core waits. Each attribute
-    /// value is JSON, for example `128`. If the connection is not open, the
-    /// core gets nothing.
+    /// Sends the state of an entity, the time of the update ([`NOW`]) and
+    /// the attributes, as Home Assistant does, and answers the effects until
+    /// the core waits. Each attribute value is JSON, for example `128`. If
+    /// the connection is not open, the core gets nothing.
+    ///
+    /// The core draws the change when its draw timer expires. Call
+    /// [`FixedShell::fire_timers`] to draw it.
     pub fn set_state(&mut self, entity_id: &str, state: &str, attributes: &[(&str, &str)]) {
         let Some((domain, object)) = entity_id.split_once('.') else {
             return;
@@ -156,7 +162,12 @@ impl FixedShell {
             return;
         };
         let base = format!("homeassistant/statestream/{domain}/{object}");
-        let messages = core::iter::once((format!("{base}/state"), state)).chain(
+        let messages = [
+            (format!("{base}/state"), state),
+            (format!("{base}/last_updated"), NOW_TEXT),
+        ]
+        .into_iter()
+        .chain(
             attributes
                 .iter()
                 .map(|(name, value)| (format!("{base}/{name}"), *value)),
@@ -210,9 +221,11 @@ fn is_topic_of(topic: &str, entity_id: &str) -> bool {
         .is_some()
 }
 
-/// Returns a fixed state message for each entity on each page, and a JSON
+/// Returns the fixed messages of the broker for each entity on each page.
+///
+/// The messages are a state, a `last_updated` time of [`NOW`], and a JSON
 /// attribute where the tile shows one. Some entities are off, one is
-/// unavailable, and one has no state.
+/// unavailable, and one has no messages.
 #[must_use]
 pub fn states() -> Vec<(String, String)> {
     let mut messages = Vec::new();
@@ -229,6 +242,7 @@ pub fn states() -> Vec<(String, String)> {
             // The entity has no state, so its tile shows `-`.
             continue;
         }
+        add("last_updated", NOW_TEXT);
         if index % 13 == 7 {
             add("state", "unavailable");
             continue;

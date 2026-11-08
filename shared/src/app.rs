@@ -4,8 +4,8 @@
 use alloc::{format, string::String};
 
 use chrono::{DateTime, Utc};
-use crux_core::{App, Command, command::RequestBuilder, macros::effect, render::RenderOperation};
-use crux_time::{Instant, clock::Time, operation as time};
+use crux_core::{App, Command, macros::effect, render::RenderOperation};
+use crux_time::operation as time;
 use facet::Facet;
 use serde::{Deserialize, Serialize};
 
@@ -75,9 +75,10 @@ pub struct Start {
     /// sleep, the shell gives the path that it kept in RTC memory. If the
     /// path is `None` or not valid, the core shows the first page.
     pub path: Option<String>,
-    /// The time at which the last state message arrived, in seconds since
-    /// the Unix epoch, from [`ViewModel::last_sync`]. After a deep sleep, the
-    /// shell gives the value that it kept in RTC memory.
+    /// The footer time of the page, in seconds since the Unix epoch, from
+    /// [`ViewModel::last_sync`]. After a deep sleep, the shell gives the
+    /// value that it kept in RTC memory. The core shows it until an entity
+    /// on the page has a `last_updated` time from Home Assistant.
     pub last_sync: Option<u64>,
 }
 
@@ -142,15 +143,6 @@ pub enum Event {
         /// The item from the stream.
         event: MqttEvent,
     },
-    /// The clock gave this time after a state message arrived. The time is
-    /// `None` if the shell gave a time that is not valid.
-    #[serde(skip)]
-    #[facet(skip)]
-    MessageTime(#[facet(opaque)] Option<DateTime<Utc>>),
-    /// The minute timer with this id expired.
-    #[serde(skip)]
-    #[facet(skip)]
-    MinutePassed(u32),
     /// The wait before the reconnect with this id is over.
     #[serde(skip)]
     #[facet(skip)]
@@ -163,6 +155,11 @@ pub enum Event {
     #[serde(skip)]
     #[facet(skip)]
     FullRefreshDue(u32),
+    /// The draw timer with this id expired. Refer to
+    /// [`refresh::redraw_soon`].
+    #[serde(skip)]
+    #[facet(skip)]
+    DrawDue(u32),
 }
 
 /// A control on the panel.
@@ -223,8 +220,6 @@ pub enum Effect {
     WifiOff(WifiOff),
     /// Put the device to sleep.
     Sleep(Sleep),
-    /// Read the wall clock.
-    TimeNow(time::Now),
     /// Start a timer.
     TimeNotifyAfter(time::NotifyAfter),
     /// Clear a timer.
@@ -249,10 +244,10 @@ pub struct Model {
     pub connection: connection::State,
     /// The power source and the sleep state.
     pub power: power::State,
-    /// The time at which the last state message arrived. The core reads
-    /// the clock at most once a minute, so the time can be up to one minute
-    /// before the arrival of the last message. Refer to
-    /// [`connection::read_message_time`].
+    /// The time that the shell kept through a deep sleep and gave back in
+    /// `Start`. The footer shows this time only if no entity on the page has
+    /// a `last_updated` time, for example after a wake, before the first
+    /// messages arrive. Refer to [`connection::page_time`].
     pub last_sync: Option<DateTime<Utc>>,
     /// The number of service calls that the core dropped, because it slept
     /// before it could send them.
@@ -339,11 +334,10 @@ impl App for Dashboard {
             Event::SetReadOnly(read_only) => rooms::set_read_only(read_only, model),
             Event::Wifi { request, status } => connection::wifi(request, status, model),
             Event::Mqtt { connection, event } => connection::mqtt(connection, event, model),
-            Event::MessageTime(now) => connection::message_time(now, model),
-            Event::MinutePassed(id) => connection::minute_passed(id, model),
             Event::Reconnect(id) => connection::reconnect(id, model),
             Event::IdleTimeout(id) => power::idle_timeout(id, model),
             Event::FullRefreshDue(id) => refresh::timer_expired(id, model),
+            Event::DrawDue(id) => refresh::draw_due(id, model),
         }
     }
 
@@ -352,31 +346,14 @@ impl App for Dashboard {
     }
 }
 
-/// The earliest time that the core accepts from the clock:
-/// 2025-01-01T00:00:00Z, in seconds since the Unix epoch.
+/// The earliest valid time of day: 2025-01-01T00:00:00Z, in seconds since
+/// the Unix epoch.
 ///
 /// A device with no RTC and no network time counts from the Unix epoch when
 /// it starts. A time before this one is such a count, not the time of day.
+/// The core does not read the clock of the device. The footer times come
+/// from Home Assistant. The firmware uses this value for its own clock.
 pub const EARLIEST_VALID_TIME: u64 = 1_735_689_600;
-
-/// Reads the wall clock with `Time::now_instant`. The answer is `None` if the
-/// shell gives a time that is not valid, or a time before
-/// [`EARLIEST_VALID_TIME`].
-///
-/// This function is the only place that reads the clock.
-pub(crate) fn now() -> RequestBuilder<Effect, Event, impl Future<Output = Option<DateTime<Utc>>>> {
-    Time::now_instant().map(valid_time)
-}
-
-/// Converts an instant from the clock to a time, or `None` if the instant is
-/// not a plausible time of day.
-fn valid_time(instant: Instant) -> Option<DateTime<Utc>> {
-    if instant.seconds() < EARLIEST_VALID_TIME {
-        return None;
-    }
-    let seconds = i64::try_from(instant.seconds()).ok()?;
-    DateTime::from_timestamp(seconds, instant.nanos())
-}
 
 fn on_start(start: Start, model: &mut Model) -> Cmd {
     let Start {
@@ -408,24 +385,4 @@ fn on_start(start: Start, model: &mut Model) -> Cmd {
     redraw(model, true)
         .and(connection::go_online(model))
         .and(power::restart_idle_timer(model))
-}
-
-#[cfg(test)]
-mod tests {
-    use crux_time::Instant;
-
-    use super::{EARLIEST_VALID_TIME, valid_time};
-
-    #[test]
-    fn a_time_since_boot_is_not_a_valid_time() {
-        // A device with no RTC: 90 seconds after the start.
-        assert_eq!(valid_time(Instant::new(90, 0)), None);
-        assert_eq!(valid_time(Instant::new(EARLIEST_VALID_TIME - 1, 0)), None);
-    }
-
-    #[test]
-    fn a_time_after_2025_is_valid() {
-        let time = valid_time(Instant::new(EARLIEST_VALID_TIME, 5)).unwrap();
-        assert_eq!(time.to_rfc3339(), "2025-01-01T00:00:00.000000005+00:00");
-    }
 }

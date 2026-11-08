@@ -1,7 +1,6 @@
 use alloc::{string::String, vec, vec::Vec};
 use core::time::Duration;
 
-use crux_time::Instant;
 use embedded_graphics::prelude::Point;
 use shared::{
     Connection, Event, PowerSource,
@@ -9,7 +8,7 @@ use shared::{
         mqtt::{Message, MqttEvent},
         network::WifiStatus,
     },
-    features::power::IDLE_TIMEOUT,
+    features::{power::IDLE_TIMEOUT, refresh::DRAW_DELAY},
 };
 
 use super::{Job, MqttOp, Shell, Signal, TimerOp, start};
@@ -27,11 +26,6 @@ const CONFIG: Config<'static> = Config {
     read_only: true,
     ntp_server: "pool.ntp.org",
 };
-
-/// 2026-11-06 12:00:00 UTC.
-fn clock() -> Instant {
-    Instant::new(1_793_966_400, 0)
-}
 
 /// A short name for each job, to compare lists of jobs.
 fn names(jobs: &[Job]) -> Vec<String> {
@@ -62,7 +56,7 @@ fn names(jobs: &[Job]) -> Vec<String> {
 }
 
 fn started(power: PowerSource, read_only: bool) -> (Shell, Vec<Job>) {
-    let mut shell = Shell::new(clock);
+    let mut shell = Shell::new();
     let config = Config {
         read_only,
         ..CONFIG
@@ -148,23 +142,35 @@ fn a_message_on_the_stream_redraws_a_visible_tile() {
     let mut shell = online(true);
     let tile = shell.view().tiles()[0].entity_id.clone();
     let (domain, object) = tile.split_once('.').unwrap();
-    let topic = alloc::format!("homeassistant/statestream/{domain}/{object}/state");
-    let message = |payload: &[u8]| Signal::Mqtt {
+    let message = |key: &str, payload: &[u8]| Signal::Mqtt {
         connection: 1,
         event: MqttEvent::Message(Message {
-            topic: topic.clone(),
+            topic: alloc::format!("homeassistant/statestream/{domain}/{object}/{key}"),
             payload: payload.to_vec(),
         }),
     };
-    // The first message also reads the clock, and the core starts the
-    // minute timer.
-    let jobs = shell.handle(message(b"on"));
-    assert_eq!(names(&jobs), ["render", "start timer 2"]);
-    assert_eq!(shell.view().updated, "Live · 12:00");
+    // The state starts the draw timer of the core, and does not draw yet.
+    let jobs = shell.handle(message("state", b"on"));
+    assert_eq!(names(&jobs), ["start timer 2"]);
+    let Job::Timer {
+        token,
+        op: TimerOp::NotifyAfter(notify),
+    } = &jobs[0]
+    else {
+        panic!("not a timer");
+    };
+    assert_eq!(Duration::from(notify.duration), DRAW_DELAY);
+    let (id, token) = (notify.id, *token);
 
-    // Within the minute, the core does not read the clock again.
-    let jobs = shell.handle(message(b"off"));
+    // The time of the update from Home Assistant waits for the same timer.
+    // 12:00 UTC is 12:00 in the UK in November.
+    let jobs = shell.handle(message("last_updated", b"2026-11-06T12:00:07.250000+00:00"));
+    assert_eq!(names(&jobs), Vec::<String>::new());
+
+    // The timer draws both once.
+    let jobs = shell.handle(Signal::Timer { id, token });
     assert_eq!(names(&jobs), ["render"]);
+    assert_eq!(shell.view().updated, "Last changed 12:00");
 }
 
 #[test]
