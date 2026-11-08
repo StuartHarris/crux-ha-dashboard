@@ -37,6 +37,8 @@ pub struct FixedShell {
     core: Core<Dashboard>,
     connection: Option<Request<Connect>>,
     timers: Vec<Request<NotifyAfter>>,
+    /// The entity ids for which the broker sends no message.
+    without: Vec<String>,
 }
 
 impl FixedShell {
@@ -44,10 +46,19 @@ impl FixedShell {
     /// effects until the core waits.
     #[must_use]
     pub fn start(power: PowerSource, path: &str) -> Self {
+        Self::start_without(power, path, &[])
+    }
+
+    /// Starts the core as [`FixedShell::start`] does, but the broker sends
+    /// no message for the entities in `without`. Each of these entities has
+    /// no state, so its tile shows `-` and its toggle shows a cross.
+    #[must_use]
+    pub fn start_without(power: PowerSource, path: &str, without: &[&str]) -> Self {
         let mut shell = Self {
             core: Core::new(),
             connection: None,
             timers: Vec::new(),
+            without: without.iter().map(ToString::to_string).collect(),
         };
         let effects = shell.core.process_event(Event::Start(Start {
             settings: Settings {
@@ -89,6 +100,13 @@ impl FixedShell {
                     let mut more = Vec::new();
                     if let Some(mut request) = self.connection.take() {
                         for (topic, payload) in states() {
+                            if self
+                                .without
+                                .iter()
+                                .any(|entity| is_topic_of(&topic, entity))
+                            {
+                                continue;
+                            }
                             let message = MqttEvent::Message(Message {
                                 topic,
                                 payload: payload.into_bytes(),
@@ -151,6 +169,16 @@ impl FixedShell {
             self.run(effects);
         }
     }
+}
+
+/// Returns `true` if `topic` is a state topic of the entity `entity_id`.
+fn is_topic_of(topic: &str, entity_id: &str) -> bool {
+    let Some((domain, object)) = entity_id.split_once('.') else {
+        return false;
+    };
+    topic
+        .strip_prefix(&format!("homeassistant/statestream/{domain}/{object}/"))
+        .is_some()
 }
 
 /// Returns a fixed state message for each entity on each page, and a JSON

@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use embedded_graphics::pixelcolor::Gray4;
 use embedded_graphics::prelude::*;
 use embedded_graphics_simulator::{OutputSettings, SimulatorDisplay};
-use shared::{Event, PowerSource, ViewModel, fixtures::FixedShell, pages::PAGES};
+use shared::{Event, PowerSource, TileState, ViewModel, fixtures::FixedShell, pages::PAGES};
 
 /// Draws `view` and compares the image with the reference image `name`.
 /// Returns a description of the difference, or `None` if the images are the
@@ -127,4 +127,23 @@ fn the_dry_run_page_matches_its_reference_image() {
     assert!(view.read_only);
     assert_eq!(view.status, "Dry run · Online, on stand");
     assert_all_match(&check("dry-run", &view).into_iter().collect::<Vec<_>>());
+}
+
+#[test]
+fn the_all_lights_toggle_with_no_state_matches_its_reference_image() {
+    let path = PAGES[0].route().to_path();
+    let shell = FixedShell::start_without(PowerSource::Stand, &path, &["light.all_lights"]);
+    let view = shell.view();
+    let index = view.index().expect("the first page is the home page");
+    let all_lights = index
+        .all_lights
+        .as_ref()
+        .expect("the home page has the toggle");
+    assert_eq!(all_lights.entity_id, "light.all_lights");
+    assert_eq!(all_lights.state, TileState::Unknown);
+    assert_all_match(
+        &check("all-lights-no-state", &view)
+            .into_iter()
+            .collect::<Vec<_>>(),
+    );
 }
