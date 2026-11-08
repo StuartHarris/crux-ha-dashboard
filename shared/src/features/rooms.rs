@@ -7,15 +7,31 @@ use crate::{
     Cmd, Control, Model,
     capabilities::mqtt::{Publish, Qos},
     features::{connection, power, refresh::redraw},
-    layout::Page,
+    layout::{BRIGHTNESS_STEP_PCT, Page},
     route::Route,
 };
 
 /// The JSON payload of a service call for Home Assistant.
+///
+/// The payload has `brightness_step_pct` only for a step of a dimmable
+/// light. Refer to `docs/mqtt.md`.
 #[derive(Serialize)]
 struct ServiceCall<'a> {
     service: &'a str,
     entity_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    brightness_step_pct: Option<i8>,
+}
+
+impl<'a> ServiceCall<'a> {
+    /// Returns a service call with no data.
+    const fn new(service: &'a str, entity_id: &'a str) -> Self {
+        Self {
+            service,
+            entity_id,
+            brightness_step_pct: None,
+        }
+    }
 }
 
 /// Acts on a tap on `control`, or on no control. Refer to
@@ -33,6 +49,8 @@ pub fn tapped(control: Option<Control>, model: &mut Model) -> Cmd {
         Some(Control::Scene(index)) => scene_tapped(index, model),
         Some(Control::AllLights) => all_lights_tapped(model),
         Some(Control::Room(index)) => room_tapped(index, model),
+        Some(Control::Brighter(index)) => step_tapped(index, BRIGHTNESS_STEP_PCT, model),
+        Some(Control::Dimmer(index)) => step_tapped(index, -BRIGHTNESS_STEP_PCT, model),
     }
 }
 
@@ -85,7 +103,36 @@ fn tile_tapped(index: usize, model: &mut Model) -> Cmd {
     let Some(service) = tile.kind.tap_service() else {
         return idle;
     };
-    call_service(model, service, tile.entity_id).and(idle)
+    call_service(model, &ServiceCall::new(service, tile.entity_id)).and(idle)
+}
+
+/// Changes the brightness of the light of the tile by `step` percent. The
+/// device is awake.
+///
+/// The core acts only if the tile has the − and + buttons now. Refer to
+/// [`Tile::has_steps`](crate::layout::Tile::has_steps). The core also
+/// ignores a − step on a light that is off, because Home Assistant does
+/// nothing for it. If the core does not act, the tap only starts the idle
+/// time again.
+///
+/// The core sends `light.turn_on` with `brightness_step_pct`. If a light is
+/// off, a + step turns it on at that brightness. Home Assistant turns a light
+/// off when its brightness gets to 0. The tile shows the new brightness when
+/// it comes back on the state stream.
+fn step_tapped(index: usize, step: i8, model: &mut Model) -> Cmd {
+    let idle = power::restart_idle_timer(model);
+    let Some(tile) = current_room(model).and_then(|page| page.tiles.get(index)) else {
+        return idle;
+    };
+    let state = model.entities.state(tile.entity_id);
+    if !tile.has_steps(state) || (step < 0 && state == Some("off")) {
+        return idle;
+    }
+    let call = ServiceCall {
+        brightness_step_pct: Some(step),
+        ..ServiceCall::new("light.turn_on", tile.entity_id)
+    };
+    call_service(model, &call).and(idle)
 }
 
 /// Turns on the scene. The device is awake.
@@ -94,7 +141,7 @@ fn scene_tapped(index: usize, model: &mut Model) -> Cmd {
     let Some(scene) = current_room(model).and_then(|page| page.scenes.get(index)) else {
         return idle;
     };
-    call_service(model, "scene.turn_on", scene.entity_id).and(idle)
+    call_service(model, &ServiceCall::new("scene.turn_on", scene.entity_id)).and(idle)
 }
 
 /// Toggles the All lights tile of the home page: its first light or switch
@@ -107,7 +154,7 @@ fn all_lights_tapped(model: &mut Model) -> Cmd {
     else {
         return idle;
     };
-    call_service(model, service, tile.entity_id).and(idle)
+    call_service(model, &ServiceCall::new(service, tile.entity_id)).and(idle)
 }
 
 /// Shows the page of the room with `index` in the list of rooms. The core
@@ -149,14 +196,14 @@ pub fn set_read_only(read_only: bool, model: &mut Model) -> Cmd {
 /// The panel shows no sign of the tap, because the state of the entity does
 /// not change. The view model tells the shell that the dashboard does a dry
 /// run, so the shell can show it.
-fn call_service(model: &mut Model, service: &str, entity_id: &str) -> Cmd {
+fn call_service(model: &mut Model, call: &ServiceCall<'_>) -> Cmd {
     let Some(settings) = &model.settings else {
         return Cmd::done();
     };
     if settings.read_only {
         return Cmd::done();
     }
-    let Ok(payload) = serde_json::to_vec(&ServiceCall { service, entity_id }) else {
+    let Ok(payload) = serde_json::to_vec(call) else {
         return Cmd::done();
     };
     let publish = Publish {

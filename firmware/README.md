@@ -232,6 +232,15 @@ Do the steps in this order. Each step needs the steps before it.
     a change of at most 2 s and no `rtc: set to` line. Then disconnect USB for one minute
     with the battery connected, connect it again, and do the same check. If the RTC has
     no valid time after a restart, examine the supply of the RTC.
+14. **The − and + buttons.** The automation `dashboard_commands` on the Pi must accept
+    `light.turn_on` (refer to `docs/mqtt.md`). Keep `read_only = false`. On a few dimmable
+    light tiles, tap each corner of the − and the + button with a finger. A tap on a
+    button changes the brightness on the tile. A tap that misses a button toggles the
+    light. Count the toggles. The log line `touch: tap at (x, y)` gives the panel
+    point of each tap. Compare it with `tile_dimmer` and `tile_brighter` in
+    `ui/src/layout.rs`. If the misses are too frequent, increase `STEP_WIDTH` or
+    `STEP_HEIGHT` in `ui/src/layout.rs`. Then run `just golden` in the root directory
+    and examine the new images.
 
 ## TODO(5b)
 

@@ -46,6 +46,29 @@ const ROOM_BASELINE: u32 = 18;
 /// The distance from the bottom of a room button to the centre of its
 /// light dots.
 const DOT_MIDDLE: u32 = 26;
+/// The space between the touch area of a − or + button and the border that
+/// the button shows. The touch area is larger than the border, so a tap
+/// near the border still hits the button.
+const STEP_INSET: u32 = 8;
+/// The radius of the corners of a − or + button.
+const STEP_RADIUS: u32 = 8;
+/// The length of the bars of the − and + signs.
+const SIGN_LENGTH: u32 = 28;
+/// The thickness of the bars of the − and + signs.
+const SIGN_THICKNESS: u32 = 4;
+/// The space between the brightness and the indicator in the strip of a
+/// tile with steps.
+const STRIP_GAP: u32 = 8;
+/// The width of the middle of the strip of a tile with steps: the space
+/// between the touch areas of the − and the + button.
+const STRIP_MIDDLE: u32 = layout::CELL_WIDTH - 2 * layout::STEP_WIDTH;
+
+// The middle of the strip has space for the indicator and the gap before
+// it. `draw_steps` subtracts both from the width of the middle.
+const _: () = assert!(STRIP_MIDDLE >= INDICATOR + STRIP_GAP);
+// The border and the sign of a − or + button fit in its touch area.
+const _: () = assert!(layout::STEP_WIDTH >= 2 * STEP_INSET + SIGN_LENGTH);
+const _: () = assert!(layout::STEP_HEIGHT >= 2 * STEP_INSET + SIGN_LENGTH);
 
 /// Draws the view model on the display.
 ///
@@ -65,6 +88,11 @@ const DOT_MIDDLE: u32 = 26;
 /// - The room buttons, in a grid of three columns and three rows. Each
 ///   button has the name of the room and its summary.
 /// - The footer, as on a room page.
+///
+/// A dimmable light tile that is on or off (`TileView::steps`) has its label
+/// at the top. Below the label is a
+/// strip with a − button at the left end, a + button at the right end, and
+/// the brightness and the on/off indicator between them.
 ///
 /// The screen is black and white, so a partial refresh of the panel is clean.
 /// A light or a switch that is on is a black tile with white text. A tile
@@ -89,6 +117,12 @@ where
             for (index, tile) in room.tiles.iter().enumerate() {
                 if let Some(area) = layout::tile(index) {
                     draw_tile(tile, area, display)?;
+                }
+                if tile.steps
+                    && let (Some(dimmer), Some(brighter)) =
+                        (layout::tile_dimmer(index), layout::tile_brighter(index))
+                {
+                    draw_steps(tile, dimmer, brighter, display)?;
                 }
             }
             for (index, scene) in room.scenes.iter().enumerate().take(MAX_SCENES) {
@@ -409,7 +443,9 @@ where
     let top = area.top_left.y.unsigned_abs();
     let inner = area.size.width - 2 * PADDING;
 
-    let label_width = if toggle {
+    // A tile with steps shows its indicator and its brightness in the strip
+    // with the − and + buttons. Refer to `draw_steps`.
+    let label_width = if toggle && !tile.steps {
         inner - INDICATOR - PADDING
     } else {
         inner
@@ -422,6 +458,9 @@ where
         label_width,
         ink,
     )?;
+    if tile.steps {
+        return Ok(());
+    }
 
     if toggle {
         let indicator = Circle::new(point(left + inner - INDICATOR, top + 12), INDICATOR);
@@ -453,6 +492,99 @@ where
             inner,
             ink,
         )?;
+    }
+    Ok(())
+}
+
+/// Draws the strip of a tile with steps: the − button in `dimmer`, the +
+/// button in `brighter`, and the brightness and the on/off indicator in the
+/// middle. The tile is black when the light is on, so the strip uses the ink
+/// of the tile.
+fn draw_steps<D>(
+    tile: &TileView,
+    dimmer: Rectangle,
+    brighter: Rectangle,
+    display: &mut D,
+) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Gray4>,
+{
+    let on = tile.state == TileState::On;
+    let ink = if on { WHITE } else { BLACK };
+    draw_step_button(dimmer, false, ink, display)?;
+    draw_step_button(brighter, true, ink, display)?;
+
+    // The middle of the strip, between the two buttons. The borders of the
+    // buttons are inside their touch areas, so the text can use all the
+    // space between the touch areas.
+    let middle_left = dimmer.top_left.x.unsigned_abs() + layout::STEP_WIDTH;
+    let center_x = middle_left + STRIP_MIDDLE / 2;
+    let center_y = dimmer.center().y.unsigned_abs();
+
+    let fonts = [&BUTTON, &DETAIL];
+    let text_width = if tile.detail.is_empty() {
+        0
+    } else {
+        let max_width = STRIP_MIDDLE - INDICATOR - STRIP_GAP;
+        let width = fonts
+            .iter()
+            .map(|font| text::width(font, &tile.detail))
+            .find(|width| *width <= max_width)
+            .unwrap_or(max_width);
+        width + STRIP_GAP
+    };
+    let start = center_x - u32::midpoint(text_width, INDICATOR);
+    if text_width > 0 {
+        text::draw_fitted(
+            display,
+            &fonts,
+            &tile.detail,
+            Anchor::center_left(point(start, center_y)),
+            text_width - STRIP_GAP,
+            ink,
+        )?;
+    }
+    let indicator = Circle::new(
+        point(start + text_width, center_y - INDICATOR / 2),
+        INDICATOR,
+    );
+    draw_indicator(tile.state, indicator, display)
+}
+
+/// Draws a − or (if `plus` is `true`) a + button in `area`, with a thin
+/// border in `ink`. The border is inside the touch area.
+fn draw_step_button<D>(
+    area: Rectangle,
+    plus: bool,
+    ink: Gray4,
+    display: &mut D,
+) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Gray4>,
+{
+    let inset = STEP_INSET.cast_signed();
+    let shape = Rectangle::new(
+        area.top_left + Point::new(inset, inset),
+        area.size - Size::new(2 * STEP_INSET, 2 * STEP_INSET),
+    );
+    RoundedRectangle::with_equal_corners(shape, Size::new(STEP_RADIUS, STEP_RADIUS))
+        .into_styled(
+            PrimitiveStyleBuilder::new()
+                .stroke_color(ink)
+                .stroke_width(2)
+                .stroke_alignment(StrokeAlignment::Inside)
+                .build(),
+        )
+        .draw(display)?;
+    let center = shape.center();
+    let fill = PrimitiveStyle::with_fill(ink);
+    Rectangle::with_center(center, Size::new(SIGN_LENGTH, SIGN_THICKNESS))
+        .into_styled(fill)
+        .draw(display)?;
+    if plus {
+        Rectangle::with_center(center, Size::new(SIGN_THICKNESS, SIGN_LENGTH))
+            .into_styled(fill)
+            .draw(display)?;
     }
     Ok(())
 }
@@ -618,6 +750,7 @@ pub mod tests {
             state,
             text: text.into(),
             detail: String::new(),
+            steps: false,
         }
     }
 
@@ -810,6 +943,84 @@ pub mod tests {
             frame.pixel(indicator_center(unavailable)),
             Some(Gray4::BLACK)
         );
+    }
+
+    /// Draws a room with a dimmable light that is on at 50%, and one that is
+    /// off, in that order.
+    fn dimmable_frame() -> Framebuffer {
+        let mut view = view();
+        let PageView::Room(room) = &mut view.page else {
+            unreachable!()
+        };
+        let mut on = tile("On", TileKind::Light, TileState::On, "On 50%");
+        on.detail = "50%".into();
+        on.steps = true;
+        let mut off = tile("Off", TileKind::Light, TileState::Off, "Off");
+        off.steps = true;
+        room.tiles = vec![on, off];
+        let mut frame = Framebuffer::new();
+        let Ok(()) = draw(&view, &mut frame);
+        frame
+    }
+
+    #[test]
+    fn a_dimmable_tile_has_a_minus_and_a_plus_button_in_its_ink() {
+        let frame = dimmable_frame();
+        for (index, ink, paper) in [
+            (0, Gray4::WHITE, Gray4::BLACK),
+            (1, Gray4::BLACK, Gray4::WHITE),
+        ] {
+            let dimmer = layout::tile_dimmer(index).unwrap();
+            let brighter = layout::tile_brighter(index).unwrap();
+            // Both signs have a bar across the centre. Only the + has a bar
+            // above the centre.
+            let above = Point::new(0, 10);
+            assert_eq!(frame.pixel(dimmer.center()), Some(ink), "{index}");
+            assert_eq!(frame.pixel(brighter.center()), Some(ink), "{index}");
+            assert_eq!(frame.pixel(dimmer.center() - above), Some(paper), "{index}");
+            assert_eq!(frame.pixel(brighter.center() - above), Some(ink), "{index}");
+            // The border of each button is inside its touch area.
+            let border = |area: embedded_graphics::primitives::Rectangle| {
+                Point::new(area.center().x, area.top_left.y + 9)
+            };
+            assert_eq!(frame.pixel(border(dimmer)), Some(ink), "{index}");
+            assert_eq!(frame.pixel(border(brighter)), Some(ink), "{index}");
+            assert_eq!(
+                frame.pixel(Point::new(dimmer.center().x, dimmer.top_left.y + 4)),
+                Some(paper),
+                "{index}"
+            );
+        }
+        assert!(frame.lumas().all(|luma| luma == 0 || luma == 15));
+    }
+
+    #[test]
+    fn a_dimmable_tile_shows_its_indicator_in_the_strip_not_in_the_label_row() {
+        let frame = dimmable_frame();
+        let on = layout::tile(0).unwrap();
+        let off = layout::tile(1).unwrap();
+        // The label row has no indicator: the tile colour is there.
+        assert_eq!(frame.pixel(indicator_center(on)), Some(Gray4::BLACK));
+        assert_eq!(frame.pixel(indicator_center(off)), Some(Gray4::WHITE));
+
+        // The strip of the tile that is off has a ring in its centre. The
+        // strip of the tile that is on has the brightness and a white dot.
+        let strip_middle = layout::tile_dimmer(0).unwrap().center().y;
+        let middle = |area: embedded_graphics::primitives::Rectangle| {
+            Point::new(area.center().x, strip_middle)
+        };
+        let ring = middle(off) - Point::new(super::INDICATOR.cast_signed() / 2 - 1, 0);
+        assert_eq!(frame.pixel(ring), Some(Gray4::BLACK));
+        assert_eq!(frame.pixel(middle(off)), Some(Gray4::WHITE));
+        let strip =
+            embedded_graphics::primitives::Rectangle::with_center(middle(on), Size::new(96, 40));
+        let white = strip
+            .points()
+            .filter(|point| frame.pixel(*point) == Some(Gray4::WHITE))
+            .count();
+        // The text and the dot together are larger than the dot alone.
+        let dot = super::INDICATOR * super::INDICATOR / 2;
+        assert!(white > dot as usize, "{white}");
     }
 
     #[test]

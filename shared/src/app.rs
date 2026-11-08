@@ -185,6 +185,22 @@ pub enum Control {
     /// is the position of the room in
     /// [`IndexView::rooms`](crate::IndexView::rooms).
     Room(usize),
+    /// The + button of the tile with this index on the current page.
+    ///
+    /// Only a dimmable light that is on or off has this button. Refer to
+    /// [`Tile::has_steps`](crate::layout::Tile::has_steps). A tap increases
+    /// the brightness by
+    /// [`BRIGHTNESS_STEP_PCT`](crate::layout::BRIGHTNESS_STEP_PCT) percent.
+    /// If the light is off, the tap turns it on at that brightness.
+    Brighter(usize),
+    /// The − button of the tile with this index on the current page.
+    ///
+    /// Only a dimmable light that is on or off has this button. A tap
+    /// decreases the brightness by
+    /// [`BRIGHTNESS_STEP_PCT`](crate::layout::BRIGHTNESS_STEP_PCT) percent.
+    /// If the brightness gets to 0, Home Assistant turns the light off. A tap
+    /// on a light that is off does nothing.
+    Dimmer(usize),
 }
 
 /// The effects that the core asks the shell to do.

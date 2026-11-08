@@ -51,6 +51,13 @@ impl Entities {
         self.states.get(entity_id)
     }
 
+    /// Returns the state text of `entity_id`, for example `on`, or `None` if
+    /// the core has no state for it.
+    #[must_use]
+    pub fn state(&self, entity_id: &str) -> Option<&str> {
+        self.get(entity_id)?.state.as_deref()
+    }
+
     /// Applies a state-stream message to the states.
     ///
     /// The core keeps only the entities on `pages` and the attributes that

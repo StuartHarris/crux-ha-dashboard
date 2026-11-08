@@ -99,13 +99,31 @@ The payload is a JSON object with a service and an entity id:
 {"service":"light.toggle","entity_id":"light.kitchen"}
 ```
 
+A tap on the − or the + button of a dimmable light tile sends `light.turn_on` with
+a brightness step in percent. The step is `-25` or `25`
+(`BRIGHTNESS_STEP_PCT` in `shared/src/layout.rs`):
+
+```json
+{"service":"light.turn_on","entity_id":"light.kitchen","brightness_step_pct":25}
+```
+
+If a light is off, a + step turns it on at 25%. When the brightness gets to 0, Home
+Assistant turns the light off. The dashboard sends no − step for a light that is off,
+because Home Assistant does nothing for it. A tile shows the − and + buttons only
+while its light is on or off, so the dashboard sends no step for a light that is
+unavailable or has no state. A toggle payload and a
+scene payload have no `brightness_step_pct` key.
+
 The Home Assistant automation `dashboard_commands` (Dashboard commands) calls the
 service. It calls the service only if all of these conditions are true:
 
 - The payload is a JSON object.
-- `service` is `light.toggle`, `switch.toggle` or `scene.turn_on`.
+- `service` is `light.toggle`, `switch.toggle`, `scene.turn_on` or `light.turn_on`.
 - `entity_id` is one entity id, and its domain is the same as the domain of the
   service. For example, `light.toggle` with `switch.kettle` does nothing.
+- For `light.turn_on`, the payload has `brightness_step_pct`, and its value is an
+  integer from -100 to 100. The automation gives it to the service as `data`.
+- The payload has no other keys.
 
 The automation ignores a command that does not agree with these conditions. It sends
 no reply. The dashboard sees the result as a new state on the state stream. The

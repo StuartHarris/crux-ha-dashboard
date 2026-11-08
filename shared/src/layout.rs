@@ -19,6 +19,12 @@ pub const MAX_LIGHTS: usize = 4;
 /// The largest number of rooms. The index page has a button for each room,
 /// and the `ui` grid of room buttons has this many cells.
 pub const MAX_ROOMS: usize = 9;
+/// The change in brightness, in percent, of one tap on the + or the − button
+/// of a dimmable light tile. Refer to [`Tile::dimmable`].
+pub const BRIGHTNESS_STEP_PCT: i8 = 25;
+// Home Assistant accepts a `brightness_step_pct` from -100 to 100. The −
+// button sends the negative value, so the step must be positive.
+const _: () = assert!(BRIGHTNESS_STEP_PCT >= 1 && BRIGHTNESS_STEP_PCT <= 100);
 
 /// One page of the dashboard: the home page or a room.
 ///
@@ -53,6 +59,11 @@ pub struct Tile {
     /// a group if the room has other lights or switches, because the group
     /// and its members are the same lights.
     pub group: bool,
+    /// The light can change its brightness. The tile has a − and a + button,
+    /// which change the brightness by [`BRIGHTNESS_STEP_PCT`]. A tap on the
+    /// other parts of the tile toggles the light. Only a light tile can be
+    /// dimmable.
+    pub dimmable: bool,
 }
 
 /// A button that turns on a Home Assistant scene.
@@ -105,6 +116,23 @@ impl TileKind {
             Self::Climate => &["current_temperature", "temperature"],
             Self::Weather => &["temperature", "temperature_unit"],
         }
+    }
+}
+
+impl Tile {
+    /// Returns `true` if the tile shows the − and + buttons for the entity
+    /// `state`, which is the state from the state stream.
+    ///
+    /// The tile must be a dimmable light (refer to [`Tile::dimmable`]), and
+    /// the light must be `on` or `off`. A light that is unavailable, or that
+    /// has no state or the state `unknown`, has no buttons. Its tile is a
+    /// toggle, as the tile of an on/off light is.
+    ///
+    /// The view and the core both use this function, so the panel shows the
+    /// buttons only when the core acts on them.
+    #[must_use]
+    pub fn has_steps(&self, state: Option<&str>) -> bool {
+        self.kind == TileKind::Light && self.dimmable && matches!(state, Some("on" | "off"))
     }
 }
 
@@ -187,7 +215,9 @@ pub const fn room(
     }
 }
 
-/// Makes a light tile.
+/// Makes a light tile for a light that can change its brightness. Refer to
+/// [`Tile::dimmable`]. For a light that can only be on or off, use
+/// [`onoff_light`].
 #[must_use]
 pub const fn light(label: &'static str, entity_id: &'static str) -> Tile {
     Tile {
@@ -195,11 +225,27 @@ pub const fn light(label: &'static str, entity_id: &'static str) -> Tile {
         entity_id,
         kind: TileKind::Light,
         group: false,
+        dimmable: true,
+    }
+}
+
+/// Makes a light tile for a light that can only be on or off. Home Assistant
+/// gives `onoff` as its only color mode. The tile has no − and + buttons.
+/// Refer to [`Tile::dimmable`].
+#[must_use]
+pub const fn onoff_light(label: &'static str, entity_id: &'static str) -> Tile {
+    Tile {
+        label,
+        entity_id,
+        kind: TileKind::Light,
+        group: false,
+        dimmable: false,
     }
 }
 
 /// Makes a light tile for a Home Assistant light group. Refer to
-/// [`Tile::group`].
+/// [`Tile::group`]. The group can change its brightness. Refer to
+/// [`Tile::dimmable`].
 #[must_use]
 pub const fn light_group(label: &'static str, entity_id: &'static str) -> Tile {
     Tile {
@@ -207,6 +253,7 @@ pub const fn light_group(label: &'static str, entity_id: &'static str) -> Tile {
         entity_id,
         kind: TileKind::Light,
         group: true,
+        dimmable: true,
     }
 }
 
@@ -218,6 +265,7 @@ pub const fn switch(label: &'static str, entity_id: &'static str) -> Tile {
         entity_id,
         kind: TileKind::Switch,
         group: false,
+        dimmable: false,
     }
 }
 
@@ -229,6 +277,7 @@ pub const fn sensor(label: &'static str, entity_id: &'static str) -> Tile {
         entity_id,
         kind: TileKind::Sensor,
         group: false,
+        dimmable: false,
     }
 }
 
@@ -240,6 +289,7 @@ pub const fn climate(label: &'static str, entity_id: &'static str) -> Tile {
         entity_id,
         kind: TileKind::Climate,
         group: false,
+        dimmable: false,
     }
 }
 
@@ -251,6 +301,7 @@ pub const fn weather(label: &'static str, entity_id: &'static str) -> Tile {
         entity_id,
         kind: TileKind::Weather,
         group: false,
+        dimmable: false,
     }
 }
 

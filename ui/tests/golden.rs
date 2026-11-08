@@ -147,3 +147,28 @@ fn the_all_lights_toggle_with_no_state_matches_its_reference_image() {
             .collect::<Vec<_>>(),
     );
 }
+
+#[test]
+fn dimmable_and_onoff_lights_match_their_reference_image() {
+    let mut shell = FixedShell::start(PowerSource::Stand, "/room/dining_room");
+    // The widest brightness on a light that is on, a dimmable light that is
+    // off, an on/off light that is on and an on/off light that is off.
+    shell.set_state("light.dining_room_lights", "on", &[("brightness", "255")]);
+    shell.set_state(
+        "light.dining_room_tall_lamp",
+        "off",
+        &[("brightness", "null")],
+    );
+    shell.set_state("light.dining_room_candle_light_left", "on", &[]);
+    shell.set_state("light.dining_room_candle_light_right", "off", &[]);
+    let view = shell.view();
+    let tiles = view.tiles();
+    let steps: Vec<bool> = tiles.iter().take(4).map(|tile| tile.steps).collect();
+    assert_eq!(steps, [true, true, false, false]);
+    assert_eq!(tiles[0].detail, "100%");
+    assert_all_match(
+        &check("dimmable-and-onoff", &view)
+            .into_iter()
+            .collect::<Vec<_>>(),
+    );
+}
