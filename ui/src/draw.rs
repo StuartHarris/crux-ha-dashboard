@@ -759,7 +759,7 @@ pub mod tests {
         climate.detail = "Set 21°".into();
         ViewModel {
             path: "/room/living_room".into(),
-            title: "Living Room".into(),
+            title: "Living room".into(),
             page_index: 1,
             page_count: 10,
             page_label: "2 / 10".into(),
@@ -804,8 +804,8 @@ pub mod tests {
         let mut weather = tile("Weather", TileKind::Weather, TileState::Value, "12.3 °C");
         weather.detail = "Partly cloudy".into();
         let rooms: [(&str, &[LightState], Option<&str>); 9] = [
-            ("Living Room", &[On, Off, Unavailable], Some("20.4°")),
-            ("Dining Room", &[Off, Off, Off], Some("19.5°")),
+            ("Living room", &[On, Off, Unavailable], Some("20.4°")),
+            ("Dining room", &[Off, Off, Off], Some("19.5°")),
             ("Kitchen", &[Off], None),
             ("Hall", &[Off, On], None),
             ("Landing", &[On, On], None),

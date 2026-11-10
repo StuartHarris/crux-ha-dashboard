@@ -36,7 +36,7 @@ fn next_page_and_previous_page_wrap_around() {
         .expect_render()
         .expect_full_refresh_timer();
     let view = app.view(&model);
-    assert_eq!(view.title, "Living Room");
+    assert_eq!(view.title, "Living room");
     assert_eq!(view.path, "/room/living_room");
     assert_eq!(view.page_index, 1);
     assert_eq!(view.page_count, count);
@@ -496,8 +496,8 @@ fn the_index_shows_each_room_and_the_header_of_the_home_page() {
     assert_eq!(
         titles,
         [
-            "Living Room",
-            "Dining Room",
+            "Living room",
+            "Dining room",
             "Kitchen",
             "Hall",
             "Landing",

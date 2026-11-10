@@ -831,8 +831,8 @@ fn the_index_shows_a_summary_of_each_room_and_a_tap_shows_the_room() {
     assert_eq!(
         rooms[..2],
         [
-            summary("Living Room", &[On, Unavailable], Some("21.4°")),
-            summary("Dining Room", &[Unavailable; 3], Some("19.5°")),
+            summary("Living room", &[On, Unavailable], Some("21.4°")),
+            summary("Dining room", &[Unavailable; 3], Some("19.5°")),
         ]
     );
     assert!(rooms[0].any_on);

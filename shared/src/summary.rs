@@ -142,7 +142,7 @@ mod tests {
 
     const LIVING_ROOM: Page = room(
         "living_room",
-        "Living Room",
+        "Living room",
         &[
             light_group("Lights", "light.living_room_lights"),
             light("Rocket lamp", "light.rocket_lamp"),
@@ -156,7 +156,7 @@ mod tests {
 
     const DINING_ROOM: Page = room(
         "dining_room",
-        "Dining Room",
+        "Dining room",
         &[
             light("Tall lamp", "light.tall_lamp"),
             climate("Thermostat", "climate.thermostat"),
@@ -229,7 +229,7 @@ mod tests {
     #[test]
     fn all_on() {
         let room = summary(&LIVING_ROOM, &lamps(["on", "on", "on"]));
-        assert_eq!(room.title, "Living Room");
+        assert_eq!(room.title, "Living room");
         assert_eq!(room.lights, [On, On, On]);
         assert!(room.any_on);
     }

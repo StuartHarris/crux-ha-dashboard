@@ -35,7 +35,7 @@ pub const PAGES: &[Page] = &[
     ),
     room(
         "living_room",
-        "Living Room",
+        "Living room",
         &[
             light_group("Lights", "light.living_room_lights"),
             light("Rocket lamp", "light.living_room_rocket_lamp"),
@@ -51,7 +51,7 @@ pub const PAGES: &[Page] = &[
     ),
     room(
         "dining_room",
-        "Dining Room",
+        "Dining room",
         &[
             light_group("Lights", "light.dining_room_lights"),
             light("Tall lamp", "light.dining_room_tall_lamp"),
