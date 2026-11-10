@@ -1,10 +1,9 @@
 //! The display task: it draws the newest view model on the panel, and it
-//! reads the touch controller between refreshes. When the SNTP task sets
-//! the clock, the display task also writes the RTC if its time is wrong.
+//! reads the touch controller between refreshes.
 //!
-//! The panel, the touch controller and the RTC share the I2C bus, so one
-//! task owns all of them. A refresh takes up to about two seconds. The task
-//! does not use the bus for touch or the RTC during a refresh.
+//! The panel and the touch controller share the I2C bus, so one task owns
+//! both of them. A refresh takes up to about two seconds. The task does not
+//! use the bus for touch during a refresh.
 //!
 //! If the touch controller does not start, or a read fails, the task tries
 //! to start it again after a wait that doubles after each failure
@@ -12,23 +11,19 @@
 
 use core::mem;
 
-use dashboard_firmware::{
-    panel::{Area, Panel},
-    rtc,
-};
+use dashboard_firmware::panel::{Area, Panel};
 use embassy_futures::select::{Either, select};
 use embassy_time::{Duration, Instant, Timer};
 use embedded_graphics::primitives::Rectangle;
 use logic::{
     backoff::Backoff,
-    clock::{RtcWrite, civil::DateTime, pcf8563},
     shell::Signal,
     touch::{Tapper, TouchMap},
 };
 use shared::ViewModel;
 use ui::{Framebuffer, Refresh, Refresher};
 
-use crate::{RENDER, RTC_WRITE, SIGNALS, clock};
+use crate::{RENDER, SIGNALS};
 
 /// The time between two reads of the touch controller.
 const TOUCH_POLL: Duration = Duration::from_millis(30);
@@ -50,24 +45,7 @@ pub async fn task(mut panel: Panel<'static>) {
         next: Framebuffer::new(),
         refresher: Refresher::default(),
     };
-    let mut rtc_write = RtcWrite::default();
     loop {
-        let now_ms = Instant::now().as_millis();
-        if RTC_WRITE.try_take().is_some() {
-            rtc_write.request(now_ms);
-        }
-        if rtc_write.due(now_ms) {
-            match write_rtc(&mut panel).await {
-                Ok(()) => rtc_write.succeeded(),
-                Err(error) if rtc_write.failed(Instant::now().as_millis()) => {
-                    log::warn!("rtc: {error:?}. No more tries until the next SNTP reply.");
-                }
-                Err(error) => log::warn!(
-                    "rtc: {error:?}. Next try in {} ms.",
-                    logic::clock::RTC_RETRY_MS
-                ),
-            }
-        }
         match select(RENDER.wait(), Timer::after(TOUCH_POLL)).await {
             Either::First(view) => render(&mut panel, &mut frames, &view).await,
             Either::Second(()) => touch.poll(&mut panel).await,
@@ -164,48 +142,6 @@ async fn render(panel: &mut Panel<'static>, frames: &mut Frames, view: &ViewMode
             frames.refresher.reset();
         }
     }
-}
-
-/// Writes the clock to the RTC, if the RTC has no valid time or a time that
-/// is more than `logic::clock::RTC_TOLERANCE_SECONDS` from the clock.
-///
-/// The RTC starts to count a second when it is written, so the function
-/// waits for the start of the next second of the clock (at most 1 s), and
-/// then writes that second. During the wait, the task does not read the
-/// touch controller.
-///
-/// Returns `Ok` if the RTC has the time now, or if the clock has no valid
-/// time to write.
-async fn write_rtc(panel: &mut Panel<'static>) -> Result<(), RtcError> {
-    let block = rtc::read(panel).map_err(RtcError::Read)?;
-    let now = clock::now();
-    if !logic::clock::is_valid(now.seconds()) {
-        return Ok(());
-    }
-    if !logic::clock::rtc_needs_write(pcf8563::decode_block(&block), now.seconds()) {
-        log::debug!("rtc: the time is correct");
-        return Ok(());
-    }
-    let (second, wait_micros) = logic::clock::next_second(now.seconds(), now.nanos());
-    let Some(payload) = pcf8563::write_payload(second, block[1]) else {
-        log::warn!("rtc: cannot keep {}", DateTime::from_unix(second));
-        return Ok(());
-    };
-    Timer::after(Duration::from_micros(wait_micros)).await;
-    rtc::write(panel, &payload).map_err(RtcError::Write)?;
-    log::info!("rtc: set to {}", DateTime::from_unix(second));
-    Ok(())
-}
-
-/// Why a write of the RTC failed.
-#[derive(Debug)]
-enum RtcError {
-    /// The read before the write failed.
-    #[allow(dead_code, reason = "the log shows the field")]
-    Read(dashboard_firmware::panel::Error),
-    /// The write failed.
-    #[allow(dead_code, reason = "the log shows the field")]
-    Write(dashboard_firmware::panel::Error),
 }
 
 /// Converts a rectangle on the panel to the area type of the driver.

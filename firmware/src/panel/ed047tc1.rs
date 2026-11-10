@@ -544,7 +544,7 @@ impl<'a> Ed047tc1<'a> {
     }
 
     /// Reads `buffer.len()` registers of `device` from `register` on. The
-    /// other devices on the bus (for example the RTC) use this function.
+    /// other devices on the bus (for example the charger) use this function.
     pub fn read_registers(&mut self, device: u8, register: u8, buffer: &mut [u8]) -> Result<()> {
         self.cfg_writer
             .i2c
@@ -553,7 +553,7 @@ impl<'a> Ed047tc1<'a> {
     }
 
     /// Writes `payload` (the first register, then the values) to `device`.
-    /// The other devices on the bus (for example the RTC) use this function.
+    /// The other devices on the bus (for example the charger) use this function.
     pub fn write_registers(&mut self, device: u8, payload: &[u8]) -> Result<()> {
         self.cfg_writer.write_register(device, payload)
     }

@@ -8,10 +8,9 @@
 //! | --- | --- | --- |
 //! | `core` | owns the shell and routes each job | |
 //! | `timers` | `StartTimer`, `CancelTimer` | `Signal::Timer` |
-//! | `display` | draws the latest view model, reads the touch controller, writes the RTC | `Signal::Tap` |
+//! | `display` | draws the latest view model, reads the touch controller | `Signal::Tap` |
 //! | `wifi` | `WifiOn`, `WifiOff` | `Signal::Wifi` |
 //! | `mqtt` | the MQTT operations, one connection at a time | `Signal::Mqtt` |
-//! | `sntp` | sets the clock from an SNTP server | |
 //! | `net` | runs the network stack | |
 
 #![no_std]
@@ -20,15 +19,13 @@
 
 extern crate alloc;
 
-mod clock;
 mod core_task;
 mod display;
 mod mqtt;
-mod sntp;
 mod timers;
 mod wifi;
 
-use dashboard_firmware::{board, lane::Lane, network, panel::Panel, panel_pins, rtc};
+use dashboard_firmware::{board, lane::Lane, network, panel::Panel, panel_pins};
 use embassy_executor::Spawner;
 use embassy_net::StackResources;
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal as Latest};
@@ -65,20 +62,11 @@ pub static TIMERS: Lane<timers::Request> = Lane::new();
 pub static MQTT: Lane<(u32, MqttOp)> = Lane::new();
 /// The work of the Wi-Fi task.
 pub static WIFI: Lane<WifiRequest> = Lane::new();
-/// A request to the display task, which owns the I2C bus, to compare the
-/// RTC with the clock and to write the RTC if necessary. The SNTP task
-/// sends it after it sets the clock.
-///
-/// If the panel does not start, the display task does not run, and no task
-/// takes the request. Then the RTC is not written, and SNTP sets the clock
-/// after each start. This is acceptable.
-pub static RTC_WRITE: Latest<CriticalSectionRawMutex, ()> = Latest::new();
 
 /// The number of sockets. `embassy_net::new` takes one socket for DNS, and
 /// one for DHCP while DHCP runs. The MQTT task has one TCP socket at a
-/// time, and the SNTP task has one UDP socket during a request. That is 4
-/// at most, and there is 1 spare.
-const SOCKETS: usize = 5;
+/// time. That is 3 at most, and there is 1 spare.
+const SOCKETS: usize = 4;
 
 #[esp_hal::main]
 async fn main(spawner: Spawner) -> ! {
@@ -91,7 +79,7 @@ async fn main(spawner: Spawner) -> ! {
     log::info!("dashboard {} starts", env!("CARGO_PKG_VERSION"));
 
     let pins = panel_pins!(peripherals);
-    let mut panel = match Panel::new(
+    let panel = match Panel::new(
         pins,
         peripherals.I2C0,
         peripherals.DMA_CH0,
@@ -104,12 +92,6 @@ async fn main(spawner: Spawner) -> ! {
             None
         }
     };
-    // The panel owns the I2C bus, so the RTC read uses it. The display task
-    // takes the panel later.
-    if let Some(panel) = &mut panel {
-        read_rtc(panel);
-    }
-    clock::log_not_set();
 
     let controller = WifiController::new(
         peripherals.WIFI,
@@ -130,26 +112,11 @@ async fn main(spawner: Spawner) -> ! {
     spawner.spawn(net_task(runner).expect("spawn the network task"));
     spawner.spawn(wifi::task(controller, stack).expect("spawn the Wi-Fi task"));
     spawner.spawn(mqtt::task(stack).expect("spawn the MQTT task"));
-    spawner.spawn(sntp::task(stack).expect("spawn the SNTP task"));
     spawner.spawn(timers::task().expect("spawn the timer task"));
     if let Some(panel) = panel {
         spawner.spawn(display::task(panel).expect("spawn the display task"));
     }
     core_task::run().await
-}
-
-/// Sets the clock from the RTC, if the RTC has a valid time.
-fn read_rtc(panel: &mut Panel<'_>) {
-    match rtc::read(panel) {
-        Ok(block) => match logic::clock::start_from_rtc(
-            logic::clock::pcf8563::decode_block(&block),
-            clock::uptime_micros(),
-        ) {
-            Some(start) => clock::set(start, clock::Source::Rtc),
-            None => log::warn!("rtc: no valid time"),
-        },
-        Err(error) => log::warn!("rtc: read failed: {error:?}"),
-    }
 }
 
 #[embassy_executor::task]

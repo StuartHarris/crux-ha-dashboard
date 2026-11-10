@@ -3,7 +3,7 @@
 //! The steps run in sequence, and each step writes its result to the log:
 //!
 //! 1. The heap: the size of the internal heap and of the PSRAM heap.
-//! 2. The I2C bus: the addresses that answer, and the time of the RTC.
+//! 2. The I2C bus: the addresses that answer.
 //! 3. The panel: a clear, then 16 grey bars with a full refresh.
 //! 4. A partial refresh: a black rectangle with the fast waveform.
 //! 5. A page of the dashboard, from the core, with a full refresh.
@@ -21,7 +21,7 @@ extern crate alloc;
 use dashboard_firmware::{
     board, network,
     panel::{Area, GT911_ADDR_LOW, PCA9535_ADDR, Panel, TPS65185_ADDR},
-    panel_pins, rtc,
+    panel_pins,
 };
 use embassy_executor::Spawner;
 use embassy_net::StackResources;
@@ -34,7 +34,6 @@ use embedded_graphics::{
 use esp_backtrace as _;
 use esp_radio::wifi::WifiController;
 use logic::{
-    clock::civil::DateTime,
     shell::{Job, Shell},
     touch::{Sample, Tapper, TouchMap},
 };
@@ -53,10 +52,11 @@ mod config {
 static RESOURCES: StaticCell<StackResources<2>> = StaticCell::new();
 
 /// The I2C devices of the board: the IO expander, the RTC, the fuel gauge,
-/// the touch controller, the PMIC of the panel and the charger.
+/// the touch controller, the PMIC of the panel and the charger. The firmware
+/// does not use the RTC, but it is on the bus.
 const EXPECTED: [(u8, &str); 6] = [
     (PCA9535_ADDR, "PCA9535 IO expander"),
-    (logic::clock::pcf8563::ADDRESS, "PCF8563 RTC"),
+    (0x51, "PCF8563 RTC"),
     (0x55, "BQ27220 fuel gauge"),
     (GT911_ADDR_LOW, "GT911 touch"),
     (TPS65185_ADDR, "TPS65185 panel PMIC"),
@@ -100,11 +100,6 @@ async fn main(spawner: Spawner) -> ! {
         log::error!("step 2: panel power on failed: {error:?}");
     }
     scan(&mut panel);
-    match rtc::read(&mut panel).map(|block| logic::clock::pcf8563::decode_block(&block)) {
-        Ok(Some(time)) => log::info!("step 2: RTC time {}", DateTime::from_unix(time)),
-        Ok(None) => log::warn!("step 2: the RTC has no valid time"),
-        Err(error) => log::error!("step 2: RTC read failed: {error:?}"),
-    }
     Timer::after(PAUSE).await;
 
     log::info!("step 3: clear and 16 grey bars");

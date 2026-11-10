@@ -12,15 +12,12 @@
 //! - [`config`] reads and checks the build-time configuration.
 //! - [`backoff`] is a wait that doubles after each failure.
 //! - [`wifi`] is the rule of the Wi-Fi task for a request during a join.
-//! - [`clock`] reads and writes the RTC, makes and checks SNTP packets, and
-//!   decides when to set the clock.
 
 #![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
 
 pub mod backoff;
-pub mod clock;
 pub mod config;
 pub mod mqtt;
 pub mod shell;
