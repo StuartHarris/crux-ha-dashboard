@@ -1,7 +1,8 @@
 //! The Wi-Fi settings for the driver.
 
 use esp_radio::wifi::{
-    AuthenticationMethodConfig, Config, ControllerConfig, WifiError, sta::StationConfig,
+    AuthenticationMethodConfig, Config, ControllerConfig, WifiError,
+    sta::{ScanMethod, StationConfig},
 };
 use logic::config::{self, WifiAuth};
 
@@ -32,5 +33,8 @@ fn station(settings: &config::Config<'_>) -> Result<StationConfig, WifiError> {
     };
     Ok(StationConfig::default()
         .with_ssid(settings.wifi_ssid.try_into()?)
-        .with_authentication(authentication))
+        .with_authentication(authentication)
+        // A fast scan joins the first access point with the SSID. A scan of
+        // all the channels joins the access point with the strongest signal.
+        .with_scan_method(ScanMethod::AllChannels))
 }

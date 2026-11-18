@@ -33,7 +33,7 @@ impl TouchMap {
     /// by 90 degrees: the controller y is the panel x, and the controller x
     /// goes from the bottom of the panel to the top. Otherwise the map scales
     /// each axis. This is the map of the `lilygo-t5s3paperpro` driver.
-    // TODO(5b): check the orientation on the device with the `bringup` touch step.
+    // The bring-up touch step on 2026-11-18 confirmed this orientation.
     #[must_use]
     pub fn to_panel(&self, (x, y): (u16, u16)) -> Point {
         let (width, height) = self.resolution;
