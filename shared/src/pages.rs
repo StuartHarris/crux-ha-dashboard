@@ -70,6 +70,10 @@ pub const PAGES: &[Page] = &[
         "kitchen",
         "Kitchen",
         &[
+            // A Home Assistant group of the seven ceiling lights. The page does
+            // not show the members, so the tile is not a `light_group`. Thus
+            // the summary of the room shows it next to the coffee machine.
+            light("Lights", "light.kitchen_lights"),
             switch("Coffee machine", "switch.kitchen_coffee_machine_socket"),
             sensor("Coffee power", "sensor.kitchen_coffee_machine_power"),
             sensor("Dishwasher", "sensor.kitchen_dishwasher_operation_state"),
