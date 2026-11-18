@@ -368,7 +368,7 @@ impl<'a> ConfigWriter<'a> {
     /// Reads one sample. INT is high, or the buffer flag is clear, when the
     /// GT911 has no new sample. A new sample with no points means that the
     /// finger lifted.
-    // TODO(5b): check on the device that a lift gives a sample with no points.
+    // On the board, each lift gives one to three samples with no points.
     fn touch_sample(&mut self) -> Result<Sample<(u16, u16)>> {
         if !self.touch_initialized {
             return Err(Error::TouchNotReady);

@@ -51,11 +51,14 @@ The second binary, `bringup`, runs the hardware checks for a new board.
 
 ### Memory
 
-The heap has a region of 72 KiB in internal RAM, for the Wi-Fi driver, and the 8 MB
-of PSRAM. The allocator uses the first region that has space. The two framebuffers of
-the display task (259,200 bytes each) do not fit in the internal region, so they go to
-PSRAM. The waveform table of the driver (65,536 bytes) fits in the internal region, so
-the driver puts it in PSRAM explicitly (`esp_alloc::ExternalMemory`).
+The heap has the 8 MB of PSRAM and a region of 72 KiB in internal RAM. The allocator
+uses the first region that has space, so `board::start` adds the PSRAM region first.
+The Wi-Fi driver and the scheduler ask for internal RAM explicitly, so the internal
+region stays free for them. With Wi-Fi and MQTT connected, about 29 KiB of it is free.
+
+Do not add the internal region first. The other allocations then fill it, and the
+Wi-Fi driver cannot get receive buffers. The device sends packets but receives none,
+so MQTT stops after the CONNACK.
 
 The release build of `dashboard` on 2026-11-07:
 
@@ -219,22 +222,24 @@ Do the steps in this order. Each step needs the steps before it.
 
 ## TODO(5b)
 
-These choices need the board:
+The bring-up on 2026-11-18 gave these results:
 
-- PSRAM: the mode is fixed to octal (`src/board.rs`). Make sure that the log shows
-  8 MB.
-- The internal heap is 72 KiB. Measure the free internal heap with Wi-Fi and MQTT
-  connected, and change `INTERNAL_HEAP` if necessary.
+| Item | Result |
+| --- | --- |
+| PSRAM | 8 MB in octal mode. |
+| Internal heap | About 29 KiB of the 72 KiB is free with Wi-Fi and MQTT connected. |
+| Touch map | The orientation is correct. Each corner gives the expected panel point. |
+| Lift | Each lift gives one to three samples with no points, so each touch gives one tap. |
+| − and + buttons | 14 taps on the buttons gave 14 steps, and no toggle. |
+| Full refresh | 1.1 s to 1.8 s. |
+| Partial refresh | 100 ms to 370 ms, by the size of the area. |
+| I2C scan | The scan does not find the GT911 at 0x5D, but the touch controller works. The probe of the scan is a read of one byte with no register, and the GT911 does not answer it. |
+
+These items stay open:
+
 - VCOM is 1600 mV, the value of the vendor firmware (`src/panel/ed047tc1.rs`).
-- The GT911 must give a new sample with no points when the finger lifts. The bring-up
-  touch step writes `release` for each such sample. If there is none, a held finger
-  gives one tap, and the next touch gives no tap.
-- The touch map turns a portrait controller (540 × 960) to landscape, as upstream does
-  (`logic/src/touch.rs`). Check it with step 6.
-- Measure the time of a full and of a partial refresh. The display task does not read
-  the touch controller during a refresh. The core asks for a full refresh after 30
-  partial renders and after 30 minutes (`shared/src/features/refresh.rs`). Change the
-  numbers if ghost images show.
+- The core asks for a full refresh after 30 partial renders and after 30 minutes
+  (`shared/src/features/refresh.rs`). Change the numbers if ghost images show.
 - `rust-mqtt` sends one topic filter in each subscribe packet. Measure the time to get
   all retained states, and the size of the receive buffer (4096 bytes).
 
