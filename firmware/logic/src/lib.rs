@@ -9,6 +9,8 @@
 //! - [`mqtt`] is the bookkeeping of the MQTT task.
 //! - [`timers`] keeps the timers of the timer task.
 //! - [`touch`] converts touch samples to taps on the panel.
+//! - [`power`] reads the power source and the charge from the charger and
+//!   the fuel gauge, and decides which changes to send to the core.
 //! - [`config`] reads and checks the build-time configuration.
 //! - [`backoff`] is a wait that doubles after each failure.
 //! - [`wifi`] is the rule of the Wi-Fi task for a request during a join.
@@ -20,6 +22,7 @@ extern crate alloc;
 pub mod backoff;
 pub mod config;
 pub mod mqtt;
+pub mod power;
 pub mod shell;
 pub mod timers;
 pub mod touch;

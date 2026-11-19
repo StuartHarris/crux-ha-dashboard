@@ -8,7 +8,7 @@
 //! | --- | --- | --- |
 //! | `core` | owns the shell and routes each job | |
 //! | `timers` | `StartTimer`, `CancelTimer` | `Signal::Timer` |
-//! | `display` | draws the latest view model, reads the touch controller | `Signal::Tap` |
+//! | `display` | draws the latest view model, reads the touch controller, the charger and the fuel gauge | `Signal::Tap`, `Signal::Event` |
 //! | `wifi` | `WifiOn`, `WifiOff` | `Signal::Wifi` |
 //! | `mqtt` | the MQTT operations, one connection at a time | `Signal::Mqtt` |
 //! | `net` | runs the network stack | |
@@ -35,7 +35,7 @@ use logic::{
     shell::{MqttOp, Signal},
     wifi::WifiRequest,
 };
-use shared::ViewModel;
+use shared::{PowerSource, ViewModel};
 use static_cell::StaticCell;
 
 esp_bootloader_esp_idf::esp_app_desc!();
@@ -79,7 +79,7 @@ async fn main(spawner: Spawner) -> ! {
     log::info!("dashboard {} starts", env!("CARGO_PKG_VERSION"));
 
     let pins = panel_pins!(peripherals);
-    let panel = match Panel::new(
+    let mut panel = match Panel::new(
         pins,
         peripherals.I2C0,
         peripherals.DMA_CH0,
@@ -92,6 +92,18 @@ async fn main(spawner: Spawner) -> ! {
             None
         }
     };
+
+    // The display task reads the charger after this. The core starts with
+    // this source, so the display task sends only a change.
+    let source = match &mut panel {
+        Some(panel) => first_source(panel).await,
+        None => None,
+    }
+    .unwrap_or_else(|| {
+        log::warn!("power: the source is not known, so the core starts on the stand");
+        PowerSource::Stand
+    });
+    log::info!("power: source {source:?} at the start");
 
     let controller = WifiController::new(
         peripherals.WIFI,
@@ -114,9 +126,27 @@ async fn main(spawner: Spawner) -> ! {
     spawner.spawn(mqtt::task(stack).expect("spawn the MQTT task"));
     spawner.spawn(timers::task().expect("spawn the timer task"));
     if let Some(panel) = panel {
-        spawner.spawn(display::task(panel).expect("spawn the display task"));
+        spawner.spawn(display::task(panel, source).expect("spawn the display task"));
     }
-    core_task::run().await
+    core_task::run(source).await
+}
+
+/// The number of tries of the first read of the charger.
+const SOURCE_TRIES: u32 = 3;
+
+/// Reads the power source from the charger. If a read fails, waits a short
+/// time and tries again, [`SOURCE_TRIES`] times in total. Logs only the last
+/// failure.
+async fn first_source(panel: &mut Panel<'static>) -> Option<PowerSource> {
+    for attempt in 1..=SOURCE_TRIES {
+        if let Some(source) = display::read_source(panel, attempt == SOURCE_TRIES) {
+            return Some(source);
+        }
+        if attempt < SOURCE_TRIES {
+            embassy_time::Timer::after(embassy_time::Duration::from_millis(20)).await;
+        }
+    }
+    None
 }
 
 #[embassy_executor::task]

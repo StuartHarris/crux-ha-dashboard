@@ -125,7 +125,7 @@ fn the_dry_run_page_matches_its_reference_image() {
     shell.send(Event::SetReadOnly(true));
     let view = shell.view();
     assert!(view.read_only);
-    assert_eq!(view.status, "Dry run · Online, on stand");
+    assert_eq!(view.status, "Dry run · Online");
     assert_all_match(&check("dry-run", &view).into_iter().collect::<Vec<_>>());
 }
 
@@ -168,6 +168,31 @@ fn dimmable_and_onoff_lights_match_their_reference_image() {
     assert_eq!(tiles[0].detail, "100%");
     assert_all_match(
         &check("dimmable-and-onoff", &view)
+            .into_iter()
+            .collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn a_low_battery_matches_its_reference_image() {
+    let mut shell = FixedShell::start(PowerSource::Battery, "/room/living_room");
+    shell.send(Event::BatteryChanged(Some(12)));
+    let view = shell.view();
+    assert!(!view.asleep);
+    // The view rounds the level to the nearest 5%.
+    assert_eq!(view.battery, Some(10));
+    assert_all_match(&check("battery-low", &view).into_iter().collect::<Vec<_>>());
+}
+
+#[test]
+fn the_stand_matches_its_reference_image() {
+    let mut shell = FixedShell::start(PowerSource::Stand, "/room/living_room");
+    shell.send(Event::BatteryChanged(Some(78)));
+    let view = shell.view();
+    assert_eq!(view.power, PowerSource::Stand);
+    assert_eq!(view.battery, Some(80));
+    assert_all_match(
+        &check("stand-charging", &view)
             .into_iter()
             .collect::<Vec<_>>(),
     );

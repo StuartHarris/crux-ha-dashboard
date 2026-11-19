@@ -15,17 +15,16 @@ use shared::{
 
 use crate::{MQTT, RENDER, SIGNALS, TIMERS, WIFI, config::CONFIG, timers::Request};
 
-/// Starts the core, then gives it each signal from the other tasks.
-pub async fn run() -> ! {
+/// Starts the core with the power source `source`, then gives it each
+/// signal from the other tasks.
+pub async fn run(source: PowerSource) -> ! {
     let mut shell = Shell::new();
     if CONFIG.read_only {
         log::info!("core: dry run, so a tap publishes no service call");
     }
-    // TODO(6): read the VBUS status of the BQ25896 for the power source, and
-    // send `PowerSourceChanged` when it changes.
     // TODO(6): after a deep sleep, give the path and the time of the last
     // update that the firmware kept in RTC memory.
-    let start = shell::start(&CONFIG, PowerSource::Stand, None, None);
+    let start = shell::start(&CONFIG, source, None, None);
     dispatch(shell.send(Event::Start(start)));
     loop {
         let signal = SIGNALS.pop().await;

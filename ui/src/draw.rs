@@ -9,8 +9,8 @@ use embedded_graphics::{
     },
 };
 use shared::{
-    IndexView, LightState, PageView, RoomSummary, SceneView, TileKind, TileState, TileView,
-    ViewModel,
+    IndexView, LightState, PageView, PowerSource, RoomSummary, SceneView, TileKind, TileState,
+    TileView, ViewModel,
     layout::{MAX_LIGHTS, MAX_SCENES},
 };
 
@@ -30,8 +30,32 @@ const PADDING: u32 = 16;
 const INDICATOR: u32 = 26;
 /// The length of a dash on the border of an unavailable tile.
 const DASH: u32 = 14;
+/// The width of the right part of the header: the status text, the
+/// percent of the battery and the power icon. The page title has the rest
+/// of the width. A test checks that each page title and the usual status
+/// texts fit. A rare long status text is clipped.
+const STATUS_AREA: u32 = 400;
+/// The width of the page title in the header.
+const TITLE_WIDTH: u32 = WIDTH - 3 * MARGIN - STATUS_AREA;
+/// The width of the box of the power icon. The battery and the plug have
+/// the same box, so the percent does not move when the power source changes.
+const POWER_ICON_WIDTH: u32 = 46;
+/// The height of the box of the power icon.
+const POWER_ICON_HEIGHT: u32 = 24;
+/// The width of the box of the percent of the battery. The widest text,
+/// `100%`, fits in it. The box keeps its width when the percent is not
+/// known, so the status text does not move.
+const PERCENT_WIDTH: u32 = 74;
+/// The space between the status text, the percent and the power icon.
+const POWER_GAP: u32 = 6;
 /// The width of the status text in the header.
-const STATUS_WIDTH: u32 = 400;
+const STATUS_WIDTH: u32 = STATUS_AREA - POWER_ICON_WIDTH - PERCENT_WIDTH - 2 * POWER_GAP;
+/// The width of the body of the battery icon, without the terminal.
+const BATTERY_BODY: u32 = 42;
+/// The thickness of the outline of the battery icon.
+const BATTERY_STROKE: u32 = 2;
+/// The space between the outline of the battery icon and its fill.
+const BATTERY_INSET: u32 = BATTERY_STROKE + 2;
 /// The diameter of a light dot on a room button.
 const DOT: u32 = 18;
 /// The distance between the centres of two light dots.
@@ -137,34 +161,136 @@ where
 
 /// Draws the title and the status at the top of `area`, and a line at the
 /// bottom of `area`.
+///
+/// From the right margin, the status has the power icon, the percent of the
+/// battery and the status text. The icon and the percent have boxes at
+/// fixed positions, so a change of the percent changes only a small area of
+/// the panel.
 fn draw_header<D>(view: &ViewModel, area: Rectangle, display: &mut D) -> Result<(), D::Error>
 where
     D: DrawTarget<Color = Gray4>,
 {
     let baseline = 42;
-    let title_width = WIDTH - 3 * MARGIN - STATUS_WIDTH;
     text::draw_fitted(
         display,
         &[&TITLE],
         &view.title,
         Anchor::baseline_left(point(MARGIN, baseline)),
-        title_width,
+        TITLE_WIDTH,
         BLACK,
     )?;
     text::draw_fitted(
         display,
         &[&LABEL, &DETAIL],
         &view.status,
-        Anchor::baseline_right(point(WIDTH - MARGIN, baseline)),
+        Anchor::baseline_right(point(STATUS_RIGHT, baseline)),
         STATUS_WIDTH,
         BLACK,
     )?;
+    if let Some(level) = view.battery {
+        text::draw(
+            display,
+            &LABEL,
+            format_args!("{}%", level.min(100)),
+            Anchor::baseline_right(point(PERCENT_RIGHT, baseline)),
+            BLACK,
+        )?;
+    }
+    let icon = power_icon_area();
+    match view.power {
+        PowerSource::Battery => draw_battery(view.battery, icon, display)?,
+        PowerSource::Stand => draw_plug(icon, display)?,
+    }
     Rectangle::new(
         point(MARGIN, area.size.height - 3),
         Size::new(WIDTH - 2 * MARGIN, 2),
     )
     .into_styled(PrimitiveStyle::with_fill(BLACK))
     .draw(display)
+}
+
+/// The right edge of the percent box in the header.
+const PERCENT_RIGHT: u32 = WIDTH - MARGIN - POWER_ICON_WIDTH - POWER_GAP;
+/// The right edge of the status text in the header.
+const STATUS_RIGHT: u32 = PERCENT_RIGHT - PERCENT_WIDTH - POWER_GAP;
+
+/// Returns the box of the power icon in the header. The middle of the box
+/// is at the middle of the status text.
+const fn power_icon_area() -> Rectangle {
+    Rectangle::new(
+        point(WIDTH - MARGIN - POWER_ICON_WIDTH, 20),
+        Size::new(POWER_ICON_WIDTH, POWER_ICON_HEIGHT),
+    )
+}
+
+/// Draws a battery in `area`: an outline with rounded corners and a
+/// terminal on the right. A black fill inside the outline shows `level`
+/// percent from the left. If the level is not known, the outline is empty.
+fn draw_battery<D>(level: Option<u8>, area: Rectangle, display: &mut D) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Gray4>,
+{
+    let left = area.top_left.x.unsigned_abs();
+    let top = area.top_left.y.unsigned_abs();
+    let height = area.size.height;
+    let body = Rectangle::new(point(left, top), Size::new(BATTERY_BODY, height));
+    RoundedRectangle::with_equal_corners(body, Size::new(4, 4))
+        .into_styled(border(BATTERY_STROKE))
+        .draw(display)?;
+    let terminal_height = height / 2;
+    Rectangle::new(
+        point(left + BATTERY_BODY, top + (height - terminal_height) / 2),
+        Size::new(area.size.width - BATTERY_BODY, terminal_height),
+    )
+    .into_styled(PrimitiveStyle::with_fill(BLACK))
+    .draw(display)?;
+    let inner = BATTERY_BODY - 2 * BATTERY_INSET;
+    let filled = level.map_or(0, |level| u32::from(level.min(100)) * inner / 100);
+    if filled == 0 {
+        return Ok(());
+    }
+    Rectangle::new(
+        point(left + BATTERY_INSET, top + BATTERY_INSET),
+        Size::new(filled, height - 2 * BATTERY_INSET),
+    )
+    .into_styled(PrimitiveStyle::with_fill(BLACK))
+    .draw(display)
+}
+
+/// Draws a mains plug in `area`, from the side: a cord on the left, the
+/// body in the middle and two prongs on the right.
+fn draw_plug<D>(area: Rectangle, display: &mut D) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Gray4>,
+{
+    let left = area.top_left.x.unsigned_abs();
+    let top = area.top_left.y.unsigned_abs();
+    let middle = top + area.size.height / 2;
+    let fill = PrimitiveStyle::with_fill(BLACK);
+    // The cord.
+    Rectangle::new(point(left, middle - 2), Size::new(14, 4))
+        .into_styled(fill)
+        .draw(display)?;
+    // The body, which is narrower at the cord.
+    Rectangle::new(point(left + 12, middle - 6), Size::new(4, 12))
+        .into_styled(fill)
+        .draw(display)?;
+    RoundedRectangle::with_equal_corners(
+        Rectangle::new(
+            point(left + 16, top + 1),
+            Size::new(16, area.size.height - 2),
+        ),
+        Size::new(4, 4),
+    )
+    .into_styled(fill)
+    .draw(display)?;
+    // The prongs.
+    for y in [middle - 7, middle + 3] {
+        Rectangle::new(point(left + 32, y), Size::new(14, 4))
+            .into_styled(fill)
+            .draw(display)?;
+    }
+    Ok(())
 }
 
 /// Draws the weather, the All lights toggle and the room buttons of the
@@ -789,7 +915,8 @@ pub mod tests {
             }),
             connection: Connection::Online,
             power: PowerSource::Stand,
-            status: "Online, on stand".into(),
+            battery: Some(78),
+            status: "Online".into(),
             asleep: false,
             read_only: false,
             last_sync: None,
@@ -1167,5 +1294,95 @@ pub mod tests {
             frame.pixel(inside(layout::all_lights(), 8)),
             Some(Gray4::WHITE)
         );
+    }
+
+    /// Counts the black pixels of `frame` in `area`.
+    fn black_in(frame: &Framebuffer, area: embedded_graphics::primitives::Rectangle) -> usize {
+        area.points()
+            .filter(|point| frame.pixel(*point) == Some(Gray4::BLACK))
+            .count()
+    }
+
+    #[test]
+    fn the_widest_percent_fits_in_its_box() {
+        assert!(crate::text::width(&crate::text::LABEL, "100%") <= super::PERCENT_WIDTH);
+    }
+
+    #[test]
+    fn each_page_title_and_the_usual_status_texts_fit_in_the_header() {
+        for page in shared::pages::PAGES {
+            assert!(
+                crate::text::width(&crate::text::TITLE, page.title) <= super::TITLE_WIDTH,
+                "{}",
+                page.title
+            );
+        }
+        // A text can fall back to the smaller font, but it is not clipped.
+        // A rare long text, for example `Dry run · Connecting, 99 taps not
+        // sent`, is clipped.
+        for status in [
+            "Online",
+            "Connecting",
+            "Offline",
+            "Asleep",
+            "Dry run · Online",
+            "Online, 1 tap not sent",
+            "Asleep, 1 tap not sent",
+        ] {
+            assert!(
+                crate::text::width(&crate::text::DETAIL, status) <= super::STATUS_WIDTH,
+                "{status}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_battery_fills_in_proportion_to_the_charge() {
+        let icon = super::power_icon_area();
+        let mut fills = Vec::new();
+        for level in [None, Some(0), Some(12), Some(50), Some(100)] {
+            let mut frame = Framebuffer::new();
+            let view = ViewModel {
+                power: PowerSource::Battery,
+                battery: level,
+                ..view()
+            };
+            let Ok(()) = draw(&view, &mut frame);
+            fills.push(black_in(&frame, icon));
+        }
+        // No level and 0% give the same empty outline. Each larger level
+        // gives more black pixels.
+        assert_eq!(fills[0], fills[1]);
+        assert!(
+            fills.windows(2).skip(1).all(|pair| pair[0] < pair[1]),
+            "{fills:?}"
+        );
+    }
+
+    #[test]
+    fn the_stand_shows_a_plug_and_no_percent_when_the_charge_is_not_known() {
+        let icon = super::power_icon_area();
+        let percent = embedded_graphics::primitives::Rectangle::new(
+            Point::new(
+                (super::PERCENT_RIGHT - super::PERCENT_WIDTH).cast_signed(),
+                10,
+            ),
+            Size::new(super::PERCENT_WIDTH, 40),
+        );
+        let mut frame = Framebuffer::new();
+        let Ok(()) = draw(&view(), &mut frame);
+        assert!(black_in(&frame, icon) > 0);
+        assert!(black_in(&frame, percent) > 0);
+
+        let mut frame = Framebuffer::new();
+        let Ok(()) = draw(
+            &ViewModel {
+                battery: None,
+                ..view()
+            },
+            &mut frame,
+        );
+        assert!(black_in(&frame, icon) > 0);
+        assert_eq!(black_in(&frame, percent), 0);
     }
 }

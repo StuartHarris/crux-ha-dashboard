@@ -14,6 +14,7 @@ use crate::{
     Cmd, Event, Model,
     capabilities::power::{Power, PowerSource, WakeSource},
     features::{connection, refresh::redraw},
+    view::rounded_level,
 };
 
 /// On battery, the time without a touch after which the device sleeps.
@@ -27,6 +28,9 @@ pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct State {
     /// The power source.
     pub source: PowerSource,
+    /// The exact charge of the battery in percent, or `None` if the shell
+    /// did not read it yet.
+    pub battery: Option<u8>,
     /// The device is asleep, or goes to sleep now.
     pub asleep: bool,
     /// The id of the newest idle timer.
@@ -65,6 +69,30 @@ pub fn source_changed(source: PowerSource, model: &mut Model) -> Cmd {
         }
         PowerSource::Battery => redraw(model, false).and(restart_idle_timer(model)),
     }
+}
+
+/// The charge of the battery changed. The core keeps the exact level and
+/// draws the level of the view.
+///
+/// The view gives the level rounded to the nearest
+/// [`BATTERY_STEP`](crate::view::BATTERY_STEP). If the rounded level does
+/// not change, the core does not draw. Thus each change of 1% does not use
+/// a partial refresh.
+///
+/// The level is a fact, not a touch, so it does not wake the device and it
+/// does not start the idle timer again. While the device sleeps, the core
+/// keeps the level but does not draw, as for a change of the dry run. The
+/// wake draws the level.
+pub fn battery_changed(level: Option<u8>, model: &mut Model) -> Cmd {
+    let shown = model.power.battery.map(rounded_level);
+    model.power.battery = level;
+    if level.map(rounded_level) == shown {
+        return Cmd::done();
+    }
+    if model.power.asleep {
+        return Cmd::done();
+    }
+    redraw(model, false)
 }
 
 /// Starts the idle timer on battery. The core then ignores the timer that

@@ -186,6 +186,8 @@ impl Shell {
     /// new core and sends `Start`. The `path` and `last_sync` come from the
     /// view model of the old core. These are the two values that the
     /// firmware keeps in RTC memory. The power source is the current one.
+    /// After `Start`, the shell sends the current charge of the battery, as
+    /// the first read of the fuel gauge does on the device.
     ///
     /// The device reads `read_only` from its configuration after a deep
     /// sleep, but the user can switch the dry run in the simulator. The
@@ -221,6 +223,9 @@ impl Shell {
             path: Some(view.path),
             last_sync: view.last_sync,
         }));
+        if view.battery.is_some() {
+            self.send(Event::BatteryChanged(view.battery));
+        }
         true
     }
 
@@ -1123,7 +1128,7 @@ mod tests {
         assert!(fixture.shell().sleep_now());
         let view = fixture.shell().view();
         assert!(view.asleep);
-        assert_eq!(view.status, "Asleep, on battery, 1 tap not sent");
+        assert_eq!(view.status, "Asleep, 1 tap not sent");
     }
 
     /// A change of a tile on the dining room page: the state, then the time
@@ -1151,6 +1156,7 @@ mod tests {
         fixture.start(PowerSource::Battery);
         fixture.mqtt(1, MqttEvent::Connected);
         fixture.shell().send(Event::NextPage);
+        fixture.shell().send(Event::BatteryChanged(Some(64)));
         state_message(&mut fixture, 1);
         let before = fixture.shell().view();
         assert!(before.last_sync.is_some());
@@ -1167,6 +1173,8 @@ mod tests {
         let after = fixture.shell().view();
         assert_eq!(after.path, before.path);
         assert_eq!(after.last_sync, before.last_sync);
+        // The new core gets the charge again, as the view rounds it.
+        assert_eq!(after.battery, Some(65));
         assert!(!after.asleep);
         assert_eq!(fixture.shell().current_connection(), Some(2));
         fixture.mqtt(2, MqttEvent::Connected);

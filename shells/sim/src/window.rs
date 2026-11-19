@@ -38,6 +38,9 @@ use crate::{
 
 /// The window title.
 const TITLE: &str = "Dashboard simulator";
+/// The change of the charge of the battery for each press of `[` or `]`,
+/// in percent.
+const LEVEL_STEP: u8 = 10;
 /// The colour of the outline of a partial refresh.
 const OUTLINE_COLOR: Color32 = Color32::RED;
 /// The format of the time of a log entry.
@@ -61,6 +64,7 @@ pub fn run(options: Options) -> Result<(), String> {
     let Options {
         settings,
         power,
+        level,
         path,
         ..
     } = options;
@@ -89,7 +93,8 @@ pub fn run(options: Options) -> Result<(), String> {
             let open = mqtt::opener(handle.clone());
             let mut shell = Shell::new(handle, notifier, open);
             shell.start(settings, power, path);
-            Ok(Box::new(App::new(shell, signals, power)))
+            shell.send(Event::BatteryChanged(Some(level)));
+            Ok(Box::new(App::new(shell, signals, power, level)))
         }),
     );
     // eframe dropped the app and its shell. The tasks stopped with no
@@ -105,6 +110,8 @@ struct App {
     signals: mpsc::Receiver<Signal>,
     screen: Screen,
     power: PowerSource,
+    /// The charge of the battery, in percent.
+    level: u8,
     scale: Scale,
     show_outline: bool,
     texture: Option<TextureHandle>,
@@ -207,12 +214,13 @@ impl eframe::App for App {
 }
 
 impl App {
-    fn new(shell: Shell, signals: mpsc::Receiver<Signal>, power: PowerSource) -> Self {
+    fn new(shell: Shell, signals: mpsc::Receiver<Signal>, power: PowerSource, level: u8) -> Self {
         Self {
             shell,
             signals,
             screen: Screen::new(),
             power,
+            level,
             scale: Scale::Fit,
             show_outline: false,
             texture: None,
@@ -258,6 +266,12 @@ impl App {
             };
             self.set_power(power);
         }
+        if pressed(Key::OpenBracket) {
+            self.set_level(self.level.saturating_sub(LEVEL_STEP));
+        }
+        if pressed(Key::CloseBracket) {
+            self.set_level(self.level.saturating_add(LEVEL_STEP));
+        }
         if pressed(Key::W) {
             self.shell.wake();
         }
@@ -294,6 +308,17 @@ impl App {
             self.power = power;
             eprintln!("power: {power:?}");
             self.shell.send(Event::PowerSourceChanged(power));
+        }
+    }
+
+    /// Sets the charge of the battery to `level` percent, at most 100, and
+    /// sends the change to the core.
+    fn set_level(&mut self, level: u8) {
+        let level = level.min(100);
+        if level != self.level {
+            self.level = level;
+            eprintln!("power: battery {level}%");
+            self.shell.send(Event::BatteryChanged(Some(level)));
         }
     }
 
@@ -403,6 +428,7 @@ impl App {
             ui.radio_value(&mut power, PowerSource::Battery, "Battery");
         });
         self.set_power(power);
+        ui.label(format!("Battery: {}% ([ and ])", self.level));
         ui.horizontal(|ui| {
             ui.label(if view.asleep { "Asleep" } else { "Awake" });
             if ui
@@ -447,8 +473,9 @@ impl App {
         ui.separator();
         ui.label(
             RichText::new(
-                "Keys (when no text box has the focus): S stand/battery, W wake, \
-                 Z sleep now, R restart, D outline, Left/Right page, Q quit",
+                "Keys (when no text box has the focus): S stand/battery, [ and ] \
+                 battery −10% and +10%, W wake, Z sleep now, R restart, D outline, \
+                 Left/Right page, Q quit",
             )
             .small(),
         );

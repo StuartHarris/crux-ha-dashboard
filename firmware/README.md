@@ -243,5 +243,21 @@ These items stay open:
 - `rust-mqtt` sends one topic filter in each subscribe packet. Measure the time to get
   all retained states, and the size of the receive buffer (4096 bytes).
 
-Phase 6 has the `TODO(6)` items: the power source from the BQ25896, deep sleep with
-wake on touch and RTC, and the radio off for `WifiOff`.
+## Power check (phase 6)
+
+The display task reads the BQ25896 charger (REG0B) and the BQ27220 fuel gauge
+(`StateOfCharge()`) each 30 seconds. It only reads these chips. Do these steps with the
+board on USB power:
+
+1. Run `just flash`. The log shows `power: source Stand at the start`, then
+   `power: battery N%`. The header shows the percent and a plug icon.
+2. Disconnect USB. In about 30 seconds, the header shows the percent and a battery
+   icon. The fill of the icon shows the charge. The serial log is on USB, so you cannot
+   see the log line `power: source Battery` now.
+3. Connect USB again. In about 30 seconds, the header shows the plug icon. If the serial
+   log connects again, it shows `power: source Stand`.
+
+If a read fails, the log shows one warning, and the header keeps the last values.
+
+Phase 6 has the other `TODO(6)` items: deep sleep with wake on touch and RTC, and the
+radio off for `WifiOff`.
