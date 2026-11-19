@@ -110,6 +110,29 @@ pub fn ping_interval(keep_alive_secs: u16) -> Option<Duration> {
     Some(Duration::from_millis(millis.max(500)))
 }
 
+/// Returns the longest silence that the client accepts from the broker for a
+/// keep-alive interval in seconds.
+///
+/// The broker answers each ping, so it sends a packet at least once in each
+/// interval. A silence of two intervals means that the link is dead. The
+/// function uses an interval of at least 30 seconds. An interval of 0 turns
+/// keep-alive off, and the function returns `None`.
+#[must_use]
+pub fn silence_limit(keep_alive_secs: u16) -> Option<Duration> {
+    if keep_alive_secs == 0 {
+        return None;
+    }
+    Some(Duration::from_secs(u64::from(keep_alive_secs.max(30)) * 2))
+}
+
+/// Returns `true` if the broker was silent for too long. `silent_for` is the
+/// time since the last packet from the broker. The limit comes from
+/// [`silence_limit`]. With keep-alive off, the function returns `false`.
+#[must_use]
+pub fn broker_silent(silent_for: Duration, keep_alive_secs: u16) -> bool {
+    silence_limit(keep_alive_secs).is_some_and(|limit| silent_for >= limit)
+}
+
 /// Removes the queued jobs that a later job supersedes, and
 /// returns the `Disconnected` signals for the connections that the task
 /// never opens.
@@ -259,7 +282,8 @@ mod tests {
     use shared::capabilities::mqtt::Publish;
 
     use super::{
-        Attempt, MAX_TRIES, Next, OUTBOX_LIMIT, Outbox, Streams, ping_interval, supersede,
+        Attempt, MAX_TRIES, Next, OUTBOX_LIMIT, Outbox, Streams, broker_silent, ping_interval,
+        silence_limit, supersede,
     };
     use shared::capabilities::mqtt::{Disconnect, Subscribe};
 
@@ -316,6 +340,43 @@ mod tests {
         };
         assert_eq!(message.topic, "topic/a");
         assert_eq!(message.payload, b"on");
+    }
+
+    #[test]
+    fn silence_limit_is_two_keep_alive_intervals() {
+        assert_eq!(silence_limit(60), Some(Duration::from_secs(120)));
+    }
+
+    #[test]
+    fn silence_limit_uses_at_least_30_seconds() {
+        assert_eq!(silence_limit(5), Some(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn silence_limit_is_off_without_keep_alive() {
+        assert_eq!(silence_limit(0), None);
+    }
+
+    #[test]
+    fn broker_is_not_silent_just_under_the_limit() {
+        assert!(!broker_silent(Duration::from_millis(119_999), 60));
+    }
+
+    #[test]
+    fn broker_is_silent_at_and_over_the_limit() {
+        assert!(broker_silent(Duration::from_secs(120), 60));
+        assert!(broker_silent(Duration::from_secs(500), 60));
+    }
+
+    #[test]
+    fn broker_is_never_silent_without_keep_alive() {
+        assert!(!broker_silent(Duration::from_secs(100_000), 0));
+    }
+
+    #[test]
+    fn small_keep_alive_uses_the_clamped_limit() {
+        assert!(!broker_silent(Duration::from_secs(59), 5));
+        assert!(broker_silent(Duration::from_secs(60), 5));
     }
 
     #[test]
