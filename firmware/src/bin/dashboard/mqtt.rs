@@ -20,9 +20,20 @@
 //!
 //! - Each send has a time limit (`WRITE_TIMEOUT`). A send that cannot get
 //!   space in the full send buffer ends the connection.
+//! - Each read of a packet outside the main loop has a time limit
+//!   (`READ_TIMEOUT`): the read of the body of a packet (with the automatic
+//!   PUBACK of `rust-mqtt`), and the read while all the subscribe packets are
+//!   in flight. These reads stop the checks of the main loop, so they must
+//!   end.
 //! - If sent data waits for its TCP ACK for `logic::mqtt::ACK_LIMIT`, the task
 //!   ends the connection (`logic::mqtt::AckWatch`).
 //! - The task ends the connection when the broker is silent for too long.
+//!
+//! When a session ends with an error, the task tells `HEALTH` before the
+//! stream ends. Then the Wi-Fi task leaves and joins again at the next
+//! `WifiOn` (`logic::wifi::LinkHealth`). A session that a new connection
+//! replaced, a change of access point and a disconnect for the core are not
+//! errors.
 //!
 //! Each connect has a clean start. The task answers each `Subscribe` job when
 //! the broker acknowledged all its filters (`logic::mqtt::Subacks`). If the
@@ -67,12 +78,13 @@ use rust_mqtt::{
         },
     },
     config::KeepAlive,
+    header::FixedHeader,
     types::{MqttBinary, MqttString, QoS, TopicFilter, TopicName},
 };
 use shared::capabilities::mqtt::{Connect, Publish, Qos, Subscribe, SubscribeOutcome};
 
 use crate::{
-    LINK_CHANGED, MQTT, SIGNALS,
+    HEALTH, LINK_CHANGED, MQTT, SIGNALS,
     transport::{Link, Transport},
 };
 
@@ -86,6 +98,11 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// The time limit of one call that sends a packet. A send waits only while
 /// the send buffer of the socket is full.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+/// The time limit of a read outside the main loop: the body of a packet
+/// after its header, or the next packet while all the subscribe packets are
+/// in flight. The broker answers a subscribe packet at once, so a longer
+/// silence means that the link is dead.
+const READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// The time limit of the disconnect packet.
 const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -107,14 +124,36 @@ struct End {
     /// The reason for the `Disconnected` item, or `None` for a disconnect
     /// that the core asked for.
     reason: Option<String>,
+    /// `true` if the session failed: the link or the broker did not work.
+    /// The Wi-Fi task then leaves and joins again.
+    failed: bool,
 }
 
 impl End {
+    /// A session that failed.
     fn error(reason: impl Into<String>) -> Self {
         Self {
             reason: Some(reason.into()),
+            failed: true,
         }
     }
+
+    /// A session that the task closed for `reason`, or for the core if
+    /// `reason` is `None`.
+    const fn closed(reason: Option<String>) -> Self {
+        Self {
+            reason,
+            failed: false,
+        }
+    }
+}
+
+/// Returns the reason for a read that took more than `READ_TIMEOUT`.
+fn read_timed_out(what: &str) -> String {
+    format!(
+        "{what} did not arrive in {} s: the link is down",
+        READ_TIMEOUT.as_secs()
+    )
 }
 
 /// Returns the next job: a pending one, or the next one from the queue.
@@ -178,6 +217,10 @@ pub async fn task(stack: Stack<'static>) {
         if let Some(reason) = &end.reason {
             log::warn!("mqtt: connection {connection} closed: {reason}");
         }
+        // The Wi-Fi task must know before the core asks for Wi-Fi again.
+        if end.failed {
+            HEALTH.lock(|health| health.borrow_mut().session_failed());
+        }
         if let Some(signal) = streams.end(connection, end.reason) {
             SIGNALS.push(signal);
         }
@@ -209,15 +252,10 @@ async fn session(
             Ok(client) => client,
             Err(end) => return end,
         };
-    log::info!("mqtt: connected");
-    if let Some(signal) = streams.connected(connection) {
-        SIGNALS.push(signal);
-    }
+    opened(streams, connection);
     let mut subacks = Subacks::default();
 
-    let ping_every = ping_interval(connect.keep_alive_secs)
-        .and_then(|every| u64::try_from(every.as_millis()).ok())
-        .map(Duration::from_millis);
+    let ping_every = ping_period(connect.keep_alive_secs);
     let mut next_ping = ping_every.map(|every| Instant::now() + every);
     // The time of the last packet from the broker.
     let mut last_heard = Instant::now();
@@ -236,7 +274,7 @@ async fn session(
             Either3::First(work) => work,
             Either3::Second(()) => {
                 disconnect(&mut client, DISCONNECT_TIMEOUT).await;
-                return End::error("the Wi-Fi access point changed");
+                return End::closed(Some("the Wi-Fi access point changed".into()));
             }
             // The check at the start of the loop reads the send buffer.
             Either3::Third(()) => continue,
@@ -247,14 +285,20 @@ async fn session(
                     disconnect(&mut client, WRITE_TIMEOUT).await;
                     // The outer loop opens the new connection.
                     pending.push_front((id, MqttOp::Connect(next)));
-                    return End::error("replaced by a new connection");
+                    return End::closed(Some("replaced by a new connection".into()));
                 }
                 _ if !streams.accepts(id) => {
                     log::debug!("mqtt: connection {id} is closed");
                 }
                 MqttOp::Subscribe(Subscribe { topics }) => {
-                    let sent =
-                        subscribe_all(&mut client, streams, connection, &mut subacks, &topics);
+                    let sent = subscribe_all(
+                        &mut client,
+                        streams,
+                        connection,
+                        &mut subacks,
+                        &mut last_heard,
+                        &topics,
+                    );
                     if let Err(reason) = sent.await {
                         return End::error(reason);
                     }
@@ -265,15 +309,14 @@ async fn session(
                 },
                 MqttOp::Disconnect(_) => {
                     disconnect(&mut client, DISCONNECT_TIMEOUT).await;
-                    return End { reason: None };
+                    return End::closed(None);
                 }
             },
             Either4::Second(Ok(header)) => {
                 last_heard = Instant::now();
-                match client.poll_body(header).await {
-                    Ok(event) => deliver(streams, connection, &mut subacks, &event),
-                    Err(error) if error.is_recoverable() => log::warn!("mqtt: {error:?}"),
-                    Err(error) => return End::error(format!("receive failed: {error:?}")),
+                let read = read_body(&mut client, header, streams, connection, &mut subacks);
+                if let Err(reason) = read.await {
+                    return End::error(reason);
                 }
                 // An acknowledgement can give quota to a waiting publish.
                 if !outbox.is_empty() {
@@ -298,6 +341,49 @@ async fn session(
             }
         }
     }
+}
+
+/// Returns the time between two pings for the keep-alive interval
+/// `keep_alive_secs`, or `None` if keep-alive is off.
+fn ping_period(keep_alive_secs: u16) -> Option<Duration> {
+    ping_interval(keep_alive_secs)
+        .and_then(|every| u64::try_from(every.as_millis()).ok())
+        .map(Duration::from_millis)
+}
+
+/// Records the CONNACK of `connection`, and tells the core.
+fn opened(streams: &Streams, connection: u32) {
+    log::info!("mqtt: connected");
+    // The CONNACK proves that the link moves data both ways.
+    HEALTH.lock(|health| health.borrow_mut().traffic());
+    if let Some(signal) = streams.connected(connection) {
+        SIGNALS.push(signal);
+    }
+}
+
+/// Reads the body of the packet with `header` and gives it to the core. The
+/// read has the limit [`READ_TIMEOUT`], because it also sends the automatic
+/// PUBACK, and the checks of the main loop do not run while it waits.
+///
+/// # Errors
+///
+/// Returns the reason to close the connection.
+async fn read_body(
+    client: &mut MqttClient<'_, '_, '_>,
+    header: FixedHeader,
+    streams: &Streams,
+    connection: u32,
+    subacks: &mut Subacks,
+) -> Result<(), String> {
+    match embassy_time::with_timeout(READ_TIMEOUT, client.poll_body(header)).await {
+        Ok(Ok(event)) => deliver(streams, connection, subacks, &event),
+        Ok(Err(error)) if error.is_recoverable() => log::warn!("mqtt: {error:?}"),
+        Ok(Err(error)) => return Err(format!("receive failed: {error:?}")),
+        // The client stopped in the middle of a packet, so the session
+        // cannot continue.
+        Err(_) => return Err(read_timed_out("the body of a packet")),
+    }
+    Ok(())
 }
 
 /// Reads the send buffer of the socket. Returns the time of the next
@@ -388,14 +474,15 @@ async fn connect_or_stop<'s, 'a, 'c>(
                 Either::Second((id, op)) => match op {
                     MqttOp::Connect(next) => {
                         pending.push_front((id, MqttOp::Connect(next)));
-                        return Err(End::error("replaced by a new connection"));
+                        let reason = "replaced by a new connection".into();
+                        return Err(End::closed(Some(reason)));
                     }
                     _ if !streams.accepts(id) => {
                         log::debug!("mqtt: connection {id} is closed");
                     }
                     MqttOp::Disconnect(_) => {
                         log::info!("mqtt: the connection stopped before it opened");
-                        return Err(End { reason: None });
+                        return Err(End::closed(None));
                     }
                     op => early.push((id, op)),
                 },
@@ -533,13 +620,23 @@ async fn subscribe_all(
     streams: &Streams,
     connection: u32,
     subacks: &mut Subacks,
+    last_heard: &mut Instant,
     topics: &[String],
 ) -> Result<(), String> {
     let started = Instant::now();
     let mut timing = SubscribeTiming::default();
     subacks.begin();
     for topic in topics {
-        subscribe(client, streams, connection, subacks, &mut timing, topic).await?;
+        subscribe(
+            client,
+            streams,
+            connection,
+            subacks,
+            last_heard,
+            &mut timing,
+            topic,
+        )
+        .await?;
     }
     log::info!(
         "mqtt: sent the subscribe for {} topics in {} ms ({} ms in sends; \
@@ -570,13 +667,15 @@ struct SubscribeTiming {
 /// Subscribes to one topic filter. `rust-mqtt` sends one filter in each
 /// packet, and it keeps up to [`IN_FLIGHT_SUBSCRIBES`] subscribe packets in
 /// flight. If all are in flight, the task reads packets (the retained
-/// states) until the broker acknowledges one. `subacks` records the packet,
-/// and `timing` the time of the sends and the reads.
+/// states) until the broker acknowledges one. Each read has the limit
+/// [`READ_TIMEOUT`] and updates `last_heard`. `subacks` records the
+/// packet, and `timing` the time of the sends and the reads.
 async fn subscribe(
     client: &mut MqttClient<'_, '_, '_>,
     streams: &Streams,
     connection: u32,
     subacks: &mut Subacks,
+    last_heard: &mut Instant,
     timing: &mut SubscribeTiming,
     topic: &str,
 ) -> Result<(), String> {
@@ -601,11 +700,18 @@ async fn subscribe(
             }
             Err(MqttError::SessionBuffer) => {
                 let started = Instant::now();
-                let read = client.poll().await;
+                // This read is outside the main loop, so the checks of the
+                // link do not run while it waits. A time limit ends it.
+                let read = embassy_time::with_timeout(READ_TIMEOUT, client.poll())
+                    .await
+                    .map_err(|_| read_timed_out("the next packet of the subscribe"))?;
                 timing.reads += 1;
                 timing.reading += started.elapsed();
                 match read {
-                    Ok(event) => deliver(streams, connection, subacks, &event),
+                    Ok(event) => {
+                        *last_heard = Instant::now();
+                        deliver(streams, connection, subacks, &event);
+                    }
                     Err(error) => return Err(format!("receive failed: {error:?}")),
                 }
             }

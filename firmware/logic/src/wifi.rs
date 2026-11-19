@@ -5,7 +5,9 @@
 //!   ([`during_switch`]);
 //! - when a join uses the access point of the last join, and when the task
 //!   scans for a better one ([`ApCache`]);
-//! - when the task changes to a better access point ([`better_access_point`]).
+//! - when the task changes to a better access point ([`better_access_point`]);
+//! - when the task leaves and joins again after an MQTT session failed, and
+//!   when it restarts the chip ([`LinkHealth`]).
 //!
 //! A join first goes to the access point of the last join, on its channel,
 //! with no scan of all the channels. This join is fast. When the core says
@@ -224,11 +226,155 @@ pub fn better_access_point(current: AccessPoint, rssi: Option<i32>, seen: &[Seen
         .copied()
 }
 
+/// The number of joins with no address from DHCP, after an MQTT session
+/// failed, before the task restarts the chip.
+///
+/// The Wi-Fi driver of `esp-radio` 1.0.0-beta.1 counts the frames that it did
+/// not send yet. A frame that the driver drops while the link is down stays in
+/// that count. When the count is full, the network stack can send and receive
+/// nothing. A new join does not reset the count, and only a restart of the
+/// chip does. The join itself works, but DHCP gets no address.
+///
+/// The value 3 is the join to the cached access point and the join after a
+/// scan of the first `WifiOn`, and one more join after the backoff of the
+/// core. Each join waits up to 20 s for DHCP, so the restart comes about one
+/// minute after the session failed.
+pub const RESTART_AFTER: u32 = 3;
+
+/// How the task starts a join for `WifiOn`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JoinStart {
+    /// The driver is not connected. Join the network.
+    Join,
+    /// The driver is connected, and the link moved data after the last
+    /// failure. Only wait for an address from DHCP.
+    Keep,
+    /// The driver is connected, but an MQTT session failed after the last
+    /// proof of traffic. Leave the access point, wait for the network stack to
+    /// drop the old address, and join again.
+    Rejoin,
+}
+
+/// What the task does after a join that got no address from DHCP.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoAddress {
+    /// Answer `Failed`. The core tries again after its backoff.
+    Fail,
+    /// The link is stuck. Restart the chip.
+    Restart,
+}
+
+/// The health of the link, which the MQTT task and the Wi-Fi task share.
+///
+/// The rules:
+///
+/// - An MQTT session that ends with an error makes the link suspect
+///   ([`LinkHealth::session_failed`]). A session that a new connection
+///   replaced, a change of access point and a disconnect that the core asked
+///   for are not errors.
+/// - While the link is suspect, a `WifiOn` with the driver connected leaves
+///   and joins again ([`JoinStart::Rejoin`]), so the task does not keep a
+///   link that is stuck.
+/// - While the link is suspect, each join that gets no address from DHCP
+///   counts ([`LinkHealth::no_address`]). At [`RESTART_AFTER`], the task
+///   restarts the chip.
+/// - A CONNACK proves that the link moves data in both directions. It clears
+///   the suspicion and the count ([`LinkHealth::traffic`]). A new address
+///   from DHCP also proves traffic, so it clears the count
+///   ([`LinkHealth::address`]).
+/// - If the network stack kept its old address through the join, the address
+///   proves nothing. It counts as a join with no address
+///   ([`LinkHealth::stale_address`]), but the task keeps the address.
+///
+/// A join that fails before DHCP (the access point is off, or it refuses
+/// the device) does not count, because the cause is not on the device. A
+/// restart clears the RAM, so after a restart the link is not suspect. Then
+/// the next restart needs an address, a session that fails, and
+/// [`RESTART_AFTER`] joins with no address. Thus the chip cannot restart
+/// again and again while DHCP or the access point is down.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LinkHealth {
+    suspect: bool,
+    no_address: u32,
+}
+
+impl LinkHealth {
+    /// Returns a healthy link, for a `static`.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            suspect: false,
+            no_address: 0,
+        }
+    }
+
+    /// Records an MQTT session that ended with an error.
+    pub const fn session_failed(&mut self) {
+        self.suspect = true;
+    }
+
+    /// Records a CONNACK from the broker.
+    pub const fn traffic(&mut self) {
+        self.suspect = false;
+        self.no_address = 0;
+    }
+
+    /// Records a new address from DHCP after a join.
+    pub const fn address(&mut self) {
+        self.no_address = 0;
+    }
+
+    /// Returns `true` if an MQTT session failed after the last CONNACK.
+    #[must_use]
+    pub const fn suspect(&self) -> bool {
+        self.suspect
+    }
+
+    /// Returns how a join for `WifiOn` starts. `connected` is `true` if the
+    /// driver says that the station is connected.
+    #[must_use]
+    pub const fn join_start(&self, connected: bool) -> JoinStart {
+        match (connected, self.suspect) {
+            (false, _) => JoinStart::Join,
+            (true, false) => JoinStart::Keep,
+            (true, true) => JoinStart::Rejoin,
+        }
+    }
+
+    /// Records a join to an access point that got no address from DHCP, and
+    /// returns what the task does next.
+    pub const fn no_address(&mut self) -> NoAddress {
+        if !self.suspect {
+            return NoAddress::Fail;
+        }
+        self.no_address += 1;
+        if self.no_address >= RESTART_AFTER {
+            NoAddress::Restart
+        } else {
+            NoAddress::Fail
+        }
+    }
+
+    /// Records a join after which the network stack has the address that it
+    /// had before the join. The stack did not see the link go down, so it can
+    /// be stuck. Counts as [`LinkHealth::no_address`].
+    pub const fn stale_address(&mut self) -> NoAddress {
+        self.no_address()
+    }
+
+    /// Returns the number of joins with no address that counted.
+    #[must_use]
+    pub const fn joins_with_no_address(&self) -> u32 {
+        self.no_address
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        AccessPoint, AfterFailure, ApCache, DuringJoin, DuringSwitch, JoinPath, ROAM_MARGIN_DB,
-        Seen, WifiRequest, better_access_point, during_join, during_switch,
+        AccessPoint, AfterFailure, ApCache, DuringJoin, DuringSwitch, JoinPath, JoinStart,
+        LinkHealth, NoAddress, RESTART_AFTER, ROAM_MARGIN_DB, Seen, WifiRequest,
+        better_access_point, during_join, during_switch,
     };
 
     const NEAR: AccessPoint = AccessPoint {
@@ -401,5 +547,88 @@ mod tests {
     #[test]
     fn an_empty_scan_stays() {
         assert_eq!(better_access_point(NEAR, Some(-90), &[]), None);
+    }
+
+    #[test]
+    fn a_healthy_link_keeps_the_join() {
+        let health = LinkHealth::default();
+        assert_eq!(health.join_start(true), JoinStart::Keep);
+        assert_eq!(health.join_start(false), JoinStart::Join);
+    }
+
+    #[test]
+    fn after_a_failed_session_a_connected_driver_leaves_and_joins_again() {
+        let mut health = LinkHealth::default();
+        health.session_failed();
+        assert_eq!(health.join_start(true), JoinStart::Rejoin);
+        // After a leave, the driver is not connected.
+        assert_eq!(health.join_start(false), JoinStart::Join);
+        // The rejoin got an address, but the link is suspect until a CONNACK.
+        health.address();
+        assert_eq!(health.join_start(true), JoinStart::Rejoin);
+        health.traffic();
+        assert_eq!(health.join_start(true), JoinStart::Keep);
+    }
+
+    #[test]
+    fn a_stuck_link_restarts_the_chip_after_the_limit() {
+        // The session stops, the rejoin and the retries get no address.
+        let mut health = LinkHealth::default();
+        health.session_failed();
+        for _ in 1..RESTART_AFTER {
+            assert_eq!(health.no_address(), NoAddress::Fail);
+        }
+        assert_eq!(health.no_address(), NoAddress::Restart);
+    }
+
+    #[test]
+    fn an_address_starts_the_count_again() {
+        let mut health = LinkHealth::default();
+        health.session_failed();
+        for _ in 1..RESTART_AFTER {
+            assert_eq!(health.no_address(), NoAddress::Fail);
+        }
+        health.address();
+        assert_eq!(health.joins_with_no_address(), 0);
+        // The next session fails too, so the link stays suspect.
+        health.session_failed();
+        assert_eq!(health.no_address(), NoAddress::Fail);
+    }
+
+    #[test]
+    fn a_dhcp_outage_with_no_failed_session_never_restarts() {
+        // After a restart, or while the broker is up and Wi-Fi is new, the
+        // link is not suspect.
+        let mut health = LinkHealth::default();
+        for _ in 0..(RESTART_AFTER * 4) {
+            assert_eq!(health.no_address(), NoAddress::Fail);
+        }
+        assert_eq!(health.joins_with_no_address(), 0);
+    }
+
+    #[test]
+    fn a_connack_clears_the_suspicion_and_the_count() {
+        let mut health = LinkHealth::default();
+        health.session_failed();
+        health.no_address();
+        health.traffic();
+        assert!(!health.suspect());
+        assert_eq!(health.joins_with_no_address(), 0);
+        for _ in 0..(RESTART_AFTER * 2) {
+            assert_eq!(health.no_address(), NoAddress::Fail);
+        }
+    }
+
+    #[test]
+    fn an_old_address_after_a_rejoin_does_not_stop_the_restart() {
+        // The stack is stuck, so it never drops the address of the old link.
+        // Each rejoin "gets" that address, and each new session fails.
+        let mut health = LinkHealth::default();
+        for _ in 1..RESTART_AFTER {
+            health.session_failed();
+            assert_eq!(health.stale_address(), NoAddress::Fail);
+        }
+        health.session_failed();
+        assert_eq!(health.stale_address(), NoAddress::Restart);
     }
 }

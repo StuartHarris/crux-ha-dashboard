@@ -11,10 +11,12 @@
 //! | `display` | draws the latest view model, reads the touch controller, the charger and the fuel gauge, sets the front light, and runs the `Sleep` job | `Signal::Tap`, `Signal::Event`, `Signal::Woke`, `Signal::Light` |
 //! | `wifi` | `WifiOn`, `WifiOff`, the radio on and off, and a change to a better access point after `WifiQuiet` | `Signal::Wifi`, `Signal::RadioOff` |
 //! | `mqtt` | the MQTT operations, one connection at a time | `Signal::Mqtt`, `Signal::Subscribed` |
+//! | `net` | runs the network stack | |
 //!
 //! After a change of access point, the Wi-Fi task sets [`LINK_CHANGED`]. The
-//! MQTT task then closes its connection, and the core connects again.
-//! | `net` | runs the network stack | |
+//! MQTT task then closes its connection, and the core connects again. The two
+//! tasks share [`HEALTH`], so the Wi-Fi task joins again after an MQTT session
+//! failed.
 
 #![no_std]
 #![no_main]
@@ -29,15 +31,19 @@ mod timers;
 mod transport;
 mod wifi;
 
+use core::cell::RefCell;
 use dashboard_firmware::{board, lane::Lane, light::FrontLight, panel::Panel, panel_pins};
 use embassy_executor::Spawner;
 use embassy_net::StackResources;
-use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal as Latest};
+use embassy_sync::{
+    blocking_mutex::{Mutex, raw::CriticalSectionRawMutex},
+    signal::Signal as Latest,
+};
 use esp_backtrace as _;
 use logic::{
     shell::{MqttOp, Signal},
     sleep::Plan,
-    wifi::WifiRequest,
+    wifi::{LinkHealth, WifiRequest},
 };
 use shared::{PowerSource, ViewModel};
 use static_cell::StaticCell;
@@ -69,6 +75,12 @@ pub static WIFI: Lane<WifiRequest> = Lane::new();
 /// Set by the Wi-Fi task after it changed to another access point. The MQTT
 /// task closes the open connection, because its TCP connection can be dead.
 pub static LINK_CHANGED: Latest<CriticalSectionRawMutex, ()> = Latest::new();
+/// The health of the link (`logic::wifi::LinkHealth`).
+///
+/// The MQTT task records each session that failed and each CONNACK. The
+/// Wi-Fi task reads it at each `WifiOn`, and records each address from DHCP.
+pub static HEALTH: Mutex<CriticalSectionRawMutex, RefCell<LinkHealth>> =
+    Mutex::new(RefCell::new(LinkHealth::new()));
 /// The `FrontLight` jobs for the display task, with their tokens.
 pub static LIGHT: Lane<(u32, u8)> = Lane::new();
 /// The `Sleep` job for the display task, or `None` when the `Sleep`

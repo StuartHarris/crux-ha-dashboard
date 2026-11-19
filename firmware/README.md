@@ -21,7 +21,7 @@ with the std shells of the root workspace would pull std into it.
 | --- | --- |
 | `shell` | Owns the core. Routes each effect to a task as a `Command`, and gives each `Signal` from a task to the core. Keeps the MQTT connection ids, the timer tokens, the `WifiOn` tokens and the `FrontLight` tokens, and the `Disconnect`, `WifiOff`, `Sleep` and `FrontLight` requests until their tasks answer. Gives at most one `Render` for each batch of effects, with the last view. Sends each tap to the core as `Tapped`, with the control from `ui::hit_test`. While `Sleep` waits, a tap or a change of the power source answers it. The core does not publish service calls in a dry run. |
 | `mqtt` | The bookkeeping of the MQTT task. The stream of each connection ends with exactly one `Disconnected` item. `supersede` removes the queued connections that a later command makes useless. `Outbox` keeps a publish while the client has no quota, and closes the connection if the publish cannot be sent. |
-| `wifi` | A `WifiOff` during a join stops the join. A `WifiOn` during a join continues it with the newer token. |
+| `wifi` | A `WifiOff` during a join stops the join. A `WifiOn` during a join continues it with the newer token. `LinkHealth` decides when a `WifiOn` leaves and joins again, and when the Wi-Fi task restarts the chip. |
 | `backoff` | A wait that doubles from 1 s to 30 s after each failure, for the start of the touch controller. |
 | `timers` | The timers of the timer task, in milliseconds since the start. |
 | `touch` | Converts a GT911 point to a panel point, and touch samples to taps with a debounce. A sample is new with a finger, new with no finger (the finger lifted), or not new. Only a new sample with no finger ends a touch. |
@@ -67,8 +67,35 @@ A send does not wait for the ACK, so the task finds a dead link in these ways:
 - Before each ping, the task checks the silence of the broker. After 120 s with no
   packet, the task ends the connection. The TCP timeout of the socket has the same
   limit.
+- Two reads are outside the main loop, so the checks above do not run while they
+  wait. Each has a limit of 10 s (`READ_TIMEOUT`): the read of the body of a packet
+  (with the automatic PUBACK), and the read while all 16 subscribe packets are in
+  flight.
 
 The core then connects again, as after any other drop.
+
+### Recovery after a failed session
+
+When a session ends with an error, the MQTT task records it in `HEALTH`
+(`logic::wifi::LinkHealth`) before the stream ends. A session that a new connection
+replaces, a change of access point and a disconnect for the core are not errors.
+
+- At the next `WifiOn`, if the driver is still connected, the Wi-Fi task leaves the
+  access point, waits for the stack to drop the address, and joins again. The log
+  shows `wifi: an MQTT session failed, so leave the access point and join again`.
+- The driver of `esp-radio` 1.0.0-beta.1 counts the frames that it did not send yet.
+  If the link goes down after the driver accepts a frame, the frame can stay in the
+  count. When the count is full, the stack can send and receive nothing. The join
+  still works, but DHCP gets no address. Only a restart clears the count.
+- After a failed session, each join that gets no new address counts. An address that
+  the stack kept from before the join also counts. After 3 (`RESTART_AFTER`), the
+  Wi-Fi task restarts the chip. The log shows
+  `wifi: 3 joins after an MQTT session failed got no new address`. A CONNACK clears
+  the count and the suspicion. A new address clears the count.
+- A join that fails before DHCP (the access point is off, or it blocks the device)
+  does not count. After a restart, the next restart needs a new address and a failed
+  session first. Thus a long outage of DHCP or of the broker cannot restart the chip
+  again and again.
 
 ### Light sleep
 
