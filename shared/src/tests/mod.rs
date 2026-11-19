@@ -8,6 +8,7 @@
 mod broker;
 mod connection;
 mod flows;
+mod light;
 mod pending;
 mod power;
 mod refresh;
@@ -25,6 +26,7 @@ use crate::{
     capabilities::mqtt::Publish,
     entities::STATESTREAM,
     features::{
+        light::LIGHT_TIMEOUT,
         pending::{PENDING_TIMEOUT, SCENE_TIMEOUT},
         refresh::FULL_REFRESH_INTERVAL,
     },
@@ -143,6 +145,35 @@ impl ExpectServiceCall for Cmd {
                 duration == PENDING_TIMEOUT || duration == SCENE_TIMEOUT,
                 "{duration:?}"
             );
+        })
+    }
+}
+
+/// Expects the effects of the front light.
+trait ExpectLight {
+    /// Expects the next effect to set the front light to `level`.
+    fn expect_light(&mut self, level: u8) -> &mut Self;
+
+    /// Expects the next effect to start the timer of [`LIGHT_TIMEOUT`].
+    fn expect_light_timer(&mut self) -> &mut Self;
+
+    /// Expects the effects of a touch while the light is off: the light at
+    /// `level`, then the light timer.
+    fn expect_touch_light(&mut self, level: u8) -> &mut Self {
+        self.expect_light(level).expect_light_timer()
+    }
+}
+
+impl ExpectLight for Cmd {
+    #[track_caller]
+    fn expect_light(&mut self, level: u8) -> &mut Self {
+        self.expect_front_light_with(|light| assert_eq!(light.level, level))
+    }
+
+    #[track_caller]
+    fn expect_light_timer(&mut self) -> &mut Self {
+        self.expect_time_notify_after_with(|notify| {
+            assert_eq!(Duration::from(notify.duration), LIGHT_TIMEOUT);
         })
     }
 }

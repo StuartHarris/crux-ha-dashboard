@@ -19,7 +19,7 @@ with the std shells of the root workspace would pull std into it.
 
 | Module | What it does |
 | --- | --- |
-| `shell` | Owns the core. Routes each effect to a task as a `Command`, and gives each `Signal` from a task to the core. Keeps the MQTT connection ids, the timer tokens and the `WifiOn` tokens, and the `Disconnect`, `WifiOff` and `Sleep` requests until their tasks answer. Gives at most one `Render` for each batch of effects, with the last view. Sends each tap to the core as `Tapped`, with the control from `ui::hit_test`. While `Sleep` waits, a tap or a change of the power source answers it. The core does not publish service calls in a dry run. |
+| `shell` | Owns the core. Routes each effect to a task as a `Command`, and gives each `Signal` from a task to the core. Keeps the MQTT connection ids, the timer tokens, the `WifiOn` tokens and the `FrontLight` tokens, and the `Disconnect`, `WifiOff`, `Sleep` and `FrontLight` requests until their tasks answer. Gives at most one `Render` for each batch of effects, with the last view. Sends each tap to the core as `Tapped`, with the control from `ui::hit_test`. While `Sleep` waits, a tap or a change of the power source answers it. The core does not publish service calls in a dry run. |
 | `mqtt` | The bookkeeping of the MQTT task. The stream of each connection ends with exactly one `Disconnected` item. `supersede` removes the queued connections that a later command makes useless. `Outbox` keeps a publish while the client has no quota, and closes the connection if the publish cannot be sent. |
 | `wifi` | A `WifiOff` during a join stops the join. A `WifiOn` during a join continues it with the newer token. |
 | `backoff` | A wait that doubles from 1 s to 30 s after each failure, for the start of the touch controller. |
@@ -40,7 +40,7 @@ cannot block each other. This is the pattern of the `cpb` example in Crux.
 | --- | --- | --- |
 | core (`main`) | Owns the shell. Sends `Start` with the power source `Stand`. | |
 | `timers` | Starts and cancels the timers of the core. | `Signal::Timer` |
-| `display` | Draws the newest view model with `ui::draw`, and refreshes the panel as `ui::Refresher` decides. Reads the touch controller every 30 ms between refreshes. Runs the `Sleep` job. | `Signal::Tap`, `Signal::Event`, `Signal::Woke` |
+| `display` | Draws the newest view model with `ui::draw`, and refreshes the panel as `ui::Refresher` decides. Reads the touch controller every 30 ms between refreshes. Sets the front light. Runs the `Sleep` job. | `Signal::Tap`, `Signal::Event`, `Signal::Woke`, `Signal::Light` |
 | `wifi` | For `WifiOn`, turns the radio on, joins the network and waits for DHCP. For `WifiOff`, leaves the network and turns the radio off. | `Signal::Wifi`, `Signal::RadioOff` |
 | `mqtt` | Opens one connection at a time with `rust-mqtt` (MQTT 5) over TCP. Subscribes, publishes, sends pings, and closes. | `Signal::Mqtt` |
 | `net` | Runs the network stack. | |
@@ -50,34 +50,43 @@ cannot block each other. This is the pattern of the `cpb` example in Crux.
 On battery, the core sleeps after 30 seconds with no touch. The core owns the steps,
 and each step waits for the answer of the firmware:
 
-1. The core publishes `asleep` and sends `Disconnect`. The MQTT task sends the
+1. This step acts only if the front light is still on. Usually the light timer
+   (20 seconds) turned the light off before the idle timer (30 seconds) expired,
+   because a tap on a control starts both timers again. A tap on no control turns
+   the light on, but it does not start the idle timer again, so it does not delay
+   the sleep. If that tap comes less than 20 seconds before the idle timeout, the
+   light is still on at the sleep. The core then sends `FrontLight` with the level 0.
+   The display task sets the duty to 0 and answers with `Signal::Light`. If the light
+   is off, the core starts the next step at once.
+2. The core publishes `asleep` and sends `Disconnect`. The MQTT task sends the
    disconnect packet (with a limit of 2 seconds) and ends the session. The stream of
    the connection then ends, and the shell answers `Disconnect`. If no connection is
    current, the shell answers at once.
-2. The core sends `WifiOff`. The Wi-Fi task disconnects, waits 100 ms for the frames
+3. The core sends `WifiOff`. The Wi-Fi task disconnects, waits 100 ms for the frames
    in the driver, and drops the `WifiController`. The drop stops the Wi-Fi driver and
    the radio. `esp-radio` 1.0.0-beta.1 has no other public call to stop it. Then the
    task sends `Signal::RadioOff`, and the shell answers `WifiOff`. `WifiOn` makes a
    new controller.
-3. The core draws the "Asleep" image and sends `Sleep`. The display task draws the
+4. The core draws the "Asleep" image and sends `Sleep`. The display task draws the
    image first, then puts the chip into light sleep. It does not wait for a blocker,
    so the touch poll and the renders continue. If one blocker stops the sleep for
    5 seconds, the log shows a warning. If the blocker is a low INT, the task clears
    the GT911 status register, and starts the touch controller again if INT stays low.
-4. The wake sources are a low level on the GT911 INT pin (GPIO3) and, if the core
+5. The wake sources are a low level on the GT911 INT pin (GPIO3) and, if the core
    asks for it, the RTC timer. The GT911 stays on and in its normal mode. The panel
    is off after each render.
-5. A touch wake, or a timer wake at the time that the core asked for, is a real
+6. A touch wake, or a timer wake at the time that the core asked for, is a real
    wake. After a touch wake, the display task reads the point (the GT911 holds it
    while INT is low) and sends it as a tap. The shell answers `Sleep` with
    `Wake::Touch` and the control at the point, and the core acts on the control. A
    service call waits until MQTT connects again. If the task cannot read the point,
-   it answers `Wake::Touch(None)`, and the touch only wakes the device. A timer wake
+   it answers `Wake::Touch(None)`. The touch then wakes the device and turns the
+   front light on, but it does not act on a control. A timer wake
    sends `Signal::Woke`. After another wake
    (for example a sleep that the hardware rejects), the chip sleeps again after
    3 seconds. In that time, a tap or a change of the power source also answers
    `Sleep`.
-6. The RTC timer also wakes the chip each 60 seconds for a check of the power source.
+7. The RTC timer also wakes the chip each 60 seconds for a check of the power source.
    The display task reads only the charger, with no Wi-Fi. If the source is new, the
    task reads it again after 1 second. If the second read agrees, the shell sends
    `PowerSourceChanged` and answers `Sleep` with `Wake::PowerSource`. Otherwise the
@@ -85,6 +94,13 @@ and each step waits for the answer of the firmware:
 
 Light sleep keeps the RAM and the PSRAM, so the core and the panel image stay, and a
 wake needs no full refresh.
+
+The LEDC of the front light stops in light sleep, and its pin keeps its level. Thus,
+before each sleep, the display task first sets the newest `FrontLight` job that waits.
+Then it always sets the duty to 0, and waits 2 ms (two PWM periods) for the LEDC to
+use the new duty. The core turns the light off
+before `Sleep`, so this is only a guard. If the guard turns the light off, the log
+shows `light: on at the sleep, so the light goes off`.
 
 `esp-hal` moves the system timer forward by the time asleep, so `Instant` and the
 timers of the core stay correct. The alarm of the scheduler (`TIMG0`) does not run in
@@ -100,6 +116,24 @@ vendor (`docs/pinmap.md`, branch `H752-01`) shows no path from the BQ25896 INT p
 a GPIO. The inputs of the PCA9535 (its INT is on GPIO38) are the button, the power
 good and the INT of the TPS65185. Thus the check of the power source each 60 seconds
 sees the stand, or a tap wakes the device first.
+
+### Front light
+
+GPIO11 (`PIN_BL_EN` in `docs/pinmap.md`, branch `H752-01`) drives the EN pin of the
+PT4103 LED boost driver. The duty of a PWM signal sets the brightness: 0% is off and
+100% is full current. The PT4103 needs a PWM frequency of 1 kHz or less.
+`src/light.rs` uses the LEDC low-speed timer 0 at 1 kHz, with a duty of 10 bits, on
+channel 0.
+
+The core owns the policy (`shared/src/features/light.rs`). A touch turns the light on
+at 60% on the stand or 25% on battery. The light goes off 20 seconds after the last
+touch. If the light is still on at a sleep, the core turns it off before the other
+steps of the sleep. The firmware only sets the level of each `FrontLight` job.
+
+The display task owns the light, because it must turn the light off before each light
+sleep. It sets the level at the start of each pass of its loop, before a render. Thus
+the light goes on before the refresh after a tap, not after it. If the panel does not
+start, no display task runs, and the core task answers each `FrontLight` job itself.
 
 The second binary, `bringup`, runs the hardware checks for a new board.
 
@@ -361,3 +395,21 @@ the drain. To measure the drain:
    the battery.
 
 For a direct value, put a meter in series with the battery.
+
+## Front light check
+
+1. On the stand, tap the panel. The panel lights. The log shows `light: 60%`.
+2. Tap an empty area of the panel. The light also goes on.
+3. Do not touch the panel for 20 seconds. The light goes off, and the log shows
+   `light: 0%`.
+4. Look for flicker at 1 kHz. Do not increase `FREQUENCY_HZ` in `src/light.rs`
+   above 1 kHz, because the PT4103 needs 1 kHz or less.
+5. If the light is too bright or too dim, change `STAND_LEVEL` or `BATTERY_LEVEL`
+   in `shared/src/features/light.rs`.
+6. Disconnect USB and tap the panel. The light is dimmer (25%).
+7. Do not touch the panel for 30 seconds. The light goes off at 20 seconds, and the
+   panel shows "Asleep" at 30 seconds. In a dark room, make sure that the light stays
+   off while the device sleeps.
+8. Tap a room button. The light goes on, and the panel shows that room.
+9. While the light is on, put the device on the stand. The light changes to the
+   level of the stand.

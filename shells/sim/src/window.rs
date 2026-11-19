@@ -52,6 +52,10 @@ const LIVE_COLOR: Color32 = Color32::from_rgb(0xD0, 0x20, 0x20);
 const LIVE_BORDER: f32 = 4.0;
 /// The colour around the panel.
 const BACKGROUND: Color32 = Color32::from_gray(0x30);
+/// The warm colour of the front light.
+const LIGHT_COLOR: (u8, u8, u8) = (0xFF, 0xC0, 0x60);
+/// The opacity of the tint of the front light at 100%, from 0 to 255.
+const LIGHT_MAX_ALPHA: u32 = 140;
 
 /// Opens the window, starts the core and runs until the user quits.
 ///
@@ -117,6 +121,8 @@ struct App {
     texture: Option<TextureHandle>,
     /// The image version and the flash state of the texture.
     uploaded: Option<(u64, bool)>,
+    /// The level of the front light in the last frame, in percent.
+    light: u8,
     /// The guard on the switch from a dry run to live service calls.
     live: LiveGuard,
     view_text: ViewText,
@@ -225,6 +231,7 @@ impl App {
             show_outline: false,
             texture: None,
             uploaded: None,
+            light: 0,
             live: LiveGuard::default(),
             view_text: ViewText::default(),
             hide_routine: true,
@@ -234,11 +241,18 @@ impl App {
     }
 
     /// Draws the view if the core asked for a render, and asks for a repaint
-    /// at the end of a flash.
+    /// at the end of a flash. Also asks for a repaint if the level of the
+    /// front light changed, because a tap can change the light with no
+    /// render.
     fn refresh(&mut self, ctx: &Context) {
         let now = Instant::now();
         if self.shell.take_render() {
             self.screen.show(&self.shell.view(), now);
+            ctx.request_repaint();
+        }
+        let light = self.shell.light();
+        if light != self.light {
+            self.light = light;
             ctx.request_repaint();
         }
         let flash = self.screen.flash();
@@ -344,6 +358,7 @@ impl App {
 
     /// Shows the panel at an integer scale in a scroll area. A click is a
     /// touch. While the shell is live, a red border is round the panel.
+    /// While the front light is on, a warm tint is over the panel.
     fn panel(&mut self, ui: &mut Ui, view: &ViewModel) {
         let texture = self.texture(ui.ctx());
         let pixels_per_point = ui.ctx().pixels_per_point();
@@ -384,6 +399,9 @@ impl App {
             let painter = ui.painter();
             let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
             painter.image(texture, rect, uv, Color32::WHITE);
+            if let Some(tint) = light_tint(self.shell.light()) {
+                painter.rect_filled(rect, 0.0, tint);
+            }
             if let Some(changed) = outline {
                 let outline = outline_rect(changed, rect.min, viewport.scale, pixels_per_point);
                 painter.rect_stroke(
@@ -491,7 +509,7 @@ impl App {
         } else if view.asleep {
             "The device is asleep."
         } else {
-            "No idle timer runs."
+            "The device cannot sleep now."
         };
         let clicked = ui
             .add_enabled(enabled, egui::Button::new("Sleep now (Z)"))
@@ -688,6 +706,18 @@ fn rows(ui: &mut Ui, id: &str, count: usize, mut row: impl FnMut(&mut Ui, usize)
         });
 }
 
+/// Returns the tint of the front light at `level` percent, or `None` if the
+/// light is off. A higher level gives a stronger tint.
+fn light_tint(level: u8) -> Option<Color32> {
+    if level == 0 {
+        return None;
+    }
+    let alpha = u32::from(level.min(100)) * LIGHT_MAX_ALPHA / 100;
+    let alpha = u8::try_from(alpha).unwrap_or(u8::MAX);
+    let (red, green, blue) = LIGHT_COLOR;
+    Some(Color32::from_rgba_unmultiplied(red, green, blue, alpha))
+}
+
 /// Converts a position in the window to a point on the panel, or `None` if
 /// the position is not on the panel. The top left of the panel is at
 /// `origin`, and each panel pixel is `scale` screen pixels wide. Both
@@ -737,6 +767,17 @@ fn outline_rect(area: Rectangle, origin: Pos2, scale: u32, pixels_per_point: f32
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_tint_of_the_front_light_is_stronger_at_a_higher_level() {
+        use shared::features::light::{BATTERY_LEVEL, STAND_LEVEL};
+
+        assert_eq!(super::light_tint(0), None);
+        let battery = super::light_tint(BATTERY_LEVEL).unwrap();
+        let stand = super::light_tint(STAND_LEVEL).unwrap();
+        assert!(battery.a() < stand.a());
+        assert!(super::light_tint(100).unwrap().a() >= stand.a());
+    }
+
     use eframe::egui::{Pos2, Rect, Vec2};
     use embedded_graphics::{prelude::*, primitives::Rectangle};
 

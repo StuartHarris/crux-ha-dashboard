@@ -15,6 +15,11 @@
 //! sends each change to the core (`logic::power::PowerMonitor`). The task
 //! only reads these chips. It never writes to them.
 //!
+//! The task also sets the front light ([`Light`]). The core task writes each
+//! `FrontLight` job in [`LIGHT`]. The task sets the level at the start of
+//! the next pass of its loop, before a render, and answers with
+//! `Signal::Light`.
+//!
 //! The task also runs the `Sleep` job, because it owns the INT pin of the
 //! touch controller and the I2C bus. The core sends `Sleep` only after the
 //! MQTT connection closed and the radio is off. The core task writes the job
@@ -23,7 +28,10 @@
 
 use core::mem;
 
-use dashboard_firmware::panel::{Area, Panel};
+use dashboard_firmware::{
+    light::FrontLight,
+    panel::{Area, Panel},
+};
 use embassy_futures::select::{Either3, select3};
 use embassy_time::{Duration, Instant, Timer};
 use embedded_graphics::{prelude::Point, primitives::Rectangle};
@@ -49,7 +57,7 @@ use logic::{
 use shared::{Event, PowerSource, ViewModel, capabilities::power::Wake};
 use ui::{Framebuffer, Refresh, Refresher};
 
-use crate::{RENDER, SIGNALS, SLEEP};
+use crate::{LIGHT, RENDER, SIGNALS, SLEEP};
 
 /// The time between two reads of the touch controller.
 const TOUCH_POLL: Duration = Duration::from_millis(30);
@@ -68,9 +76,17 @@ struct Frames {
     refresher: Refresher,
 }
 
-/// `source` is the power source that the core got in `Start`.
+/// `source` is the power source that the core got in `Start`. If `light` is
+/// `None`, the front light did not start. The task then answers each
+/// `FrontLight` job, but it does not set a level.
 #[embassy_executor::task]
-pub async fn task(mut panel: Panel<'static>, source: PowerSource, mut sleep: Sleep) {
+pub async fn task(
+    mut panel: Panel<'static>,
+    source: PowerSource,
+    mut sleep: Sleep,
+    light: Option<FrontLight>,
+) {
+    let mut light = Light(light);
     let mut touch = Touch::default();
     let mut power = Power::new(source, sleep.fixed_source);
     let mut frames = Frames {
@@ -79,7 +95,11 @@ pub async fn task(mut panel: Panel<'static>, source: PowerSource, mut sleep: Sle
         refresher: Refresher::default(),
     };
     loop {
-        match select3(RENDER.wait(), SLEEP.wait(), Timer::after(TOUCH_POLL)).await {
+        let next = select3(RENDER.wait(), SLEEP.wait(), Timer::after(TOUCH_POLL)).await;
+        // A tap gives a `FrontLight` job and a render together. The light
+        // goes on first, because a refresh takes up to about two seconds.
+        light.poll();
+        match next {
             Either3::First(view) => render(&mut panel, &mut frames, &view).await,
             Either3::Second(job) => sleep.set_job(job),
             Either3::Third(()) => {
@@ -93,7 +113,40 @@ pub async fn task(mut panel: Panel<'static>, source: PowerSource, mut sleep: Sle
         power.poll(&mut panel);
         // A view model that waits blocks the sleep, so the last image
         // before `Sleep` is on the panel first.
-        sleep.poll(&mut panel, &mut touch, &mut power);
+        sleep.poll(&mut panel, &mut touch, &mut power, &mut light);
+    }
+}
+
+/// The front light, or `None` if it did not start.
+struct Light(Option<FrontLight>);
+
+impl Light {
+    /// Sets the level of the newest `FrontLight` job that waits, and answers
+    /// the jobs that wait. The answer for the newest job is also for the
+    /// older jobs.
+    ///
+    /// The task answers also if it cannot set the level, because the core
+    /// waits for the answer before the steps of a sleep.
+    fn poll(&mut self) {
+        let Some(&(token, level)) = LIGHT.take_all().last() else {
+            return;
+        };
+        match &mut self.0 {
+            Some(light) => match light.set(level) {
+                Ok(()) => log::info!("light: {level}%"),
+                Err(error) => log::warn!("light: cannot set the level {level}% ({error:?})"),
+            },
+            None => log::warn!("light: the light did not start, so the level {level}% is not set"),
+        }
+        SIGNALS.push(Signal::Light { token });
+    }
+
+    /// Turns the light off before a light sleep. Refer to
+    /// [`FrontLight::off_for_sleep`].
+    fn off_for_sleep(&mut self) {
+        if let Some(light) = &mut self.0 {
+            light.off_for_sleep();
+        }
     }
 }
 
@@ -105,6 +158,11 @@ pub async fn task(mut panel: Panel<'static>, source: PowerSource, mut sleep: Sle
 /// forward by the time asleep, so `Instant` and the running timers stay
 /// correct. The alarm of the scheduler (`TIMG0`) stops in the sleep, so the
 /// task arms it again after the wake.
+///
+/// The LEDC of the front light also stops in the sleep, and the pin keeps
+/// its level. Thus, before each sleep, the task sets the newest
+/// `FrontLight` job that waits, then sets the duty to 0. The core turns the
+/// light off before `Sleep`, so this is a guard.
 ///
 /// A wake by the INT pin, or by the RTC timer at the deadline of the core, is
 /// a real wake. After a touch wake, the task reads the point and sends it as
@@ -149,7 +207,13 @@ impl Sleep {
     /// ended, and nothing blocks the sleep (`logic::sleep::Readiness`). It
     /// does not wait for a blocker, so the touch poll and the renders
     /// continue, and the task tries again on its next pass.
-    fn poll(&mut self, panel: &mut Panel<'static>, touch: &mut Touch, power: &mut Power) {
+    fn poll(
+        &mut self,
+        panel: &mut Panel<'static>,
+        touch: &mut Touch,
+        power: &mut Power,
+        light: &mut Light,
+    ) {
         let now = now_ms();
         let Some(requested) = self.job.filter(|_| self.sleeper.can_sleep(now)) else {
             self.sleeper.unblocked();
@@ -174,6 +238,11 @@ impl Sleep {
         self.sleeper.unblocked();
         let seconds = self.sleeper.timer_seconds(now);
         log::debug!("power: light sleep, wake on {plan:?}, timer {seconds} s");
+        // The core turned the light off before `Sleep`. This is a guard. A
+        // `FrontLight` job can arrive after the poll at the start of this
+        // pass, so the task sets that level first.
+        light.poll();
+        light.off_for_sleep();
         let started = Instant::now();
         let cause = self.sleep(panel, plan, seconds);
         let slept = Instant::now().duration_since(started).as_millis();
@@ -203,7 +272,7 @@ impl Sleep {
                     log::info!("touch: wake tap at ({}, {})", point.x, point.y);
                     SIGNALS.push(Signal::Tap(point));
                 } else {
-                    log::info!("touch: no point after the wake, so the touch only wakes");
+                    log::info!("touch: no point after the wake, so the touch acts on no control");
                     SIGNALS.push(Signal::Woke(Wake::Touch(None)));
                 }
             }

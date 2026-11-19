@@ -41,7 +41,8 @@ pub enum Wake {
     /// [`Event::Tapped`](crate::Event::Tapped). The last image shows the
     /// page and its controls, so the touch wakes the device and also acts
     /// as a tap. If the shell cannot read the point, it answers `None`, and
-    /// the touch only wakes the device.
+    /// the touch wakes the device and turns the front light on, but it does
+    /// not act on a control.
     Touch(Option<Control>),
     /// The timer of [`WakeSource::Timer`] expired.
     Timer,

@@ -6,14 +6,14 @@ use core::time::Duration;
 use crux_core::App;
 
 use super::{
-    ExpectFullRefreshTimer, ExpectServiceCall,
+    ExpectFullRefreshTimer, ExpectLight, ExpectServiceCall,
     connection::{drive_to_connected, drive_to_connecting},
     set_state, start_at, tap_all_lights, tap_brighter, tap_dimmer, tap_room, tap_scene, tap_tile,
 };
 use crate::{
     Control, Dashboard, EffectTestExt, Event, Model, PowerSource, Route, TileState,
     capabilities::mqtt::Qos,
-    features::{connection::Link, pending::QUEUED_TIMEOUT},
+    features::{connection::Link, light::STAND_LEVEL, pending::QUEUED_TIMEOUT},
     view::LightState,
 };
 
@@ -92,6 +92,7 @@ fn a_tap_on_a_light_publishes_a_toggle() {
     model.route = Route::room("living_room");
 
     app.update(tap_tile(1), &mut model)
+        .expect_touch_light(STAND_LEVEL)
         .expect_only_service_call_with(|publish| {
             assert_eq!(publish.topic, "dashboard/hall/cmd");
             assert_eq!(
@@ -112,6 +113,7 @@ fn the_plus_and_minus_buttons_of_a_dimmable_light_publish_a_brightness_step() {
     set_state(&mut model, "light.living_room_rocket_lamp", "on");
 
     app.update(tap_brighter(1), &mut model)
+        .expect_touch_light(STAND_LEVEL)
         .expect_only_service_call_with(|publish| {
             assert_eq!(publish.topic, "dashboard/hall/cmd");
             assert_eq!(
@@ -124,6 +126,7 @@ fn the_plus_and_minus_buttons_of_a_dimmable_light_publish_a_brightness_step() {
     // The tile already has a mark, so the view does not change and the core
     // does not draw. The call still goes, with a new timer.
     app.update(tap_dimmer(1), &mut model)
+        .expect_light_timer()
         .expect_mqtt_publish_with(|publish| {
             assert_eq!(
                 publish.payload,
@@ -134,6 +137,7 @@ fn the_plus_and_minus_buttons_of_a_dimmable_light_publish_a_brightness_step() {
         .expect_no_effects();
     // A light group is dimmable too.
     app.update(tap_dimmer(0), &mut model)
+        .expect_light_timer()
         .expect_only_service_call_with(|publish| {
             assert_eq!(
                 publish.payload,
@@ -162,15 +166,19 @@ fn a_brightness_step_on_a_tile_that_is_not_a_dimmable_light_does_nothing() {
     }
 
     // The index page has no tiles.
-    app.update(tap_brighter(0), &mut model).expect_no_effects();
+    app.update(tap_brighter(0), &mut model)
+        .expect_touch_light(STAND_LEVEL)
+        .expect_no_effects();
 
     // The candle lights are on/off lights. The thermostat and the humidity
     // sensor are not lights, and the page has no tile 6.
     model.route = Route::room("dining_room");
     for index in [2, 3, 4, 5, 6] {
         app.update(tap_brighter(index), &mut model)
+            .expect_light_timer()
             .expect_no_effects();
         app.update(tap_dimmer(index), &mut model)
+            .expect_light_timer()
             .expect_no_effects();
     }
 
@@ -178,13 +186,18 @@ fn a_brightness_step_on_a_tile_that_is_not_a_dimmable_light_does_nothing() {
     model.route = Route::room("hall");
     for index in [2, 3] {
         app.update(tap_brighter(index), &mut model)
+            .expect_light_timer()
             .expect_no_effects();
     }
 
     // The coffee machine is a switch.
     model.route = Route::room("kitchen");
-    app.update(tap_brighter(0), &mut model).expect_no_effects();
-    app.update(tap_dimmer(0), &mut model).expect_no_effects();
+    app.update(tap_brighter(0), &mut model)
+        .expect_light_timer()
+        .expect_no_effects();
+    app.update(tap_dimmer(0), &mut model)
+        .expect_light_timer()
+        .expect_no_effects();
     assert_eq!(model.connection.outbox.len(), 0);
 }
 
@@ -204,11 +217,14 @@ fn a_plus_step_on_a_light_at_full_brightness_does_nothing_and_a_minus_step_dims_
 
     // Home Assistant does nothing for the step, so the core sends no call
     // and gives no mark.
-    app.update(tap_brighter(1), &mut model).expect_no_effects();
+    app.update(tap_brighter(1), &mut model)
+        .expect_touch_light(STAND_LEVEL)
+        .expect_no_effects();
     assert!(model.pending.marks.is_empty());
     assert_eq!(app.view(&model).tiles()[1].state, TileState::On);
 
     app.update(tap_dimmer(1), &mut model)
+        .expect_light_timer()
         .expect_only_service_call_with(|publish| {
             assert_eq!(
                 publish.payload,
@@ -224,8 +240,11 @@ fn a_minus_step_on_a_light_that_is_off_does_nothing_and_a_plus_step_turns_it_on(
     model.route = Route::room("living_room");
     set_state(&mut model, "light.living_room_rocket_lamp", "off");
 
-    app.update(tap_dimmer(1), &mut model).expect_no_effects();
+    app.update(tap_dimmer(1), &mut model)
+        .expect_touch_light(STAND_LEVEL)
+        .expect_no_effects();
     app.update(tap_brighter(1), &mut model)
+        .expect_light_timer()
         .expect_only_service_call_with(|publish| {
             assert_eq!(
                 publish.payload,
@@ -241,19 +260,28 @@ fn a_brightness_step_on_a_light_with_no_usable_state_does_nothing() {
     model.route = Route::room("living_room");
 
     // The core has no state for the rocket lamp yet.
-    app.update(tap_brighter(1), &mut model).expect_no_effects();
-    app.update(tap_dimmer(1), &mut model).expect_no_effects();
+    app.update(tap_brighter(1), &mut model)
+        .expect_touch_light(STAND_LEVEL)
+        .expect_no_effects();
+    app.update(tap_dimmer(1), &mut model)
+        .expect_light_timer()
+        .expect_no_effects();
 
     for state in ["unavailable", "unknown"] {
         set_state(&mut model, "light.living_room_rocket_lamp", state);
-        app.update(tap_brighter(1), &mut model).expect_no_effects();
-        app.update(tap_dimmer(1), &mut model).expect_no_effects();
+        app.update(tap_brighter(1), &mut model)
+            .expect_light_timer()
+            .expect_no_effects();
+        app.update(tap_dimmer(1), &mut model)
+            .expect_light_timer()
+            .expect_no_effects();
     }
     assert_eq!(model.connection.outbox.len(), 0);
 
     // A tap on the tile still sends the toggle, as for an on/off light. The
     // tile is not on or off, so it does not show the mark.
     app.update(tap_tile(1), &mut model)
+        .expect_light_timer()
         .expect_mqtt_publish()
         .expect_pending_timer();
     assert_eq!(app.view(&model).tiles()[1].state, TileState::Unknown);
@@ -266,6 +294,7 @@ fn a_toggle_has_no_brightness_step() {
     model.route = Route::room("living_room");
 
     app.update(tap_tile(1), &mut model)
+        .expect_touch_light(STAND_LEVEL)
         .expect_only_service_call_with(|publish| {
             let payload = core::str::from_utf8(&publish.payload).unwrap();
             assert!(!payload.contains("brightness_step_pct"), "{payload}");
@@ -280,6 +309,7 @@ fn a_tap_on_a_switch_publishes_a_toggle() {
 
     // Tile 0 is the lights, and tile 1 is the coffee machine.
     app.update(tap_tile(1), &mut model)
+        .expect_touch_light(STAND_LEVEL)
         .expect_only_service_call_with(|publish| {
             assert_eq!(
                 publish.payload,
@@ -295,6 +325,7 @@ fn a_tap_on_a_scene_publishes_scene_turn_on() {
     model.route = Route::room("hall");
 
     app.update(tap_scene(2), &mut model)
+        .expect_touch_light(STAND_LEVEL)
         .expect_only_service_call_with(|publish| {
             assert_eq!(publish.topic, "dashboard/hall/cmd");
             assert_eq!(
@@ -310,15 +341,27 @@ fn a_tap_on_a_sensor_climate_or_weather_tile_or_outside_the_grid_does_nothing() 
     let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Stand);
 
     // The index page has no tiles and no scenes.
-    app.update(tap_tile(0), &mut model).expect_no_effects();
-    app.update(tap_tile(1), &mut model).expect_no_effects();
-    app.update(tap_scene(0), &mut model).expect_no_effects();
+    app.update(tap_tile(0), &mut model)
+        .expect_touch_light(STAND_LEVEL)
+        .expect_no_effects();
+    app.update(tap_tile(1), &mut model)
+        .expect_light_timer()
+        .expect_no_effects();
+    app.update(tap_scene(0), &mut model)
+        .expect_light_timer()
+        .expect_no_effects();
 
     model.route = Route::room("dining_room");
     // The thermostat and the humidity sensor.
-    app.update(tap_tile(4), &mut model).expect_no_effects();
-    app.update(tap_tile(5), &mut model).expect_no_effects();
-    app.update(tap_tile(6), &mut model).expect_no_effects();
+    app.update(tap_tile(4), &mut model)
+        .expect_light_timer()
+        .expect_no_effects();
+    app.update(tap_tile(5), &mut model)
+        .expect_light_timer()
+        .expect_no_effects();
+    app.update(tap_tile(6), &mut model)
+        .expect_light_timer()
+        .expect_no_effects();
 }
 
 #[test]
@@ -329,6 +372,7 @@ fn a_tap_before_the_connection_opens_waits_in_the_outbox_and_goes_first() {
     // The connection is starting, so the core only starts the timeout of the
     // outbox. The toggle has no state, so it does not show the mark.
     app.update(tap_all_lights(), &mut model)
+        .expect_touch_light(STAND_LEVEL)
         .expect_only_time_notify_after_with(|notify| {
             assert_eq!(Duration::from(notify.duration), QUEUED_TIMEOUT);
         });
@@ -373,10 +417,18 @@ fn a_tap_in_a_dry_run_sends_no_service_call() {
     set_state(&mut model, "light.hall_hall_light", "on");
     assert!(app.view(&model).read_only);
 
-    app.update(tap_tile(0), &mut model).expect_no_effects();
-    app.update(tap_scene(2), &mut model).expect_no_effects();
-    app.update(tap_brighter(1), &mut model).expect_no_effects();
-    app.update(tap_dimmer(1), &mut model).expect_no_effects();
+    app.update(tap_tile(0), &mut model)
+        .expect_touch_light(STAND_LEVEL)
+        .expect_no_effects();
+    app.update(tap_scene(2), &mut model)
+        .expect_light_timer()
+        .expect_no_effects();
+    app.update(tap_brighter(1), &mut model)
+        .expect_light_timer()
+        .expect_no_effects();
+    app.update(tap_dimmer(1), &mut model)
+        .expect_light_timer()
+        .expect_no_effects();
     assert_eq!(model.connection.outbox.len(), 0);
 }
 
@@ -386,7 +438,9 @@ fn a_tap_in_a_dry_run_before_the_connection_opens_is_not_kept() {
     let (mut model, _cmd, _request) = drive_to_connecting(PowerSource::Stand);
     let _ = app.update(Event::SetReadOnly(true), &mut model);
 
-    app.update(tap_all_lights(), &mut model).expect_no_effects();
+    app.update(tap_all_lights(), &mut model)
+        .expect_touch_light(STAND_LEVEL)
+        .expect_no_effects();
     assert_eq!(model.connection.outbox.len(), 0);
 }
 
@@ -403,12 +457,15 @@ fn set_read_only_changes_the_view_and_the_next_tap() {
     // The same value again changes nothing.
     app.update(Event::SetReadOnly(true), &mut model)
         .expect_no_effects();
-    app.update(tap_all_lights(), &mut model).expect_no_effects();
+    app.update(tap_all_lights(), &mut model)
+        .expect_touch_light(STAND_LEVEL)
+        .expect_no_effects();
 
     app.update(Event::SetReadOnly(false), &mut model)
         .expect_only_render();
     assert!(!app.view(&model).read_only);
     app.update(tap_all_lights(), &mut model)
+        .expect_light_timer()
         .expect_only_service_call();
 }
 
@@ -470,27 +527,32 @@ fn a_tap_on_a_navigation_button_turns_the_page() {
     let count = model.pages.len();
 
     app.update(Event::Tapped(Some(Control::NextPage)), &mut model)
+        .expect_touch_light(STAND_LEVEL)
         .expect_render()
         .expect_full_refresh_timer();
     assert_eq!(app.view(&model).page_index, 1);
     app.update(Event::Tapped(Some(Control::PreviousPage)), &mut model)
+        .expect_light_timer()
         .expect_render()
         .expect_full_refresh_timer();
     app.update(Event::Tapped(Some(Control::PreviousPage)), &mut model)
+        .expect_light_timer()
         .expect_render()
         .expect_full_refresh_timer();
     assert_eq!(app.view(&model).page_index, count - 1);
     app.update(Event::Tapped(Some(Control::Home)), &mut model)
+        .expect_light_timer()
         .expect_render()
         .expect_full_refresh_timer();
     assert_eq!(app.view(&model).path, "/");
 }
 
 #[test]
-fn a_tap_on_no_control_changes_nothing_while_awake() {
+fn a_tap_on_no_control_while_awake_only_turns_the_light_on() {
     let app = Dashboard;
     let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Stand);
     app.update(Event::Tapped(None), &mut model)
+        .expect_touch_light(STAND_LEVEL)
         .expect_no_effects();
 }
 
@@ -501,6 +563,7 @@ fn a_tap_on_a_room_button_shows_the_room() {
 
     // The rooms are the pages after the home page, in order.
     app.update(tap_room(7), &mut model)
+        .expect_touch_light(STAND_LEVEL)
         .expect_render()
         .expect_full_refresh_timer();
     let view = app.view(&model);
@@ -515,7 +578,9 @@ fn a_tap_on_a_room_button_shows_the_room() {
 fn a_room_button_that_the_index_does_not_have_does_nothing() {
     let app = Dashboard;
     let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Stand);
-    app.update(tap_room(9), &mut model).expect_no_effects();
+    app.update(tap_room(9), &mut model)
+        .expect_touch_light(STAND_LEVEL)
+        .expect_no_effects();
     assert_eq!(model.route, Route::Home);
 }
 
@@ -525,6 +590,7 @@ fn a_tap_on_all_lights_publishes_a_toggle() {
     let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Stand);
     set_state(&mut model, "light.all_lights", "on");
     app.update(tap_all_lights(), &mut model)
+        .expect_touch_light(STAND_LEVEL)
         .expect_only_service_call_with(|publish| {
             assert_eq!(publish.topic, "dashboard/hall/cmd");
             assert_eq!(
@@ -594,6 +660,7 @@ fn the_all_lights_toggle_shows_and_toggles_the_same_tile() {
     let shown = &view.index().unwrap().all_lights.as_ref().unwrap().entity_id;
     assert_eq!(shown, "switch.fan");
     app.update(tap_all_lights(), &mut model)
+        .expect_touch_light(STAND_LEVEL)
         .expect_only_service_call_with(|publish| {
             assert_eq!(
                 publish.payload,

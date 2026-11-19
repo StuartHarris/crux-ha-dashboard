@@ -3,9 +3,11 @@
 //! The core builds without std when you turn off the `std` feature.
 //!
 //! - [`app`] is the root: the events, the effects, the model and the dispatch.
-//! - [`features`] has the logic for rooms, the connection, power, the
-//!   refresh of the panel and the marks of taps that wait for Home Assistant.
-//! - [`capabilities`] has the custom effects: MQTT, network and power.
+//! - [`features`] has the logic for rooms, the connection, power, the front
+//!   light, the refresh of the panel and the marks of taps that wait for
+//!   Home Assistant.
+//! - [`capabilities`] has the custom effects: MQTT, network, power and the
+//!   front light.
 //! - [`view`] makes the view model, which has all the text that the `ui`
 //!   crate draws.
 //! - [`summary`] makes the summary of each room on the index page.

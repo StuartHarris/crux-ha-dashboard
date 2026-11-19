@@ -8,6 +8,7 @@ use crate::{
     capabilities::mqtt::{Publish, Qos},
     features::{
         connection::{self, Call},
+        light,
         pending::{self, Confirm},
         power,
         refresh::redraw,
@@ -49,7 +50,9 @@ pub fn tapped(control: Option<Control>, model: &mut Model) -> Cmd {
         let wake = power::wake_up(model);
         return wake.and(tapped(control, model));
     }
-    match control {
+    // Each touch turns the front light on, also a touch on no control.
+    let light = light::touched(model);
+    let action = match control {
         None => Cmd::done(),
         Some(Control::PreviousPage) => turn_page(model, false),
         Some(Control::Home) => navigate(Route::Home, model),
@@ -60,7 +63,8 @@ pub fn tapped(control: Option<Control>, model: &mut Model) -> Cmd {
         Some(Control::Room(index)) => room_tapped(index, model),
         Some(Control::Brighter(index)) => step_tapped(index, BRIGHTNESS_STEP_PCT, model),
         Some(Control::Dimmer(index)) => step_tapped(index, -BRIGHTNESS_STEP_PCT, model),
-    }
+    };
+    light.and(action)
 }
 
 /// Shows the page at `route`. The core ignores a route that has no page,

@@ -102,6 +102,17 @@ fn tile(label: &str, state: TileState, text: &str) -> (String, TileState, String
     (label.into(), state, text.into())
 }
 
+/// Returns the ids of the idle timers that sent `events`, in order.
+fn idle_timeouts(events: &[Event]) -> Vec<u32> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Event::IdleTimeout(id) => Some(*id),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Returns the number of times that `effect` is in `log`.
 fn count(log: &[String], effect: &str) -> usize {
     log.iter().filter(|entry| *entry == effect).count()
@@ -179,13 +190,18 @@ fn on_the_stand_the_dashboard_shows_live_state_and_controls_lights() {
     // A scene has no state that confirms it, so its mark stays for a short
     // time.
     assert!(shell.view().scenes()[1].pending);
-    assert_eq!(shell.timers(), [SCENE_TIMEOUT]);
-    shell.fire_timers();
+    let events = shell.advance(SCENE_TIMEOUT);
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, Event::PendingTimeout(_))),
+        "{events:?}"
+    );
     assert!(!shell.view().scenes()[1].pending);
 
-    // On the stand nothing sleeps, and no timer other than the full-refresh
-    // timer runs.
-    assert_eq!(shell.timers(), []);
+    // On the stand nothing sleeps, and no idle timer runs.
+    let events = shell.advance(IDLE_TIMEOUT);
+    assert_eq!(idle_timeouts(&events), [] as [u32; 0]);
     assert_eq!(shell.sleep, None);
 }
 
@@ -194,7 +210,6 @@ fn on_battery_the_dashboard_wakes_syncs_accepts_taps_then_sleeps() {
     let mut shell = house();
 
     shell.send(start_at(PowerSource::Battery, Some("/room/dining_room")));
-    assert_eq!(shell.timers(), [IDLE_TIMEOUT]);
     assert_eq!(shell.view().tiles()[4].text, "19.5°");
     assert_eq!(shell.view().tiles()[4].detail, "Set 21°");
 
@@ -209,17 +224,24 @@ fn on_battery_the_dashboard_wakes_syncs_accepts_taps_then_sleeps() {
         Some("on")
     );
     assert_eq!(shell.view().tiles()[1].text, "On");
-    // The tap restarted the idle timer. The first timer is now stale.
-    assert_eq!(shell.timers(), [IDLE_TIMEOUT, IDLE_TIMEOUT]);
 
+    // The tap started the light timer and the idle timer again. The idle
+    // timer of the start is now stale.
     shell.take_log();
-    shell.fire_timers();
+    let events = shell.advance(IDLE_TIMEOUT);
+    let idle = events
+        .iter()
+        .filter(|event| matches!(event, Event::IdleTimeout(_)))
+        .count();
+    assert_eq!(idle, 2, "{events:?}");
 
     // The last image shows the time of the last update from Home Assistant.
     assert_eq!(
         shell.take_log(),
         [
-            // Each step waits for the answer of the shell.
+            // The light timer turned the light off before the idle timeout.
+            "FrontLight 0",
+            // Each step of the sleep waits for the answer of the shell.
             "MqttPublish dashboard/hall/status asleep",
             "MqttDisconnect",
             "WifiOff",
@@ -245,14 +267,13 @@ fn on_battery_the_dashboard_wakes_syncs_accepts_taps_then_sleeps() {
     assert_eq!(last.connection, Connection::Offline);
     assert_eq!(last.updated, "Last changed 09:41");
     assert_eq!(last.path, "/room/dining_room");
-    assert_eq!(shell.timers().len(), 0);
 }
 
 #[test]
 fn a_battery_wake_shows_the_changes_from_while_it_slept() {
     let mut shell = house();
     shell.send(start(PowerSource::Battery));
-    shell.fire_timers();
+    shell.advance(IDLE_TIMEOUT);
     assert!(shell.model.power.asleep);
 
     shell.broker.time += 3600;
@@ -273,7 +294,7 @@ fn a_battery_wake_shows_the_changes_from_while_it_slept() {
     assert_eq!(weather_detail(&shell), "Sunny");
 
     assert_eq!(shell.view().updated, "Last changed 10:41");
-    shell.fire_timers();
+    shell.advance(IDLE_TIMEOUT);
     assert!(shell.view().asleep);
     assert_eq!(
         shell.frames.last().unwrap().view.updated,
@@ -285,7 +306,7 @@ fn a_battery_wake_shows_the_changes_from_while_it_slept() {
 fn a_move_to_the_stand_while_asleep_connects_and_stays_awake() {
     let mut shell = house();
     shell.send(start(PowerSource::Battery));
-    shell.fire_timers();
+    shell.advance(IDLE_TIMEOUT);
     assert!(shell.model.power.asleep);
 
     shell.send(Event::PowerSourceChanged(PowerSource::Stand));
@@ -295,7 +316,10 @@ fn a_move_to_the_stand_while_asleep_connects_and_stays_awake() {
         shell.broker.retained("dashboard/hall/status"),
         Some("online")
     );
-    assert_eq!(shell.timers().len(), 0);
+    // On the stand, the device does not sleep again. No idle timer with the
+    // current id fires.
+    let events = shell.advance(IDLE_TIMEOUT);
+    assert!(!idle_timeouts(&events).contains(&shell.model.power.idle));
     assert!(!shell.view().asleep);
 }
 
@@ -303,13 +327,13 @@ fn a_move_to_the_stand_while_asleep_connects_and_stays_awake() {
 fn a_move_off_the_stand_sleeps_after_the_idle_timeout() {
     let mut shell = house();
     shell.send(start(PowerSource::Stand));
-    assert!(!shell.timers().contains(&IDLE_TIMEOUT));
+    shell.advance(IDLE_TIMEOUT);
+    assert_eq!(shell.sleep, None);
 
     shell.send(Event::PowerSourceChanged(PowerSource::Battery));
-    assert_eq!(shell.timers(), [IDLE_TIMEOUT]);
     assert!(shell.broker.is_connected());
 
-    shell.fire_timers();
+    shell.advance(IDLE_TIMEOUT);
     assert!(shell.sleep.is_some());
     assert!(!shell.wifi_on);
 }
@@ -318,10 +342,15 @@ fn a_move_off_the_stand_sleeps_after_the_idle_timeout() {
 fn a_move_to_the_stand_cancels_the_idle_timeout() {
     let mut shell = house();
     shell.send(start(PowerSource::Battery));
+    let idle = shell.model.power.idle;
 
+    // The move makes the idle timer of the start stale.
     shell.send(Event::PowerSourceChanged(PowerSource::Stand));
-    shell.fire_timers();
+    assert_ne!(shell.model.power.idle, idle);
 
+    // The stale timer fires, and the core ignores it.
+    let events = shell.advance(IDLE_TIMEOUT);
+    assert_eq!(idle_timeouts(&events), [idle]);
     assert_eq!(shell.sleep, None);
     assert!(shell.broker.is_connected());
 }
@@ -340,7 +369,6 @@ fn on_the_stand_a_lost_connection_reconnects_after_a_backoff() {
     let view = shell.view();
     assert_eq!(view.connection, Connection::Connecting);
     assert_eq!(view.updated, "Last changed 09:41");
-    assert_eq!(shell.timers(), [RECONNECT_MIN]);
 
     // While the dashboard is offline, Home Assistant changes a light two
     // minutes later.
@@ -349,7 +377,12 @@ fn on_the_stand_a_lost_connection_reconnects_after_a_backoff() {
 
     // The new connection gets the retained change and its time.
     shell.take_log();
-    shell.fire_shortest_timers();
+    let events = shell.advance(RECONNECT_MIN);
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, Event::Reconnect(_)))
+    );
     assert!(shell.broker.is_connected());
     assert_eq!(
         shell.broker.retained("dashboard/hall/status"),
@@ -366,10 +399,14 @@ fn while_the_broker_is_down_the_wait_doubles_up_to_a_limit() {
     shell.broker.down = true;
     shell.send(start(PowerSource::Stand));
 
+    // Only the reconnect timer and the full-refresh timer run, and the
+    // reconnect timer is due first.
     let mut waits = vec![];
     for _ in 0..9 {
-        waits.extend(shell.timers());
-        shell.fire_timers();
+        let before = shell.now();
+        let events = shell.advance_to_next();
+        assert!(matches!(events[..], [Event::Reconnect(_)]), "{events:?}");
+        waits.push(shell.now().saturating_sub(before));
     }
     let secs = |seconds| Duration::from_secs(seconds);
     assert_eq!(
@@ -387,8 +424,12 @@ fn while_the_broker_is_down_the_wait_doubles_up_to_a_limit() {
         ]
     );
 
+    // The next try after the longest wait connects.
     shell.broker.down = false;
-    shell.fire_timers();
+    let before = shell.now();
+    let events = shell.advance_to_next();
+    assert!(matches!(events[..], [Event::Reconnect(_)]), "{events:?}");
+    assert_eq!(shell.now().saturating_sub(before), RECONNECT_MAX);
     assert!(shell.broker.is_connected());
     assert_eq!(shell.model.connection.backoff, RECONNECT_MIN);
 }
@@ -404,8 +445,20 @@ fn taps_without_a_connection_are_sent_when_the_core_connects() {
     shell.send(tap_scene(0));
     assert_eq!(shell.broker.service_calls.len(), 0);
 
+    // Each tap also tried to connect, so some reconnect timers are stale.
+    // The reconnect timers fire in the order in which the core started
+    // them. A stale timer does nothing. The first live timer connects and
+    // sends the calls.
     shell.broker.down = false;
-    shell.fire_timers();
+    let mut fired = vec![];
+    while !shell.broker.is_connected() {
+        let events = shell.advance_to_next();
+        let [Event::Reconnect(id)] = events[..] else {
+            panic!("one reconnect timer: {events:?}");
+        };
+        fired.push(id);
+    }
+    assert!(fired.is_sorted(), "{fired:?}");
     let calls: Vec<_> = shell
         .broker
         .service_calls
@@ -427,10 +480,12 @@ fn wifi_that_fails_on_battery_wake_is_tried_again_until_the_device_sleeps() {
     let mut shell = house();
     shell.wifi_works = false;
     shell.send(start(PowerSource::Battery));
-    assert_eq!(shell.timers(), [IDLE_TIMEOUT, RECONNECT_MIN]);
     assert_eq!(shell.view().connection, Connection::Connecting);
 
-    shell.fire_timers();
+    // The core tries Wi-Fi again after each wait, until the idle timeout.
+    shell.take_log();
+    shell.advance(IDLE_TIMEOUT);
+    assert!(count(&shell.take_log(), "WifiOn") > 1);
     assert!(shell.sleep.is_some());
     // The core never connected, so it has no time of an update.
     assert_eq!(shell.view().updated, "");
@@ -438,10 +493,15 @@ fn wifi_that_fails_on_battery_wake_is_tried_again_until_the_device_sleeps() {
     // A reconnect timer from before the sleep is stale, so the device stays
     // asleep with Wi-Fi off.
     shell.take_log();
-    shell.fire_timers();
+    let events = shell.advance(RECONNECT_MAX);
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, Event::Reconnect(_))),
+        "{events:?}"
+    );
     assert!(shell.model.power.asleep);
     assert!(!shell.take_log().iter().any(|effect| effect == "WifiOn"));
-    assert_eq!(shell.timers().len(), 0);
 }
 
 #[test]
@@ -477,7 +537,7 @@ fn on_the_stand_a_wifi_drop_asks_for_wifi_again_before_it_reconnects() {
     shell.run();
     shell.take_log();
 
-    shell.fire_timers();
+    shell.advance(RECONNECT_MIN);
     let log = shell.take_log();
     let wifi = log.iter().position(|effect| effect == "WifiOn");
     let connect = log.iter().position(|effect| effect == "MqttConnect");
@@ -495,12 +555,11 @@ fn on_battery_a_tap_that_waits_for_a_connection_delays_the_sleep_once() {
     assert_eq!(shell.model.connection.outbox.len(), 1);
 
     // The first idle timeout waits one more idle period for the connection.
-    shell.fire_timers();
+    shell.advance(IDLE_TIMEOUT);
     assert_eq!(shell.sleep, None);
-    assert!(shell.timers().contains(&IDLE_TIMEOUT));
 
     // The connection still fails, so the core drops the tap and sleeps.
-    shell.fire_timers();
+    shell.advance(IDLE_TIMEOUT);
     assert!(shell.sleep.is_some());
     let view = shell.view();
     assert_eq!(view.status, "Asleep, 1 tap not sent");
@@ -518,16 +577,25 @@ fn on_battery_a_tap_that_is_sent_before_the_extra_period_ends_is_not_lost() {
     shell.broker.down = true;
     shell.send(start(PowerSource::Battery));
     shell.send(tap_all_lights());
-    shell.fire_timers();
-    assert_eq!(shell.sleep, None);
 
-    // The reconnect timer fires before the extra idle period ends.
+    // The broker comes back just before the idle timeout. At the idle
+    // timeout, the core starts one more idle period, and then a reconnect
+    // timer fires and sends the tap.
+    let second = Duration::from_secs(1);
+    shell.advance(IDLE_TIMEOUT.saturating_sub(second));
     shell.broker.down = false;
-    shell.fire_shortest_timers();
+    let events = shell.advance(second);
+    let idle = events
+        .iter()
+        .rposition(|event| matches!(event, Event::IdleTimeout(_)));
+    let reconnect = events
+        .iter()
+        .position(|event| matches!(event, Event::Reconnect(_)));
+    assert!(idle.is_some() && idle < reconnect, "{events:?}");
     assert_eq!(shell.broker.service_calls.len(), 1);
     assert_eq!(shell.sleep, None);
 
-    shell.fire_timers();
+    shell.advance(IDLE_TIMEOUT);
     assert!(shell.sleep.is_some());
     assert_eq!(shell.view().status, "Asleep");
 }
@@ -537,28 +605,26 @@ fn a_wake_after_a_long_outage_retries_after_the_shortest_wait() {
     let mut shell = house();
     shell.broker.down = true;
     shell.send(start(PowerSource::Stand));
-    for _ in 0..8 {
-        shell.fire_timers();
+    while shell.model.connection.backoff < RECONNECT_MAX {
+        shell.advance_to_next();
     }
-    assert_eq!(shell.model.connection.backoff, RECONNECT_MAX);
 
     shell.send(Event::PowerSourceChanged(PowerSource::Battery));
     while shell.sleep.is_none() {
-        shell.fire_timers();
+        shell.advance_to_next();
     }
     shell.wake(Wake::Timer);
-    assert!(
-        shell.timers().contains(&RECONNECT_MIN),
-        "{:?}",
-        shell.timers()
-    );
+    // The wake tries at once, and again after the shortest wait.
+    shell.take_log();
+    shell.advance(RECONNECT_MIN);
+    assert_eq!(count(&shell.take_log(), "MqttConnect"), 1);
 }
 
 #[test]
 fn after_a_deep_sleep_the_view_shows_the_last_update_that_the_shell_kept() {
     let mut shell = house();
     shell.send(start(PowerSource::Battery));
-    shell.fire_timers();
+    shell.advance(IDLE_TIMEOUT);
     // The shell keeps the time of the last state message, not the time of
     // the sleep.
     let kept = shell.view().last_sync;
@@ -590,8 +656,7 @@ fn the_footer_shows_the_time_of_the_last_update_not_a_clock() {
 
     // Time passes with no message: nothing changes on the screen.
     let frames = shell.frames.len();
-    shell.broker.time += 600;
-    shell.fire_timers();
+    shell.advance(Duration::from_secs(600));
     assert_eq!(shell.frames.len(), frames);
     assert_eq!(shell.view().updated, "Last changed 09:41");
 
@@ -621,7 +686,7 @@ fn the_footer_shows_the_time_of_the_last_update_not_a_clock() {
 fn on_battery_a_tap_while_asleep_wakes_and_toggles_the_light() {
     let mut shell = house();
     shell.send(start(PowerSource::Battery));
-    shell.fire_timers();
+    shell.advance(IDLE_TIMEOUT);
     assert!(shell.view().asleep);
     let frames = shell.frames.len();
 
@@ -775,7 +840,7 @@ fn a_dimmable_light_has_steps_only_while_it_is_on_or_off() {
 fn on_battery_a_brightness_step_while_asleep_wakes_and_changes_the_light() {
     let mut shell = house();
     shell.send(start_at(PowerSource::Battery, Some("/room/living_room")));
-    shell.fire_timers();
+    shell.advance(IDLE_TIMEOUT);
     assert!(shell.view().asleep);
 
     // The tap that wakes the device also steps the brightness. The call
@@ -908,7 +973,7 @@ fn the_all_lights_toggle_calls_home_assistant() {
 fn a_touch_wake_on_a_light_sends_the_toggle_after_the_reconnect() {
     let mut shell = house();
     shell.send(start(PowerSource::Battery));
-    shell.fire_timers();
+    shell.advance(IDLE_TIMEOUT);
     assert!(shell.sleep.is_some());
     shell.take_log();
 
@@ -929,7 +994,7 @@ fn a_touch_wake_on_a_light_sends_the_toggle_after_the_reconnect() {
 fn the_stand_while_asleep_wakes_and_the_shell_answers_sleep() {
     let mut shell = house();
     shell.send(start(PowerSource::Battery));
-    shell.fire_timers();
+    shell.advance(IDLE_TIMEOUT);
     assert!(shell.sleep.is_some());
     shell.take_log();
 
@@ -942,6 +1007,9 @@ fn the_stand_while_asleep_wakes_and_the_shell_answers_sleep() {
     assert_eq!(shell.sleep, None);
     assert!(!shell.model.power.asleep);
     assert_eq!(shell.view().connection, Connection::Online);
-    // On the stand, no idle timer runs.
-    assert!(!shell.timers().contains(&IDLE_TIMEOUT));
+    // On the stand, the device does not sleep again. No idle timer with the
+    // current id fires.
+    let events = shell.advance(IDLE_TIMEOUT);
+    assert!(!idle_timeouts(&events).contains(&shell.model.power.idle));
+    assert_eq!(shell.sleep, None);
 }

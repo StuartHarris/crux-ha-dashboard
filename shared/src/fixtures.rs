@@ -127,6 +127,7 @@ impl FixedShell {
                     more
                 }
                 Effect::WifiOff(mut request) => self.resolve(&mut request, ()),
+                Effect::FrontLight(mut request) => self.resolve(&mut request, ()),
                 Effect::TimeNotifyAfter(request) => {
                     self.timers.push(request);
                     Vec::new()

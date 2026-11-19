@@ -2,10 +2,13 @@
 //!
 //! - On the stand, the device stays awake and connected.
 //! - On battery, the device connects when it wakes. After [`IDLE_TIMEOUT`]
-//!   without a touch, it sleeps in steps, and each step waits for the
-//!   answer of the shell: publish `asleep` and disconnect, then turn Wi-Fi
-//!   off, then draw the last image with the time of the last state message
-//!   and sleep until a touch.
+//!   without a touch, or at [`Event::SleepNow`], it sleeps in steps. Each
+//!   step waits for the answer of the shell: publish `asleep` and
+//!   disconnect, then turn Wi-Fi off, then draw the last image with the
+//!   time of the last state message and sleep until a touch.
+//! - If the front light is still on at the sleep, one more step turns it
+//!   off first. Usually the light timer turned it off already. Refer to
+//!   [`LIGHT_TIMEOUT`](crate::features::light::LIGHT_TIMEOUT).
 //! - Each sleep has an id. A tap or a move to the stand wakes the device
 //!   during the steps, and the core then ignores the answers of the steps and
 //!   of `Sleep`.
@@ -22,14 +25,14 @@ use crate::{
         network::Network,
         power::{Power, PowerSource, Wake, WakeSource},
     },
-    features::{connection, refresh::redraw, rooms},
+    features::{connection, light, refresh::redraw, rooms},
     view::rounded_level,
 };
 
 /// On battery, the time without a touch after which the device sleeps.
 ///
-/// No other timer of the core waits for this time, so a shell can find the
-/// idle timer by its duration, for example to end the idle time early.
+/// To end the idle time early, a shell sends
+/// [`Event::SleepNow`](crate::Event::SleepNow).
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The power source and the sleep state.
@@ -114,9 +117,13 @@ pub fn source_changed(source: PowerSource, model: &mut Model) -> Cmd {
             // The core ignores the idle timer that runs now.
             model.power.idle = model.power.idle.wrapping_add(1);
             connection::restart(model);
-            redraw(model, was_asleep).and(connection::go_online(model))
+            light::source_changed(model)
+                .and(redraw(model, was_asleep))
+                .and(connection::go_online(model))
         }
-        PowerSource::Battery => redraw(model, false).and(restart_idle_timer(model)),
+        PowerSource::Battery => light::source_changed(model)
+            .and(redraw(model, false))
+            .and(restart_idle_timer(model)),
     }
 }
 
@@ -157,12 +164,34 @@ pub fn restart_idle_timer(model: &mut Model) -> Cmd {
     timer.then_send(move |_| Event::IdleTimeout(id))
 }
 
-/// The idle timer expired: sleep.
-///
-/// If service calls wait in the outbox, the core first waits one more idle
-/// period for the connection.
+/// The idle timer with the id `id` expired. If it is the newest idle timer,
+/// the idle time ends ([`idle_ended`]).
 pub fn idle_timeout(id: u32, model: &mut Model) -> Cmd {
-    if id != model.power.idle || model.power.source != PowerSource::Battery || model.power.asleep {
+    if id != model.power.idle {
+        return Cmd::done();
+    }
+    idle_ended(model)
+}
+
+/// The user asked to sleep now. The idle time ends at once, as if the idle
+/// timer expired ([`idle_ended`]).
+///
+/// The core ignores the idle timer that runs now, also if the event does
+/// nothing.
+pub fn sleep_now(model: &mut Model) -> Cmd {
+    model.power.idle = model.power.idle.wrapping_add(1);
+    idle_ended(model)
+}
+
+/// The idle time ended: sleep.
+///
+/// Before `Start` (with no settings), on the stand, or while the device
+/// sleeps, the core does nothing. If service calls wait in the outbox, the
+/// core first waits one more idle period for the connection. The next end
+/// of the idle time then sleeps.
+fn idle_ended(model: &mut Model) -> Cmd {
+    if model.settings.is_none() || model.power.source != PowerSource::Battery || model.power.asleep
+    {
         return Cmd::done();
     }
     if !model.connection.outbox.is_empty() && !model.power.extended {
@@ -173,15 +202,37 @@ pub fn idle_timeout(id: u32, model: &mut Model) -> Cmd {
     sleep(model)
 }
 
-/// Starts the steps of a sleep: publishes `asleep` and disconnects. The
-/// answer to `Disconnect` starts the next step ([`offline`]).
-///
-/// The core drops the service calls that wait in the outbox, and the view
-/// shows how many. The last image shows the time of the last state message.
+/// Starts the steps of a sleep. If the front light is on, the first step
+/// turns it off, and the answer to `FrontLight` starts the next step
+/// ([`light_off`]). Otherwise the core starts that step at once.
 fn sleep(model: &mut Model) -> Cmd {
     model.power.asleep = true;
     model.power.sleep = model.power.sleep.wrapping_add(1);
     let id = model.power.sleep;
+    if light::is_on(model) {
+        return light::off(model).then(Cmd::event(Event::LightOffForSleep(id)));
+    }
+    disconnect(id, model)
+}
+
+/// The front light of the sleep `id` is off: publish `asleep` and
+/// disconnect.
+///
+/// The core ignores this answer if a tap or a move to the stand woke the
+/// device first.
+pub fn light_off(id: u32, model: &mut Model) -> Cmd {
+    if id != model.power.sleep || !model.power.asleep {
+        return Cmd::done();
+    }
+    disconnect(id, model)
+}
+
+/// Publishes `asleep` and disconnects. The answer to `Disconnect` starts the
+/// next step ([`offline`]).
+///
+/// The core drops the service calls that wait in the outbox, and the view
+/// shows how many. The last image shows the time of the last state message.
+fn disconnect(id: u32, model: &mut Model) -> Cmd {
     model.unsent += model.connection.outbox.len();
     connection::go_offline(model).then(Mqtt::disconnect().then_send(move |()| Event::Offline(id)))
 }

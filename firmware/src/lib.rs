@@ -8,6 +8,7 @@
 //! - [`board`] starts the chip: the clocks, the heap and the scheduler.
 //! - [`panel`] drives the panel and reads the touch controller.
 //! - [`lane`] is a queue between two tasks.
+//! - [`light`] drives the front light.
 //! - [`network`] makes the configuration of the Wi-Fi driver.
 //!
 //! Each binary includes the build-time configuration from `cfg.toml`
@@ -26,5 +27,6 @@ extern crate alloc;
 
 pub mod board;
 pub mod lane;
+pub mod light;
 pub mod network;
 pub mod panel;

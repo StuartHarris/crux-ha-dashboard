@@ -1,18 +1,23 @@
 //! A test shell. It runs the core and answers each effect as a real shell
 //! does, with the fake broker for MQTT.
 //!
-//! Timers do not expire by themselves. A test fires them with
-//! [`Shell::fire_timers`], so the test controls the time.
+//! The shell has a fake clock, which starts at 0. Timers do not expire by
+//! themselves. A test moves the clock with [`Shell::advance`] or
+//! [`Shell::advance_to_next`]. The timers that are due then fire in the
+//! order of their deadlines. Both functions return the events that the
+//! fired timers sent to the core, so a test sees what each timer did. The
+//! shell does not find a timer by its kind or by its duration.
 //!
-//! The full-refresh timer runs all the time while the device is awake, so the
-//! shell keeps it apart from the other timers. [`Shell::timers`] and
-//! [`Shell::fire_timers`] do not include it. A test fires it with
-//! [`Shell::fire_full_refresh_timer`].
+//! A stale timer (one that the core no longer uses) stays until its
+//! deadline, as on a real device. When it fires, the core ignores its event.
 //!
 //! The draw timer is short, and the steps of a test are far apart in time.
-//! Thus, by default, [`Shell::run`] fires the draw timers when the core
-//! waits, and draws. A test of the draw timer sets [`Shell::auto_draw`] to
-//! `false`, and then fires them with [`Shell::fire_draw_timers`].
+//! Thus, by default, [`Shell::run`] moves the clock to the next deadline
+//! while the core waits for a draw. A test of the draw timer sets
+//! [`Shell::auto_draw`] to `false`.
+//!
+//! The shell answers `FrontLight` at once and keeps the level in
+//! [`Shell::light`].
 
 use alloc::{format, string::String, vec::Vec};
 use core::time::Duration;
@@ -27,8 +32,14 @@ use crate::{
         network::WifiStatus,
         power::{Sleep, Wake},
     },
-    features::refresh::{DRAW_DELAY, FULL_REFRESH_INTERVAL},
 };
+
+/// A timer that waits.
+struct Timer {
+    /// The time on the clock of the shell at which the timer fires.
+    due: Duration,
+    request: Request<NotifyAfter>,
+}
 
 /// One image on the panel.
 pub struct Frame {
@@ -55,12 +66,14 @@ pub struct Shell {
     pub wifi_works: bool,
     /// Wi-Fi is on.
     pub wifi_on: bool,
-    timers: Vec<Request<NotifyAfter>>,
-    /// The full-refresh timers that wait.
-    refresh_timers: Vec<Request<NotifyAfter>>,
-    /// The draw timers that wait.
-    draw_timers: Vec<Request<NotifyAfter>>,
-    /// If `true`, [`Shell::run`] fires the draw timers when the core waits.
+    /// The timers that wait, in the order in which the core started them.
+    timers: Vec<Timer>,
+    /// The time on the clock of the shell.
+    now: Duration,
+    /// The level of the front light, in percent.
+    pub light: u8,
+    /// If `true`, [`Shell::run`] moves the clock to the next deadline while
+    /// the core waits for a draw.
     pub auto_draw: bool,
     /// The frames that the shell drew, in order.
     pub frames: Vec<Frame>,
@@ -88,8 +101,8 @@ impl Shell {
             wifi_works: true,
             wifi_on: false,
             timers: Vec::new(),
-            refresh_timers: Vec::new(),
-            draw_timers: Vec::new(),
+            now: Duration::ZERO,
+            light: 0,
             auto_draw: true,
             frames: Vec::new(),
             drawn_seq: 0,
@@ -143,14 +156,26 @@ impl Shell {
     }
 
     /// Answers effects and sends events until the core waits. If
-    /// [`Shell::auto_draw`] is `true`, it then fires the draw timers and
-    /// answers the effects again.
+    /// [`Shell::auto_draw`] is `true` and the core waits for a draw, it then
+    /// fires the timers in the order of their deadlines until the core drew.
     pub fn run(&mut self) {
         self.settle();
-        if self.auto_draw {
-            while !self.draw_timers.is_empty() {
-                self.fire_draw_timers();
-            }
+        let mut fired = Vec::new();
+        self.auto_draw_until(Duration::MAX, &mut fired);
+    }
+
+    /// If [`Shell::auto_draw`] is `true`, fires the timers that are due at or
+    /// before `limit`, in the order of their deadlines, while the core waits
+    /// for a draw. Adds the events of the fired timers to `fired`.
+    fn auto_draw_until(&mut self, limit: Duration, fired: &mut Vec<Event>) {
+        if !self.auto_draw {
+            return;
+        }
+        while self.model.refresh.draw_pending {
+            let Some(index) = self.next_due(limit) else {
+                break;
+            };
+            self.fire(index, limit, fired);
         }
     }
 
@@ -189,73 +214,90 @@ impl Shell {
         self.app.view(&self.model)
     }
 
-    /// Returns the number of full-refresh timers that wait.
-    pub const fn full_refresh_timers(&self) -> usize {
-        self.refresh_timers.len()
+    /// Returns the time on the clock of the shell.
+    pub const fn now(&self) -> Duration {
+        self.now
     }
 
-    /// Returns the number of draw timers that wait.
-    pub const fn draw_timers(&self) -> usize {
-        self.draw_timers.len()
-    }
-
-    /// Fires the draw timers that wait, in order, and answers the effects
-    /// until the core waits.
-    pub fn fire_draw_timers(&mut self) {
-        for mut timer in core::mem::take(&mut self.draw_timers) {
-            let id = timer.operation.id;
-            timer.resolve(id).expect("the core waits for the timer");
-        }
+    /// Moves the clock forward by `duration`. Each timer that is due fires,
+    /// in the order of the deadlines, and the shell answers the effects
+    /// until the core waits. Returns the events that the fired timers sent,
+    /// in order, also the events of the draw timers.
+    pub fn advance(&mut self, duration: Duration) -> Vec<Event> {
         self.settle();
-    }
-
-    /// Fires the full-refresh timers that wait, as if
-    /// [`FULL_REFRESH_INTERVAL`] passed. The other timers do not fire.
-    pub fn fire_full_refresh_timer(&mut self) {
-        self.broker.time += FULL_REFRESH_INTERVAL.as_secs();
-        for mut timer in core::mem::take(&mut self.refresh_timers) {
-            let id = timer.operation.id;
-            timer.resolve(id).expect("the core waits for the timer");
+        let target = self.now + duration;
+        let mut fired = Vec::new();
+        while let Some(index) = self.next_due(target) {
+            self.fire(index, target, &mut fired);
         }
-        self.run();
+        self.set_now(target);
+        fired
     }
 
-    /// Returns the durations of the timers that wait, other than the
-    /// full-refresh timer.
-    pub fn timers(&self) -> Vec<Duration> {
+    /// Moves the clock to the next deadline, and fires the timers that are
+    /// due then. Returns the events that they sent. If no timer waits,
+    /// returns no events.
+    pub fn advance_to_next(&mut self) -> Vec<Event> {
+        match self.timers.iter().map(|timer| timer.due).min() {
+            Some(due) => self.advance(due.saturating_sub(self.now)),
+            None => Vec::new(),
+        }
+    }
+
+    /// Returns the place of the timer with the earliest deadline at or
+    /// before `target`. Of two timers with the same deadline, the timer that
+    /// the core started first comes first.
+    fn next_due(&self, target: Duration) -> Option<usize> {
         self.timers
             .iter()
-            .map(|timer| timer.operation.duration.into())
-            .collect()
+            .enumerate()
+            .filter(|(_, timer)| timer.due <= target)
+            .min_by_key(|(index, timer)| (timer.due, *index))
+            .map(|(index, _)| index)
     }
 
-    /// Fires all the timers that wait, other than the full-refresh timer, as
-    /// if their time passed.
-    pub fn fire_timers(&mut self) {
-        let longest = self.timers().into_iter().max().unwrap_or_default();
-        self.broker.time += longest.as_secs();
-        for mut timer in core::mem::take(&mut self.timers) {
-            let id = timer.operation.id;
-            timer.resolve(id).expect("the core waits for the timer");
+    /// Fires the timer at `index` and answers the effects until the core
+    /// waits. A draw that the core then waits for fires only if it is due at
+    /// or before `limit`. Adds the events of the fired timers to `fired`.
+    fn fire(&mut self, index: usize, limit: Duration, fired: &mut Vec<Event>) {
+        let mut timer = self.timers.remove(index);
+        self.set_now(timer.due);
+        let id = timer.request.operation.id;
+        timer
+            .request
+            .resolve(id)
+            .expect("the core waits for the timer");
+        // The core waited before the timer fired, so each new event comes
+        // from this timer.
+        let events: Vec<Event> = self
+            .commands
+            .iter_mut()
+            .flat_map(|command| command.events().collect::<Vec<_>>())
+            .collect();
+        for event in &events {
+            let command = self.app.update(event.clone(), &mut self.model);
+            self.commands.push(command);
         }
-        self.run();
+        fired.extend(events);
+        self.settle();
+        self.auto_draw_until(limit, fired);
     }
 
-    /// Fires the timers with the shortest wait, as if that time passed.
-    pub fn fire_shortest_timers(&mut self) {
-        let Some(shortest) = self.timers().into_iter().min() else {
-            return;
-        };
-        self.broker.time += shortest.as_secs();
-        let (due, waiting) = core::mem::take(&mut self.timers)
-            .into_iter()
-            .partition(|timer| Duration::from(timer.operation.duration) == shortest);
-        self.timers = waiting;
-        for mut timer in due {
-            let id = timer.operation.id;
-            timer.resolve(id).expect("the core waits for the timer");
-        }
-        self.run();
+    /// Sets the clock to `now`. The clock of the broker moves forward by the
+    /// same number of whole seconds.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `now` is before the time on the clock. The clock never
+    /// goes back.
+    fn set_now(&mut self, now: Duration) {
+        assert!(
+            now >= self.now,
+            "the clock goes back from {:?} to {now:?}",
+            self.now
+        );
+        self.broker.time += now.as_secs() - self.now.as_secs();
+        self.now = now;
     }
 
     /// Returns the log and clears it, so that a test can check the effects
@@ -314,24 +356,23 @@ impl Shell {
                 self.sleep = Some(request.operation.clone());
                 self.sleep_request = Some(request);
             }
+            Effect::FrontLight(mut request) => {
+                let level = request.operation.level;
+                self.log.push(format!("FrontLight {level}"));
+                self.light = level;
+                request.resolve(()).expect("the core waits for the light");
+            }
             Effect::TimeNotifyAfter(request) => {
                 let duration = Duration::from(request.operation.duration);
                 self.log
                     .push(format!("TimeNotifyAfter {}ms", duration.as_millis()));
-                if duration == FULL_REFRESH_INTERVAL {
-                    self.refresh_timers.push(request);
-                } else if duration == DRAW_DELAY {
-                    self.draw_timers.push(request);
-                } else {
-                    self.timers.push(request);
-                }
+                let due = self.now + duration;
+                self.timers.push(Timer { due, request });
             }
             Effect::TimeClear(mut request) => {
                 self.log.push("TimeClear".into());
                 let id = request.operation.id;
-                self.timers.retain(|timer| timer.operation.id != id);
-                self.refresh_timers.retain(|timer| timer.operation.id != id);
-                self.draw_timers.retain(|timer| timer.operation.id != id);
+                self.timers.retain(|timer| timer.request.operation.id != id);
                 request.resolve(id).expect("the core waits for the clear");
             }
         }
