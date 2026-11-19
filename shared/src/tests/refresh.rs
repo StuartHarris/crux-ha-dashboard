@@ -8,6 +8,7 @@ use crux_core::App;
 use super::{ExpectFullRefreshTimer, connection::drive_to_connected, shell::Shell, start};
 use crate::{
     Dashboard, EffectTestExt, Event, Model, PowerSource,
+    capabilities::power::Wake,
     features::refresh::{
         DRAW_DELAY, FULL_REFRESH_INTERVAL, PARTIALS_PER_FULL, redraw, redraw_soon,
     },
@@ -182,7 +183,7 @@ fn no_full_refresh_timer_runs_while_the_device_sleeps() {
     assert_eq!(shell.full_refresh_timers(), 0);
 
     // The wake draws with a full refresh and starts the timer again.
-    shell.send(Event::Woke);
+    shell.wake(Wake::Timer);
     assert!(shell.frames.last().unwrap().full);
     assert_eq!(shell.full_refresh_timers(), 1);
 }

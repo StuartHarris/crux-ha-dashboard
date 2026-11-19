@@ -25,3 +25,7 @@ id = "hall"
 # If true, the core does a dry run: a tap does not publish a service call, so
 # no device in the house changes. Set it to false when the dashboard works.
 read_only = true
+# If true, the firmware tells the core that the device is on battery, also on
+# USB power. The device then sleeps after 30 seconds with no touch. Use it to
+# test the sleep with the serial log on USB. Keep it false in normal use.
+force_battery = false

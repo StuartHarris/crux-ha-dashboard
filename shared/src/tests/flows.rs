@@ -12,7 +12,7 @@ use crate::{
     Connection, Event, LightState,
     LightState::{Off, On, Unavailable},
     PowerSource, RoomSummary, Route, TileState,
-    capabilities::power::WakeSource,
+    capabilities::power::{Wake, WakeSource},
     features::{
         connection::{RECONNECT_MAX, RECONNECT_MIN},
         power::IDLE_TIMEOUT,
@@ -207,11 +207,12 @@ fn on_battery_the_dashboard_wakes_syncs_accepts_taps_then_sleeps() {
     assert_eq!(
         shell.take_log(),
         [
-            // No full-refresh timer runs while the device sleeps.
-            "TimeClear",
+            // Each step waits for the answer of the shell.
             "MqttPublish dashboard/hall/status asleep",
             "MqttDisconnect",
             "WifiOff",
+            // No full-refresh timer runs while the device sleeps.
+            "TimeClear",
             "Render",
             "Sleep",
         ]
@@ -246,7 +247,7 @@ fn a_battery_wake_shows_the_changes_from_while_it_slept() {
     shell.broker.set_state("light.all_lights", "off", &[]);
     shell.broker.set_state("weather.home", "sunny", &[]);
 
-    shell.send(Event::Woke);
+    shell.wake(Wake::Timer);
     assert!(shell.wifi_on);
     assert_eq!(shell.broker.connections, 2);
     assert_eq!(shell.view().connection, Connection::Online);
@@ -495,7 +496,7 @@ fn on_battery_a_tap_that_waits_for_a_connection_delays_the_sleep_once() {
 
     // The next connection clears the notice.
     shell.broker.down = false;
-    shell.send(Event::Woke);
+    shell.wake(Wake::Timer);
     assert_eq!(shell.view().status, "Online");
 }
 
@@ -533,7 +534,7 @@ fn a_wake_after_a_long_outage_retries_after_the_shortest_wait() {
     while shell.sleep.is_none() {
         shell.fire_timers();
     }
-    shell.send(Event::Woke);
+    shell.wake(Wake::Timer);
     assert!(
         shell.timers().contains(&RECONNECT_MIN),
         "{:?}",
@@ -605,22 +606,25 @@ fn the_footer_shows_the_time_of_the_last_update_not_a_clock() {
 }
 
 #[test]
-fn on_battery_a_tap_while_asleep_wakes_and_does_not_toggle_the_light() {
+fn on_battery_a_tap_while_asleep_wakes_and_toggles_the_light() {
     let mut shell = house();
     shell.send(start(PowerSource::Battery));
     shell.fire_timers();
     assert!(shell.view().asleep);
+    let frames = shell.frames.len();
 
+    // The last image shows the toggle, so the tap that wakes the device also
+    // acts on it.
     shell.send(tap_all_lights());
     assert!(!shell.view().asleep);
-    assert!(shell.frames.last().unwrap().full);
+    assert!(shell.frames[frames..].iter().any(|frame| frame.full));
     assert_eq!(shell.view().connection, Connection::Online);
-    assert_eq!(shell.broker.service_calls.len(), 0);
-    assert_eq!(shell.broker.state("light.all_lights"), Some("on"));
-
-    // The device is awake, so the next tap acts on the toggle.
-    shell.send(tap_all_lights());
+    assert_eq!(shell.broker.service_calls.len(), 1);
     assert_eq!(shell.broker.state("light.all_lights"), Some("off"));
+
+    // The next tap acts on the toggle again.
+    shell.send(tap_all_lights());
+    assert_eq!(shell.broker.state("light.all_lights"), Some("on"));
 }
 
 #[test]
@@ -756,25 +760,26 @@ fn a_dimmable_light_has_steps_only_while_it_is_on_or_off() {
 }
 
 #[test]
-fn on_battery_a_brightness_step_while_asleep_wakes_and_does_not_change_the_light() {
+fn on_battery_a_brightness_step_while_asleep_wakes_and_changes_the_light() {
     let mut shell = house();
     shell.send(start_at(PowerSource::Battery, Some("/room/living_room")));
     shell.fire_timers();
     assert!(shell.view().asleep);
 
+    // The tap that wakes the device also steps the brightness. The call
+    // waits for the connection, then goes out.
     shell.send(tap_brighter(1));
     assert!(!shell.view().asleep);
-    assert_eq!(shell.broker.service_calls.len(), 0);
-    assert_eq!(
-        texts(&shell)[1],
-        tile("Rocket lamp", TileState::On, "On 50%")
-    );
-
-    // The device is awake, so the next tap changes the brightness.
-    shell.send(tap_brighter(1));
+    assert_eq!(shell.broker.service_calls.len(), 1);
     assert_eq!(
         texts(&shell)[1],
         tile("Rocket lamp", TileState::On, "On 75%")
+    );
+
+    shell.send(tap_brighter(1));
+    assert_eq!(
+        texts(&shell)[1],
+        tile("Rocket lamp", TileState::On, "On 100%")
     );
 }
 
@@ -885,4 +890,46 @@ fn the_all_lights_toggle_calls_home_assistant() {
     shell.send(tap_tile(0));
     shell.send(tap_scene(0));
     assert_eq!(shell.broker.service_calls.len(), 1);
+}
+
+#[test]
+fn a_touch_wake_on_a_light_sends_the_toggle_after_the_reconnect() {
+    let mut shell = house();
+    shell.send(start(PowerSource::Battery));
+    shell.fire_timers();
+    assert!(shell.sleep.is_some());
+    shell.take_log();
+
+    // The tap that wakes the device is on the All lights toggle. The shell
+    // answers `Sleep` with the control. The core keeps the toggle until the
+    // connection is open, then sends it.
+    shell.send(tap_all_lights());
+    let log = shell.take_log();
+    assert_eq!(log[0], "Wake Touch(Some(AllLights))");
+    assert!(log.contains(&"WifiOn".into()), "{log:?}");
+    assert!(!shell.model.power.asleep);
+    assert_eq!(shell.view().connection, Connection::Online);
+    assert_eq!(shell.broker.service_calls.len(), 1);
+    assert_eq!(shell.sleep, None);
+}
+
+#[test]
+fn the_stand_while_asleep_wakes_and_the_shell_answers_sleep() {
+    let mut shell = house();
+    shell.send(start(PowerSource::Battery));
+    shell.fire_timers();
+    assert!(shell.sleep.is_some());
+    shell.take_log();
+
+    // The shell sends the change, then answers `Sleep` with `PowerSource`.
+    // The core woke at the change, so it ignores the answer.
+    shell.send(Event::PowerSourceChanged(PowerSource::Stand));
+    let log = shell.take_log();
+    assert_eq!(log.last().map(String::as_str), Some("Wake PowerSource"));
+    assert_eq!(count(&log, "WifiOn"), 1, "{log:?}");
+    assert_eq!(shell.sleep, None);
+    assert!(!shell.model.power.asleep);
+    assert_eq!(shell.view().connection, Connection::Online);
+    // On the stand, no idle timer runs.
+    assert!(!shell.timers().contains(&IDLE_TIMEOUT));
 }

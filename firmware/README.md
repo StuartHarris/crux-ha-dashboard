@@ -19,12 +19,13 @@ with the std shells of the root workspace would pull std into it.
 
 | Module | What it does |
 | --- | --- |
-| `shell` | Owns the core. Routes each effect to a task as a `Command`, and gives each `Signal` from a task to the core. Keeps the MQTT connection ids, the timer tokens and the `WifiOn` tokens. Gives at most one `Render` for each batch of effects, with the last view. Sends each tap to the core as `Tapped`, with the control from `ui::hit_test`. The core decides what a tap does while the device sleeps, and does not publish service calls in a dry run. |
+| `shell` | Owns the core. Routes each effect to a task as a `Command`, and gives each `Signal` from a task to the core. Keeps the MQTT connection ids, the timer tokens and the `WifiOn` tokens, and the `Disconnect`, `WifiOff` and `Sleep` requests until their tasks answer. Gives at most one `Render` for each batch of effects, with the last view. Sends each tap to the core as `Tapped`, with the control from `ui::hit_test`. While `Sleep` waits, a tap or a change of the power source answers it. The core does not publish service calls in a dry run. |
 | `mqtt` | The bookkeeping of the MQTT task. The stream of each connection ends with exactly one `Disconnected` item. `supersede` removes the queued connections that a later command makes useless. `Outbox` keeps a publish while the client has no quota, and closes the connection if the publish cannot be sent. |
 | `wifi` | A `WifiOff` during a join stops the join. A `WifiOn` during a join continues it with the newer token. |
 | `backoff` | A wait that doubles from 1 s to 30 s after each failure, for the start of the touch controller. |
 | `timers` | The timers of the timer task, in milliseconds since the start. |
 | `touch` | Converts a GT911 point to a panel point, and touch samples to taps with a debounce. A sample is new with a finger, new with no finger (the finger lifted), or not new. Only a new sample with no finger ends a touch. |
+| `sleep` | Decides when the chip can go into light sleep for a `Sleep` job, which wake is a real wake, and when a blocker gets a warning. |
 | `config` | Reads and checks `cfg.toml`. Its `Debug` output does not show the passwords. `build.rs` includes this file, so it uses only `core`. |
 
 ## The hardware binary
@@ -39,13 +40,66 @@ cannot block each other. This is the pattern of the `cpb` example in Crux.
 | --- | --- | --- |
 | core (`main`) | Owns the shell. Sends `Start` with the power source `Stand`. | |
 | `timers` | Starts and cancels the timers of the core. | `Signal::Timer` |
-| `display` | Draws the newest view model with `ui::draw`, and refreshes the panel as `ui::Refresher` decides. Reads the touch controller every 30 ms between refreshes. | `Signal::Tap` |
-| `wifi` | Joins the network and waits for DHCP, or leaves the network. | `Signal::Wifi` |
+| `display` | Draws the newest view model with `ui::draw`, and refreshes the panel as `ui::Refresher` decides. Reads the touch controller every 30 ms between refreshes. Runs the `Sleep` job. | `Signal::Tap`, `Signal::Event`, `Signal::Woke` |
+| `wifi` | For `WifiOn`, turns the radio on, joins the network and waits for DHCP. For `WifiOff`, leaves the network and turns the radio off. | `Signal::Wifi`, `Signal::RadioOff` |
 | `mqtt` | Opens one connection at a time with `rust-mqtt` (MQTT 5) over TCP. Subscribes, publishes, sends pings, and closes. | `Signal::Mqtt` |
 | `net` | Runs the network stack. | |
 
-`Sleep` writes a line to the log, and the device stays awake. The next tap goes to the
-core as usual, and the core wakes because it sleeps. Deep sleep comes in phase 6.
+### Light sleep
+
+On battery, the core sleeps after 30 seconds with no touch. The core owns the steps,
+and each step waits for the answer of the firmware:
+
+1. The core publishes `asleep` and sends `Disconnect`. The MQTT task sends the
+   disconnect packet (with a limit of 2 seconds) and ends the session. The stream of
+   the connection then ends, and the shell answers `Disconnect`. If no connection is
+   current, the shell answers at once.
+2. The core sends `WifiOff`. The Wi-Fi task disconnects, waits 100 ms for the frames
+   in the driver, and drops the `WifiController`. The drop stops the Wi-Fi driver and
+   the radio. `esp-radio` 1.0.0-beta.1 has no other public call to stop it. Then the
+   task sends `Signal::RadioOff`, and the shell answers `WifiOff`. `WifiOn` makes a
+   new controller.
+3. The core draws the "Asleep" image and sends `Sleep`. The display task draws the
+   image first, then puts the chip into light sleep. It does not wait for a blocker,
+   so the touch poll and the renders continue. If one blocker stops the sleep for
+   5 seconds, the log shows a warning. If the blocker is a low INT, the task clears
+   the GT911 status register, and starts the touch controller again if INT stays low.
+4. The wake sources are a low level on the GT911 INT pin (GPIO3) and, if the core
+   asks for it, the RTC timer. The GT911 stays on and in its normal mode. The panel
+   is off after each render.
+5. A touch wake, or a timer wake at the time that the core asked for, is a real
+   wake. After a touch wake, the display task reads the point (the GT911 holds it
+   while INT is low) and sends it as a tap. The shell answers `Sleep` with
+   `Wake::Touch` and the control at the point, and the core acts on the control. A
+   service call waits until MQTT connects again. If the task cannot read the point,
+   it answers `Wake::Touch(None)`, and the touch only wakes the device. A timer wake
+   sends `Signal::Woke`. After another wake
+   (for example a sleep that the hardware rejects), the chip sleeps again after
+   3 seconds. In that time, a tap or a change of the power source also answers
+   `Sleep`.
+6. The RTC timer also wakes the chip each 60 seconds for a check of the power source.
+   The display task reads only the charger, with no Wi-Fi. If the source is new, the
+   task reads it again after 1 second. If the second read agrees, the shell sends
+   `PowerSourceChanged` and answers `Sleep` with `Wake::PowerSource`. Otherwise the
+   chip sleeps again at once. The check writes only a debug line to the log.
+
+Light sleep keeps the RAM and the PSRAM, so the core and the panel image stay, and a
+wake needs no full refresh.
+
+`esp-hal` moves the system timer forward by the time asleep, so `Instant` and the
+timers of the core stay correct. The alarm of the scheduler (`TIMG0`) does not run in
+the sleep, so the display task arms it again after the wake.
+
+The INT pin is in the low-level mode (register 0x804D, bits 1:0 are 10). The touch
+poll reads a sample only while INT is low, and at 30 ms it got each tap in the
+bring-up. Thus INT stays low longer than a poll interval, and a level wake does not
+miss a short touch.
+
+The charger cannot wake the device when it goes on the stand. The pin map of the
+vendor (`docs/pinmap.md`, branch `H752-01`) shows no path from the BQ25896 INT pin to
+a GPIO. The inputs of the PCA9535 (its INT is on GPIO38) are the button, the power
+good and the INT of the TPS65185. Thus the check of the power source each 60 seconds
+sees the stand, or a tap wakes the device first.
 
 The second binary, `bringup`, runs the hardware checks for a new board.
 
@@ -250,7 +304,8 @@ The display task reads the BQ25896 charger (REG0B) and the BQ27220 fuel gauge
 board on USB power:
 
 1. Run `just flash`. The log shows `power: source Stand at the start`, then
-   `power: battery N%`. The header shows the percent and a plug icon.
+   `power: battery N%`. The header shows the percent and a plug icon. Keep
+   `force_battery = false` for this check.
 2. Disconnect USB. In about 30 seconds, the header shows the percent and a battery
    icon. The fill of the icon shows the charge. The serial log is on USB, so you cannot
    see the log line `power: source Battery` now.
@@ -259,5 +314,50 @@ board on USB power:
 
 If a read fails, the log shows one warning, and the header keeps the last values.
 
-Phase 6 has the other `TODO(6)` items: deep sleep with wake on touch and RTC, and the
-radio off for `WifiOff`.
+## Sleep check (phase 6)
+
+On USB the core is on the stand, so it never sleeps. The setting `force_battery` in
+`[device]` makes the firmware tell the core that the device is on battery. The power
+poll then sends no change of the source, but it still sends the charge.
+
+Light sleep stops the clock of the USB-Serial-JTAG port. The computer can show the
+port as disconnected, and the log can stop until you connect the cable again. esp-hal
+1.2.2 has no setting that keeps the port on in light sleep, so `force_battery` cannot
+keep the log. Thus examine the panel and the status topic for each step, not only the
+log.
+
+1. Set `force_battery = true` in `cfg.toml`.
+2. Run `just flash`. The log shows `power: source Battery at the start`. The header
+   shows a battery icon.
+3. On the Pi, run
+   `mosquitto_sub -h localhost -u dashboard -P <password> -t 'dashboard/+/status' -v`.
+   The status is `online`.
+4. Do not touch the panel for 30 seconds. The panel must show "Asleep", and the
+   status must show `asleep`. The log can show `wifi: off, and the radio is off`,
+   then `power: sleep until [Touch]`. The last log lines before the sleep can be
+   lost.
+5. Tap a room button on the panel. The panel must show that room, so the tap that
+   wakes the device also acts. In a few seconds the status is `online` again. If the
+   log continues, it shows
+   `power: woke by Touch after N ms, average current M mA (not verified)` and
+   `touch: wake tap at (x, y)`.
+6. Wait 30 seconds again. The panel must show "Asleep" again.
+7. Set `force_battery = false` in `cfg.toml` and run `just flash`.
+
+### Drain while asleep
+
+The wake line gives `AverageCurrent()` of the BQ27220 (command 0x14). The unit (mA) and
+the sign (negative for a discharge) are not verified on the board, so the log marks
+the value "not verified". The display task reads it directly after the wake, so the value is
+mostly the current while the device was asleep. But the serial log needs USB, and on
+USB the value is the charge current, not the drain. Thus the wake line cannot give
+the drain. To measure the drain:
+
+1. Flash with `force_battery = false`, and disconnect USB.
+2. Write down the charge in the header.
+3. Let the device sleep for some hours, then tap it. Write down the charge and the
+   time.
+4. Calculate the drain from the change of the charge, the time and the capacity of
+   the battery.
+
+For a direct value, put a meter in series with the battery.

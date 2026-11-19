@@ -347,6 +347,7 @@ name = "dashboard-firmware"
 version = "0.1.0"
 dependencies = [
  "allocator-api2",
+ "critical-section",
  "crux_core",
  "crux_time",
  "embassy-executor",

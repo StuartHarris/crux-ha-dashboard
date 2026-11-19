@@ -14,26 +14,42 @@
 //! source and the charge, and
 //! sends each change to the core (`logic::power::PowerMonitor`). The task
 //! only reads these chips. It never writes to them.
+//!
+//! The task also runs the `Sleep` job, because it owns the INT pin of the
+//! touch controller and the I2C bus. The core sends `Sleep` only after the
+//! MQTT connection closed and the radio is off. The core task writes the job
+//! in [`SLEEP`], and `None` when the shell answered the request. Refer to
+//! [`Sleep`].
 
 use core::mem;
 
 use dashboard_firmware::panel::{Area, Panel};
-use embassy_futures::select::{Either, select};
+use embassy_futures::select::{Either3, select3};
 use embassy_time::{Duration, Instant, Timer};
-use embedded_graphics::primitives::Rectangle;
+use embedded_graphics::{prelude::Point, primitives::Rectangle};
+use esp_hal::{
+    peripherals::LPWR,
+    rtc_cntl::{
+        WakeupSource,
+        sleep::{LowPower, RtcSleepConfig},
+        wakeup_cause,
+    },
+};
 use logic::{
     backoff::Backoff,
     power::{
-        CHARGER_ADDRESS, CHARGER_STATUS, GAUGE_ADDRESS, GAUGE_STATE_OF_CHARGE, PowerMonitor,
-        level_from_bq27220, source_from_bq25896,
+        CHARGER_ADDRESS, CHARGER_STATUS, GAUGE_ADDRESS, GAUGE_AVERAGE_CURRENT,
+        GAUGE_STATE_OF_CHARGE, PowerMonitor, current_from_bq27220, level_from_bq27220,
+        source_from_bq25896,
     },
     shell::Signal,
-    touch::{Tapper, TouchMap},
+    sleep::{After, Blocker, Cause, Plan, Readiness, Sleeper},
+    touch::{Sample, Tapper, TouchMap},
 };
-use shared::{Event, PowerSource, ViewModel};
+use shared::{Event, PowerSource, ViewModel, capabilities::power::Wake};
 use ui::{Framebuffer, Refresh, Refresher};
 
-use crate::{RENDER, SIGNALS};
+use crate::{RENDER, SIGNALS, SLEEP};
 
 /// The time between two reads of the touch controller.
 const TOUCH_POLL: Duration = Duration::from_millis(30);
@@ -54,23 +70,225 @@ struct Frames {
 
 /// `source` is the power source that the core got in `Start`.
 #[embassy_executor::task]
-pub async fn task(mut panel: Panel<'static>, source: PowerSource) {
+pub async fn task(mut panel: Panel<'static>, source: PowerSource, mut sleep: Sleep) {
     let mut touch = Touch::default();
-    let mut power = Power::new(source);
+    let mut power = Power::new(source, sleep.fixed_source);
     let mut frames = Frames {
         shown: Framebuffer::new(),
         next: Framebuffer::new(),
         refresher: Refresher::default(),
     };
     loop {
-        match select(RENDER.wait(), Timer::after(TOUCH_POLL)).await {
-            Either::First(view) => render(&mut panel, &mut frames, &view).await,
-            Either::Second(()) => touch.poll(&mut panel).await,
+        match select3(RENDER.wait(), SLEEP.wait(), Timer::after(TOUCH_POLL)).await {
+            Either3::First(view) => render(&mut panel, &mut frames, &view).await,
+            Either3::Second(job) => sleep.set_job(job),
+            Either3::Third(()) => {
+                if touch.poll(&mut panel).await {
+                    sleep.sleeper.tapped(now_ms());
+                }
+            }
         }
         // After each branch, so that many renders in a row do not stop the
         // power poll.
         power.poll(&mut panel);
+        // A view model that waits blocks the sleep, so the last image
+        // before `Sleep` is on the panel first.
+        sleep.poll(&mut panel, &mut touch, &mut power);
     }
+}
+
+/// The light sleep of the chip.
+///
+/// Light sleep keeps the RAM and the PSRAM, so the program continues after
+/// the wake, with no full refresh. The wake sources are the GT911 INT pin
+/// (GPIO3, a low level) and the RTC timer. `esp-hal` moves the system timer
+/// forward by the time asleep, so `Instant` and the running timers stay
+/// correct. The alarm of the scheduler (`TIMG0`) stops in the sleep, so the
+/// task arms it again after the wake.
+///
+/// A wake by the INT pin, or by the RTC timer at the deadline of the core, is
+/// a real wake. After a touch wake, the task reads the point and sends it as
+/// a tap, which answers the job and acts on its control. Else it answers
+/// the job with `Signal::Woke`. The RTC timer also wakes the chip each
+/// `logic::sleep::CHECK_SECONDS` for a read of the charger. If the source
+/// changes, the shell answers the job with `Wake::PowerSource`. Otherwise
+/// the chip sleeps again at once. After another wake, the chip sleeps again
+/// after `logic::sleep::WAKE_HOLD_MS`. In that time, a tap or a change of
+/// the power source can also end the `Sleep` request (`logic::shell`).
+pub struct Sleep {
+    low_power: LowPower<'static>,
+    /// The `Sleep` job that waits for a real wake.
+    job: Option<Plan>,
+    sleeper: Sleeper,
+    /// The power source does not follow the charger (`force_battery`).
+    fixed_source: bool,
+}
+
+impl Sleep {
+    /// Makes the sleep. If `force_battery` is `true`, the power poll keeps
+    /// the source `Battery`.
+    pub fn new(lpwr: LPWR<'static>, force_battery: bool) -> Self {
+        Self {
+            low_power: LowPower::new(lpwr),
+            job: None,
+            sleeper: Sleeper::default(),
+            fixed_source: force_battery,
+        }
+    }
+
+    /// Takes a new `Sleep` job, or `None` when the shell answered the
+    /// request.
+    fn set_job(&mut self, job: Option<Plan>) {
+        if let Some(plan) = job {
+            self.sleeper.start(now_ms(), plan);
+        }
+        self.job = job;
+    }
+
+    /// Sleeps if a `Sleep` job waits, the hold after the last wake or tap
+    /// ended, and nothing blocks the sleep (`logic::sleep::Readiness`). It
+    /// does not wait for a blocker, so the touch poll and the renders
+    /// continue, and the task tries again on its next pass.
+    fn poll(&mut self, panel: &mut Panel<'static>, touch: &mut Touch, power: &mut Power) {
+        let now = now_ms();
+        let Some(requested) = self.job.filter(|_| self.sleeper.can_sleep(now)) else {
+            self.sleeper.unblocked();
+            return;
+        };
+        let Some(plan) = requested.armed(touch.is_ready()) else {
+            if self.sleeper.not_ready(now) {
+                log::warn!("power: the touch controller is not ready, so the device stays awake");
+            }
+            return;
+        };
+        let readiness = Readiness {
+            render_pending: RENDER.signaled(),
+            touch_pending: panel.touch_pending(),
+        };
+        if let Some(blocker) = readiness.blocker(plan) {
+            if self.sleeper.blocked(now, blocker) {
+                warn_blocked(panel, touch, blocker);
+            }
+            return;
+        }
+        self.sleeper.unblocked();
+        let seconds = self.sleeper.timer_seconds(now);
+        log::debug!("power: light sleep, wake on {plan:?}, timer {seconds} s");
+        let started = Instant::now();
+        let cause = self.sleep(panel, plan, seconds);
+        let slept = Instant::now().duration_since(started).as_millis();
+        // First, while the device draws little current.
+        let current = read_average_current(panel);
+        let after = self.sleeper.after(now_ms(), cause);
+        if after == After::CheckPower {
+            log::debug!("power: check of the power source after {slept} ms");
+            if power.check(panel) {
+                // The new source needs its second read. The power poll does
+                // it, and the shell then answers the job.
+                self.sleeper.woke(now_ms());
+            }
+            return;
+        }
+        log::info!(
+            "power: woke by {cause:?} after {slept} ms, average current {} (not verified)",
+            Milliamps(current)
+        );
+        match after {
+            After::Touch => {
+                self.job = None;
+                // The GT911 holds the point while INT is low. The tap at the
+                // point answers the job (`logic::shell`), and it acts on its
+                // control.
+                if let Some(point) = touch.wake_point(panel) {
+                    log::info!("touch: wake tap at ({}, {})", point.x, point.y);
+                    SIGNALS.push(Signal::Tap(point));
+                } else {
+                    log::info!("touch: no point after the wake, so the touch only wakes");
+                    SIGNALS.push(Signal::Woke(Wake::Touch(None)));
+                }
+            }
+            After::Answer(wake) => {
+                self.job = None;
+                SIGNALS.push(Signal::Woke(wake));
+            }
+            After::SleepAgain | After::CheckPower => self.sleeper.woke(now_ms()),
+        }
+    }
+
+    /// Enters light sleep with the touch wake of `plan` and a timer wake
+    /// after `seconds`, and returns the cause of the wake.
+    fn sleep(&mut self, panel: &mut Panel<'static>, plan: Plan, seconds: u32) -> Cause {
+        // The sleep and the reads of the wake cause are in one critical
+        // section, as in the automatic light sleep of `esp-rtos`. Thus no
+        // interrupt handler clears the GPIO interrupt before the read.
+        let wake = critical_section::with(|_| {
+            if plan.touch {
+                panel.touch_wake_arm();
+            }
+            self.low_power.set_wakeup_deadline(
+                esp_hal::time::Instant::now()
+                    + esp_hal::time::Duration::from_secs(u64::from(seconds)),
+            );
+            self.low_power.sleep_light(RtcSleepConfig::default());
+            let touch = plan.touch && panel.touch_wake_disarm();
+            if touch {
+                Cause::Touch
+            } else if wakeup_cause().contains(WakeupSource::Timer) {
+                Cause::Timer
+            } else {
+                Cause::Other
+            }
+        });
+        // The deadline is a standing request, so remove it.
+        self.low_power.clear_wakeup_deadline();
+        // The alarm of the scheduler did not run in the sleep.
+        esp_rtos::rearm_alarm();
+        wake
+    }
+}
+
+/// Writes a warning about a blocker that stopped the sleeps for
+/// `logic::sleep::BLOCK_WARNING_MS`. If the GT911 holds INT low, clears its
+/// status register. If INT is still low, starts the touch controller again.
+fn warn_blocked(panel: &mut Panel<'static>, touch: &mut Touch, blocker: Blocker) {
+    log::warn!("power: {blocker:?} stops the sleep");
+    if blocker != Blocker::Touch {
+        return;
+    }
+    if let Err(error) = panel.touch_clear_status() {
+        log::warn!("touch: cannot clear the status ({error:?})");
+    }
+    if panel.touch_pending() {
+        log::warn!("touch: INT is still low, so the touch controller starts again");
+        touch.restart();
+    }
+}
+
+/// Returns the time since the start, in milliseconds.
+fn now_ms() -> u64 {
+    Instant::now().as_millis()
+}
+
+/// A current in mA for the log, or "not known".
+struct Milliamps(Option<i16>);
+
+impl core::fmt::Display for Milliamps {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            Some(current) => write!(f, "{current} mA"),
+            None => write!(f, "not known"),
+        }
+    }
+}
+
+/// Reads the average current in mA from the BQ27220 fuel gauge. A negative
+/// value is a discharge. Returns `None` if the read fails.
+fn read_average_current(panel: &mut Panel<'static>) -> Option<i16> {
+    let mut bytes = [0; 2];
+    panel
+        .read_registers(GAUGE_ADDRESS, GAUGE_AVERAGE_CURRENT, &mut bytes)
+        .ok()
+        .map(|()| current_from_bq27220(bytes))
 }
 
 /// Reads the power source from the BQ25896 charger. Returns `None` if the
@@ -124,9 +342,15 @@ struct Power {
 }
 
 impl Power {
-    fn new(source: PowerSource) -> Self {
+    /// If `fixed` is `true`, the monitor keeps `source` and sends no change
+    /// of the source.
+    fn new(source: PowerSource, fixed: bool) -> Self {
         Self {
-            monitor: PowerMonitor::new(source),
+            monitor: if fixed {
+                PowerMonitor::fixed(source)
+            } else {
+                PowerMonitor::new(source)
+            },
             next: Instant::now(),
             charger_failed: false,
             gauge_failed: false,
@@ -145,6 +369,22 @@ impl Power {
         let level = read_level(panel, !self.gauge_failed);
         self.charger_failed = source.is_none();
         self.gauge_failed = level.is_none();
+        self.send(source, level, now);
+    }
+
+    /// Reads only the charger now, as the check of the power source during
+    /// a sleep does. Sends a change to the core. Returns `true` if a new
+    /// source waits for its second read.
+    fn check(&mut self, panel: &mut Panel<'static>) -> bool {
+        let source = read_source(panel, !self.charger_failed);
+        self.charger_failed = source.is_none();
+        self.send(source, None, Instant::now());
+        self.monitor.is_pending()
+    }
+
+    /// Gives the reads to the monitor, sends each change to the core, and
+    /// sets the time of the next read.
+    fn send(&mut self, source: Option<PowerSource>, level: Option<u8>, now: Instant) {
         for event in self.monitor.update(source, level) {
             match &event {
                 Event::PowerSourceChanged(source) => log::info!("power: source {source:?}"),
@@ -172,9 +412,37 @@ struct Touch {
 }
 
 impl Touch {
+    /// Returns `true` if the touch controller started.
+    const fn is_ready(&self) -> bool {
+        self.map.is_some()
+    }
+
+    /// Reads the point of the touch that woke the chip, or `None` if the
+    /// read fails or the sample has no point. Marks the touch as used, so
+    /// that a later sample of the same touch is not a second tap.
+    fn wake_point(&mut self, panel: &mut Panel<'static>) -> Option<Point> {
+        let map = self.map?;
+        let point = match panel.touch_sample() {
+            Ok(Sample::Pressed(raw)) => Some(map.to_panel(raw)),
+            Ok(_) => None,
+            Err(error) => {
+                log::warn!("touch: read failed after the wake ({error:?})");
+                None
+            }
+        };
+        self.tapper.consume(Instant::now().as_millis());
+        point
+    }
+
+    /// Makes the next poll start the touch controller again.
+    const fn restart(&mut self) {
+        self.map = None;
+    }
+
     /// Reads one sample, and sends a tap to the core. Starts the controller
     /// first, if it did not start and the wait after the last failure ended.
-    async fn poll(&mut self, panel: &mut Panel<'static>) {
+    /// Returns `true` if the task sent a tap.
+    async fn poll(&mut self, panel: &mut Panel<'static>) -> bool {
         let now = Instant::now().as_millis();
         let Some(map) = self.map else {
             if self.backoff.ready(now) {
@@ -192,19 +460,22 @@ impl Touch {
                     }
                 }
             }
-            return;
+            return false;
         };
         match panel.touch_sample() {
             Ok(sample) => {
                 if let Some(tap) = self.tapper.sample(now, sample.map(|raw| map.to_panel(raw))) {
                     log::info!("touch: tap at ({}, {})", tap.x, tap.y);
                     SIGNALS.push(Signal::Tap(tap));
+                    return true;
                 }
+                false
             }
             Err(error) => {
                 self.map = None;
                 let wait = self.backoff.failed(now);
                 log::warn!("touch: read failed ({error:?}). Next start in {wait} ms.");
+                false
             }
         }
     }

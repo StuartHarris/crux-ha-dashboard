@@ -27,6 +27,8 @@
 //!   panel. The start of the touch controller is a separate `async` call, so
 //!   the caller decides when to try it again.
 //! - A failed power-on turns the high voltages off again.
+//! - The GT911 INT pin can wake the chip from light sleep
+//!   ([`Panel::touch_wake_arm`]).
 //! - It has no SD card, battery, RTC, rotation or deep sleep code. The
 //!   caller reads and writes the other devices on the I2C bus, for example
 //!   the BQ25896 charger, with [`Panel::read_registers`] and
@@ -200,6 +202,34 @@ impl<'a> Panel<'a> {
     /// [`Panel::init_touch`] succeeds.
     pub fn touch_sample(&mut self) -> Result<Sample<(u16, u16)>> {
         self.epd.touch_sample()
+    }
+
+    /// Returns `true` if the touch controller started and holds INT low,
+    /// because it has a sample that the host did not read.
+    pub fn touch_pending(&self) -> bool {
+        self.epd.touch_pending()
+    }
+
+    /// Writes 0 to the status register of the GT911 (0x814E), and so drops
+    /// a sample that the host did not read. Returns
+    /// [`Error::TouchNotReady`] until [`Panel::init_touch`] succeeds.
+    pub fn touch_clear_status(&mut self) -> Result<()> {
+        self.epd.touch_clear_status()
+    }
+
+    /// Makes the GT911 INT pin (GPIO3) a light-sleep wake source. A low
+    /// level wakes the chip. Call [`Panel::touch_wake_disarm`] after the
+    /// sleep. Arm it only after the touch controller started, because INT
+    /// selects the I2C address of the GT911 during its reset.
+    pub fn touch_wake_arm(&mut self) {
+        self.epd.touch_wake_arm();
+    }
+
+    /// Removes the wake source of [`Panel::touch_wake_arm`], and returns
+    /// `true` if the INT pin ended the last sleep. Call it with interrupts
+    /// off, directly after the sleep.
+    pub fn touch_wake_disarm(&mut self) -> bool {
+        self.epd.touch_wake_disarm()
     }
 
     /// Resets the touch controller and returns its resolution, as (x, y).

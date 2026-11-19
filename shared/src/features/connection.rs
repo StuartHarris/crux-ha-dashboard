@@ -117,7 +117,9 @@ pub fn go_online(model: &mut Model) -> Cmd {
     }
 }
 
-/// Publishes `asleep` on the status topic, disconnects and turns Wi-Fi off.
+/// Publishes `asleep` on the status topic, if the connection is up, and
+/// forgets the links. The caller then sends `Disconnect` and `WifiOff`, one
+/// after the other.
 pub fn go_offline(model: &mut Model) -> Cmd {
     let state = &mut model.connection;
     state.outbox.clear();
@@ -126,7 +128,7 @@ pub fn go_offline(model: &mut Model) -> Cmd {
     state.id = state.id.wrapping_add(1);
     state.wifi_request = state.wifi_request.wrapping_add(1);
 
-    let mut command = match &model.settings {
+    let command = match &model.settings {
         Some(settings) if state.mqtt == Link::Up => Mqtt::publish(Publish {
             topic: settings.status_topic(),
             payload: STATUS_ASLEEP.into(),
@@ -135,12 +137,6 @@ pub fn go_offline(model: &mut Model) -> Cmd {
         }),
         _ => Cmd::done(),
     };
-    if state.mqtt != Link::Down {
-        command = command.then(Mqtt::disconnect());
-    }
-    if state.wifi != Link::Down {
-        command = command.then(Network::wifi_off());
-    }
     state.mqtt = Link::Down;
     state.wifi = Link::Down;
     command
@@ -171,9 +167,10 @@ pub fn wifi(request: u32, status: WifiStatus, model: &mut Model) -> Cmd {
             connect(model)
         }
         WifiStatus::Connected => {
-            // The device went to sleep while Wi-Fi started.
+            // The device went to sleep while Wi-Fi started. The steps of the
+            // sleep turn Wi-Fi off.
             model.connection.wifi = Link::Down;
-            Network::wifi_off()
+            Cmd::done()
         }
         WifiStatus::Failed => {
             model.connection.wifi = Link::Down;
@@ -328,11 +325,19 @@ fn connected(model: &mut Model) -> Cmd {
     model.connection.backoff = RECONNECT_MIN;
     model.unsent = 0;
 
-    let mut commands = alloc::vec![
-        Mqtt::subscribe(entities::topics(model.pages)),
-        Mqtt::publish(status),
-    ];
-    commands.extend(model.connection.outbox.drain(..).map(Mqtt::publish));
+    // The service calls of the outbox go first, so a tap that waits for the
+    // connection does not wait behind the subscribe (one packet for each
+    // topic). The subscribe after the status is safe: the state messages are
+    // retained, so the broker sends the newest one of each topic with the
+    // subscribe, also if the seed automation publishes before it.
+    let mut commands: Vec<Cmd> = model
+        .connection
+        .outbox
+        .drain(..)
+        .map(Mqtt::publish)
+        .collect();
+    commands.push(Mqtt::publish(status));
+    commands.push(Mqtt::subscribe(entities::topics(model.pages)));
     commands.push(redraw(model, false));
     Cmd::all(commands)
 }

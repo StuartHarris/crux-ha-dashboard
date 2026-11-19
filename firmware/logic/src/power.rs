@@ -4,8 +4,9 @@
 //!
 //! - The BQ25896 charger (I2C address 0x6B) tells if USB gives power. Refer
 //!   to [`source_from_bq25896`].
-//! - The BQ27220 fuel gauge (I2C address 0x55) gives the charge in percent.
-//!   Refer to [`level_from_bq27220`].
+//! - The BQ27220 fuel gauge (I2C address 0x55) gives the charge in percent
+//!   and the current. Refer to [`level_from_bq27220`] and
+//!   [`current_from_bq27220`].
 //! - [`PowerMonitor`] gives an event to the core only when a value changes.
 
 use alloc::vec::Vec;
@@ -23,6 +24,16 @@ pub const GAUGE_ADDRESS: u8 = 0x55;
 /// The `StateOfCharge()` command of the BQ27220 (0x2C and 0x2D). The gauge
 /// gives the charge in percent as a little-endian `u16`.
 pub const GAUGE_STATE_OF_CHARGE: u8 = 0x2C;
+/// The `AverageCurrent()` command of the BQ27220 (0x14 and 0x15).
+///
+/// The gauge gives the average current in mA as a little-endian `i16`. A
+/// negative value is a discharge. The `Current()` command (0x0C) gives the
+/// current now. The codes are in `bq27220_def.h` of the LilyGo vendor
+/// library. 0x14 is also `BQ27XXX_REG_AI` of a related gauge in the Linux
+/// `bq27xxx_battery` driver. The unit and the sign follow the `BQ27xxx`
+/// family, and a check against the technical reference manual (SLUUBD4) is
+/// still to do.
+pub const GAUGE_AVERAGE_CURRENT: u8 = 0x14;
 
 /// The `PG_STAT` bit of REG0B: 1 if the input power is good.
 const POWER_GOOD: u8 = 1 << 2;
@@ -54,6 +65,13 @@ pub fn level_from_bq27220(bytes: [u8; 2]) -> Option<u8> {
     u8::try_from(percent).ok().filter(|percent| *percent <= 100)
 }
 
+/// Returns the current in mA from the two bytes of the `AverageCurrent()`
+/// or `Current()` command of the BQ27220. A negative value is a discharge.
+#[must_use]
+pub const fn current_from_bq27220(bytes: [u8; 2]) -> i16 {
+    i16::from_le_bytes(bytes)
+}
+
 /// Decides when the power source and the charge changed.
 ///
 /// A change of the power source needs two good, equal reads in a row,
@@ -64,10 +82,15 @@ pub fn level_from_bq27220(bytes: [u8; 2]) -> Option<u8> {
 /// The fuel gauge can give 0% before it has an estimate of the charge. Thus
 /// a level of 0 while the device is on the stand is not known, as a failed
 /// read.
+///
+/// A monitor from [`PowerMonitor::fixed`] keeps its power source. It ignores
+/// the reads of the charger, and it gives only the events of the charge.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PowerMonitor {
     /// The power source that the core has.
     source: PowerSource,
+    /// The monitor ignores the reads of the charger.
+    fixed: bool,
     /// A new power source that waits for a second read.
     pending: Option<PowerSource>,
     /// The charge that the core has, or `None` before the first good read.
@@ -82,8 +105,21 @@ impl PowerMonitor {
     pub const fn new(source: PowerSource) -> Self {
         Self {
             source,
+            fixed: false,
             pending: None,
             level: None,
+        }
+    }
+
+    /// Makes a monitor that keeps the power source `source`, for example
+    /// `Battery` while the device is on USB power for a test of the sleep.
+    /// The monitor sends no `PowerSourceChanged`, and the rule for 0% uses
+    /// `source`.
+    #[must_use]
+    pub const fn fixed(source: PowerSource) -> Self {
+        Self {
+            fixed: true,
+            ..Self::new(source)
         }
     }
 
@@ -100,6 +136,7 @@ impl PowerMonitor {
     /// documentation for the rules.
     pub fn update(&mut self, source: Option<PowerSource>, level: Option<u8>) -> Vec<Event> {
         let mut events = Vec::new();
+        let source = if self.fixed { None } else { source };
         let on_stand = source.unwrap_or(self.source) == PowerSource::Stand;
         let level = level.filter(|level| *level > 0 || !on_stand);
         let Some(source) = source else {
@@ -135,7 +172,7 @@ impl PowerMonitor {
 mod tests {
     use shared::{Event, PowerSource};
 
-    use super::{PowerMonitor, level_from_bq27220, source_from_bq25896};
+    use super::{PowerMonitor, current_from_bq27220, level_from_bq27220, source_from_bq25896};
 
     #[test]
     fn the_charger_status_gives_the_power_source() {
@@ -165,6 +202,32 @@ mod tests {
         assert_eq!(level_from_bq27220([101, 0]), None);
         assert_eq!(level_from_bq27220([50, 1]), None);
         assert_eq!(level_from_bq27220([0xFF, 0xFF]), None);
+    }
+
+    #[test]
+    fn the_gauge_gives_a_signed_current() {
+        assert_eq!(current_from_bq27220([0, 0]), 0);
+        // 500 mA of charge.
+        assert_eq!(current_from_bq27220([0xF4, 0x01]), 500);
+        // A discharge of 5 mA.
+        assert_eq!(current_from_bq27220([0xFB, 0xFF]), -5);
+        assert_eq!(current_from_bq27220([0x00, 0x80]), i16::MIN);
+    }
+
+    #[test]
+    fn a_fixed_source_ignores_the_charger() {
+        let mut monitor = PowerMonitor::fixed(PowerSource::Battery);
+        assert_eq!(
+            monitor.update(Some(PowerSource::Stand), Some(90)),
+            [Event::BatteryChanged(Some(90))]
+        );
+        assert_eq!(monitor.update(Some(PowerSource::Stand), Some(90)), []);
+        assert!(!monitor.is_pending());
+        // The rule for 0% uses the fixed source, so 0% is a real level.
+        assert_eq!(
+            monitor.update(Some(PowerSource::Stand), Some(0)),
+            [Event::BatteryChanged(Some(0))]
+        );
     }
 
     #[test]

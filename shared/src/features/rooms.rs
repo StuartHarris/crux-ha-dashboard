@@ -38,7 +38,10 @@ impl<'a> ServiceCall<'a> {
 /// [`Event::Tapped`](crate::Event::Tapped).
 pub fn tapped(control: Option<Control>, model: &mut Model) -> Cmd {
     if model.power.asleep {
-        return power::woke(model);
+        // The tap wakes the device, then acts on its control. A service call
+        // waits in the outbox until the connection is open.
+        let wake = power::wake_up(model);
+        return wake.and(tapped(control, model));
     }
     match control {
         None => Cmd::done(),

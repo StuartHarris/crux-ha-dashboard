@@ -8,8 +8,8 @@
 //! | --- | --- | --- |
 //! | `core` | owns the shell and routes each job | |
 //! | `timers` | `StartTimer`, `CancelTimer` | `Signal::Timer` |
-//! | `display` | draws the latest view model, reads the touch controller, the charger and the fuel gauge | `Signal::Tap`, `Signal::Event` |
-//! | `wifi` | `WifiOn`, `WifiOff` | `Signal::Wifi` |
+//! | `display` | draws the latest view model, reads the touch controller, the charger and the fuel gauge, and runs the `Sleep` job | `Signal::Tap`, `Signal::Event`, `Signal::Woke` |
+//! | `wifi` | `WifiOn`, `WifiOff`, and the radio on and off | `Signal::Wifi`, `Signal::RadioOff` |
 //! | `mqtt` | the MQTT operations, one connection at a time | `Signal::Mqtt` |
 //! | `net` | runs the network stack | |
 
@@ -25,14 +25,14 @@ mod mqtt;
 mod timers;
 mod wifi;
 
-use dashboard_firmware::{board, lane::Lane, network, panel::Panel, panel_pins};
+use dashboard_firmware::{board, lane::Lane, panel::Panel, panel_pins};
 use embassy_executor::Spawner;
 use embassy_net::StackResources;
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal as Latest};
 use esp_backtrace as _;
-use esp_radio::wifi::WifiController;
 use logic::{
     shell::{MqttOp, Signal},
+    sleep::Plan,
     wifi::WifiRequest,
 };
 use shared::{PowerSource, ViewModel};
@@ -62,6 +62,9 @@ pub static TIMERS: Lane<timers::Request> = Lane::new();
 pub static MQTT: Lane<(u32, MqttOp)> = Lane::new();
 /// The work of the Wi-Fi task.
 pub static WIFI: Lane<WifiRequest> = Lane::new();
+/// The `Sleep` job for the display task, or `None` when the `Sleep`
+/// request ended. A newer value replaces one that the task did not read yet.
+pub static SLEEP: Latest<CriticalSectionRawMutex, Option<Plan>> = Latest::new();
 
 /// The number of sockets. `embassy_net::new` takes one socket for DNS, and
 /// one for DHCP while DHCP runs. The MQTT task has one TCP socket at a
@@ -95,21 +98,21 @@ async fn main(spawner: Spawner) -> ! {
 
     // The display task reads the charger after this. The core starts with
     // this source, so the display task sends only a change.
-    let source = match &mut panel {
-        Some(panel) => first_source(panel).await,
-        None => None,
-    }
-    .unwrap_or_else(|| {
-        log::warn!("power: the source is not known, so the core starts on the stand");
-        PowerSource::Stand
-    });
+    let source = if config::CONFIG.force_battery {
+        log::warn!("power: force_battery is true, so the core is on battery also on USB");
+        PowerSource::Battery
+    } else {
+        match &mut panel {
+            Some(panel) => first_source(panel).await,
+            None => None,
+        }
+        .unwrap_or_else(|| {
+            log::warn!("power: the source is not known, so the core starts on the stand");
+            PowerSource::Stand
+        })
+    };
     log::info!("power: source {source:?} at the start");
 
-    let controller = WifiController::new(
-        peripherals.WIFI,
-        network::controller_config(&config::CONFIG),
-    )
-    .expect("start the Wi-Fi driver");
     let interface = esp_radio::wifi::Interface::station();
 
     let rng = esp_hal::rng::Rng::new();
@@ -122,11 +125,12 @@ async fn main(spawner: Spawner) -> ! {
     );
 
     spawner.spawn(net_task(runner).expect("spawn the network task"));
-    spawner.spawn(wifi::task(controller, stack).expect("spawn the Wi-Fi task"));
+    spawner.spawn(wifi::task(peripherals.WIFI, stack).expect("spawn the Wi-Fi task"));
     spawner.spawn(mqtt::task(stack).expect("spawn the MQTT task"));
     spawner.spawn(timers::task().expect("spawn the timer task"));
     if let Some(panel) = panel {
-        spawner.spawn(display::task(panel, source).expect("spawn the display task"));
+        let sleep = display::Sleep::new(peripherals.LPWR, config::CONFIG.force_battery);
+        spawner.spawn(display::task(panel, source, sleep).expect("spawn the display task"));
     }
     core_task::run(source).await
 }

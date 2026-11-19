@@ -13,7 +13,7 @@ use crate::{
     capabilities::{
         mqtt::{Connect, Credentials, Disconnect, MqttEvent, Publish, Subscribe},
         network::{WifiOff, WifiOn, WifiStatus},
-        power::{PowerSource, Sleep},
+        power::{PowerSource, Sleep, Wake},
     },
     entities::Entities,
     features::{
@@ -93,11 +93,6 @@ pub enum Event {
     /// The shell started. On battery, the device also starts after a deep
     /// sleep.
     Start(Start),
-    /// The device woke from a light sleep, which kept the core in memory,
-    /// for a reason that is not a tap. Examples are a timer and the Wake
-    /// button of the simulator. A tap that wakes the device is a `Tapped`
-    /// event.
-    Woke,
     /// The device moved to the stand or off the stand.
     PowerSourceChanged(PowerSource),
     /// The charge of the battery changed, in percent. `None` means that the
@@ -106,12 +101,14 @@ pub enum Event {
     BatteryChanged(Option<u8>),
     /// The user tapped the panel, on this control or (`None`) on no control.
     ///
-    /// The shell sends each tap, also while the device is asleep, and gets
-    /// the control from `ui::hit_test`. The core decides what the tap does:
+    /// The shell gets the control from `ui::hit_test`. While a `Sleep`
+    /// request waits, the shell answers it with `Wake::Touch` and the
+    /// control, in place of a tap. The core decides what the tap does:
     ///
-    /// - If the device is asleep, the tap wakes it. The core does not act on
-    ///   the control, because the user cannot see the controls on a panel
-    ///   that sleeps.
+    /// - If the device is asleep (for example during the steps before
+    ///   `Sleep`), the tap wakes it and then acts on the control, because
+    ///   the panel still shows the page. A service call waits in the outbox
+    ///   until the connection is open.
     /// - If the device is awake, a tap on a control acts on it. A tap on no
     ///   control does nothing, so a touch by accident does not keep the
     ///   device awake.
@@ -155,6 +152,24 @@ pub enum Event {
     #[serde(skip)]
     #[facet(skip)]
     IdleTimeout(u32),
+    /// The MQTT connection closed for the sleep with this id.
+    #[serde(skip)]
+    #[facet(skip)]
+    Offline(u32),
+    /// The radio is off for the sleep with this id.
+    #[serde(skip)]
+    #[facet(skip)]
+    RadioOff(u32),
+    /// The `Sleep` request of the sleep with this id ended.
+    #[serde(skip)]
+    #[facet(skip)]
+    Woke {
+        /// The id of the sleep. The core ignores the answer of an older
+        /// sleep.
+        sleep: u32,
+        /// What ended the sleep.
+        wake: Wake,
+    },
     /// The full-refresh timer with this id expired.
     #[serde(skip)]
     #[facet(skip)]
@@ -329,7 +344,6 @@ impl App for Dashboard {
     fn update(&self, event: Event, model: &mut Model) -> Cmd {
         match event {
             Event::Start(start) => on_start(start, model),
-            Event::Woke => power::woke(model),
             Event::PowerSourceChanged(source) => power::source_changed(source, model),
             Event::BatteryChanged(level) => power::battery_changed(level, model),
             Event::Tapped(control) => rooms::tapped(control, model),
@@ -341,6 +355,9 @@ impl App for Dashboard {
             Event::Mqtt { connection, event } => connection::mqtt(connection, event, model),
             Event::Reconnect(id) => connection::reconnect(id, model),
             Event::IdleTimeout(id) => power::idle_timeout(id, model),
+            Event::Offline(id) => power::offline(id, model),
+            Event::RadioOff(id) => power::radio_off(id, model),
+            Event::Woke { sleep, wake } => power::woke(sleep, wake, model),
             Event::FullRefreshDue(id) => refresh::timer_expired(id, model),
             Event::DrawDue(id) => refresh::draw_due(id, model),
         }

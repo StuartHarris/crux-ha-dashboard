@@ -120,6 +120,15 @@ impl Tapper {
         self.last_tap_ms = Some(now_ms);
         Some(point)
     }
+
+    /// Marks the touch now as used at the time `now_ms`, with no tap. The
+    /// next sample of the same touch gives no tap. The shell uses this after
+    /// a wake that it sent to the core as `Woke`, so that the touch that woke
+    /// the device does not also act on a control.
+    pub const fn consume(&mut self, now_ms: u64) {
+        self.pressed = true;
+        self.last_tap_ms = Some(now_ms);
+    }
 }
 
 #[cfg(test)]
@@ -199,6 +208,21 @@ mod tests {
         assert_eq!(tapper.sample(1040, Sample::Released), None);
         assert_eq!(tapper.sample(1080, pressed(5)), None);
         assert_eq!(tapper.sample(1120, Sample::Released), None);
+        assert!(
+            tapper
+                .sample(1000 + MIN_TAP_INTERVAL_MS, pressed(5))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_consumed_touch_gives_no_tap() {
+        let mut tapper = Tapper::default();
+        tapper.consume(1000);
+        // A late sample of the touch that woke the device.
+        assert_eq!(tapper.sample(1030, pressed(5)), None);
+        assert_eq!(tapper.sample(1060, Sample::Released), None);
+        // The next touch is a new tap.
         assert!(
             tapper
                 .sample(1000 + MIN_TAP_INTERVAL_MS, pressed(5))

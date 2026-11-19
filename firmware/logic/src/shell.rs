@@ -15,11 +15,18 @@
 //! - Each `WifiOn` request has a token. `WifiOff` answers the requests that
 //!   wait with `Failed`, which the core ignores, because it no longer wants
 //!   the connection. The shell then drops a late answer of the Wi-Fi task.
+//! - `Disconnect` ends when the stream of its connection ends, or at once if
+//!   no connection is current. `WifiOff` ends at [`Signal::RadioOff`], in the
+//!   order of the requests.
+//! - `Sleep` ends at [`Signal::Woke`]. While it waits, a tap is the wake
+//!   (`Wake::Touch` with the control at the point), and a change of the
+//!   power source also ends it (`Wake::PowerSource`). [`Shell::is_sleeping`] tells
+//!   the task that runs the sleep when the request ended.
 //! - One batch of effects gives at most one `Render` job, with the view
 //!   at the end of the batch. It is at the place of the last `Render` effect,
 //!   so it stays before a `Sleep` that follows it.
 
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::{boxed::Box, collections::VecDeque, string::String, vec::Vec};
 
 use crux_core::{Request, capability::Operation};
 use crux_time::{
@@ -32,7 +39,7 @@ use shared::{
     capabilities::{
         mqtt::{Connect, Credentials, Disconnect, MqttEvent, Publish, Subscribe},
         network::{WifiOff, WifiOn, WifiStatus},
-        power::Sleep,
+        power::{Sleep, Wake},
     },
 };
 
@@ -64,8 +71,14 @@ pub enum Signal {
         status: WifiStatus,
     },
     /// A tap at this point on the panel. The shell sends it to the core as
-    /// `Event::Tapped`, also on no control and while the device sleeps.
+    /// `Event::Tapped`, also on no control. While a `Sleep` request waits,
+    /// the tap answers it with `Wake::Touch` and the control, in place of a
+    /// tap.
     Tap(Point),
+    /// The radio is off. The answer to the oldest `WifiOff` job that waits.
+    RadioOff,
+    /// The device woke from a real wake. The answer to the `Sleep` job.
+    Woke(Wake),
     /// An event for the core, for example `PowerSourceChanged`.
     Event(Event),
 }
@@ -124,8 +137,11 @@ pub enum Job {
         op: WifiOn,
     },
     /// Turn Wi-Fi off. Stop a join that is in progress, and do not answer it.
+    /// Answer with [`Signal::RadioOff`] when the radio is off.
     WifiOff(WifiOff),
-    /// Put the device to sleep.
+    /// Draw the view model that waits, then put the device to sleep. Answer
+    /// with [`Signal::Woke`] at the first real wake. After another wake,
+    /// sleep again.
     Sleep(Sleep),
     /// Do an operation on a timer.
     Timer {
@@ -157,6 +173,13 @@ pub struct Shell {
     /// The `WifiOn` requests that wait for an answer, with their tokens.
     wifi: Vec<(u32, Request<WifiOn>)>,
     last_wifi_token: u32,
+    /// The `Disconnect` requests that wait for the end of the stream of their
+    /// connection.
+    disconnects: Vec<(u32, Request<Disconnect>)>,
+    /// The `WifiOff` requests that wait for the radio, from the oldest.
+    wifi_off: VecDeque<Request<WifiOff>>,
+    /// The `Sleep` request that waits for a wake.
+    sleep: Option<Request<Sleep>>,
 }
 
 impl Default for Shell {
@@ -178,7 +201,16 @@ impl Shell {
             last_token: 0,
             wifi: Vec::new(),
             last_wifi_token: 0,
+            disconnects: Vec::new(),
+            wifi_off: VecDeque::new(),
+            sleep: None,
         }
+    }
+
+    /// Returns `true` while a `Sleep` request waits for its answer.
+    #[must_use]
+    pub const fn is_sleeping(&self) -> bool {
+        self.sleep.is_some()
     }
 
     /// Returns the view of the core now.
@@ -206,11 +238,20 @@ impl Shell {
                     return Vec::new();
                 };
                 let last = matches!(event, MqttEvent::Disconnected { .. });
-                let effects = resolve(&self.core, &mut self.connections[index].1, event);
+                let mut effects = resolve(&self.core, &mut self.connections[index].1, event);
                 if last {
                     self.connections.remove(index);
                     if self.current == Some(connection) {
                         self.current = None;
+                    }
+                    // The connection is closed, so its `Disconnect` requests
+                    // end.
+                    let (done, waiting) = core::mem::take(&mut self.disconnects)
+                        .into_iter()
+                        .partition(|(id, _)| *id == connection);
+                    self.disconnects = waiting;
+                    for (_, mut request) in done {
+                        effects.extend(resolve(&self.core, &mut request, ()));
                     }
                 }
                 self.process(effects)
@@ -232,10 +273,42 @@ impl Shell {
                 self.process(effects)
             }
             Signal::Tap(point) => {
+                // The last image shows the page, so the point has the same
+                // control while the device sleeps.
                 let control = ui::hit_test(&self.view(), point);
+                if self.is_sleeping() {
+                    return self.wake(Wake::Touch(control));
+                }
                 self.send(Event::Tapped(control))
             }
-            Signal::Event(event) => self.send(event),
+            Signal::Event(event) => {
+                let power = matches!(event, Event::PowerSourceChanged(_));
+                let mut jobs = self.send(event);
+                if power && self.is_sleeping() {
+                    jobs.extend(self.wake(Wake::PowerSource));
+                }
+                jobs
+            }
+            Signal::RadioOff => match self.wifi_off.pop_front() {
+                Some(mut request) => {
+                    let effects = resolve(&self.core, &mut request, ());
+                    self.process(effects)
+                }
+                None => Vec::new(),
+            },
+            Signal::Woke(wake) => self.wake(wake),
+        }
+    }
+
+    /// Answers the `Sleep` request that waits with `wake`. If no request
+    /// waits, returns no jobs.
+    fn wake(&mut self, wake: Wake) -> Vec<Job> {
+        match self.sleep.take() {
+            Some(mut request) => {
+                let effects = resolve(&self.core, &mut request, wake);
+                self.process(effects)
+            }
+            None => Vec::new(),
         }
     }
 
@@ -307,12 +380,14 @@ impl Shell {
                 }
                 Vec::new()
             }
-            Effect::MqttDisconnect(request) => {
-                if let Some(current) = self.current.take() {
-                    jobs.push(mqtt(current, MqttOp::Disconnect(request.operation)));
+            Effect::MqttDisconnect(mut request) => match self.current.take() {
+                Some(current) => {
+                    jobs.push(mqtt(current, MqttOp::Disconnect(request.operation.clone())));
+                    self.disconnects.push((current, request));
+                    Vec::new()
                 }
-                Vec::new()
-            }
+                None => resolve(&self.core, &mut request, ()),
+            },
             Effect::WifiOn(request) => {
                 self.last_wifi_token = self.last_wifi_token.wrapping_add(1);
                 let token = self.last_wifi_token;
@@ -322,11 +397,13 @@ impl Shell {
                 Vec::new()
             }
             Effect::WifiOff(request) => {
-                jobs.push(Job::WifiOff(request.operation));
+                jobs.push(Job::WifiOff(request.operation.clone()));
+                self.wifi_off.push_back(request);
                 self.answer_wifi(|_| true, WifiStatus::Failed)
             }
             Effect::Sleep(request) => {
-                jobs.push(Job::Sleep(request.operation));
+                jobs.push(Job::Sleep(request.operation.clone()));
+                self.sleep = Some(request);
                 Vec::new()
             }
             Effect::TimeNotifyAfter(request) => {
@@ -382,8 +459,9 @@ fn resolve<Op: Operation>(
 /// have `read_only` from the configuration, so the core does a dry run if
 /// it is `true`.
 ///
-/// `path` and `last_sync` are the values that the firmware kept in RTC
-/// memory during a deep sleep, or `None` after a cold start.
+/// `path` and `last_sync` are for a start after a deep sleep, with the
+/// values that the firmware kept in RTC memory. The firmware uses light
+/// sleep, which keeps the core, so it gives `None` for both.
 #[must_use]
 pub fn start(
     config: &Config<'_>,

@@ -14,6 +14,8 @@
 //! - [`config`] reads and checks the build-time configuration.
 //! - [`backoff`] is a wait that doubles after each failure.
 //! - [`wifi`] is the rule of the Wi-Fi task for a request during a join.
+//! - [`sleep`] decides when the chip can go into light sleep, and which
+//!   wake is a real wake.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -24,6 +26,7 @@ pub mod config;
 pub mod mqtt;
 pub mod power;
 pub mod shell;
+pub mod sleep;
 pub mod timers;
 pub mod touch;
 pub mod wifi;

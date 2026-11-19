@@ -9,6 +9,10 @@
 //! has no quota. If it cannot be sent, the connection closes, and the core
 //! reconnects.
 //!
+//! While the task connects, it also takes its jobs. A `Disconnect` or a new
+//! `Connect` stops the attempt, so the core does not wait for a connection
+//! that it no longer wants.
+//!
 //! Each send waits for the ACK of the broker, because `rust-mqtt` flushes the
 //! socket after each packet. When the Wi-Fi link is down, no ACK comes, and
 //! the TCP timeout does not see the dead link. So each send has a time limit
@@ -26,9 +30,9 @@ use alloc::{
     string::{String, ToString},
     vec::Vec,
 };
-use core::{net::Ipv4Addr, num::NonZero, str::FromStr};
+use core::{net::Ipv4Addr, num::NonZero, pin::pin, str::FromStr};
 
-use embassy_futures::select::{Either4, select4};
+use embassy_futures::select::{Either, Either4, select, select4};
 use embassy_net::{IpAddress, Stack, dns::DnsQueryType, tcp::TcpSocket};
 use embassy_time::{Duration, Instant, Timer};
 use logic::{
@@ -66,6 +70,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// The time limit of one call that sends a packet. `rust-mqtt` flushes the
 /// socket after each packet, and the flush waits for the ACK of the broker.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+/// The time limit of the disconnect packet.
+const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The client: up to 16 subscribe packets and 16 received messages in
 /// flight, 4 sent messages in flight, 1 subscription identifier, 2 user
@@ -165,30 +171,23 @@ async fn session(
     connect: &Connect,
     pending: &mut Pending,
 ) -> End {
-    let address = match resolve(stack, &connect.host).await {
-        Ok(address) => address,
-        Err(reason) => return End::error(reason),
-    };
     let mut rx = [0; RX_BUFFER];
     let mut tx = [0; TX_BUFFER];
-    let mut socket = TcpSocket::new(stack, &mut rx, &mut tx);
-    // This timeout alone does not see a dead Wi-Fi link. Each send waits for
-    // the ACK of the broker, so each send has its own time limit
-    // (`WRITE_TIMEOUT`). The session also checks the silence of the broker
-    // (see `broker_silent`).
-    socket.set_timeout(tcp_timeout(connect.keep_alive_secs));
-    match embassy_time::with_timeout(CONNECT_TIMEOUT, socket.connect((address, connect.port))).await
-    {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => return End::error(format!("TCP connect failed: {error:?}")),
-        Err(_) => return End::error("TCP connect timed out"),
-    }
-
     let mut buffer = AllocBuffer;
-    let mut client = MqttClient::new(&mut buffer);
-    if let Err(reason) = open(&mut client, socket, connect).await {
-        return End::error(reason);
-    }
+    let mut client = match connect_or_stop(
+        stack,
+        streams,
+        connect,
+        pending,
+        &mut rx,
+        &mut tx,
+        &mut buffer,
+    )
+    .await
+    {
+        Ok(client) => client,
+        Err(end) => return end,
+    };
     log::info!("mqtt: connected");
     if let Some(signal) = streams.connected(connection) {
         SIGNALS.push(signal);
@@ -208,7 +207,7 @@ async fn session(
         match select4(next_job(pending), client.poll_header(), ping, retry).await {
             Either4::First((id, op)) => match op {
                 MqttOp::Connect(next) => {
-                    disconnect(&mut client).await;
+                    disconnect(&mut client, WRITE_TIMEOUT).await;
                     // The outer loop opens the new connection.
                     pending.push_front((id, MqttOp::Connect(next)));
                     return End::error("replaced by a new connection");
@@ -236,7 +235,7 @@ async fn session(
                     }
                 }
                 MqttOp::Disconnect(_) => {
-                    disconnect(&mut client).await;
+                    disconnect(&mut client, DISCONNECT_TIMEOUT).await;
                     return End { reason: None };
                 }
             },
@@ -309,16 +308,89 @@ fn timed_out(what: &str) -> String {
     )
 }
 
-/// Sends a disconnect packet. A failure or a time-out only gets a log line,
-/// because the session ends anyway.
-async fn disconnect(client: &mut MqttClient<'_, '_>) {
-    match embassy_time::with_timeout(WRITE_TIMEOUT, client.disconnect(&DisconnectOptions::new()))
-        .await
-    {
+/// Sends a disconnect packet, with the time limit `limit`. A failure or a
+/// time-out only gets a log line, because the session ends anyway.
+///
+/// For the `Disconnect` request of the core, the limit is
+/// [`DISCONNECT_TIMEOUT`]. The shell answers the request when the session
+/// ends, so a dead link cannot stop the sleep for long.
+async fn disconnect(client: &mut MqttClient<'_, '_>, limit: Duration) {
+    match embassy_time::with_timeout(limit, client.disconnect(&DisconnectOptions::new())).await {
         Ok(Ok(_)) => {}
         Ok(Err(error)) => log::warn!("mqtt: disconnect failed: {error:?}"),
-        Err(_) => log::warn!("mqtt: {}", timed_out("disconnect")),
+        Err(_) => log::warn!("mqtt: the disconnect timed out after {} s", limit.as_secs()),
     }
+}
+
+/// Opens the connection, and takes the jobs while it connects. A
+/// `Disconnect` or a new `Connect` stops the attempt, and the function
+/// returns the end of the session. The other jobs of this connection go back
+/// to `pending`, in order, when the connection is open.
+async fn connect_or_stop<'a, 'c>(
+    stack: Stack<'static>,
+    streams: &Streams,
+    connect: &Connect,
+    pending: &mut Pending,
+    rx: &'a mut [u8],
+    tx: &'a mut [u8],
+    buffer: &'c mut AllocBuffer,
+) -> Result<MqttClient<'a, 'c>, End> {
+    let mut early = Vec::new();
+    let client = {
+        let mut attempt = pin!(attempt(stack, connect, rx, tx, buffer));
+        loop {
+            match select(attempt.as_mut(), next_job(pending)).await {
+                Either::First(Ok(client)) => break client,
+                Either::First(Err(reason)) => return Err(End::error(reason)),
+                Either::Second((id, op)) => match op {
+                    MqttOp::Connect(next) => {
+                        pending.push_front((id, MqttOp::Connect(next)));
+                        return Err(End::error("replaced by a new connection"));
+                    }
+                    _ if !streams.accepts(id) => {
+                        log::debug!("mqtt: connection {id} is closed");
+                    }
+                    MqttOp::Disconnect(_) => {
+                        log::info!("mqtt: the connection stopped before it opened");
+                        return Err(End { reason: None });
+                    }
+                    op => early.push((id, op)),
+                },
+            }
+        }
+    };
+    for job in early.into_iter().rev() {
+        pending.push_front(job);
+    }
+    Ok(client)
+}
+
+/// Resolves the host, opens the TCP connection and sends the MQTT
+/// connect. Returns the client of the open connection, or the reason for
+/// the failure.
+async fn attempt<'a, 'c>(
+    stack: Stack<'static>,
+    connect: &Connect,
+    rx: &'a mut [u8],
+    tx: &'a mut [u8],
+    buffer: &'c mut AllocBuffer,
+) -> Result<MqttClient<'a, 'c>, String> {
+    let address = resolve(stack, &connect.host).await?;
+    let mut socket = TcpSocket::new(stack, rx, tx);
+    // This timeout alone does not see a dead Wi-Fi link. Each send waits for
+    // the ACK of the broker, so each send has its own time limit
+    // (`WRITE_TIMEOUT`). The session also checks the silence of the broker
+    // (see `broker_silent`).
+    socket.set_timeout(tcp_timeout(connect.keep_alive_secs));
+    match embassy_time::with_timeout(CONNECT_TIMEOUT, socket.connect((address, connect.port))).await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => return Err(format!("TCP connect failed: {error:?}")),
+        Err(_) => return Err("TCP connect timed out".into()),
+    }
+    let mut client = MqttClient::new(buffer);
+    open(&mut client, socket, connect).await?;
+    Ok(client)
 }
 
 /// Returns the reason to close the connection if the broker was silent for too
