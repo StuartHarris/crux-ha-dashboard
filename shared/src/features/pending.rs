@@ -55,8 +55,9 @@
 //!
 //! # Timers
 //!
-//! - [`PENDING_TIMEOUT`] after the core issued the service call, Home
-//!   Assistant did not confirm it. The core removes the mark, and the tile
+//! - [`PENDING_TIMEOUT`] (or [`TARGET_TIMEOUT`] for a step of a thermostat)
+//!   after the core issued the service call, Home Assistant did not confirm
+//!   it. The core removes the mark, and the tile
 //!   shows the last state that the core has. If a newer call for the entity
 //!   waits in the outbox, the mark stays for that call.
 //! - [`SCENE_TIMEOUT`] after the core issued the call of a scene, the core
@@ -97,6 +98,16 @@ use crate::{
 /// The time after which the core removes the mark of a service call that
 /// Home Assistant did not confirm.
 pub const PENDING_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The time after which the core removes the mark of a step of a thermostat
+/// that Home Assistant did not confirm.
+///
+/// A thermostat can take much longer than a light to report its new target.
+/// A Nest thermostat reports it through the Google cloud, and on the board
+/// that took from 1.3 s to 14 s. The time is less than
+/// [`IDLE_TIMEOUT`](crate::features::power::IDLE_TIMEOUT), so the device does
+/// not sleep while the mark waits.
+pub const TARGET_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// The time after which the core removes the mark of a scene. A scene has no
 /// state that confirms it.
@@ -313,10 +324,10 @@ pub fn issued(entity_id: &str, model: &mut Model) -> Cmd {
     let Some(confirm) = state.get_mut(entity_id).map(|mark| mark.confirm) else {
         return Cmd::done();
     };
-    let wait = if confirm == Confirm::Scene {
-        SCENE_TIMEOUT
-    } else {
-        PENDING_TIMEOUT
+    let wait = match confirm {
+        Confirm::Scene => SCENE_TIMEOUT,
+        Confirm::Target(_) => TARGET_TIMEOUT,
+        _ => PENDING_TIMEOUT,
     };
     let (command, timer) = state.start(wait);
     if let Some(mark) = state.get_mut(entity_id) {

@@ -28,7 +28,7 @@ use crate::{
     entities::STATESTREAM,
     features::{
         light::LIGHT_TIMEOUT,
-        pending::{PENDING_TIMEOUT, SCENE_TIMEOUT},
+        pending::{PENDING_TIMEOUT, SCENE_TIMEOUT, TARGET_TIMEOUT},
         refresh::FULL_REFRESH_INTERVAL,
     },
 };
@@ -134,8 +134,8 @@ trait ExpectServiceCall {
         self.expect_only_service_call_with(|_| {});
     }
 
-    /// Expects the effect that starts the timer of a mark: [`PENDING_TIMEOUT`]
-    /// or [`SCENE_TIMEOUT`].
+    /// Expects the effect that starts the timer of a mark: [`PENDING_TIMEOUT`],
+    /// [`TARGET_TIMEOUT`] or [`SCENE_TIMEOUT`].
     fn expect_pending_timer(&mut self) -> &mut Self;
 }
 
@@ -152,7 +152,7 @@ impl ExpectServiceCall for Cmd {
         self.expect_time_notify_after_with(|notify| {
             let duration = Duration::from(notify.duration);
             assert!(
-                duration == PENDING_TIMEOUT || duration == SCENE_TIMEOUT,
+                [PENDING_TIMEOUT, TARGET_TIMEOUT, SCENE_TIMEOUT].contains(&duration),
                 "{duration:?}"
             );
         })

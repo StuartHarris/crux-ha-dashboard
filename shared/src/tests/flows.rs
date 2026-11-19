@@ -15,7 +15,7 @@ use crate::{
     capabilities::power::{Wake, WakeSource},
     features::{
         connection::{RECONNECT_MAX, RECONNECT_MIN},
-        pending::{PENDING_TIMEOUT, SCENE_TIMEOUT},
+        pending::{PENDING_TIMEOUT, SCENE_TIMEOUT, TARGET_TIMEOUT},
         power::IDLE_TIMEOUT,
     },
 };
@@ -1065,7 +1065,18 @@ fn a_thermostat_step_past_its_limit_shows_the_mark_until_the_timeout() {
     );
     assert_eq!(shell.view().tiles()[4].state, TileState::Pending);
 
+    // A thermostat can be slow, so the mark stays after the timeout of a
+    // light.
     let events = shell.advance(PENDING_TIMEOUT);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, Event::PendingTimeout(_))),
+        "{events:?}"
+    );
+    assert_eq!(shell.view().tiles()[4].state, TileState::Pending);
+
+    let events = shell.advance(TARGET_TIMEOUT.saturating_sub(PENDING_TIMEOUT));
     assert!(
         events
             .iter()

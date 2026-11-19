@@ -194,8 +194,10 @@ than the time at the tap. For a brightness step, `last_updated` is later than th
 time at the tap. For a step of a thermostat, `last_updated` is later than the time at
 the tap, and the `temperature` attribute is the target of the step. A change of the
 current temperature alone does not confirm the step. Thus the state stream must publish `last_updated` (`publish_timestamps: true`).
-If Home Assistant does not confirm the call in 5 seconds, the tile shows the last
-state again. A call that changes nothing shows the pattern for these 5 seconds. A scene
+If Home Assistant does not confirm the call in 5 seconds (20 seconds for a step of a
+thermostat), the tile shows the last state again. A call that changes nothing shows the
+pattern for this time. A thermostat gets more time, because a Nest thermostat reports
+its new target through the Google cloud, and that can take more than 10 seconds. A scene
 has no state, so its button shows the pattern for 2 seconds. Refer to
 `shared/src/features/pending.rs`.
 
