@@ -9,6 +9,7 @@ use super::{ExpectFullRefreshTimer, connection::drive_to_connected, shell::Shell
 use crate::{
     Dashboard, EffectTestExt, Event, Model, PowerSource,
     capabilities::power::Wake,
+    features::power::IDLE_TIMEOUT,
     features::refresh::{
         DRAW_DELAY, FULL_REFRESH_INTERVAL, PARTIALS_PER_FULL, redraw, redraw_soon,
     },
@@ -140,24 +141,31 @@ fn the_timer_does_nothing_while_the_device_sleeps() {
 fn on_the_stand_the_panel_has_a_full_refresh_each_interval() {
     let mut shell = Shell::new();
     shell.send(start(PowerSource::Stand));
-    assert_eq!(shell.full_refresh_timers(), 1);
     // A state message draws with a partial refresh.
     shell.broker.set_state("light.all_lights", "on", &[]);
     shell.run();
     assert!(!shell.frames.last().unwrap().full);
     let frames = shell.frames.len();
 
-    shell.fire_full_refresh_timer();
+    assert_eq!(full_refreshes_due(&mut shell), 1);
     assert_eq!(shell.frames.len(), frames + 1);
     assert!(shell.frames.last().unwrap().full);
-    // The full refresh starts the next timer.
-    assert_eq!(shell.full_refresh_timers(), 1);
 
-    // With no partial render since, the next interval draws nothing.
+    // The full refresh started the next timer. With no partial render
+    // since, the next interval draws nothing.
     let frames = shell.frames.len();
-    shell.fire_full_refresh_timer();
+    assert_eq!(full_refreshes_due(&mut shell), 1);
     assert_eq!(shell.frames.len(), frames);
-    assert_eq!(shell.full_refresh_timers(), 1);
+}
+
+/// Moves the clock by [`FULL_REFRESH_INTERVAL`], and returns the number of
+/// full-refresh timers that fired.
+fn full_refreshes_due(shell: &mut Shell) -> usize {
+    shell
+        .advance(FULL_REFRESH_INTERVAL)
+        .iter()
+        .filter(|event| matches!(event, Event::FullRefreshDue(_)))
+        .count()
 }
 
 #[test]
@@ -169,23 +177,24 @@ fn each_full_refresh_starts_the_timer_again() {
     shell.send(Event::NextPage);
     let log = shell.take_log();
     assert!(log.contains(&"TimeClear".into()), "{log:?}");
-    assert_eq!(shell.full_refresh_timers(), 1);
+    // Only the new timer runs.
+    assert_eq!(full_refreshes_due(&mut shell), 1);
 }
 
 #[test]
 fn no_full_refresh_timer_runs_while_the_device_sleeps() {
     let mut shell = Shell::new();
     shell.send(start(PowerSource::Battery));
-    assert_eq!(shell.full_refresh_timers(), 1);
-
-    shell.fire_timers();
+    shell.advance(IDLE_TIMEOUT);
     assert!(shell.view().asleep);
-    assert_eq!(shell.full_refresh_timers(), 0);
+    assert_eq!(full_refreshes_due(&mut shell), 0);
 
     // The wake draws with a full refresh and starts the timer again.
+    shell.take_log();
     shell.wake(Wake::Timer);
     assert!(shell.frames.last().unwrap().full);
-    assert_eq!(shell.full_refresh_timers(), 1);
+    let timer = alloc::format!("TimeNotifyAfter {}ms", FULL_REFRESH_INTERVAL.as_millis());
+    assert!(shell.take_log().contains(&timer));
 }
 
 #[test]
@@ -261,12 +270,12 @@ fn the_retained_messages_at_a_connection_give_one_draw_timer_and_one_render() {
         .filter(|line| *line == "TimeNotifyAfter 200ms")
         .count();
     assert_eq!(draws, 1, "{log:?}");
-    assert_eq!(shell.draw_timers(), 1);
     let renders = log.iter().filter(|line| *line == "Render").count();
     assert_eq!(renders, 2, "{log:?}");
 
     // The timer draws all the changes once.
-    shell.fire_draw_timers();
+    let events = shell.advance(DRAW_DELAY);
+    assert!(matches!(events[..], [Event::DrawDue(_)]), "{events:?}");
     assert_eq!(shell.frames.len(), frames + 1);
     assert_eq!(shell.take_log(), ["Render"]);
     let view = &shell.frames.last().unwrap().view;
@@ -300,20 +309,23 @@ fn a_draw_timer_that_waits_when_the_device_sleeps_draws_nothing() {
     let mut shell = Shell::new();
     shell.auto_draw = false;
     shell.send(start(PowerSource::Battery));
-    shell.fire_draw_timers();
+    // A change comes just before the idle timeout.
+    let before = IDLE_TIMEOUT.saturating_sub(DRAW_DELAY / 2);
+    shell.advance(before);
     shell.broker.set_state("light.all_lights", "on", &[]);
     shell.run();
-    assert_eq!(shell.draw_timers(), 1);
+    assert!(shell.model.refresh.draw_pending);
 
     // The idle timeout puts the device to sleep. The last image is a full
     // refresh with the change.
-    shell.fire_timers();
+    shell.advance(IDLE_TIMEOUT.saturating_sub(before));
     assert!(shell.view().asleep);
     let frames = shell.frames.len();
     assert!(shell.frames.last().unwrap().full);
 
     shell.take_log();
-    shell.fire_draw_timers();
+    let events = shell.advance(DRAW_DELAY);
+    assert!(matches!(events[..], [Event::DrawDue(_)]), "{events:?}");
     assert_eq!(shell.frames.len(), frames);
     assert_eq!(shell.take_log(), [] as [&str; 0]);
 }

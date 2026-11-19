@@ -6,7 +6,7 @@ use core::time::Duration;
 use crux_core::{App, Request};
 
 use super::{
-    ExpectServiceCall,
+    ExpectLight, ExpectServiceCall,
     broker::iso_time,
     connection::{drive_to_connected, drive_to_connecting, send, topic},
     set_state,
@@ -18,7 +18,9 @@ use crate::{
     capabilities::mqtt::{Connect, MqttEvent},
     features::{
         connection::{OUTBOX_LIMIT, RECONNECT_MIN},
+        light::STAND_LEVEL,
         pending::{PENDING_TIMEOUT, QUEUED_TIMEOUT, SCENE_TIMEOUT},
+        power::IDLE_TIMEOUT,
         refresh::DRAW_DELAY,
     },
 };
@@ -78,6 +80,7 @@ fn a_tap_marks_the_tile_until_a_newer_last_updated_confirms_it() {
 
     // The tap draws the mark at once, and keeps the text of the last state.
     app.update(tap_tile(1), &mut model)
+        .expect_touch_light(STAND_LEVEL)
         .expect_only_service_call();
     let view = app.view(&model);
     assert_eq!(view.tiles()[1].state, TileState::Pending);
@@ -158,6 +161,7 @@ fn the_timeout_shows_the_last_state_and_an_old_timer_is_ignored() {
     // first one.
     let mut second_tap = app.update(tap_tile(1), &mut model);
     second_tap
+        .expect_light_timer()
         .expect_mqtt_publish()
         .expect_pending_timer()
         .expect_no_effects();
@@ -187,6 +191,7 @@ fn a_step_keeps_the_brightness_text_while_it_waits() {
     );
 
     app.update(tap_brighter(1), &mut model)
+        .expect_touch_light(STAND_LEVEL)
         .expect_only_service_call();
     let view = app.view(&model);
     let tile = &view.tiles()[1];
@@ -203,6 +208,7 @@ fn a_scene_mark_ends_after_the_scene_timeout() {
     model.route = Route::room("hall");
 
     app.update(tap_scene(2), &mut model)
+        .expect_touch_light(STAND_LEVEL)
         .expect_mqtt_publish()
         .expect_time_notify_after_with(|notify| {
             assert_eq!(Duration::from(notify.duration), SCENE_TIMEOUT);
@@ -247,8 +253,12 @@ fn a_dry_run_gives_no_mark() {
     let _ = app.update(Event::SetReadOnly(true), &mut model);
     model.route = Route::room("hall");
 
-    app.update(tap_tile(0), &mut model).expect_no_effects();
-    app.update(tap_scene(2), &mut model).expect_no_effects();
+    app.update(tap_tile(0), &mut model)
+        .expect_touch_light(STAND_LEVEL)
+        .expect_no_effects();
+    app.update(tap_scene(2), &mut model)
+        .expect_light_timer()
+        .expect_no_effects();
     assert!(model.pending.marks.is_empty());
     assert_ne!(tile_state(&model, 0), TileState::Pending);
 }
@@ -283,8 +293,13 @@ fn a_call_that_the_sleep_drops_loses_its_mark() {
     assert_eq!(tile_state(&model, 1), TileState::Pending);
     // The first idle timeout waits one more period for the connection.
     let _ = app.update(Event::IdleTimeout(model.power.idle), &mut model);
-    let _ = app.update(Event::IdleTimeout(model.power.idle), &mut model);
+    let mut sleep = app.update(Event::IdleTimeout(model.power.idle), &mut model);
     assert!(model.power.asleep);
+    // The tap turned the light on, so the first step of the sleep turns it
+    // off. The core drops the call in the next step.
+    let light_off = sleep.resolve_front_light(|_| ()).expect_one_event();
+    assert_eq!(model.unsent, 0);
+    let _ = app.update(light_off, &mut model);
     assert_eq!(model.unsent, 1);
     assert!(model.pending.marks.is_empty());
     assert_ne!(tile_state(&model, 1), TileState::Pending);
@@ -313,39 +328,42 @@ fn a_timeout_while_asleep_removes_the_mark_but_does_not_draw() {
 fn a_tap_that_wakes_the_device_shows_the_mark_through_the_reconnect() {
     let mut shell = super::flows::house();
     shell.send(start_at(PowerSource::Battery, Some("/room/living_room")));
-    shell.fire_timers();
+    shell.advance(IDLE_TIMEOUT);
     assert!(shell.view().asleep);
 
     // The broker is down, so the call waits in the outbox. The mark shows,
     // and its timer does not start yet.
     shell.broker.down = true;
+    shell.take_log();
     shell.send(tap_tile(1));
+    let mark_timer = alloc::format!("TimeNotifyAfter {}ms", PENDING_TIMEOUT.as_millis());
+    let log = shell.take_log();
+    assert!(!log.contains(&mark_timer), "{log:?}");
     assert!(!shell.view().asleep);
     let frame = shell.frames.last().unwrap();
     assert_eq!(frame.view.tiles()[1].state, TileState::Pending);
     assert_eq!(shell.model.connection.outbox.len(), 1);
-    let timers = shell.timers();
-    assert!(timers.contains(&RECONNECT_MIN), "{timers:?}");
-    assert!(!timers.contains(&PENDING_TIMEOUT), "{timers:?}");
 
     // The connection opens. The timer of the mark starts when the core
     // issues the call, and Home Assistant confirms the call.
     shell.broker.down = false;
-    shell.take_log();
-    shell.fire_shortest_timers();
+    shell.advance(RECONNECT_MIN);
     let log = shell.take_log();
     let call = log
         .iter()
         .position(|effect| effect.starts_with("MqttPublish dashboard/hall/cmd"))
         .expect("the service call");
-    assert_eq!(
-        log[call + 1],
-        alloc::format!("TimeNotifyAfter {}ms", PENDING_TIMEOUT.as_millis())
-    );
+    assert_eq!(log[call + 1], mark_timer);
     let frame = shell.frames.last().unwrap();
     assert_eq!(frame.view.tiles()[1].state, TileState::Off);
     // The confirm cleared the timer of the mark.
-    assert!(!shell.timers().contains(&PENDING_TIMEOUT));
+    let events = shell.advance(PENDING_TIMEOUT);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, Event::PendingTimeout(_))),
+        "{events:?}"
+    );
 }
 
 /// The fake device shows each tap in the frame that it draws.
@@ -359,7 +377,13 @@ fn the_flow_of_a_tap_draws_the_new_state() {
     let frame = shell.frames.last().unwrap();
     assert_eq!(frame.view.tiles()[1].state, TileState::Off);
     assert!(!frame.full);
-    assert_eq!(shell.timers(), []);
+    let events = shell.advance(PENDING_TIMEOUT);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, Event::PendingTimeout(_))),
+        "{events:?}"
+    );
 }
 
 /// Sends the `last_updated` time `seconds` of the lamp, and returns the
@@ -509,6 +533,7 @@ fn a_mark_whose_call_cannot_go_out_ends_after_the_queued_timeout() {
     set_state(&mut model, LAMP, "on");
 
     app.update(tap_tile(1), &mut model)
+        .expect_touch_light(STAND_LEVEL)
         .expect_time_notify_after_with(|notify| {
             assert_eq!(Duration::from(notify.duration), QUEUED_TIMEOUT);
         })

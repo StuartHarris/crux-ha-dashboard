@@ -22,6 +22,9 @@
 //!   (`Wake::Touch` with the control at the point), and a change of the
 //!   power source also ends it (`Wake::PowerSource`). [`Shell::is_sleeping`] tells
 //!   the task that runs the sleep when the request ended.
+//! - Each `FrontLight` request has a token. The task that drives the light
+//!   answers with [`Signal::Light`] and the token when the light has the
+//!   level. The answer is also for the older requests that wait.
 //! - One batch of effects gives at most one `Render` job, with the view
 //!   at the end of the batch. It is at the place of the last `Render` effect,
 //!   so it stays before a `Sleep` that follows it.
@@ -37,6 +40,7 @@ use embedded_graphics::prelude::Point;
 use shared::{
     Core, Dashboard, Effect, Event, PowerSource, Settings, Start, ViewModel,
     capabilities::{
+        light::FrontLight,
         mqtt::{Connect, Credentials, Disconnect, MqttEvent, Publish, Subscribe},
         network::{WifiOff, WifiOn, WifiStatus},
         power::{Sleep, Wake},
@@ -79,6 +83,12 @@ pub enum Signal {
     RadioOff,
     /// The device woke from a real wake. The answer to the `Sleep` job.
     Woke(Wake),
+    /// The front light has the level of the `FrontLight` job with this
+    /// token. The answer is also for the older jobs that wait.
+    Light {
+        /// The token of the newest job that the answer is for.
+        token: u32,
+    },
     /// An event for the core, for example `PowerSourceChanged`.
     Event(Event),
 }
@@ -143,6 +153,15 @@ pub enum Job {
     /// with [`Signal::Woke`] at the first real wake. After another wake,
     /// sleep again.
     Sleep(Sleep),
+    /// Set the front light to `level` percent. Answer with
+    /// [`Signal::Light`] and the token when the light has the level.
+    FrontLight {
+        /// The token of the request.
+        token: u32,
+        /// The level in percent, from 0 to 100. The value 0 turns the light
+        /// off.
+        level: u8,
+    },
     /// Do an operation on a timer.
     Timer {
         /// The token of the timer in the shell.
@@ -180,6 +199,9 @@ pub struct Shell {
     wifi_off: VecDeque<Request<WifiOff>>,
     /// The `Sleep` request that waits for a wake.
     sleep: Option<Request<Sleep>>,
+    /// The `FrontLight` requests that wait for an answer, with their tokens.
+    lights: Vec<(u32, Request<FrontLight>)>,
+    last_light_token: u32,
 }
 
 impl Default for Shell {
@@ -204,6 +226,8 @@ impl Shell {
             disconnects: Vec::new(),
             wifi_off: VecDeque::new(),
             sleep: None,
+            lights: Vec::new(),
+            last_light_token: 0,
         }
     }
 
@@ -297,6 +321,17 @@ impl Shell {
                 None => Vec::new(),
             },
             Signal::Woke(wake) => self.wake(wake),
+            Signal::Light { token } => {
+                let (answered, waiting) = core::mem::take(&mut self.lights)
+                    .into_iter()
+                    .partition(|(request, _)| *request <= token);
+                self.lights = waiting;
+                let mut effects = Vec::new();
+                for (_, mut request) in answered {
+                    effects.extend(resolve(&self.core, &mut request, ()));
+                }
+                self.process(effects)
+            }
         }
     }
 
@@ -404,6 +439,14 @@ impl Shell {
             Effect::Sleep(request) => {
                 jobs.push(Job::Sleep(request.operation.clone()));
                 self.sleep = Some(request);
+                Vec::new()
+            }
+            Effect::FrontLight(request) => {
+                self.last_light_token = self.last_light_token.wrapping_add(1);
+                let token = self.last_light_token;
+                let level = request.operation.level;
+                self.lights.push((token, request));
+                jobs.push(Job::FrontLight { token, level });
                 Vec::new()
             }
             Effect::TimeNotifyAfter(request) => {

@@ -31,7 +31,6 @@ use shared::{
         network::WifiStatus,
         power::{Sleep, Wake},
     },
-    features::power::IDLE_TIMEOUT,
 };
 use tokio::{runtime::Handle, task::JoinHandle};
 
@@ -98,14 +97,6 @@ struct Timer {
     token: u64,
 }
 
-impl Timer {
-    /// Returns `true` if the timer is an idle timer of the core. No other
-    /// timer of the core waits for [`IDLE_TIMEOUT`].
-    fn is_idle(&self) -> bool {
-        Duration::from(self.request.operation.duration) == IDLE_TIMEOUT
-    }
-}
-
 /// The shell.
 pub struct Shell {
     core: Core<Dashboard>,
@@ -129,6 +120,9 @@ pub struct Shell {
     disconnects: Vec<(u64, Request<Disconnect>)>,
     /// The `Sleep` request that waits for a wake.
     sleep: Option<Request<Sleep>>,
+    /// The level of the front light, in percent. The window shows the
+    /// light as a tint over the panel.
+    light: u8,
 }
 
 impl Drop for Shell {
@@ -164,6 +158,7 @@ impl Shell {
             settings: None,
             disconnects: Vec::new(),
             sleep: None,
+            light: 0,
         }
     }
 
@@ -291,49 +286,33 @@ impl Shell {
         true
     }
 
-    /// Returns `true` if "Sleep now" can work: the device is on battery and
-    /// awake, and an idle timer runs.
+    /// Returns `true` if "Sleep now" can work: the view shows that the
+    /// device is on battery and awake. The core ignores `SleepNow` in the
+    /// other cases.
     pub fn can_sleep_now(&self) -> bool {
         let view = self.view();
-        view.power == PowerSource::Battery
-            && !view.asleep
-            && self.timers.values().any(Timer::is_idle)
+        view.power == PowerSource::Battery && !view.asleep
     }
 
-    /// Fires the idle timers of the core now, as if the idle time passed.
+    /// Sends `Event::SleepNow` to the core, which ends the idle time now.
     /// Returns `false` if [`Shell::can_sleep_now`] is `false`, and then does
     /// nothing.
     ///
     /// The shell does not make the device sleep. The core decides, as after
     /// a real idle timeout. If taps wait to be sent, the core first waits one
-    /// more idle period, and a second "Sleep now" ends that period.
-    ///
-    /// The core starts a new idle timer after each tap and ignores the older
-    /// timers, so the shell fires all the idle timers. The other timers
-    /// continue to run.
+    /// more idle period, and a second "Sleep now" ends that period. The
+    /// timers continue to run.
     pub fn sleep_now(&mut self) -> bool {
         if !self.can_sleep_now() {
             return false;
         }
-        let ids: Vec<TimerId> = self
-            .timers
-            .iter()
-            .filter(|(_, timer)| timer.is_idle())
-            .map(|(id, _)| *id)
-            .collect();
         eprintln!("power: sleep now");
-        for id in ids {
-            if let Some(mut timer) = self.timers.remove(&id) {
-                timer.task.abort();
-                self.inspector.effect(
-                    "TimeNotifyAfter",
-                    format!("timer {}", id.0),
-                    "resolved early: Sleep now",
-                );
-                let effects = resolve(&self.core, &mut timer.request, id);
-                self.process(effects);
-            }
-        }
+        self.inspector.effect(
+            "Event",
+            "SleepNow".into(),
+            "sent by the shell: the core ends the idle time",
+        );
+        self.send(Event::SleepNow);
         true
     }
 
@@ -355,6 +334,12 @@ impl Shell {
     /// Returns the logs of the shell, to clear them.
     pub const fn inspector_mut(&mut self) -> &mut Inspector {
         &mut self.inspector
+    }
+
+    /// Returns the level of the front light, in percent. The value 0 means
+    /// that the light is off.
+    pub const fn light(&self) -> u8 {
+        self.light
     }
 
     /// Returns the view of the core now.
@@ -534,6 +519,16 @@ impl Shell {
                 );
                 self.sleep = Some(request);
                 Vec::new()
+            }
+            Effect::FrontLight(mut request) => {
+                let level = request.operation.level;
+                self.light = level;
+                self.inspector.effect(
+                    "FrontLight",
+                    format!("{level}%"),
+                    "resolved: the window shows the light",
+                );
+                resolve(&self.core, &mut request, ())
             }
             Effect::TimeNotifyAfter(request) => {
                 let id = request.operation.id;
@@ -726,11 +721,14 @@ mod tests {
     use shared::{
         Control, Event, PowerSource, Settings,
         capabilities::mqtt::{Connect, Credentials, Message, MqttEvent, Publish},
-        features::refresh::{DRAW_DELAY, FULL_REFRESH_INTERVAL},
+        features::{
+            power::IDLE_TIMEOUT,
+            refresh::{DRAW_DELAY, FULL_REFRESH_INTERVAL},
+        },
     };
     use tokio::runtime::Runtime;
 
-    use super::{IDLE_TIMEOUT, Notifier, Shell, Signal};
+    use super::{Notifier, Shell, Signal};
     use crate::{
         inspector::{Delivery, Direction, Packet},
         mqtt::{Link, Opener, Sink},
@@ -844,22 +842,31 @@ mod tests {
             });
         }
 
-        /// Fires the idle timer, with its token.
-        fn fire_timer(&mut self) {
-            let (id, token) = self.timer().unwrap();
-            self.shell().handle(Signal::Timer { id, token });
+        /// Starts the core as [`Fixture::start`] does, and returns the id
+        /// and the token of each timer that the start started, in the order
+        /// in which the shell started them.
+        fn start_timers(&mut self, power: PowerSource) -> Vec<(crux_time::TimerId, u64)> {
+            let before = running(self.shell());
+            self.start(power);
+            running(self.shell())
+                .into_iter()
+                .filter(|timer| !before.contains(timer))
+                .collect()
         }
 
-        /// Returns the id and the token of the idle timer.
-        fn timer(&mut self) -> Option<(crux_time::TimerId, u64)> {
-            let mut idle = self
-                .shell()
-                .timers
-                .iter()
-                .filter(|(_, timer)| timer.is_idle());
-            let found = idle.next().map(|(id, timer)| (*id, timer.token));
-            assert!(idle.next().is_none());
-            found
+        /// Runs `action` on the shell, and returns the id and the token of
+        /// each timer that the action started, in the order in which the
+        /// shell started them.
+        fn new_timers(
+            &mut self,
+            action: impl FnOnce(&mut Shell),
+        ) -> Vec<(crux_time::TimerId, u64)> {
+            let before = running(self.shell());
+            action(self.shell());
+            running(self.shell())
+                .into_iter()
+                .filter(|timer| !before.contains(timer))
+                .collect()
         }
 
         fn take_log(&self) -> Vec<String> {
@@ -867,22 +874,34 @@ mod tests {
         }
     }
 
+    /// Returns the id and the token of each timer that runs.
+    /// The shell keeps the timers in a map, so this function sorts them by
+    /// their tokens, which increase in the order of the starts.
+    fn running(shell: &Shell) -> Vec<(crux_time::TimerId, u64)> {
+        let mut timers: Vec<_> = shell
+            .timers
+            .iter()
+            .map(|(id, timer)| (*id, timer.token))
+            .collect();
+        timers.sort_by_key(|(_, token)| *token);
+        timers
+    }
+
     #[test]
     fn a_timer_signal_with_an_old_token_is_ignored() {
         let mut fixture = Fixture::new();
-        // On battery, the core starts the idle timer.
-        fixture.start(PowerSource::Battery);
-        let (id, token) = fixture.timer().unwrap();
+        // The first timer that the start started.
+        let (id, token) = fixture.start_timers(PowerSource::Battery)[0];
 
         // A signal from an aborted task that had the same id.
         fixture.shell().handle(Signal::Timer {
             id,
             token: token - 1,
         });
-        assert_eq!(fixture.timer(), Some((id, token)));
+        assert!(running(fixture.shell()).contains(&(id, token)));
 
         fixture.shell().handle(Signal::Timer { id, token });
-        assert_eq!(fixture.timer(), None);
+        assert!(!running(fixture.shell()).iter().any(|timer| timer.0 == id));
     }
 
     #[test]
@@ -895,9 +914,9 @@ mod tests {
             ["open 1", "publish dashboard/test/status 1", "subscribe 1"]
         );
 
-        // The idle timer expires: the core publishes `asleep`, disconnects
-        // and sleeps.
-        fixture.fire_timer();
+        // The idle time ends: the core publishes `asleep`, disconnects and
+        // sleeps.
+        assert!(fixture.shell().sleep_now());
         assert!(fixture.shell().view().asleep);
         assert_eq!(
             fixture.take_log(),
@@ -956,7 +975,7 @@ mod tests {
     fn a_tap_on_no_control_while_asleep_wakes_the_core() {
         let mut fixture = Fixture::new();
         fixture.start(PowerSource::Battery);
-        fixture.fire_timer();
+        assert!(fixture.shell().sleep_now());
         assert!(fixture.shell().view().asleep);
         // The header has no control. The shell still sends the tap.
         fixture.shell().tap(Point::new(100, 20));
@@ -1065,9 +1084,14 @@ mod tests {
     #[test]
     fn the_effect_log_has_the_effects_and_their_answers() {
         let mut fixture = Fixture::new();
-        fixture.start(PowerSource::Battery);
+        let timers = fixture.start_timers(PowerSource::Battery);
         fixture.mqtt(1, MqttEvent::Connected);
-        fixture.fire_timer();
+        // The timers of the start expire, in order. On battery, one of them
+        // is the idle timer, so the core sleeps.
+        for (id, token) in timers {
+            fixture.shell().handle(Signal::Timer { id, token });
+        }
+        assert!(fixture.shell().view().asleep);
         // The stream ends, so the `Disconnect` request ends, and the core
         // continues to sleep.
         fixture.mqtt(1, MqttEvent::Disconnected { reason: None });
@@ -1100,11 +1124,42 @@ mod tests {
     }
 
     #[test]
+    fn a_tap_turns_the_front_light_on_and_the_sleep_turns_it_off() {
+        use shared::features::light::BATTERY_LEVEL;
+
+        let mut fixture = Fixture::new();
+        fixture.start(PowerSource::Battery);
+        fixture.mqtt(1, MqttEvent::Connected);
+        assert_eq!(fixture.shell().light(), 0);
+
+        // The shell answers `FrontLight` at once.
+        fixture.shell().tap(Point::new(1, 1));
+        assert_eq!(fixture.shell().light(), BATTERY_LEVEL);
+
+        // The sleep turns the light off before it disconnects.
+        assert!(fixture.shell().sleep_now());
+        assert_eq!(fixture.shell().light(), 0);
+        let effects: Vec<_> = fixture
+            .shell()
+            .inspector()
+            .effects
+            .iter()
+            .map(|entry| entry.effect)
+            .collect();
+        // The log has the newest entry first.
+        let light = effects.iter().position(|effect| *effect == "FrontLight");
+        let disconnect = effects
+            .iter()
+            .position(|effect| *effect == "MqttDisconnect");
+        assert!(disconnect.is_some() && disconnect < light, "{effects:?}");
+    }
+
+    #[test]
     fn a_tap_while_sleep_waits_answers_sleep_with_the_control() {
         let mut fixture = Fixture::new();
         fixture.start(PowerSource::Battery);
         fixture.mqtt(1, MqttEvent::Connected);
-        fixture.fire_timer();
+        assert!(fixture.shell().sleep_now());
         fixture.mqtt(1, MqttEvent::Disconnected { reason: None });
         assert!(fixture.shell().sleep.is_some());
         fixture.take_log();
@@ -1133,7 +1188,7 @@ mod tests {
         let mut fixture = Fixture::new();
         fixture.start(PowerSource::Battery);
         fixture.mqtt(1, MqttEvent::Connected);
-        fixture.fire_timer();
+        assert!(fixture.shell().sleep_now());
         fixture.mqtt(1, MqttEvent::Disconnected { reason: None });
         assert!(fixture.shell().sleep.is_some());
 
@@ -1159,7 +1214,7 @@ mod tests {
     }
 
     #[test]
-    fn sleep_now_fires_the_idle_timer_and_the_core_sleeps() {
+    fn sleep_now_ends_the_idle_time_and_the_core_sleeps() {
         let mut fixture = Fixture::new();
         fixture.start(PowerSource::Battery);
         fixture.mqtt(1, MqttEvent::Connected);
@@ -1204,7 +1259,7 @@ mod tests {
     }
 
     #[test]
-    fn sleep_now_does_not_fire_the_other_timers() {
+    fn sleep_now_sends_an_intent_and_does_not_fire_a_timer() {
         let mut fixture = Fixture::new();
         fixture.start(PowerSource::Battery);
         fixture.mqtt(1, MqttEvent::Connected);
@@ -1225,8 +1280,11 @@ mod tests {
         assert!(fixture.shell().view().asleep);
         fixture.mqtt(1, MqttEvent::Disconnected { reason: None });
         // The core clears the full-refresh timer before it sleeps. The draw
-        // timer is now stale, and draws nothing when it fires.
-        assert_eq!(durations(fixture.shell()), [DRAW_DELAY]);
+        // timer and the idle timer still run. They are now stale, and they
+        // do nothing when they fire.
+        let mut running = durations(fixture.shell());
+        running.sort();
+        assert_eq!(running, [DRAW_DELAY, IDLE_TIMEOUT]);
     }
 
     #[test]
@@ -1343,24 +1401,25 @@ mod tests {
     #[test]
     fn restart_ignores_the_signals_of_the_old_core() {
         let mut fixture = Fixture::new();
-        fixture.start(PowerSource::Battery);
+        // The first timer that the start started.
+        let (old_id, old_token) = fixture.start_timers(PowerSource::Battery)[0];
         fixture.mqtt(1, MqttEvent::Connected);
-        let (old_id, old_token) = fixture.timer().unwrap();
         assert!(fixture.shell().sleep_now());
-        assert!(fixture.shell().restart());
+        let timers = fixture.new_timers(|shell| assert!(shell.restart()));
         fixture.take_log();
-        let (id, token) = fixture.timer().unwrap();
-        assert!(token > old_token);
+        assert_ne!(timers.len(), 0);
+        assert!(timers.iter().all(|(_, token)| *token > old_token));
 
         // A late signal of the old connection does not reach the core.
         fixture.mqtt(1, MqttEvent::Disconnected { reason: None });
         assert_eq!(fixture.shell().current_connection(), Some(2));
-        // A late signal of the old idle timer does not fire the new one.
+        // A late signal of a timer of the old core does not fire a new one.
         fixture.shell().handle(Signal::Timer {
             id: old_id,
             token: old_token,
         });
-        assert_eq!(fixture.timer(), Some((id, token)));
+        let now = running(fixture.shell());
+        assert!(timers.iter().all(|timer| now.contains(timer)));
         assert!(!fixture.shell().view().asleep);
     }
 }

@@ -9,7 +9,11 @@ use shared::{
         network::WifiStatus,
         power::Wake,
     },
-    features::{power::IDLE_TIMEOUT, refresh::DRAW_DELAY},
+    features::{
+        light::{BATTERY_LEVEL, LIGHT_TIMEOUT, STAND_LEVEL},
+        power::IDLE_TIMEOUT,
+        refresh::DRAW_DELAY,
+    },
 };
 
 use super::{Job, MqttOp, Shell, Signal, TimerOp, start};
@@ -44,6 +48,7 @@ fn names(jobs: &[Job]) -> Vec<String> {
             Job::WifiOn { token, .. } => alloc::format!("wifi on {token}"),
             Job::WifiOff(_) => "wifi off".into(),
             Job::Sleep(_) => "sleep".into(),
+            Job::FrontLight { token, level } => alloc::format!("light {level} {token}"),
             Job::Timer {
                 token,
                 op: TimerOp::NotifyAfter(_),
@@ -87,22 +92,35 @@ const fn joined(token: u32) -> Signal {
     }
 }
 
-/// Returns the id and the token of the idle timer that `jobs` start.
-fn timer_of(jobs: &[Job]) -> Option<(crux_time::TimerId, u32)> {
-    jobs.iter().find_map(|job| match job {
-        Job::Timer {
-            token,
-            op: TimerOp::NotifyAfter(notify),
-        } if Duration::from(notify.duration) == IDLE_TIMEOUT => Some((notify.id, *token)),
-        _ => None,
-    })
+/// Returns the id, the token and the duration of each timer that `jobs`
+/// start, in order.
+fn started_timers(jobs: &[Job]) -> Vec<(crux_time::TimerId, u32, Duration)> {
+    jobs.iter()
+        .filter_map(|job| match job {
+            Job::Timer {
+                token,
+                op: TimerOp::NotifyAfter(notify),
+            } => Some((notify.id, *token, Duration::from(notify.duration))),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The signal of the user intent that ends the idle time now. The tests of
+/// the sleep use it, so they do not need the idle timer.
+const fn sleep_now() -> Signal {
+    Signal::Event(Event::SleepNow)
 }
 
 #[test]
 fn start_draws_and_turns_wifi_on() {
     let (_, jobs) = started(PowerSource::Stand, true);
-    // Timer 1 is the full-refresh timer of the core.
-    assert_eq!(names(&jobs), ["render", "start timer 1", "wifi on 1"]);
+    // The core turns the light off, because its state after a reset is not
+    // known. Timer 1 is the full-refresh timer of the core.
+    assert_eq!(
+        names(&jobs),
+        ["light 0 1", "render", "start timer 1", "wifi on 1"]
+    );
 }
 
 #[test]
@@ -191,12 +209,94 @@ fn the_read_only_setting_of_the_config_makes_a_dry_run_in_the_core() {
 }
 
 #[test]
-fn a_tap_on_dead_space_while_awake_does_nothing() {
-    // The shell sends the tap, and the core ignores it, also on battery.
-    let mut shell = online(true);
-    assert_eq!(shell.handle(Signal::Tap(Point::new(100, 20))), Vec::new());
+fn a_tap_on_dead_space_while_awake_only_turns_the_light_on() {
+    // The shell sends the tap. The core turns the light on and starts the
+    // light timer, but it does not draw, also on battery.
+    // On battery, the idle timer has token 2, so the light timer has 3.
+    for (power, level, timer) in [
+        (PowerSource::Stand, STAND_LEVEL, 2),
+        (PowerSource::Battery, BATTERY_LEVEL, 3),
+    ] {
+        let (mut shell, _) = started(power, true);
+        let jobs = shell.handle(Signal::Tap(Point::new(100, 20)));
+        assert_eq!(
+            names(&jobs),
+            [
+                alloc::format!("light {level} 2"),
+                alloc::format!("start timer {timer}"),
+            ],
+            "{power:?}"
+        );
+        let timers = started_timers(&jobs);
+        assert_eq!(timers.len(), 1, "{power:?}");
+        assert_eq!(timers[0].2, LIGHT_TIMEOUT, "{power:?}");
+    }
+}
+
+#[test]
+fn a_light_answer_is_also_for_the_older_requests() {
     let (mut shell, _) = started(PowerSource::Battery, true);
-    assert_eq!(shell.handle(Signal::Tap(Point::new(100, 20))), Vec::new());
+    shell.handle(Signal::Tap(Point::new(100, 20)));
+    let jobs = shell.handle(sleep_now());
+    assert_eq!(names(&jobs), ["light 0 3"]);
+
+    // No answer came for jobs 1 to 3. An answer with a newer token answers
+    // all of them, so the sleep continues.
+    let jobs = shell.handle(Signal::Light { token: 5 });
+    assert_eq!(names(&jobs), ["wifi off"]);
+    // Each request ended, so a second answer does nothing.
+    assert_eq!(shell.handle(Signal::Light { token: 5 }), Vec::new());
+}
+
+#[test]
+fn on_battery_the_sleep_waits_for_the_light_before_it_disconnects() {
+    let (mut shell, _) = started(PowerSource::Battery, true);
+    shell.handle(Signal::Light { token: 1 });
+    shell.handle(joined(1));
+    shell.handle(Signal::Mqtt {
+        connection: 1,
+        event: MqttEvent::Connected,
+    });
+    let jobs = shell.handle(Signal::Tap(Point::new(100, 20)));
+    assert!(names(&jobs).contains(&"light 25 2".into()));
+    shell.handle(Signal::Light { token: 2 });
+
+    // The first step of the sleep turns the light off, and the core waits.
+    let jobs = shell.handle(sleep_now());
+    assert_eq!(names(&jobs), ["light 0 3"]);
+    assert!(shell.view().asleep);
+
+    // An answer for an older job does not answer job 3.
+    assert_eq!(shell.handle(Signal::Light { token: 2 }), Vec::new());
+
+    // The light is off. The next step disconnects.
+    let jobs = shell.handle(Signal::Light { token: 3 });
+    assert_eq!(
+        names(&jobs),
+        ["publish dashboard/test/status 1", "disconnect 1"]
+    );
+}
+
+#[test]
+fn a_tap_while_the_light_goes_off_for_the_sleep_wakes_and_the_late_answer_is_ignored() {
+    let (mut shell, _) = started(PowerSource::Battery, true);
+    shell.handle(Signal::Tap(Point::new(100, 20)));
+    let jobs = shell.handle(sleep_now());
+    assert_eq!(names(&jobs), ["light 0 3"]);
+
+    // The tap wakes the device and turns the light on again.
+    let jobs = shell.handle(Signal::Tap(Point::new(100, 20)));
+    assert!(
+        names(&jobs).contains(&"light 25 4".into()),
+        "{:?}",
+        names(&jobs)
+    );
+    assert!(!shell.view().asleep);
+
+    // The answer of the sleep step comes late. The core does not disconnect.
+    let jobs = shell.handle(Signal::Light { token: 3 });
+    assert_eq!(jobs, Vec::new());
+    assert!(!shell.view().asleep);
 }
 
 #[test]
@@ -224,13 +324,15 @@ fn the_items_of_an_ended_stream_are_ignored() {
 
 #[test]
 fn on_battery_the_idle_timer_sleeps_and_a_tap_wakes() {
-    let (mut shell, jobs) = started(PowerSource::Battery, true);
-    let (id, token) = timer_of(&jobs).unwrap();
-    shell.handle(joined(1));
-    shell.handle(Signal::Mqtt {
-        connection: 1,
-        event: MqttEvent::Connected,
-    });
+    let mut shell = online(true);
+    // Off the stand, the core starts the idle timer, and no other timer.
+    let jobs = shell.handle(Signal::Event(Event::PowerSourceChanged(
+        PowerSource::Battery,
+    )));
+    let timers = started_timers(&jobs);
+    assert_eq!(timers.len(), 1, "{:?}", names(&jobs));
+    let (id, token, duration) = timers[0];
+    assert_eq!(duration, IDLE_TIMEOUT);
 
     let jobs = shell.handle(Signal::Timer { id, token });
     // The first step of the sleep. The core waits for the disconnect.
@@ -264,7 +366,7 @@ fn on_battery_the_idle_timer_sleeps_and_a_tap_wakes() {
 #[test]
 fn a_timer_signal_with_an_old_token_is_ignored() {
     let (mut shell, jobs) = started(PowerSource::Battery, true);
-    let (id, token) = timer_of(&jobs).unwrap();
+    let (id, token, _) = started_timers(&jobs)[0];
     let stale = Signal::Timer {
         id,
         token: token.wrapping_sub(1),
@@ -275,15 +377,28 @@ fn a_timer_signal_with_an_old_token_is_ignored() {
 }
 
 #[test]
-fn a_new_timer_with_the_same_id_cancels_the_old_task() {
-    // A tap on battery restarts the idle timer. The core uses a new timer
-    // id, so the old timer keeps its task until the core clears it.
-    let (mut shell, jobs) = started(PowerSource::Battery, true);
-    let (_, first) = timer_of(&jobs).unwrap();
-    let jobs = shell.handle(Signal::Tap(ui::layout::next().center()));
-    let (_, second) = timer_of(&jobs).unwrap();
+fn a_timer_that_the_core_clears_cancels_its_task_and_the_count_does_not_grow() {
+    // A page turn draws with a full refresh. The core clears the
+    // full-refresh timer and starts a new one.
+    let mut shell = online(true);
+    let (_, first, _) = started_timers(&shell.send(Event::NextPage))[0];
+    let count = shell.timer_count();
+
+    let jobs = shell.send(Event::NextPage);
+    let names = names(&jobs);
+    let cancel = names
+        .iter()
+        .position(|name| *name == alloc::format!("cancel timer {first}"));
+    let timers = started_timers(&jobs);
+    assert_eq!(timers.len(), 1, "{names:?}");
+    let (_, second, _) = timers[0];
+    let start = names
+        .iter()
+        .position(|name| *name == alloc::format!("start timer {second}"));
+    // The old task stops before the new one starts.
+    assert!(cancel.is_some() && cancel < start, "{names:?}");
     assert_ne!(first, second);
-    assert!(shell.timer_count() >= 1);
+    assert_eq!(shell.timer_count(), count);
 }
 
 #[test]
@@ -307,10 +422,9 @@ fn start_has_the_settings_of_the_config() {
 
 #[test]
 fn a_late_wifi_answer_after_wifi_off_is_dropped() {
-    let (mut shell, jobs) = started(PowerSource::Battery, true);
-    // The idle timer expires before Wi-Fi joins: the core turns Wi-Fi off.
-    let (id, token) = timer_of(&jobs).unwrap();
-    let jobs = shell.handle(Signal::Timer { id, token });
+    let (mut shell, _) = started(PowerSource::Battery, true);
+    // The idle time ends before Wi-Fi joins: the core turns Wi-Fi off.
+    let jobs = shell.handle(sleep_now());
     assert!(
         names(&jobs).contains(&"wifi off".into()),
         "{:?}",
@@ -349,16 +463,17 @@ fn a_batch_has_at_most_one_render_with_the_last_view() {
 
 #[test]
 fn the_render_before_sleep_stays_before_sleep() {
-    let (mut shell, jobs) = started(PowerSource::Battery, true);
-    let (id, token) = timer_of(&jobs).unwrap();
+    let (mut shell, _) = started(PowerSource::Battery, true);
     // No connection is open, so the disconnect ends at once.
-    let jobs = shell.handle(Signal::Timer { id, token });
+    let jobs = shell.handle(sleep_now());
     assert_eq!(names(&jobs), ["wifi off"]);
     let jobs = shell.handle(Signal::RadioOff);
     let names = names(&jobs);
     // The core clears the full-refresh timer before it sleeps.
     assert!(names.contains(&"cancel timer 1".into()), "{names:?}");
-    assert_eq!(shell.timer_count(), 0);
+    // Only the idle timer of the start runs. It is stale, because
+    // `SleepNow` ended the idle time.
+    assert_eq!(shell.timer_count(), 1);
     let render = names.iter().position(|name| name == "render").unwrap();
     let sleep = names.iter().position(|name| name == "sleep").unwrap();
     assert!(render < sleep, "{names:?}");
@@ -369,26 +484,25 @@ fn the_render_before_sleep_stays_before_sleep() {
     assert!(view.asleep);
 }
 
-/// Starts on battery, connects, and lets the idle timer expire. Returns the
-/// shell and the jobs of the idle timeout.
+/// Starts on battery, connects, and ends the idle time with `SleepNow`.
+/// Returns the shell and the jobs of the end of the idle time.
 fn idle_timeout() -> (Shell, Vec<Job>) {
     idle_timeout_with(true)
 }
 
 /// As [`idle_timeout`], with the dry run on or off.
 fn idle_timeout_with(read_only: bool) -> (Shell, Vec<Job>) {
-    let (mut shell, jobs) = started(PowerSource::Battery, read_only);
-    let (id, token) = timer_of(&jobs).unwrap();
+    let (mut shell, _) = started(PowerSource::Battery, read_only);
     shell.handle(joined(1));
     shell.handle(Signal::Mqtt {
         connection: 1,
         event: MqttEvent::Connected,
     });
-    let jobs = shell.handle(Signal::Timer { id, token });
+    let jobs = shell.handle(sleep_now());
     (shell, jobs)
 }
 
-/// Lets the idle timer expire and answers each step, until the `Sleep` job.
+/// Ends the idle time and answers each step, until the `Sleep` job.
 fn asleep() -> Shell {
     asleep_with(true)
 }
@@ -444,9 +558,8 @@ fn each_step_of_the_sleep_waits_for_the_answer_of_its_task() {
 #[test]
 fn a_disconnect_with_no_connection_ends_at_once() {
     // Wi-Fi never joins, so no connection opens.
-    let (mut shell, jobs) = started(PowerSource::Battery, true);
-    let (id, token) = timer_of(&jobs).unwrap();
-    let jobs = shell.handle(Signal::Timer { id, token });
+    let (mut shell, _) = started(PowerSource::Battery, true);
+    let jobs = shell.handle(sleep_now());
     // The disconnect ends at once, so Wi-Fi off follows in the same batch.
     assert_eq!(names(&jobs), ["wifi off"]);
 }

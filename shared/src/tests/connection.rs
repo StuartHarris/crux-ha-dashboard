@@ -5,7 +5,7 @@ use core::time::Duration;
 
 use crux_core::{App, Request};
 
-use super::{ExpectFullRefreshTimer, start};
+use super::{ExpectFullRefreshTimer, ExpectLight, start};
 use crate::{
     Cmd, Connection, Dashboard, Effect, EffectTestExt, Event, Model, PowerSource, Route, TileState,
     capabilities::{
@@ -27,6 +27,7 @@ pub fn drive_to_connecting(power: PowerSource) -> (Model, Cmd, Request<Connect>)
 
     let mut cmd = app.update(start(power), &mut model);
     let event = cmd
+        .expect_light(0)
         .expect_render()
         .expect_full_refresh_timer()
         .resolve_wifi_on(|_| WifiStatus::Connected)
@@ -147,6 +148,7 @@ fn start_on_the_stand_draws_and_turns_wifi_on() {
     let mut model = Model::default();
 
     app.update(start(PowerSource::Stand), &mut model)
+        .expect_light(0)
         .expect_render()
         .expect_full_refresh_timer()
         .expect_only_wifi_on();
@@ -441,6 +443,7 @@ fn wifi_that_fails_is_tried_again_after_a_backoff() {
 
     let event = app
         .update(start(PowerSource::Stand), &mut model)
+        .expect_light(0)
         .expect_render()
         .expect_full_refresh_timer()
         .resolve_wifi_on(|_| WifiStatus::Failed)
@@ -493,13 +496,17 @@ fn an_answer_to_an_older_wifi_request_is_ignored() {
     let mut model = Model::default();
 
     let mut first = app.update(start(PowerSource::Battery), &mut model);
-    first.expect_render().expect_full_refresh_timer();
+    first
+        .expect_light(0)
+        .expect_render()
+        .expect_full_refresh_timer();
     let mut old = first.expect_effect().expect_wifi_on();
 
     // The shell starts again, for example after a deep sleep, and the core
     // asks for Wi-Fi again.
     let mut second = app.update(start(PowerSource::Battery), &mut model);
     second
+        .expect_light(0)
         .expect_render()
         .expect_full_refresh_timer()
         .expect_wifi_on();

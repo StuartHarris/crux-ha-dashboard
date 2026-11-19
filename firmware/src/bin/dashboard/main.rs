@@ -8,7 +8,7 @@
 //! | --- | --- | --- |
 //! | `core` | owns the shell and routes each job | |
 //! | `timers` | `StartTimer`, `CancelTimer` | `Signal::Timer` |
-//! | `display` | draws the latest view model, reads the touch controller, the charger and the fuel gauge, and runs the `Sleep` job | `Signal::Tap`, `Signal::Event`, `Signal::Woke` |
+//! | `display` | draws the latest view model, reads the touch controller, the charger and the fuel gauge, sets the front light, and runs the `Sleep` job | `Signal::Tap`, `Signal::Event`, `Signal::Woke`, `Signal::Light` |
 //! | `wifi` | `WifiOn`, `WifiOff`, and the radio on and off | `Signal::Wifi`, `Signal::RadioOff` |
 //! | `mqtt` | the MQTT operations, one connection at a time | `Signal::Mqtt` |
 //! | `net` | runs the network stack | |
@@ -25,7 +25,7 @@ mod mqtt;
 mod timers;
 mod wifi;
 
-use dashboard_firmware::{board, lane::Lane, panel::Panel, panel_pins};
+use dashboard_firmware::{board, lane::Lane, light::FrontLight, panel::Panel, panel_pins};
 use embassy_executor::Spawner;
 use embassy_net::StackResources;
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal as Latest};
@@ -62,6 +62,8 @@ pub static TIMERS: Lane<timers::Request> = Lane::new();
 pub static MQTT: Lane<(u32, MqttOp)> = Lane::new();
 /// The work of the Wi-Fi task.
 pub static WIFI: Lane<WifiRequest> = Lane::new();
+/// The `FrontLight` jobs for the display task, with their tokens.
+pub static LIGHT: Lane<(u32, u8)> = Lane::new();
 /// The `Sleep` job for the display task, or `None` when the `Sleep`
 /// request ended. A newer value replaces one that the task did not read yet.
 pub static SLEEP: Latest<CriticalSectionRawMutex, Option<Plan>> = Latest::new();
@@ -128,11 +130,21 @@ async fn main(spawner: Spawner) -> ! {
     spawner.spawn(wifi::task(peripherals.WIFI, stack).expect("spawn the Wi-Fi task"));
     spawner.spawn(mqtt::task(stack).expect("spawn the MQTT task"));
     spawner.spawn(timers::task().expect("spawn the timer task"));
+    // The display task drives the front light, because it must turn the
+    // light off before each light sleep.
+    let has_display = panel.is_some();
     if let Some(panel) = panel {
         let sleep = display::Sleep::new(peripherals.LPWR, config::CONFIG.force_battery);
-        spawner.spawn(display::task(panel, source, sleep).expect("spawn the display task"));
+        let light = match FrontLight::new(peripherals.LEDC, peripherals.GPIO11) {
+            Ok(light) => Some(light),
+            Err(error) => {
+                log::error!("light: cannot start: {error:?}");
+                None
+            }
+        };
+        spawner.spawn(display::task(panel, source, sleep, light).expect("spawn the display task"));
     }
-    core_task::run(source).await
+    core_task::run(source, has_display).await
 }
 
 /// The number of tries of the first read of the charger.

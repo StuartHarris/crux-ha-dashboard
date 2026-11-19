@@ -11,13 +11,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     capabilities::{
+        light::FrontLight,
         mqtt::{Connect, Credentials, Disconnect, MqttEvent, Publish, Subscribe},
         network::{WifiOff, WifiOn, WifiStatus},
         power::{PowerSource, Sleep, Wake},
     },
     entities::Entities,
     features::{
-        connection, pending, power,
+        connection, light, pending, power,
         refresh::{self, redraw},
         rooms,
     },
@@ -110,8 +111,11 @@ pub enum Event {
     ///   the panel still shows the page. A service call waits in the outbox
     ///   until the connection is open.
     /// - If the device is awake, a tap on a control acts on it. A tap on no
-    ///   control does nothing, so a touch by accident does not keep the
-    ///   device awake.
+    ///   control does not act, and it does not start the idle timer again.
+    ///   Thus a touch by accident does not keep the device awake.
+    ///
+    /// Each tap also turns the front light on, also a tap on no control.
+    /// Refer to [`light`].
     Tapped(Option<Control>),
     /// The user asked for the next page.
     NextPage,
@@ -123,6 +127,11 @@ pub enum Event {
     /// [`Settings::read_only`]. Before `Start`, the core keeps a request for
     /// a dry run. `Start` cannot then stop the dry run.
     SetReadOnly(bool),
+    /// The user asked the device to sleep now. The core acts as if the idle
+    /// timer expired now: on battery, the device sleeps, or first waits one
+    /// more idle period if service calls wait in the outbox. On the stand,
+    /// or while the device sleeps, the event does nothing.
+    SleepNow,
 
     /// The answer to a `WifiOn` request.
     #[serde(skip)]
@@ -152,6 +161,11 @@ pub enum Event {
     #[serde(skip)]
     #[facet(skip)]
     IdleTimeout(u32),
+    /// The front light is off for the sleep with this id. Refer to
+    /// [`power::light_off`].
+    #[serde(skip)]
+    #[facet(skip)]
+    LightOffForSleep(u32),
     /// The MQTT connection closed for the sleep with this id.
     #[serde(skip)]
     #[facet(skip)]
@@ -184,6 +198,10 @@ pub enum Event {
     #[serde(skip)]
     #[facet(skip)]
     PendingTimeout(u32),
+    /// The light timer with this id expired. Refer to [`light`].
+    #[serde(skip)]
+    #[facet(skip)]
+    LightTimeout(u32),
 }
 
 /// A control on the panel.
@@ -244,6 +262,8 @@ pub enum Effect {
     WifiOff(WifiOff),
     /// Put the device to sleep.
     Sleep(Sleep),
+    /// Set the brightness of the front light.
+    FrontLight(FrontLight),
     /// Start a timer.
     TimeNotifyAfter(time::NotifyAfter),
     /// Clear a timer.
@@ -268,6 +288,8 @@ pub struct Model {
     pub connection: connection::State,
     /// The power source and the sleep state.
     pub power: power::State,
+    /// The state of the front light. Refer to [`light`].
+    pub light: light::State,
     /// The time that the shell kept through a deep sleep and gave back in
     /// `Start`. The footer shows this time only if no entity on the page has
     /// a `last_updated` time, for example after a wake, before the first
@@ -296,6 +318,7 @@ impl Default for Model {
             entities: Entities::default(),
             connection: connection::State::default(),
             power: power::State::default(),
+            light: light::State::default(),
             last_sync: None,
             unsent: 0,
             full_refresh_seq: 0,
@@ -363,13 +386,16 @@ impl App for Dashboard {
             Event::Wifi { request, status } => connection::wifi(request, status, model),
             Event::Mqtt { connection, event } => connection::mqtt(connection, event, model),
             Event::Reconnect(id) => connection::reconnect(id, model),
+            Event::SleepNow => power::sleep_now(model),
             Event::IdleTimeout(id) => power::idle_timeout(id, model),
+            Event::LightOffForSleep(id) => power::light_off(id, model),
             Event::Offline(id) => power::offline(id, model),
             Event::RadioOff(id) => power::radio_off(id, model),
             Event::Woke { sleep, wake } => power::woke(sleep, wake, model),
             Event::FullRefreshDue(id) => refresh::timer_expired(id, model),
             Event::DrawDue(id) => refresh::draw_due(id, model),
             Event::PendingTimeout(id) => pending::timeout(id, model),
+            Event::LightTimeout(id) => light::timeout(id, model),
         }
     }
 
@@ -405,7 +431,10 @@ fn on_start(start: Start, model: &mut Model) -> Cmd {
     model.power.asleep = false;
     connection::reset(model);
 
-    redraw(model, true)
+    // The state of the light after a reset is not known, so the core turns
+    // it off.
+    light::reset(model)
+        .and(redraw(model, true))
         .and(connection::go_online(model))
         .and(power::restart_idle_timer(model))
 }
