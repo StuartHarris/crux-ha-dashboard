@@ -239,7 +239,8 @@ fn a_tap_on_a_switch_publishes_a_toggle() {
     let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Stand);
     model.route = Route::room("kitchen");
 
-    app.update(tap_tile(0), &mut model)
+    // Tile 0 is the lights, and tile 1 is the coffee machine.
+    app.update(tap_tile(1), &mut model)
         .expect_only_mqtt_publish_with(|publish| {
             assert_eq!(
                 publish.payload,
