@@ -100,6 +100,10 @@ pub enum Event {
     Woke,
     /// The device moved to the stand or off the stand.
     PowerSourceChanged(PowerSource),
+    /// The charge of the battery changed, in percent. `None` means that the
+    /// shell cannot read the charge. The shell sends the first level after
+    /// `Start`. The event does not wake the device.
+    BatteryChanged(Option<u8>),
     /// The user tapped the panel, on this control or (`None`) on no control.
     ///
     /// The shell sends each tap, also while the device is asleep, and gets
@@ -327,6 +331,7 @@ impl App for Dashboard {
             Event::Start(start) => on_start(start, model),
             Event::Woke => power::woke(model),
             Event::PowerSourceChanged(source) => power::source_changed(source, model),
+            Event::BatteryChanged(level) => power::battery_changed(level, model),
             Event::Tapped(control) => rooms::tapped(control, model),
             Event::NextPage => rooms::turn_page(model, true),
             Event::PreviousPage => rooms::turn_page(model, false),

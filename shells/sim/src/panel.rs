@@ -172,6 +172,7 @@ mod tests {
             }),
             connection: Connection::Online,
             power: PowerSource::Stand,
+            battery: None,
             status: status.into(),
             asleep: false,
             read_only: false,
@@ -184,13 +185,13 @@ mod tests {
     #[test]
     fn a_partial_refresh_gives_the_area_that_changed() {
         let mut panel = Panel::new();
-        let first = panel.draw(&view("Online, on stand", 1));
+        let first = panel.draw(&view("Online", 1));
         assert_eq!(first, Refresh::Full);
 
-        let same = panel.draw(&view("Online, on stand", 1));
+        let same = panel.draw(&view("Online", 1));
         assert_eq!(same, Refresh::None);
 
-        let update = panel.draw(&view("Connecting, on stand", 1));
+        let update = panel.draw(&view("Connecting", 1));
         let Refresh::Partial(area) = update else {
             panic!("not a partial refresh: {update:?}");
         };

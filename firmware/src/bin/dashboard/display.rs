@@ -8,6 +8,12 @@
 //! If the touch controller does not start, or a read fails, the task tries
 //! to start it again after a wait that doubles after each failure
 //! (`logic::backoff`), and it writes one log line for each try.
+//!
+//! The BQ25896 charger and the BQ27220 fuel gauge are on the same bus. Each
+//! [`POWER_POLL`], after a touch read or a render, the task reads the power
+//! source and the charge, and
+//! sends each change to the core (`logic::power::PowerMonitor`). The task
+//! only reads these chips. It never writes to them.
 
 use core::mem;
 
@@ -17,16 +23,25 @@ use embassy_time::{Duration, Instant, Timer};
 use embedded_graphics::primitives::Rectangle;
 use logic::{
     backoff::Backoff,
+    power::{
+        CHARGER_ADDRESS, CHARGER_STATUS, GAUGE_ADDRESS, GAUGE_STATE_OF_CHARGE, PowerMonitor,
+        level_from_bq27220, source_from_bq25896,
+    },
     shell::Signal,
     touch::{Tapper, TouchMap},
 };
-use shared::ViewModel;
+use shared::{Event, PowerSource, ViewModel};
 use ui::{Framebuffer, Refresh, Refresher};
 
 use crate::{RENDER, SIGNALS};
 
 /// The time between two reads of the touch controller.
 const TOUCH_POLL: Duration = Duration::from_millis(30);
+/// The time between two reads of the charger and the fuel gauge.
+const POWER_POLL: Duration = Duration::from_secs(30);
+/// The time to the next read of the charger when a new power source waits
+/// for its second read.
+const POWER_CONFIRM: Duration = Duration::from_secs(1);
 
 /// The frames of the display task.
 struct Frames {
@@ -37,9 +52,11 @@ struct Frames {
     refresher: Refresher,
 }
 
+/// `source` is the power source that the core got in `Start`.
 #[embassy_executor::task]
-pub async fn task(mut panel: Panel<'static>) {
+pub async fn task(mut panel: Panel<'static>, source: PowerSource) {
     let mut touch = Touch::default();
+    let mut power = Power::new(source);
     let mut frames = Frames {
         shown: Framebuffer::new(),
         next: Framebuffer::new(),
@@ -50,6 +67,98 @@ pub async fn task(mut panel: Panel<'static>) {
             Either::First(view) => render(&mut panel, &mut frames, &view).await,
             Either::Second(()) => touch.poll(&mut panel).await,
         }
+        // After each branch, so that many renders in a row do not stop the
+        // power poll.
+        power.poll(&mut panel);
+    }
+}
+
+/// Reads the power source from the BQ25896 charger. Returns `None` if the
+/// read fails. If `warn` is `true`, logs a failure.
+pub fn read_source(panel: &mut Panel<'static>, warn: bool) -> Option<PowerSource> {
+    let mut status = [0];
+    match panel.read_registers(CHARGER_ADDRESS, CHARGER_STATUS, &mut status) {
+        Ok(()) => Some(source_from_bq25896(status[0])),
+        Err(error) => {
+            if warn {
+                log::warn!("power: cannot read the BQ25896 ({error:?})");
+            }
+            None
+        }
+    }
+}
+
+/// Reads the charge in percent from the BQ27220 fuel gauge. Returns `None`
+/// if the read fails or the value is not valid. If `warn` is `true`, logs a
+/// failure.
+fn read_level(panel: &mut Panel<'static>, warn: bool) -> Option<u8> {
+    let mut bytes = [0; 2];
+    match panel.read_registers(GAUGE_ADDRESS, GAUGE_STATE_OF_CHARGE, &mut bytes) {
+        Ok(()) => {
+            let level = level_from_bq27220(bytes);
+            if level.is_none() && warn {
+                log::warn!("power: the BQ27220 gives a charge that is not valid ({bytes:?})");
+            }
+            level
+        }
+        Err(error) => {
+            if warn {
+                log::warn!("power: cannot read the BQ27220 ({error:?})");
+            }
+            None
+        }
+    }
+}
+
+/// The state of the power poll.
+struct Power {
+    monitor: PowerMonitor,
+    /// The time of the next read. The first read is at once.
+    next: Instant,
+    /// The last read of the charger failed, so the task does not log the
+    /// next failure.
+    charger_failed: bool,
+    /// The last read of the fuel gauge failed, so the task does not log the
+    /// next failure.
+    gauge_failed: bool,
+}
+
+impl Power {
+    fn new(source: PowerSource) -> Self {
+        Self {
+            monitor: PowerMonitor::new(source),
+            next: Instant::now(),
+            charger_failed: false,
+            gauge_failed: false,
+        }
+    }
+
+    /// If the time of the next read came, reads the charger and the fuel
+    /// gauge, and sends each change to the core.
+    fn poll(&mut self, panel: &mut Panel<'static>) {
+        let now = Instant::now();
+        if now < self.next {
+            return;
+        }
+        // The task logs only the first failure in a row of each chip.
+        let source = read_source(panel, !self.charger_failed);
+        let level = read_level(panel, !self.gauge_failed);
+        self.charger_failed = source.is_none();
+        self.gauge_failed = level.is_none();
+        for event in self.monitor.update(source, level) {
+            match &event {
+                Event::PowerSourceChanged(source) => log::info!("power: source {source:?}"),
+                Event::BatteryChanged(Some(level)) => log::info!("power: battery {level}%"),
+                _ => {}
+            }
+            SIGNALS.push(Signal::Event(event));
+        }
+        let wait = if self.monitor.is_pending() {
+            POWER_CONFIRM
+        } else {
+            POWER_POLL
+        };
+        self.next = now + wait;
     }
 }
 

@@ -490,13 +490,13 @@ fn on_battery_a_tap_that_waits_for_a_connection_delays_the_sleep_once() {
     shell.fire_timers();
     assert!(shell.sleep.is_some());
     let view = shell.view();
-    assert_eq!(view.status, "Asleep, on battery, 1 tap not sent");
+    assert_eq!(view.status, "Asleep, 1 tap not sent");
     assert_eq!(shell.broker.service_calls.len(), 0);
 
     // The next connection clears the notice.
     shell.broker.down = false;
     shell.send(Event::Woke);
-    assert_eq!(shell.view().status, "Online, on battery");
+    assert_eq!(shell.view().status, "Online");
 }
 
 #[test]
@@ -516,7 +516,7 @@ fn on_battery_a_tap_that_is_sent_before_the_extra_period_ends_is_not_lost() {
 
     shell.fire_timers();
     assert!(shell.sleep.is_some());
-    assert_eq!(shell.view().status, "Asleep, on battery");
+    assert_eq!(shell.view().status, "Asleep");
 }
 
 #[test]

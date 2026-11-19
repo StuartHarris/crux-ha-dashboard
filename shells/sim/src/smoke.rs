@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use shared::{Connection, Settings, capabilities::mqtt::MqttEvent};
+use shared::{Connection, Event, Settings, capabilities::mqtt::MqttEvent};
 
 use crate::{
     inspector::Direction,
@@ -42,6 +42,7 @@ pub fn run(options: Options, out: &Path) -> Result<(), String> {
         ..options.settings
     };
     shell.start(settings, options.power, options.path);
+    shell.send(Event::BatteryChanged(Some(options.level)));
 
     let started = Instant::now();
     let mut last_message: Option<Instant> = None;

@@ -411,9 +411,9 @@ fn set_read_only_while_asleep_does_not_draw() {
 fn the_status_shows_the_dry_run() {
     let app = Dashboard;
     let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Stand);
-    assert_eq!(app.view(&model).status, "Online, on stand");
+    assert_eq!(app.view(&model).status, "Online");
     let _ = app.update(Event::SetReadOnly(true), &mut model);
-    assert_eq!(app.view(&model).status, "Dry run · Online, on stand");
+    assert_eq!(app.view(&model).status, "Dry run · Online");
 }
 
 #[test]

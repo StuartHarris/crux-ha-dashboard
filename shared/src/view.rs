@@ -39,13 +39,23 @@ pub struct ViewModel {
     pub page: PageView,
     /// The connection to Home Assistant.
     pub connection: Connection,
-    /// The power source.
+    /// The power source. A renderer shows it as an icon after the status
+    /// text: a plug on the stand, and a battery on battery.
     pub power: PowerSource,
-    /// The connection and the power source as text, for example
-    /// `Online, on stand`. If the core dropped taps before it slept, the text
-    /// also gives their number, for example `Asleep, on battery, 1 tap not
-    /// sent`. In a dry run, the text starts with `Dry run · `, so the panel
-    /// shows why a tap does not change a light.
+    /// The charge of the battery in percent, rounded to the nearest
+    /// [`BATTERY_STEP`], or `None` if the shell did not read it. A renderer
+    /// shows the percent before the power icon, and the battery icon fills
+    /// in proportion to the charge. If the charge is not known, a renderer
+    /// shows only the icon.
+    ///
+    /// The rounding prevents a partial refresh for each change of 1%.
+    pub battery: Option<u8>,
+    /// The connection as text, for example `Online`. If the core dropped
+    /// taps before it slept, the text also gives their number, for example
+    /// `Asleep, 1 tap not sent`. In a dry run, the text starts with
+    /// `Dry run · `, so the panel shows why a tap does not change a light.
+    /// The text does not give the power source. Refer to
+    /// [`power`](Self::power) and [`battery`](Self::battery).
     pub status: String,
     /// The device is asleep. The panel keeps this image until the device wakes.
     pub asleep: bool,
@@ -238,6 +248,17 @@ pub enum Connection {
     Online,
 }
 
+/// The step of the charge of the battery in the view, in percent. Refer to
+/// [`ViewModel::battery`].
+pub const BATTERY_STEP: u8 = 5;
+
+/// Returns `level` rounded to the nearest [`BATTERY_STEP`], at most 100.
+#[must_use]
+pub const fn rounded_level(level: u8) -> u8 {
+    let level = if level > 100 { 100 } else { level };
+    (level + BATTERY_STEP / 2) / BATTERY_STEP * BATTERY_STEP
+}
+
 /// Makes the view model from the model.
 #[must_use]
 pub fn view(model: &Model) -> ViewModel {
@@ -278,13 +299,8 @@ pub fn view(model: &Model) -> ViewModel {
         ),
         connection,
         power: model.power.source,
-        status: status(
-            connection,
-            model.power.source,
-            model.power.asleep,
-            model.unsent,
-            read_only,
-        ),
+        battery: model.power.battery.map(rounded_level),
+        status: status(connection, model.power.asleep, model.unsent, read_only),
         last_sync: time.and_then(|time| u64::try_from(time.timestamp()).ok()),
         asleep: model.power.asleep,
         read_only,
@@ -354,29 +370,19 @@ fn local_time(time: DateTime<Utc>) -> String {
     format!("{:02}:{:02}", local.hour(), local.minute())
 }
 
-/// Returns the status text: the dry run, the connection, the power source
-/// and the number of taps that the core did not send.
-fn status(
-    connection: Connection,
-    power: PowerSource,
-    asleep: bool,
-    unsent: usize,
-    read_only: bool,
-) -> String {
+/// Returns the status text: the dry run, the connection and the number of
+/// taps that the core did not send.
+fn status(connection: Connection, asleep: bool, unsent: usize, read_only: bool) -> String {
     let connection = match connection {
         _ if asleep => "Asleep",
         Connection::Online => "Online",
         Connection::Connecting => "Connecting",
         Connection::Offline => "Offline",
     };
-    let power = match power {
-        PowerSource::Stand => "on stand",
-        PowerSource::Battery => "on battery",
-    };
     let text = match unsent {
-        0 => format!("{connection}, {power}"),
-        1 => format!("{connection}, {power}, 1 tap not sent"),
-        _ => format!("{connection}, {power}, {unsent} taps not sent"),
+        0 => String::from(connection),
+        1 => format!("{connection}, 1 tap not sent"),
+        _ => format!("{connection}, {unsent} taps not sent"),
     };
     if read_only {
         format!("Dry run · {text}")

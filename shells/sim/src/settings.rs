@@ -21,9 +21,10 @@ Modes:
   (none)              Open a window. Click to tap. Keys: S moves the device on
                       or off the stand, W wakes it, Z ends the idle time on
                       battery so that the core sleeps, R restarts the
-                      sleeping device with a new core (a deep sleep), D
-                      shows the area of each partial refresh, Left and Right
-                      turn the page, Q quits.
+                      sleeping device with a new core (a deep sleep), [ and ]
+                      decrease and increase the charge of the battery by 10%,
+                      D shows the area of each partial refresh, Left and
+                      Right turn the page, Q quits.
                       The window also shows the controls, the view model,
                       the effect log and the MQTT log.
   --png <FILE>        Draw a page with fixed entity states to a PNG file.
@@ -41,6 +42,9 @@ Options (each has an environment variable):
   --device <ID>       The device id in MQTT topics (DASHBOARD_DEVICE, default sim,
                       or smoke in the --smoke mode)
   --battery           Start off the stand (DASHBOARD_POWER=battery)
+  --level <PERCENT>   The charge of the battery at the start, from 0 to 100
+                      (DASHBOARD_BATTERY, default 78). The --png mode does
+                      not use it.
   --page <PATH>       The page to show first, for example /room/kitchen
                       (DASHBOARD_PAGE)
   --read-only         Start in a dry run: the core does not publish service
@@ -62,6 +66,8 @@ pub const DEFAULT_DEVICE: &str = "sim";
 /// window, so a smoke test and a window can connect at the same time. The
 /// broker closes the older connection of two clients with the same id.
 pub const DEFAULT_SMOKE_DEVICE: &str = "smoke";
+/// The default charge of the battery at the start, in percent.
+pub const DEFAULT_LEVEL: u8 = 78;
 /// The default password file, relative to the home directory.
 pub const DEFAULT_PASSWORD_FILE: &str = ".config/crux-ha-dashboard/mqtt";
 
@@ -88,6 +94,8 @@ pub struct Options {
     pub settings: Settings,
     /// The power source at the start.
     pub power: PowerSource,
+    /// The charge of the battery at the start, in percent.
+    pub level: u8,
     /// The path of the page to show first.
     pub path: Option<String>,
 }
@@ -114,15 +122,10 @@ pub fn parse(
     let mut user = env("DASHBOARD_USER").unwrap_or_else(|| DEFAULT_USER.into());
     let mut device = env("DASHBOARD_DEVICE");
     let mut password_file = env("DASHBOARD_PASSWORD_FILE").map(PathBuf::from);
-    let mut power = match env("DASHBOARD_POWER").as_deref() {
-        None | Some("stand") => PowerSource::Stand,
-        Some("battery") => PowerSource::Battery,
-        Some(other) => {
-            return Err(format!(
-                "DASHBOARD_POWER must be `stand` or `battery`, not `{other}`"
-            ));
-        }
-    };
+    let mut power = power_from_env(env("DASHBOARD_POWER").as_deref())?;
+    let mut level = env("DASHBOARD_BATTERY")
+        .as_deref()
+        .map_or(Ok(DEFAULT_LEVEL), parse_level)?;
     let mut path = env("DASHBOARD_PAGE");
     let mut read_only = match env("DASHBOARD_READ_ONLY").as_deref() {
         None | Some("0" | "false") => false,
@@ -164,6 +167,7 @@ pub fn parse(
             "--device" => device = Some(value()?),
             "--page" => path = Some(value()?),
             "--battery" => power = PowerSource::Battery,
+            "--level" => level = parse_level(&value()?)?,
             "--read-only" => read_only = true,
             other => return Err(format!("unknown argument `{other}`\n\n{USAGE}")),
         }
@@ -208,8 +212,28 @@ pub fn parse(
             read_only,
         },
         power,
+        level,
         path,
     })
+}
+
+/// Reads the power source from the value of `DASHBOARD_POWER`.
+fn power_from_env(value: Option<&str>) -> Result<PowerSource, String> {
+    match value {
+        None | Some("stand") => Ok(PowerSource::Stand),
+        Some("battery") => Ok(PowerSource::Battery),
+        Some(other) => Err(format!(
+            "DASHBOARD_POWER must be `stand` or `battery`, not `{other}`"
+        )),
+    }
+}
+
+/// Reads the charge of the battery in percent from `text`.
+fn parse_level(text: &str) -> Result<u8, String> {
+    text.parse()
+        .ok()
+        .filter(|level| *level <= 100)
+        .ok_or_else(|| format!("the charge must be a number from 0 to 100, not `{text}`"))
 }
 
 /// Returns the default device id of `mode`.
@@ -269,6 +293,7 @@ mod tests {
         assert_eq!(options.settings.port, 1883);
         assert_eq!(options.settings.device_id, "sim");
         assert_eq!(options.power, PowerSource::Stand);
+        assert_eq!(options.level, 78);
         assert_eq!(options.path, None);
         let credentials = options.settings.credentials.unwrap();
         assert_eq!(credentials.username, "dashboard");
@@ -363,6 +388,20 @@ mod tests {
         assert!(parse_ok("", env).settings.read_only);
         let env = |name: &str| (name == "DASHBOARD_READ_ONLY").then(|| "maybe".to_string());
         assert!(parse(Vec::new(), env, Some(Path::new("/h")), secret).is_err());
+    }
+
+    #[test]
+    fn the_charge_from_the_argument_or_the_environment() {
+        assert_eq!(parse_ok("--level 12", no_env).level, 12);
+        let env = |name: &str| (name == "DASHBOARD_BATTERY").then(|| "40".to_string());
+        assert_eq!(parse_ok("", env).level, 40);
+        assert_eq!(parse_ok("--level 100", env).level, 100);
+        for text in ["--level 101", "--level -1", "--level full"] {
+            let Err(message) = parse(args(text), no_env, None, secret) else {
+                panic!("`{text}` must not be valid");
+            };
+            assert!(message.contains("from 0 to 100"), "{message}");
+        }
     }
 
     #[test]

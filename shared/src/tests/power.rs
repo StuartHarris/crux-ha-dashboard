@@ -223,3 +223,100 @@ fn no_other_timer_waits_for_the_idle_timeout() {
     }
     assert_ne!(RECONNECT_MAX, IDLE_TIMEOUT);
 }
+
+#[test]
+fn a_battery_level_draws_once_and_the_same_level_draws_nothing() {
+    let app = Dashboard;
+    let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Battery);
+    let idle = model.power.idle;
+    assert_eq!(app.view(&model).battery, None);
+
+    // A partial render, with no timer.
+    app.update(Event::BatteryChanged(Some(80)), &mut model)
+        .expect_only_render();
+    assert_eq!(app.view(&model).battery, Some(80));
+    assert_eq!(model.power.idle, idle);
+
+    app.update(Event::BatteryChanged(Some(80)), &mut model)
+        .expect_no_effects();
+
+    // The shell cannot read the charge now.
+    app.update(Event::BatteryChanged(None), &mut model)
+        .expect_only_render();
+    assert_eq!(app.view(&model).battery, None);
+}
+
+#[test]
+fn a_battery_level_while_asleep_does_not_wake_the_device() {
+    let app = Dashboard;
+    let mut model = asleep_on_battery();
+    let idle = model.power.idle;
+
+    // The core keeps the level, but it does not draw, turn Wi-Fi on or
+    // start a timer.
+    app.update(Event::BatteryChanged(Some(41)), &mut model)
+        .expect_no_effects();
+    assert!(model.power.asleep);
+    assert_eq!(model.power.idle, idle);
+    assert_eq!(model.connection.wifi, Link::Down);
+    assert_eq!(app.view(&model).battery, Some(40));
+
+    // The wake draws the level.
+    let _ = app.update(Event::Woke, &mut model);
+    assert_eq!(app.view(&model).battery, Some(40));
+    assert_eq!(model.full_refresh_seq, 1);
+}
+
+#[test]
+fn the_status_text_does_not_give_the_power_source() {
+    let app = Dashboard;
+    for source in [PowerSource::Stand, PowerSource::Battery] {
+        let (mut model, _cmd, _request) = drive_to_connected(source);
+        let _ = app.update(Event::BatteryChanged(Some(55)), &mut model);
+        let view = app.view(&model);
+        assert_eq!(view.status, "Online", "{source:?}");
+        assert_eq!(view.power, source);
+        assert_eq!(view.battery, Some(55));
+    }
+}
+
+#[test]
+fn the_view_rounds_the_battery_level_to_the_nearest_step() {
+    use crate::view::rounded_level;
+
+    for (level, rounded) in [
+        (0, 0),
+        (2, 0),
+        (3, 5),
+        (12, 10),
+        (13, 15),
+        (77, 75),
+        (78, 80),
+        (98, 100),
+        (100, 100),
+        (200, 100),
+    ] {
+        assert_eq!(rounded_level(level), rounded, "{level}");
+    }
+}
+
+#[test]
+fn a_battery_change_that_does_not_change_the_rounded_level_does_not_draw() {
+    let app = Dashboard;
+    let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Battery);
+    app.update(Event::BatteryChanged(Some(80)), &mut model)
+        .expect_only_render();
+
+    // 79, 78 and 81 all show as 80%. The core keeps the exact value.
+    for level in [79, 78, 81] {
+        app.update(Event::BatteryChanged(Some(level)), &mut model)
+            .expect_no_effects();
+        assert_eq!(model.power.battery, Some(level));
+        assert_eq!(app.view(&model).battery, Some(80));
+    }
+
+    // 77 shows as 75%, so the core draws.
+    app.update(Event::BatteryChanged(Some(77)), &mut model)
+        .expect_only_render();
+    assert_eq!(app.view(&model).battery, Some(75));
+}
