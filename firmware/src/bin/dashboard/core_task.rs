@@ -6,6 +6,7 @@ use core::time::Duration;
 use crux_time::operation::NotifyAfter;
 use logic::{
     shell::{self, Job, Shell, TimerOp},
+    sleep::Plan,
     wifi::WifiRequest,
 };
 use shared::{
@@ -13,7 +14,7 @@ use shared::{
     capabilities::network::{WifiOff, WifiOn},
 };
 
-use crate::{MQTT, RENDER, SIGNALS, TIMERS, WIFI, config::CONFIG, timers::Request};
+use crate::{MQTT, RENDER, SIGNALS, SLEEP, TIMERS, WIFI, config::CONFIG, timers::Request};
 
 /// Starts the core with the power source `source`, then gives it each
 /// signal from the other tasks.
@@ -22,17 +23,29 @@ pub async fn run(source: PowerSource) -> ! {
     if CONFIG.read_only {
         log::info!("core: dry run, so a tap publishes no service call");
     }
-    // TODO(6): after a deep sleep, give the path and the time of the last
-    // update that the firmware kept in RTC memory.
+    // The firmware uses light sleep, which keeps the core in RAM, so a wake
+    // does not start the core again.
+    // TODO: if the firmware uses deep sleep in the future, give the path and
+    // the time of the last update that it kept in RTC memory.
     let start = shell::start(&CONFIG, source, None, None);
     dispatch(shell.send(Event::Start(start)));
     loop {
         let signal = SIGNALS.pop().await;
+        let sleeping = shell.is_sleeping();
         dispatch(shell.handle(signal));
+        // The shell answered the `Sleep` request, so the display task stops
+        // the sleep.
+        if sleeping && !shell.is_sleeping() {
+            SLEEP.signal(None);
+        }
     }
 }
 
 /// Gives each job to the task that does it.
+///
+/// The display task runs the `Sleep` job. `RENDER` gets the last view model
+/// before [`SLEEP`] gets the job, and the display task draws a view model that
+/// waits before it sleeps.
 fn dispatch(jobs: alloc::vec::Vec<Job>) {
     for job in jobs {
         match job {
@@ -41,15 +54,8 @@ fn dispatch(jobs: alloc::vec::Vec<Job>) {
             Job::WifiOn { token, op: WifiOn } => WIFI.push(WifiRequest::On { token }),
             Job::WifiOff(WifiOff) => WIFI.push(WifiRequest::Off),
             Job::Sleep(sleep) => {
-                // TODO(6): a deep sleep with wake on the GT911 INT (GPIO3)
-                // and the RTC (GPIO2), after the panel, the front light and
-                // the touch controller are off. In this phase the device
-                // stays awake. The next tap goes to the core, which wakes
-                // because it sleeps.
-                log::info!(
-                    "power: sleep until {:?}. Tap the panel to wake.",
-                    sleep.wake_on
-                );
+                log::info!("power: sleep until {:?}", sleep.wake_on);
+                SLEEP.signal(Some(Plan::new(&sleep)));
             }
             Job::Timer {
                 token,

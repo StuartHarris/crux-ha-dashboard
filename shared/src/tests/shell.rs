@@ -23,7 +23,10 @@ use crux_time::operation::NotifyAfter;
 use super::broker::Broker;
 use crate::{
     Cmd, Dashboard, Effect, Event, Model, ViewModel,
-    capabilities::{network::WifiStatus, power::Sleep},
+    capabilities::{
+        network::WifiStatus,
+        power::{Sleep, Wake},
+    },
     features::refresh::{DRAW_DELAY, FULL_REFRESH_INTERVAL},
 };
 
@@ -65,8 +68,10 @@ pub struct Shell {
     drawn_seq: u32,
     /// The core asked for a render that the shell did not draw yet.
     render_requested: bool,
-    /// The last sleep request. A start or a wake clears it.
+    /// The `Sleep` request that waits for its answer. A start or a wake
+    /// clears it.
     pub sleep: Option<Sleep>,
+    sleep_request: Option<Request<Sleep>>,
     /// A short name for each effect, in order.
     pub log: Vec<String>,
 }
@@ -90,17 +95,45 @@ impl Shell {
             drawn_seq: 0,
             render_requested: false,
             sleep: None,
+            sleep_request: None,
             log: Vec::new(),
         }
     }
 
     /// Sends an event to the core and answers effects until the core waits.
+    ///
+    /// As a real shell does, while a `Sleep` request waits, the shell answers
+    /// it with `Wake::Touch` and the control, in place of a tap. After a
+    /// change of the power source, it answers it with `Wake::PowerSource`.
     pub fn send(&mut self, event: Event) {
-        if matches!(event, Event::Woke | Event::Start(_) | Event::Tapped(_)) {
-            self.sleep = None;
+        match event {
+            Event::Start(_) => {
+                self.sleep = None;
+                self.sleep_request = None;
+            }
+            Event::Tapped(control) if self.sleep_request.is_some() => {
+                self.wake(Wake::Touch(control));
+                return;
+            }
+            _ => {}
         }
+        let power_changed = matches!(event, Event::PowerSourceChanged(_));
         self.queue(event);
         self.run();
+        if power_changed && self.sleep_request.is_some() {
+            self.wake(Wake::PowerSource);
+        }
+    }
+
+    /// Answers the `Sleep` request that waits with `wake`, and answers
+    /// effects until the core waits. If no request waits, does nothing.
+    pub fn wake(&mut self, wake: Wake) {
+        self.sleep = None;
+        if let Some(mut request) = self.sleep_request.take() {
+            self.log.push(format!("Wake {wake:?}"));
+            request.resolve(wake).expect("the core waits for the wake");
+            self.run();
+        }
     }
 
     /// Sends an event to the core, but does not answer the effects yet.
@@ -252,9 +285,13 @@ impl Shell {
                     .push(format!("MqttPublish {} {payload}", publish.topic));
                 self.broker.publish_from_dashboard(publish);
             }
-            Effect::MqttDisconnect(_) => {
+            Effect::MqttDisconnect(mut request) => {
                 self.log.push("MqttDisconnect".into());
+                // The stream ends first, then the request.
                 self.broker.disconnect();
+                request
+                    .resolve(())
+                    .expect("the core waits for the disconnect");
             }
             Effect::WifiOn(mut request) => {
                 self.log.push("WifiOn".into());
@@ -266,14 +303,16 @@ impl Shell {
                 };
                 request.resolve(status).expect("the core waits for Wi-Fi");
             }
-            Effect::WifiOff(_) => {
+            Effect::WifiOff(mut request) => {
                 self.log.push("WifiOff".into());
                 self.wifi_on = false;
                 self.broker.drop_connection();
+                request.resolve(()).expect("the core waits for Wi-Fi off");
             }
             Effect::Sleep(request) => {
                 self.log.push("Sleep".into());
-                self.sleep = Some(request.operation);
+                self.sleep = Some(request.operation.clone());
+                self.sleep_request = Some(request);
             }
             Effect::TimeNotifyAfter(request) => {
                 let duration = Duration::from(request.operation.duration);

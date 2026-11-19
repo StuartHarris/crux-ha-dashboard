@@ -1,13 +1,17 @@
 //! Tests of the power feature: the idle timer, sleep and the power source.
 
+use alloc::vec::Vec;
 use core::time::Duration;
 
 use crux_core::App;
 
 use super::{ExpectFullRefreshTimer, connection::drive_to_connected, start};
 use crate::{
-    Connection, Control, Dashboard, EffectTestExt, Event, Model, PowerSource,
-    capabilities::{network::WifiStatus, power::WakeSource},
+    Connection, Control, Dashboard, Effect, EffectTestExt, Event, Model, PowerSource,
+    capabilities::{
+        network::WifiStatus,
+        power::{Wake, WakeSource},
+    },
     features::{connection::Link, power::IDLE_TIMEOUT},
 };
 
@@ -27,31 +31,111 @@ fn start_on_battery_also_starts_the_idle_timer() {
 }
 
 #[test]
-fn the_idle_timeout_disconnects_and_sleeps() {
+fn the_idle_timeout_sleeps_in_steps_and_a_touch_wakes() {
     let app = Dashboard;
     let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Battery);
     model.last_sync = chrono::DateTime::from_timestamp(super::NOW.cast_signed(), 0);
 
-    // The core does not read the clock. The last image shows the time of the
-    // last state message.
-    app.update(Event::IdleTimeout(model.power.idle), &mut model)
-        .expect_mqtt_publish_with(|publish| {
-            assert_eq!(publish.topic, "dashboard/hall/status");
-            assert_eq!(publish.payload, b"asleep");
-            assert!(publish.retain);
-        })
-        .expect_mqtt_disconnect()
-        .expect_wifi_off()
-        .expect_render()
-        .expect_only_sleep_with(|sleep| assert_eq!(sleep.wake_on, [WakeSource::Touch]));
+    // Step 1: publish `asleep`, then disconnect. The core waits for the
+    // answer of the shell.
+    let mut sleep = app.update(Event::IdleTimeout(model.power.idle), &mut model);
+    sleep.expect_mqtt_publish_with(|publish| {
+        assert_eq!(publish.topic, "dashboard/hall/status");
+        assert_eq!(publish.payload, b"asleep");
+        assert!(publish.retain);
+    });
+    let offline = sleep.resolve_mqtt_disconnect(|_| ()).expect_one_event();
+    assert!(model.power.asleep);
+    assert_eq!(app.view(&model).connection, Connection::Offline);
 
+    // Step 2: turn Wi-Fi off, and wait for the answer.
+    let radio_off = app
+        .update(offline, &mut model)
+        .resolve_wifi_off(|_| ())
+        .expect_one_event();
+
+    // Step 3: draw the last image, and sleep until a touch.
+    let mut last = app.update(radio_off, &mut model);
+    let effects: Vec<Effect> = last.effects().collect();
+    // The render of the last image, and the sleep.
+    assert_eq!(effects.len(), 2);
+    assert!(matches!(effects[0], Effect::Render(_)));
+    let mut request = effects
+        .into_iter()
+        .find_map(|effect| match effect {
+            Effect::Sleep(request) => Some(request),
+            _ => None,
+        })
+        .expect("a Sleep request");
+    assert_eq!(request.operation.wake_on, [WakeSource::Touch]);
+    // The touch is on no control, so it only wakes the device.
+    request.resolve(Wake::Touch(None)).unwrap();
+    let woke = last.expect_one_event();
     let view = app.view(&model);
     assert!(view.asleep);
     // The start asked for the first full refresh, and the sleep for the second.
     assert_eq!(view.full_refresh_seq, 2);
-    assert_eq!(view.connection, Connection::Offline);
     assert_eq!(view.updated, "Last changed 09:41");
     assert_eq!(model.connection.wifi, Link::Down);
+
+    // The touch wakes the device: draw, connect and start the idle timer.
+    app.update(woke, &mut model)
+        .expect_render()
+        .expect_full_refresh_timer()
+        .expect_wifi_on()
+        .expect_only_time_notify_after_with(|notify| {
+            assert_eq!(Duration::from(notify.duration), IDLE_TIMEOUT);
+        });
+    assert!(!model.power.asleep);
+    assert_eq!(model.full_refresh_seq, 3);
+}
+
+#[test]
+fn a_tap_during_the_steps_wakes_and_the_late_answers_are_ignored() {
+    let app = Dashboard;
+    let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Battery);
+    let mut sleep = app.update(Event::IdleTimeout(model.power.idle), &mut model);
+    sleep.expect_mqtt_publish();
+    let mut disconnect = sleep.expect_effect().expect_mqtt_disconnect();
+
+    // The user taps before the disconnect ends.
+    app.update(Event::Tapped(None), &mut model)
+        .expect_render()
+        .expect_full_refresh_timer()
+        .expect_wifi_on()
+        .expect_only_time_notify_after();
+    assert!(!model.power.asleep);
+
+    // The disconnect ends. The core does not continue the sleep.
+    disconnect.resolve(()).unwrap();
+    let offline = sleep.expect_one_event();
+    app.update(offline, &mut model).expect_no_effects();
+    assert!(!model.power.asleep);
+}
+
+#[test]
+fn the_answer_of_an_older_sleep_is_ignored() {
+    let app = Dashboard;
+    let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Battery);
+    let old = model.power.sleep.wrapping_add(1);
+    let _ = app.update(Event::IdleTimeout(model.power.idle), &mut model);
+    assert_eq!(model.power.sleep, old);
+
+    // The device moves to the stand and wakes. The shell then answers the
+    // `Sleep` request.
+    let _ = app.update(Event::PowerSourceChanged(PowerSource::Stand), &mut model);
+    assert!(!model.power.asleep);
+    for event in [
+        Event::Offline(old),
+        Event::RadioOff(old),
+        Event::Woke {
+            sleep: old,
+            wake: Wake::PowerSource,
+        },
+    ] {
+        app.update(event, &mut model).expect_no_effects();
+    }
+    assert!(!model.power.asleep);
 }
 
 #[test]
@@ -107,7 +191,9 @@ fn on_the_stand_while_asleep_wakes_and_connects() {
         .expect_full_refresh_timer()
         .resolve_wifi_on(|_| WifiStatus::Connected)
         .expect_event();
-    assert_eq!(model.full_refresh_seq, 3);
+    // The idle timeout only started the steps of the sleep, so the core
+    // drew no last image. The wake asked for the second full refresh.
+    assert_eq!(model.full_refresh_seq, 2);
     assert!(!model.power.asleep);
 
     let _connect = app
@@ -117,16 +203,44 @@ fn on_the_stand_while_asleep_wakes_and_connects() {
 }
 
 #[test]
-fn woke_turns_wifi_on_and_starts_the_idle_timer() {
+fn a_timer_wake_turns_wifi_on_and_starts_the_idle_timer() {
     let app = Dashboard;
     let mut model = asleep_on_battery();
 
-    app.update(Event::Woke, &mut model)
+    app.update(woke(&model, Wake::Timer), &mut model)
         .expect_render()
         .expect_full_refresh_timer()
         .expect_wifi_on()
         .expect_only_time_notify_after();
     assert_eq!(model.full_refresh_seq, 1);
+}
+
+#[test]
+fn a_power_source_wake_on_battery_is_ignored() {
+    let app = Dashboard;
+    let mut model = asleep_on_battery();
+
+    // The shell answers `PowerSource` only after a real change. If the core
+    // is still on battery, the answer does not wake it.
+    app.update(woke(&model, Wake::PowerSource), &mut model)
+        .expect_no_effects();
+    assert!(model.power.asleep);
+
+    // On the stand, the same answer wakes the device.
+    model.power.source = PowerSource::Stand;
+    app.update(woke(&model, Wake::PowerSource), &mut model)
+        .expect_render()
+        .expect_full_refresh_timer()
+        .expect_only_wifi_on();
+    assert!(!model.power.asleep);
+}
+
+/// The answer to the `Sleep` request of the newest sleep.
+const fn woke(model: &Model, wake: Wake) -> Event {
+    Event::Woke {
+        sleep: model.power.sleep,
+        wake,
+    }
 }
 
 /// Returns a model of a device on battery that sleeps, with settings.
@@ -143,37 +257,60 @@ fn asleep_on_battery() -> Model {
 }
 
 #[test]
-fn a_tap_while_asleep_wakes_and_does_not_act_on_the_control() {
+fn a_tap_on_no_control_while_asleep_only_wakes() {
     let app = Dashboard;
-    for control in [
-        None,
-        Some(Control::PreviousPage),
-        Some(Control::Home),
-        Some(Control::NextPage),
-        Some(Control::Tile(0)),
-        Some(Control::Scene(0)),
-        Some(Control::Brighter(1)),
-        Some(Control::Dimmer(1)),
-    ] {
-        let mut model = asleep_on_battery();
-        // On this page, tile 1 is a dimmable light. While the device is
-        // awake, each control here acts.
-        model.route = crate::Route::room("living_room");
-        super::set_state(&mut model, "light.living_room_rocket_lamp", "on");
-        let route = model.route.clone();
+    let mut model = asleep_on_battery();
+    let route = model.route.clone();
 
-        // The same effects as `Woke`: draw, connect and start the idle timer.
-        app.update(Event::Tapped(control), &mut model)
-            .expect_render()
-            .expect_full_refresh_timer()
-            .expect_wifi_on()
-            .expect_only_time_notify_after_with(|notify| {
-                assert_eq!(Duration::from(notify.duration), IDLE_TIMEOUT);
-            });
-        assert!(!model.power.asleep, "{control:?}");
-        assert_eq!(model.full_refresh_seq, 1, "{control:?}");
-        assert_eq!(model.route, route, "{control:?}");
-        assert_eq!(model.connection.outbox.len(), 0, "{control:?}");
+    // Draw, connect and start the idle timer.
+    app.update(woke(&model, Wake::Touch(None)), &mut model)
+        .expect_render()
+        .expect_full_refresh_timer()
+        .expect_wifi_on()
+        .expect_only_time_notify_after_with(|notify| {
+            assert_eq!(Duration::from(notify.duration), IDLE_TIMEOUT);
+        });
+    assert!(!model.power.asleep);
+    assert_eq!(model.route, route);
+    assert_eq!(model.connection.outbox.len(), 0);
+}
+
+#[test]
+fn a_touch_wake_on_a_room_button_opens_the_room() {
+    let app = Dashboard;
+    let mut model = asleep_on_battery();
+    assert_eq!(model.route, crate::Route::Home);
+
+    let _ = app.update(
+        woke(&model, Wake::Touch(Some(Control::Room(0)))),
+        &mut model,
+    );
+    assert!(!model.power.asleep);
+    let first_room = model.rooms().next().unwrap().route();
+    assert_eq!(model.route, first_room);
+    // The redraw after the wake shows the room.
+    assert_eq!(app.view(&model).path, first_room.to_path());
+}
+
+#[test]
+fn a_touch_wake_on_a_light_queues_the_service_call() {
+    let app = Dashboard;
+    for read_only in [false, true] {
+        let mut model = asleep_on_battery();
+        if let Some(settings) = &mut model.settings {
+            settings.read_only = read_only;
+        }
+        model.route = crate::Route::room("living_room");
+
+        let _ = app.update(
+            woke(&model, Wake::Touch(Some(Control::Tile(0)))),
+            &mut model,
+        );
+        assert!(!model.power.asleep);
+        // The connection is not open yet, so the toggle waits in the
+        // outbox. A dry run sends nothing.
+        let expected = usize::from(!read_only);
+        assert_eq!(model.connection.outbox.len(), expected, "{read_only}");
     }
 }
 
@@ -262,7 +399,7 @@ fn a_battery_level_while_asleep_does_not_wake_the_device() {
     assert_eq!(app.view(&model).battery, Some(40));
 
     // The wake draws the level.
-    let _ = app.update(Event::Woke, &mut model);
+    let _ = app.update(woke(&model, Wake::Timer), &mut model);
     assert_eq!(app.view(&model).battery, Some(40));
     assert_eq!(model.full_refresh_seq, 1);
 }

@@ -20,7 +20,7 @@ use core::fmt;
 const KEYS: &[(&str, &[&str])] = &[
     ("wifi", &["ssid", "password", "auth"]),
     ("mqtt", &["host", "port", "username", "password"]),
-    ("device", &["id", "read_only"]),
+    ("device", &["id", "read_only", "force_battery"]),
 ];
 
 /// A key that the firmware used before, and why it is not necessary now.
@@ -87,6 +87,11 @@ pub struct Config<'a> {
     /// (`[device] read_only`, `true` if not set). The firmware gives it to
     /// the core in `Settings::read_only`.
     pub read_only: bool,
+    /// If `true`, the firmware tells the core that the device is on battery,
+    /// also on USB power (`[device] force_battery`, `false` if not set). The
+    /// power poll then sends no `PowerSourceChanged`. Use it to test the
+    /// sleep with the serial log on USB.
+    pub force_battery: bool,
 }
 
 impl fmt::Debug for Config<'_> {
@@ -102,6 +107,7 @@ impl fmt::Debug for Config<'_> {
             .field("mqtt_password", &hidden(self.mqtt_password))
             .field("device_id", &self.device_id)
             .field("read_only", &self.read_only)
+            .field("force_battery", &self.force_battery)
             .finish()
     }
 }
@@ -250,6 +256,7 @@ struct Partial<'a> {
     mqtt_password: Option<&'a str>,
     device_id: Option<&'a str>,
     read_only: Option<bool>,
+    force_battery: Option<bool>,
 }
 
 impl<'a> Partial<'a> {
@@ -275,6 +282,10 @@ impl<'a> Partial<'a> {
             ("device", "id") => self.device_id = Some(text()?),
             ("device", "read_only") => match value {
                 Value::Boolean(flag) => self.read_only = Some(flag),
+                _ => return None,
+            },
+            ("device", "force_battery") => match value {
+                Value::Boolean(flag) => self.force_battery = Some(flag),
                 _ => return None,
             },
             _ => {}
@@ -321,6 +332,7 @@ impl<'a> Partial<'a> {
             mqtt_password: self.mqtt_password.unwrap_or(""),
             device_id: self.device_id.ok_or(Error::Missing("device.id"))?,
             read_only: self.read_only.unwrap_or(true),
+            force_battery: self.force_battery.unwrap_or(false),
         })
     }
 }
@@ -371,6 +383,7 @@ mod tests {
         assert_eq!(config.mqtt_port, 1883);
         assert_eq!(config.device_id, "hall");
         assert!(config.read_only);
+        assert!(!config.force_battery);
     }
 
     #[test]
@@ -391,6 +404,7 @@ mod tests {
             [device]
             id = "kitchen"
             read_only = false
+            force_battery = true
         "#;
         assert_eq!(
             Config::parse(text),
@@ -404,6 +418,7 @@ mod tests {
                 mqtt_password: "secret",
                 device_id: "kitchen",
                 read_only: false,
+                force_battery: true,
             })
         );
     }
@@ -415,6 +430,7 @@ mod tests {
         assert_eq!(config.mqtt_port, 1883);
         assert_eq!(config.mqtt_username, "");
         assert!(config.read_only);
+        assert!(!config.force_battery);
     }
 
     #[test]
@@ -488,6 +504,18 @@ mod tests {
             }
         );
         assert!(alloc::format!("{error}").contains("[mqqt]"));
+    }
+
+    #[test]
+    fn force_battery_must_be_a_boolean() {
+        let text = "[device]\nid = 'd'\nforce_battery = 'yes'\n";
+        assert_eq!(
+            Config::parse(text),
+            Err(Error::Value {
+                line: 3,
+                key: "force_battery"
+            })
+        );
     }
 
     #[test]

@@ -5,14 +5,19 @@
 //! sequence of [`MqttEvent`] values: `Connected` when the broker accepts the
 //! connection, a `Message` for each message on a subscribed topic, and one
 //! `Disconnected` as the last item. Messages for all subscriptions arrive on
-//! the stream of their connection. [`Subscribe`], [`Publish`] and
-//! [`Disconnect`] are notifications. They apply to the open connection, and the
-//! shell does not answer them.
+//! the stream of their connection. [`Subscribe`] and [`Publish`] are
+//! notifications. [`Disconnect`] is a request, and the shell answers it when
+//! the connection is closed. These three operations apply to the open
+//! connection.
 
 use alloc::{string::String, vec::Vec};
 use core::fmt;
 
-use crux_core::{Command, Request, command::StreamBuilder, macros::Operation};
+use crux_core::{
+    Command, Request,
+    command::{RequestBuilder, StreamBuilder},
+    macros::Operation,
+};
 use facet::Facet;
 use futures::Stream;
 use serde::{Deserialize, Serialize};
@@ -111,13 +116,16 @@ pub struct Publish {
 /// Closes the open connection with a disconnect packet, so the broker does
 /// not publish the last will.
 ///
-/// The stream of the connection then sends `Disconnected` and ends.
+/// The stream of the connection sends `Disconnected` and ends. Then the shell
+/// answers this request. If no connection is open, the shell answers at once.
+/// The shell can limit the time for the disconnect packet, so that a dead
+/// link does not stop the answer. The connection then closes with no packet.
 ///
 /// The shell must do the MQTT operations in the order that it gets them. Before
 /// sleep, the core publishes `asleep` on the status topic and then sends
 /// `Disconnect`, so the publish must reach the broker first.
 #[derive(Operation, Facet, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[operation(notify)]
+#[operation(request, output = ())]
 pub struct Disconnect;
 
 /// A message from the broker on a subscribed topic.
@@ -178,13 +186,15 @@ impl Mqtt {
         notify(publish)
     }
 
-    /// Closes the open connection.
-    pub fn disconnect<Effect, Event>() -> Command<Effect, Event>
+    /// Closes the open connection. The request ends when the connection is
+    /// closed.
+    #[must_use]
+    pub fn disconnect<Effect, Event>() -> RequestBuilder<Effect, Event, impl Future<Output = ()>>
     where
         Effect: From<Request<Disconnect>> + Send + 'static,
         Event: Send + 'static,
     {
-        notify(Disconnect)
+        Command::request_from_shell(Disconnect)
     }
 }
 

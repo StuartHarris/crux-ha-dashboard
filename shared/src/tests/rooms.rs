@@ -283,7 +283,7 @@ fn a_tap_on_a_sensor_climate_or_weather_tile_or_outside_the_grid_does_nothing() 
 }
 
 #[test]
-fn a_tap_before_the_connection_opens_waits_in_the_outbox() {
+fn a_tap_before_the_connection_opens_waits_in_the_outbox_and_goes_first() {
     let app = Dashboard;
     let (mut model, mut cmd, mut request) = drive_to_connecting(PowerSource::Stand);
 
@@ -295,15 +295,16 @@ fn a_tap_before_the_connection_opens_waits_in_the_outbox() {
         .resolve(crate::capabilities::mqtt::MqttEvent::Connected)
         .unwrap();
     let event = cmd.expect_one_event();
+    // The service call goes first, so it does not wait behind the subscribe.
     app.update(event, &mut model)
-        .expect_mqtt_subscribe()
-        .expect_mqtt_publish_with(|publish| assert_eq!(publish.payload, b"online"))
         .expect_mqtt_publish_with(|publish| {
             assert_eq!(
                 publish.payload,
                 br#"{"service":"light.toggle","entity_id":"light.all_lights"}"#
             );
         })
+        .expect_mqtt_publish_with(|publish| assert_eq!(publish.payload, b"online"))
+        .expect_mqtt_subscribe()
         .expect_only_render();
     assert_eq!(model.connection.outbox.len(), 0);
     assert_eq!(model.connection.mqtt, Link::Up);

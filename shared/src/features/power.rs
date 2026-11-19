@@ -2,8 +2,13 @@
 //!
 //! - On the stand, the device stays awake and connected.
 //! - On battery, the device connects when it wakes. After [`IDLE_TIMEOUT`]
-//!   without a touch, it disconnects, turns Wi-Fi off, draws the last image
-//!   with the time of the last state message, and sleeps until a touch.
+//!   without a touch, it sleeps in steps, and each step waits for the
+//!   answer of the shell: publish `asleep` and disconnect, then turn Wi-Fi
+//!   off, then draw the last image with the time of the last state message
+//!   and sleep until a touch.
+//! - Each sleep has an id. A tap or a move to the stand wakes the device
+//!   during the steps, and the core then ignores the answers of the steps and
+//!   of `Sleep`.
 
 use alloc::vec;
 use core::time::Duration;
@@ -12,8 +17,12 @@ use crux_time::clock::Time;
 
 use crate::{
     Cmd, Event, Model,
-    capabilities::power::{Power, PowerSource, WakeSource},
-    features::{connection, refresh::redraw},
+    capabilities::{
+        mqtt::Mqtt,
+        network::Network,
+        power::{Power, PowerSource, Wake, WakeSource},
+    },
+    features::{connection, refresh::redraw, rooms},
     view::rounded_level,
 };
 
@@ -38,10 +47,50 @@ pub struct State {
     /// The core waits one more idle period, because service calls wait in
     /// the outbox.
     pub extended: bool,
+    /// The id of the newest sleep. The core ignores the answers of an older
+    /// sleep.
+    pub sleep: u32,
 }
 
-/// The device woke from a light sleep: connect again.
-pub fn woke(model: &mut Model) -> Cmd {
+/// The `Sleep` request of the sleep `id` ended with `wake`.
+///
+/// If the device still sleeps for that request, it wakes and connects again.
+/// A touch also acts as a tap on its control. A change of the power source
+/// comes first as `PowerSourceChanged`, so `Wake::PowerSource` wakes the
+/// device only if the source is now `Stand`. On battery, the core ignores it.
+pub fn woke(id: u32, wake: Wake, model: &mut Model) -> Cmd {
+    if id != model.power.sleep || !model.power.asleep {
+        return Cmd::done();
+    }
+    match wake {
+        Wake::Touch(control) => rooms::tapped(control, model),
+        Wake::PowerSource if model.power.source != PowerSource::Stand => Cmd::done(),
+        Wake::Timer | Wake::PowerSource => wake_up(model),
+    }
+}
+
+/// The MQTT connection of the sleep `id` closed: turn Wi-Fi off.
+pub fn offline(id: u32, model: &mut Model) -> Cmd {
+    if id != model.power.sleep || !model.power.asleep {
+        return Cmd::done();
+    }
+    Network::wifi_off().then_send(move |()| Event::RadioOff(id))
+}
+
+/// The radio of the sleep `id` is off: draw the last image and sleep.
+pub fn radio_off(id: u32, model: &mut Model) -> Cmd {
+    if id != model.power.sleep || !model.power.asleep {
+        return Cmd::done();
+    }
+    redraw(model, true).and(
+        Power::sleep(vec![WakeSource::Touch])
+            .then_send(move |wake| Event::Woke { sleep: id, wake }),
+    )
+}
+
+/// Wakes the device from a sleep, or from the steps before it, and connects
+/// again.
+pub fn wake_up(model: &mut Model) -> Cmd {
     if !model.power.asleep {
         return restart_idle_timer(model);
     }
@@ -124,14 +173,15 @@ pub fn idle_timeout(id: u32, model: &mut Model) -> Cmd {
     sleep(model)
 }
 
-/// Disconnects, turns Wi-Fi off, draws the last image and sleeps.
+/// Starts the steps of a sleep: publishes `asleep` and disconnects. The
+/// answer to `Disconnect` starts the next step ([`offline`]).
 ///
 /// The core drops the service calls that wait in the outbox, and the view
 /// shows how many. The last image shows the time of the last state message.
 fn sleep(model: &mut Model) -> Cmd {
     model.power.asleep = true;
+    model.power.sleep = model.power.sleep.wrapping_add(1);
+    let id = model.power.sleep;
     model.unsent += model.connection.outbox.len();
-    connection::go_offline(model)
-        .then(redraw(model, true))
-        .then(Power::sleep(vec![WakeSource::Touch]))
+    connection::go_offline(model).then(Mqtt::disconnect().then_send(move |()| Event::Offline(id)))
 }

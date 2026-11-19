@@ -13,7 +13,7 @@ use esp_hal::{
     delay::Delay,
     dma::DmaTxBuf,
     dma_tx_buffer,
-    gpio::{Flex, InputConfig, Level, Output, OutputConfig},
+    gpio::{Event, Flex, InputConfig, Level, Output, OutputConfig, Pull},
     i2c::master::{Config as I2cConfig, I2c},
     lcd_cam::{
         LcdCam,
@@ -339,6 +339,38 @@ impl<'a> ConfigWriter<'a> {
         self.touch_int.is_low()
     }
 
+    /// Writes 0 to the status register (0x814E). The GT911 then releases INT
+    /// until it has a new sample.
+    fn touch_clear_status(&mut self) -> Result<()> {
+        if !self.touch_initialized {
+            return Err(Error::TouchNotReady);
+        }
+        self.write_register16(self.touch_addr, GT911_POINT_INFO, &[0x00])
+    }
+
+    /// Makes the GT911 INT pin a light-sleep wake source: a low level wakes
+    /// the chip. `init_touch` sets the low-level mode of INT (0x804D bits
+    /// 1:0 are 10). The touch poll reads a sample only while INT is low, and
+    /// at 30 ms it gets each tap. Thus INT stays low for more than one poll
+    /// interval, and a level wake does not miss a short touch. The pull-up
+    /// keeps INT high if the GT911 does not drive it.
+    fn touch_wake_arm(&mut self) {
+        self.touch_int
+            .apply_input_config(&InputConfig::default().with_pull(Pull::Up));
+        self.touch_int.listen(Event::LowLevel);
+    }
+
+    /// Removes the wake source of [`Self::touch_wake_arm`], and returns
+    /// `true` if the INT pin ended the last sleep. Call it before interrupts
+    /// are on again, so that the GPIO interrupt does not run.
+    fn touch_wake_disarm(&mut self) -> bool {
+        let woke = self.touch_int.caused_wakeup();
+        self.touch_int.unlisten();
+        self.touch_int.clear_interrupt();
+        self.touch_int.apply_input_config(&InputConfig::default());
+        woke
+    }
+
     fn touch_read_u16(&mut self, reg: u16) -> Result<u16> {
         let mut value = [0u8; 2];
         self.read_register16(self.touch_addr, reg, &mut value)?;
@@ -537,6 +569,22 @@ impl<'a> Ed047tc1<'a> {
     pub async fn init_touch(&mut self) -> Result<(u16, u16)> {
         self.cfg_writer.init_touch().await?;
         Ok(self.cfg_writer.touch_resolution)
+    }
+
+    pub fn touch_pending(&self) -> bool {
+        self.cfg_writer.touch_initialized && self.cfg_writer.touch_pressed()
+    }
+
+    pub fn touch_wake_arm(&mut self) {
+        self.cfg_writer.touch_wake_arm();
+    }
+
+    pub fn touch_clear_status(&mut self) -> Result<()> {
+        self.cfg_writer.touch_clear_status()
+    }
+
+    pub fn touch_wake_disarm(&mut self) -> bool {
+        self.cfg_writer.touch_wake_disarm()
     }
 
     pub fn scan(&mut self, found: &mut [u8; 16]) -> usize {

@@ -171,7 +171,7 @@ fn wifi_opens_a_connection_with_a_last_will() {
 }
 
 #[test]
-fn connected_subscribes_publishes_online_and_draws() {
+fn connected_publishes_online_subscribes_and_draws() {
     let app = Dashboard;
     let (mut model, mut cmd, mut request) = drive_to_connecting(PowerSource::Stand);
 
@@ -179,6 +179,12 @@ fn connected_subscribes_publishes_online_and_draws() {
     let event = cmd.expect_one_event();
 
     app.update(event, &mut model)
+        .expect_mqtt_publish_with(|publish| {
+            assert_eq!(publish.topic, "dashboard/hall/status");
+            assert_eq!(publish.payload, b"online");
+            assert_eq!(publish.qos, Qos::AtLeastOnce);
+            assert!(publish.retain);
+        })
         .expect_mqtt_subscribe_with(|subscribe| {
             let has = |topic: &str| subscribe.topics.iter().any(|t| t == topic);
             assert!(has(
@@ -190,12 +196,6 @@ fn connected_subscribes_publishes_online_and_draws() {
             assert!(has("homeassistant/statestream/weather/home/temperature"));
             assert!(!subscribe.topics.iter().any(|topic| topic.contains("scene")));
             assert!(!subscribe.topics.iter().any(|topic| topic.contains('#')));
-        })
-        .expect_mqtt_publish_with(|publish| {
-            assert_eq!(publish.topic, "dashboard/hall/status");
-            assert_eq!(publish.payload, b"online");
-            assert_eq!(publish.qos, Qos::AtLeastOnce);
-            assert!(publish.retain);
         })
         .expect_only_render();
 

@@ -307,7 +307,7 @@ impl App {
         if power != self.power {
             self.power = power;
             eprintln!("power: {power:?}");
-            self.shell.send(Event::PowerSourceChanged(power));
+            self.shell.set_power_source(power);
         }
     }
 

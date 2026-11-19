@@ -57,6 +57,8 @@ esp-backtrace = { version = "0.20.0", features = ["esp32s3", "panic-handler", "p
 embassy-executor = "0.10.0"
 embassy-time = "0.5.1"
 embassy-sync = "0.8.0"
+# The light sleep runs in a critical section (`display::Sleep`).
+critical-section = "1.2.0"
 embassy-futures = "0.1.2"
 embassy-net = { version = "0.9.1", features = ["dhcpv4", "medium-ethernet", "tcp", "dns", "proto-ipv4"] }
 embedded-io-async = "0.7"

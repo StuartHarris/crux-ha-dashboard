@@ -27,8 +27,9 @@ use crux_time::{TimerId, operation::NotifyAfter};
 use shared::{
     Core, Dashboard, Effect, Event, PowerSource, Settings, Start, ViewModel,
     capabilities::{
-        mqtt::{Connect, MqttEvent, Publish},
+        mqtt::{Connect, Disconnect, MqttEvent, Publish},
         network::WifiStatus,
+        power::{Sleep, Wake},
     },
     features::power::IDLE_TIMEOUT,
 };
@@ -123,6 +124,11 @@ pub struct Shell {
     inspector: Inspector,
     /// The settings that [`Shell::start`] gave, for [`Shell::restart`].
     settings: Option<Settings>,
+    /// The `Disconnect` requests that wait for the end of the stream of
+    /// their connection.
+    disconnects: Vec<(u64, Request<Disconnect>)>,
+    /// The `Sleep` request that waits for a wake.
+    sleep: Option<Request<Sleep>>,
 }
 
 impl Drop for Shell {
@@ -156,6 +162,8 @@ impl Shell {
             render: false,
             inspector: Inspector::default(),
             settings: None,
+            disconnects: Vec::new(),
+            sleep: None,
         }
     }
 
@@ -216,6 +224,8 @@ impl Shell {
             timer.task.abort();
         }
         self.current = None;
+        self.disconnects.clear();
+        self.sleep = None;
         self.core = Core::new();
         self.send(Event::Start(Start {
             settings,
@@ -236,22 +246,49 @@ impl Shell {
     }
 
     /// Sends a tap at `point` on the panel to the core, with the control at
-    /// that point. The shell sends each tap, also on no control and while
-    /// the device is asleep. The core decides what the tap does.
+    /// that point. While a `Sleep` request waits, the tap is the wake: the
+    /// shell answers the request with `Wake::Touch` and the control, and
+    /// sends no tap. Else the shell sends each tap, also on no control. The
+    /// core decides what the tap does.
     pub fn tap(&mut self, point: Point) {
         let control = ui::hit_test(&self.view(), point);
+        if self.answer_sleep(Wake::Touch(control)) {
+            return;
+        }
         self.send(Event::Tapped(control));
     }
 
-    /// Sends `Woke`, a wake that is not a tap, for example from the Wake
-    /// button.
+    /// Answers the `Sleep` request that waits with `Wake::Timer`, a wake that
+    /// is not a tap, for example from the Wake button. If no request waits,
+    /// does nothing.
     ///
     /// The core stays in memory while the simulator sleeps, as in a light
-    /// sleep. If the device is awake, the core only starts the idle time
-    /// again.
+    /// sleep.
     pub fn wake(&mut self) {
-        eprintln!("power: wake");
-        self.send(Event::Woke);
+        if !self.answer_sleep(Wake::Timer) {
+            eprintln!("power: wake, but the device does not sleep");
+        }
+    }
+
+    /// Sends the change of the power source to the core. If a `Sleep`
+    /// request waits, then answers it with `Wake::PowerSource`.
+    pub fn set_power_source(&mut self, power: PowerSource) {
+        self.send(Event::PowerSourceChanged(power));
+        self.answer_sleep(Wake::PowerSource);
+    }
+
+    /// Answers the `Sleep` request that waits with `wake`. Returns `false`
+    /// if no request waits.
+    fn answer_sleep(&mut self, wake: Wake) -> bool {
+        let Some(mut request) = self.sleep.take() else {
+            return false;
+        };
+        eprintln!("power: wake ({wake:?})");
+        self.inspector
+            .effect("Sleep", String::new(), format!("resolved: {wake:?}"));
+        let effects = resolve(&self.core, &mut request, wake);
+        self.process(effects);
+        true
     }
 
     /// Returns `true` if "Sleep now" can work: the device is on battery and
@@ -347,11 +384,25 @@ impl Shell {
                 };
                 let last = self.record_stream(connection, &event, retained);
                 let live = &mut self.connections[index];
-                let effects = resolve(&self.core, &mut live.request, event);
+                let mut effects = resolve(&self.core, &mut live.request, event);
                 if last {
                     self.connections.remove(index);
                     if self.current == Some(connection) {
                         self.current = None;
+                    }
+                    // The connection is closed, so its `Disconnect` requests
+                    // end.
+                    let (done, waiting) = std::mem::take(&mut self.disconnects)
+                        .into_iter()
+                        .partition(|(id, _)| *id == connection);
+                    self.disconnects = waiting;
+                    for (_, mut request) in done {
+                        self.inspector.effect(
+                            "MqttDisconnect",
+                            format!("connection {connection}"),
+                            "resolved: closed",
+                        );
+                        effects.extend(resolve(&self.core, &mut request, ()));
                     }
                 }
                 self.process(effects);
@@ -451,30 +502,37 @@ impl Shell {
                 self.publish(&request.operation);
                 Vec::new()
             }
-            Effect::MqttDisconnect(_) => {
-                self.disconnect_current();
-                Vec::new()
+            Effect::MqttDisconnect(mut request) => {
+                if let Some(current) = self.current {
+                    self.disconnect_current();
+                    self.disconnects.push((current, request));
+                    return Vec::new();
+                }
+                self.inspector
+                    .effect("MqttDisconnect", String::new(), "resolved: no connection");
+                resolve(&self.core, &mut request, ())
             }
             Effect::WifiOn(mut request) => {
                 self.inspector
                     .effect("WifiOn", String::new(), "resolved: Connected");
                 resolve(&self.core, &mut request, WifiStatus::Connected)
             }
-            Effect::WifiOff(_) => {
+            Effect::WifiOff(mut request) => {
                 self.inspector.effect(
                     "WifiOff",
                     String::new(),
-                    "nothing to do: the simulator has no Wi-Fi",
+                    "resolved: the simulator has no Wi-Fi",
                 );
-                Vec::new()
+                resolve(&self.core, &mut request, ())
             }
-            Effect::Sleep(_) => {
+            Effect::Sleep(request) => {
                 eprintln!("power: asleep. Click the panel or press W to wake it.");
                 self.inspector.effect(
                     "Sleep",
                     String::new(),
                     "asleep: click the panel or press W to wake it",
                 );
+                self.sleep = Some(request);
                 Vec::new()
             }
             Effect::TimeNotifyAfter(request) => {
@@ -834,7 +892,7 @@ mod tests {
         fixture.mqtt(1, MqttEvent::Connected);
         assert_eq!(
             fixture.take_log(),
-            ["open 1", "subscribe 1", "publish dashboard/test/status 1"]
+            ["open 1", "publish dashboard/test/status 1", "subscribe 1"]
         );
 
         // The idle timer expires: the core publishes `asleep`, disconnects
@@ -858,7 +916,7 @@ mod tests {
         fixture.mqtt(2, MqttEvent::Connected);
         assert_eq!(
             fixture.take_log(),
-            ["subscribe 2", "publish dashboard/test/status 2"]
+            ["publish dashboard/test/status 2", "subscribe 2"]
         );
         assert_eq!(
             fixture.shell().view().connection,
@@ -1010,6 +1068,9 @@ mod tests {
         fixture.start(PowerSource::Battery);
         fixture.mqtt(1, MqttEvent::Connected);
         fixture.fire_timer();
+        // The stream ends, so the `Disconnect` request ends, and the core
+        // continues to sleep.
+        fixture.mqtt(1, MqttEvent::Disconnected { reason: None });
         let effects: Vec<_> = fixture
             .shell()
             .inspector()
@@ -1038,6 +1099,56 @@ mod tests {
         assert!(expired);
     }
 
+    #[test]
+    fn a_tap_while_sleep_waits_answers_sleep_with_the_control() {
+        let mut fixture = Fixture::new();
+        fixture.start(PowerSource::Battery);
+        fixture.mqtt(1, MqttEvent::Connected);
+        fixture.fire_timer();
+        fixture.mqtt(1, MqttEvent::Disconnected { reason: None });
+        assert!(fixture.shell().sleep.is_some());
+        fixture.take_log();
+
+        // A tap on a tile wakes the device and acts on the tile. The
+        // service call waits for the new connection.
+        let tile = ui::layout::tile(0).unwrap().center();
+        fixture.shell().tap(tile);
+        assert!(fixture.shell().sleep.is_none());
+        assert!(!fixture.shell().view().asleep);
+        assert_eq!(fixture.take_log(), ["open 2"]);
+        fixture.mqtt(2, MqttEvent::Connected);
+        let log = fixture.take_log();
+        assert!(
+            log.contains(&"publish dashboard/test/cmd 2".into()),
+            "{log:?}"
+        );
+
+        // With no `Sleep` request, the Wake button does nothing.
+        fixture.shell().wake();
+        assert_eq!(fixture.take_log(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_stand_while_sleep_waits_answers_sleep() {
+        let mut fixture = Fixture::new();
+        fixture.start(PowerSource::Battery);
+        fixture.mqtt(1, MqttEvent::Connected);
+        fixture.fire_timer();
+        fixture.mqtt(1, MqttEvent::Disconnected { reason: None });
+        assert!(fixture.shell().sleep.is_some());
+
+        fixture.shell().set_power_source(PowerSource::Stand);
+        assert!(fixture.shell().sleep.is_none());
+        assert!(!fixture.shell().view().asleep);
+        let answered = fixture
+            .shell()
+            .inspector()
+            .effects
+            .iter()
+            .any(|entry| entry.outcome == "resolved: PowerSource");
+        assert!(answered);
+    }
+
     /// Returns the durations of the timers that run.
     fn durations(shell: &Shell) -> Vec<Duration> {
         shell
@@ -1062,6 +1173,10 @@ mod tests {
             fixture.take_log(),
             ["publish dashboard/test/status 1", "disconnect 1"]
         );
+        // The core waits for the end of the connection before the next step.
+        assert!(fixture.shell().sleep.is_none());
+        fixture.mqtt(1, MqttEvent::Disconnected { reason: None });
+        assert!(fixture.shell().sleep.is_some());
         let effects: Vec<_> = fixture
             .shell()
             .inspector()
@@ -1108,6 +1223,7 @@ mod tests {
 
         assert!(fixture.shell().sleep_now());
         assert!(fixture.shell().view().asleep);
+        fixture.mqtt(1, MqttEvent::Disconnected { reason: None });
         // The core clears the full-refresh timer before it sleeps. The draw
         // timer is now stale, and draws nothing when it fires.
         assert_eq!(durations(fixture.shell()), [DRAW_DELAY]);

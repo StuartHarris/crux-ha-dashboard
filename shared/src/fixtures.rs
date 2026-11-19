@@ -121,7 +121,12 @@ impl FixedShell {
                     }
                     more
                 }
-                Effect::MqttDisconnect(_) => self.end_stream(),
+                Effect::MqttDisconnect(mut request) => {
+                    let mut more = self.end_stream();
+                    more.extend(self.resolve(&mut request, ()));
+                    more
+                }
+                Effect::WifiOff(mut request) => self.resolve(&mut request, ()),
                 Effect::TimeNotifyAfter(request) => {
                     self.timers.push(request);
                     Vec::new()
@@ -131,10 +136,7 @@ impl FixedShell {
                     self.timers.retain(|timer| timer.operation.id != id);
                     self.resolve(&mut request, id)
                 }
-                Effect::Render(_)
-                | Effect::MqttPublish(_)
-                | Effect::WifiOff(_)
-                | Effect::Sleep(_) => Vec::new(),
+                Effect::Render(_) | Effect::MqttPublish(_) | Effect::Sleep(_) => Vec::new(),
             };
             queue.extend(more);
         }

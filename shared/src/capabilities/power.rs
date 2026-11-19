@@ -2,11 +2,11 @@
 
 use alloc::vec::Vec;
 
-use crux_core::{Command, Request, macros::Operation};
+use crux_core::{Command, Request, command::RequestBuilder, macros::Operation};
 use facet::Facet;
-use serde::{Deserialize, Serialize};
 
-use super::notify;
+use crate::Control;
+use serde::{Deserialize, Serialize};
 
 /// Where the device gets its power.
 #[derive(Facet, Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -32,18 +32,40 @@ pub enum WakeSource {
     },
 }
 
-/// Puts the device to sleep. The panel keeps its last image.
+/// What ended a sleep. The answer to [`Sleep`].
+#[derive(Facet, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub enum Wake {
+    /// A touch on the panel, on this control or (`None`) on no control. The
+    /// shell gets the control from `ui::hit_test`, as for
+    /// [`Event::Tapped`](crate::Event::Tapped). The last image shows the
+    /// page and its controls, so the touch wakes the device and also acts
+    /// as a tap. If the shell cannot read the point, it answers `None`, and
+    /// the touch only wakes the device.
+    Touch(Option<Control>),
+    /// The timer of [`WakeSource::Timer`] expired.
+    Timer,
+    /// The shell saw a change of the power source. It sends
+    /// [`Event::PowerSourceChanged`](crate::Event::PowerSourceChanged) first.
+    PowerSource,
+}
+
+/// Puts the device to sleep until one of `wake_on` occurs. The panel keeps
+/// its last image.
 ///
-/// The shell does not answer. After a deep sleep, the device starts again and
-/// the shell sends [`Event::Start`](crate::Event::Start). After a light sleep,
-/// the shell sends the tap that woke the device as
-/// [`Event::Tapped`](crate::Event::Tapped), or
-/// [`Event::Woke`](crate::Event::Woke) for a wake that is not a tap.
+/// The core sends `Sleep` together with the `Render` of the last image. The
+/// shell must draw that image on the panel before the device sleeps.
 ///
-/// The core sends `Sleep` after the `Render` of the last image. The shell must
-/// finish that render on the panel before the device sleeps.
+/// The shell answers once, at the first real wake, with the [`Wake`] that
+/// ended the sleep. A wake that has no cause in `wake_on` (for example a
+/// sleep that the hardware rejects) is a detail of the shell. The shell then
+/// sleeps again and does not answer. If the shell sees a change of the power
+/// source before it answers, it answers [`Wake::PowerSource`].
+///
+/// After a deep sleep, the device starts again and the shell sends
+/// [`Event::Start`](crate::Event::Start). Then no answer comes.
 #[derive(Operation, Facet, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[operation(notify)]
+#[operation(request, output = Wake)]
 pub struct Sleep {
     /// The things that wake the device.
     pub wake_on: Vec<WakeSource>,
@@ -53,12 +75,16 @@ pub struct Sleep {
 pub struct Power;
 
 impl Power {
-    /// Puts the device to sleep until one of `wake_on` occurs.
-    pub fn sleep<Effect, Event>(wake_on: Vec<WakeSource>) -> Command<Effect, Event>
+    /// Puts the device to sleep until one of `wake_on` occurs. The request
+    /// gives the cause of the wake.
+    #[must_use]
+    pub fn sleep<Effect, Event>(
+        wake_on: Vec<WakeSource>,
+    ) -> RequestBuilder<Effect, Event, impl Future<Output = Wake>>
     where
         Effect: From<Request<Sleep>> + Send + 'static,
         Event: Send + 'static,
     {
-        notify(Sleep { wake_on })
+        Command::request_from_shell(Sleep { wake_on })
     }
 }
