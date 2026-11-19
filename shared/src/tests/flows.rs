@@ -15,13 +15,14 @@ use crate::{
     capabilities::power::{Wake, WakeSource},
     features::{
         connection::{RECONNECT_MAX, RECONNECT_MIN},
+        pending::SCENE_TIMEOUT,
         power::IDLE_TIMEOUT,
     },
 };
 
 /// Home Assistant publishes the state of some entities before the dashboard
 /// starts.
-fn house() -> Shell {
+pub fn house() -> Shell {
     let mut shell = Shell::new();
     let broker = &mut shell.broker;
     broker.set_state(
@@ -175,6 +176,12 @@ fn on_the_stand_the_dashboard_shows_live_state_and_controls_lights() {
     let call = shell.broker.service_calls.last().unwrap();
     assert_eq!(call.service, "scene.turn_on");
     assert_eq!(call.entity_id, "scene.living_room_living_room_dimmed");
+    // A scene has no state that confirms it, so its mark stays for a short
+    // time.
+    assert!(shell.view().scenes()[1].pending);
+    assert_eq!(shell.timers(), [SCENE_TIMEOUT]);
+    shell.fire_timers();
+    assert!(!shell.view().scenes()[1].pending);
 
     // On the stand nothing sleeps, and no timer other than the full-refresh
     // timer runs.
@@ -191,6 +198,11 @@ fn on_battery_the_dashboard_wakes_syncs_accepts_taps_then_sleeps() {
     assert_eq!(shell.view().tiles()[4].text, "19.5°");
     assert_eq!(shell.view().tiles()[4].detail, "Set 21°");
 
+    // The lamp has a state, so its new state confirms the tap.
+    shell
+        .broker
+        .set_state("light.dining_room_tall_lamp", "off", &[]);
+    shell.run();
     shell.send(tap_tile(1));
     assert_eq!(
         shell.broker.state("light.dining_room_tall_lamp"),

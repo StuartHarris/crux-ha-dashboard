@@ -16,6 +16,7 @@ use shared::{
 
 use crate::{
     layout::{self, MARGIN, WIDTH},
+    pattern,
     text::{self, Anchor, BUTTON, DETAIL, LABEL, TITLE, VALUE_LARGE, VALUE_MEDIUM, VALUE_SMALL},
 };
 
@@ -28,6 +29,9 @@ const RADIUS: u32 = 12;
 const PADDING: u32 = 16;
 /// The diameter of the on/off indicator on a light or switch tile.
 const INDICATOR: u32 = 26;
+/// The diameter of the dot in the indicator of a toggle that waits for Home
+/// Assistant.
+const PENDING_DOT: u32 = 8;
 /// The length of a dash on the border of an unavailable tile.
 const DASH: u32 = 14;
 /// The width of the right part of the header: the status text, the
@@ -120,7 +124,10 @@ const _: () = assert!(layout::STEP_HEIGHT >= 2 * STEP_INSET + SIGN_LENGTH);
 ///
 /// The screen is black and white, so a partial refresh of the panel is clean.
 /// A light or a switch that is on is a black tile with white text. A tile
-/// that Home Assistant cannot reach has a dashed border. The All lights
+/// that Home Assistant cannot reach has a dashed border. A tile or a scene
+/// button that waits for Home Assistant (`TileState::Pending` and
+/// `SceneView::pending`) has a pattern of black and white pixels, which
+/// looks light grey. Its text is black with a white outline. The All lights
 /// toggle uses the same rules.
 ///
 /// # Errors
@@ -363,12 +370,15 @@ where
     D: DrawTarget<Color = Gray4>,
 {
     let on = toggle.state == TileState::On;
+    let pending = toggle.state == TileState::Pending;
+    let outline = pending_outline(pending);
     let ink = if on { WHITE } else { BLACK };
     let shape = RoundedRectangle::with_equal_corners(area, Size::new(RADIUS, RADIUS));
     match toggle.state {
         TileState::On => shape
             .into_styled(PrimitiveStyle::with_fill(BLACK))
             .draw(display)?,
+        TileState::Pending => draw_pending_fill(shape, 4, display)?,
         TileState::Unavailable => draw_dashed_border(area, display)?,
         TileState::Unknown => shape.into_styled(border(2)).draw(display)?,
         _ => shape.into_styled(border(4)).draw(display)?,
@@ -377,13 +387,14 @@ where
     let left = area.top_left.x.unsigned_abs() + PADDING;
     let inner = area.size.width - 2 * PADDING;
     let middle = area.center().y.unsigned_abs();
-    text::draw_fitted(
+    text::draw_fitted_outlined(
         display,
         &[&BUTTON, &DETAIL],
         &toggle.label,
         Anchor::center_left(point(left, middle)),
         inner - INDICATOR - PADDING,
         ink,
+        outline,
     )?;
     let indicator = Circle::new(
         point(left + inner - INDICATOR, middle - INDICATOR / 2),
@@ -394,7 +405,9 @@ where
 
 /// Draws the indicator of a toggle in `circle`: a white dot if the toggle is
 /// on, a ring if it is off, and a cross if its state is unknown or
-/// unavailable. The toggle is black when it is on, so the dot is white.
+/// unavailable. The toggle is black when it is on, so the dot is white. A
+/// toggle that waits for Home Assistant has a ring with a black dot in the
+/// centre, on white.
 fn draw_indicator<D>(state: TileState, circle: Circle, display: &mut D) -> Result<(), D::Error>
 where
     D: DrawTarget<Color = Gray4>,
@@ -405,6 +418,20 @@ where
             .draw(display),
         TileState::Unknown | TileState::Unavailable => {
             draw_cross(circle.center(), circle.diameter, BLACK, display)
+        }
+        TileState::Pending => {
+            circle
+                .into_styled(
+                    PrimitiveStyleBuilder::new()
+                        .fill_color(WHITE)
+                        .stroke_color(BLACK)
+                        .stroke_width(3)
+                        .build(),
+                )
+                .draw(display)?;
+            Circle::with_center(circle.center(), PENDING_DOT)
+                .into_styled(PrimitiveStyle::with_fill(BLACK))
+                .draw(display)
         }
         _ => circle
             .into_styled(PrimitiveStyle::with_stroke(BLACK, 3))
@@ -548,6 +575,8 @@ where
 {
     let toggle = matches!(tile.kind, TileKind::Light | TileKind::Switch);
     let on = toggle && tile.state == TileState::On;
+    let pending = tile.state == TileState::Pending;
+    let outline = pending_outline(pending);
     let ink = if on { WHITE } else { BLACK };
     let shape = RoundedRectangle::with_equal_corners(area, Size::new(RADIUS, RADIUS));
 
@@ -555,6 +584,7 @@ where
         _ if on => shape
             .into_styled(PrimitiveStyle::with_fill(BLACK))
             .draw(display)?,
+        TileState::Pending => draw_pending_fill(shape, 4, display)?,
         TileState::Unavailable => draw_dashed_border(area, display)?,
         _ => shape
             .into_styled(border(if toggle && tile.state != TileState::Unknown {
@@ -576,13 +606,14 @@ where
     } else {
         inner
     };
-    text::draw_fitted(
+    text::draw_fitted_outlined(
         display,
         &[&LABEL],
         &tile.label,
         Anchor::top_left(point(left, top + 12)),
         label_width,
         ink,
+        outline,
     )?;
     if tile.steps {
         return Ok(());
@@ -601,22 +632,24 @@ where
     } else {
         (&[&VALUE_MEDIUM, &VALUE_SMALL], 86)
     };
-    text::draw_fitted(
+    text::draw_fitted_outlined(
         display,
         fonts,
         &tile.text,
         Anchor::baseline_left(point(left, top + value_baseline)),
         inner,
         ink,
+        outline,
     )?;
     if !tile.detail.is_empty() {
-        text::draw_fitted(
+        text::draw_fitted_outlined(
             display,
             &[&LABEL, &DETAIL],
             &tile.detail,
             Anchor::baseline_left(point(left, top + 120)),
             inner,
             ink,
+            outline,
         )?;
     }
     Ok(())
@@ -637,8 +670,10 @@ where
 {
     let on = tile.state == TileState::On;
     let ink = if on { WHITE } else { BLACK };
-    draw_step_button(dimmer, false, ink, display)?;
-    draw_step_button(brighter, true, ink, display)?;
+    let outline = pending_outline(tile.state == TileState::Pending);
+    let fill = outline;
+    draw_step_button(dimmer, false, ink, fill, display)?;
+    draw_step_button(brighter, true, ink, fill, display)?;
 
     // The middle of the strip, between the two buttons. The borders of the
     // buttons are inside their touch areas, so the text can use all the
@@ -661,13 +696,14 @@ where
     };
     let start = center_x - u32::midpoint(text_width, INDICATOR);
     if text_width > 0 {
-        text::draw_fitted(
+        text::draw_fitted_outlined(
             display,
             &fonts,
             &tile.detail,
             Anchor::center_left(point(start, center_y)),
             text_width - STRIP_GAP,
             ink,
+            outline,
         )?;
     }
     let indicator = Circle::new(
@@ -678,11 +714,14 @@ where
 }
 
 /// Draws a − or (if `plus` is `true`) a + button in `area`, with a thin
-/// border in `ink`. The border is inside the touch area.
+/// border in `ink`. The border is inside the touch area. If `fill` has a
+/// colour, the button has a fill of that colour, for example white on the
+/// pattern of a tile that waits for Home Assistant.
 fn draw_step_button<D>(
     area: Rectangle,
     plus: bool,
     ink: Gray4,
+    fill: Option<Gray4>,
     display: &mut D,
 ) -> Result<(), D::Error>
 where
@@ -693,14 +732,15 @@ where
         area.top_left + Point::new(inset, inset),
         area.size - Size::new(2 * STEP_INSET, 2 * STEP_INSET),
     );
+    let mut style = PrimitiveStyleBuilder::new()
+        .stroke_color(ink)
+        .stroke_width(2)
+        .stroke_alignment(StrokeAlignment::Inside);
+    if let Some(fill) = fill {
+        style = style.fill_color(fill);
+    }
     RoundedRectangle::with_equal_corners(shape, Size::new(STEP_RADIUS, STEP_RADIUS))
-        .into_styled(
-            PrimitiveStyleBuilder::new()
-                .stroke_color(ink)
-                .stroke_width(2)
-                .stroke_alignment(StrokeAlignment::Inside)
-                .build(),
-        )
+        .into_styled(style.build())
         .draw(display)?;
     let center = shape.center();
     let fill = PrimitiveStyle::with_fill(ink);
@@ -754,34 +794,139 @@ fn draw_scene<D>(scene: &SceneView, area: Rectangle, display: &mut D) -> Result<
 where
     D: DrawTarget<Color = Gray4>,
 {
-    draw_button(&scene.label, area, false, display)
+    let fill = if scene.pending {
+        Fill::Pending
+    } else {
+        Fill::White
+    };
+    draw_button(&scene.label, area, fill, display)
 }
 
-/// Draws a button with a border, and its text in the centre.
-fn draw_button<D>(
-    label: &str,
-    area: Rectangle,
-    filled: bool,
-    display: &mut D,
-) -> Result<(), D::Error>
+/// The fill of a button.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Fill {
+    /// A white button with a border and black text.
+    White,
+    /// A black button with white text.
+    Black,
+    /// The pattern of a button that waits for Home Assistant, with a border
+    /// and black text. Refer to [`draw_pending_fill`].
+    Pending,
+}
+
+/// Draws a button with the fill `fill`, and its text in the centre.
+fn draw_button<D>(label: &str, area: Rectangle, fill: Fill, display: &mut D) -> Result<(), D::Error>
 where
     D: DrawTarget<Color = Gray4>,
 {
     let shape = RoundedRectangle::with_equal_corners(area, Size::new(RADIUS, RADIUS));
-    let (style, ink) = if filled {
-        (PrimitiveStyle::with_fill(BLACK), WHITE)
-    } else {
-        (border(3), BLACK)
+    let outline = pending_outline(fill == Fill::Pending);
+    let ink = match fill {
+        Fill::White => {
+            shape.into_styled(border(3)).draw(display)?;
+            BLACK
+        }
+        Fill::Black => {
+            shape
+                .into_styled(PrimitiveStyle::with_fill(BLACK))
+                .draw(display)?;
+            WHITE
+        }
+        Fill::Pending => {
+            draw_pending_fill(shape, 3, display)?;
+            BLACK
+        }
     };
-    shape.into_styled(style).draw(display)?;
-    text::draw_fitted(
+    text::draw_fitted_outlined(
         display,
         &[&BUTTON, &DETAIL],
         label,
         Anchor::center(area.center()),
         area.size.width - 2 * PADDING,
         ink,
+        outline,
     )
+}
+
+/// Draws the pattern of a tile or a button that waits for Home Assistant in
+/// `shape`, and a black border of `width` on its edge.
+///
+/// The pattern is a grid of black dots, so 25% of the pixels are black. Thus
+/// the pattern looks light grey. Refer to [`pattern`]. It is clearly
+/// different from the black of a light that is on and from the white of a
+/// light that is off. The text on the pattern is black, with a white outline
+/// of 1 pixel around each glyph, so it stays clear. Refer to
+/// [`pending_outline`].
+///
+/// The panel has only black and white pixels, so the change to the pattern
+/// is a partial refresh. A grey level of `Gray4` needs a full refresh, which
+/// flashes. Refer to `Refresher`.
+fn draw_pending_fill<D>(
+    shape: RoundedRectangle,
+    width: u32,
+    display: &mut D,
+) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Gray4>,
+{
+    shape
+        .into_styled(PrimitiveStyle::with_fill(BLACK))
+        .draw(&mut Dots(display))?;
+    shape
+        .into_styled(
+            PrimitiveStyleBuilder::new()
+                .stroke_color(BLACK)
+                .stroke_width(width)
+                .stroke_alignment(StrokeAlignment::Inside)
+                .build(),
+        )
+        .draw(display)
+}
+
+/// Returns the colour of the outline of the text on a tile or a button:
+/// white if it waits for Home Assistant, or no outline. Refer to
+/// [`draw_pending_fill`].
+const fn pending_outline(pending: bool) -> Option<Gray4> {
+    if pending { Some(WHITE) } else { None }
+}
+
+/// A draw target that draws only the pixels of the grid of the pending
+/// pattern, and white in place of the other pixels. Refer to
+/// [`draw_pending_fill`].
+struct Dots<'a, D>(&'a mut D);
+
+impl<D> Dimensions for Dots<'_, D>
+where
+    D: DrawTarget<Color = Gray4>,
+{
+    fn bounding_box(&self) -> Rectangle {
+        self.0.bounding_box()
+    }
+}
+
+impl<D> DrawTarget for Dots<'_, D>
+where
+    D: DrawTarget<Color = Gray4>,
+{
+    type Color = Gray4;
+    type Error = D::Error;
+
+    fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
+    where
+        I: IntoIterator<Item = Pixel<Gray4>>,
+    {
+        self.0
+            .draw_iter(pixels.into_iter().map(|Pixel(point, color)| {
+                Pixel(
+                    point,
+                    if pattern::is_black(point) {
+                        color
+                    } else {
+                        WHITE
+                    },
+                )
+            }))
+    }
 }
 
 fn draw_footer<D>(view: &ViewModel, display: &mut D) -> Result<(), D::Error>
@@ -790,7 +935,12 @@ where
 {
     draw_arrow_button(layout::previous(), false, display)?;
     // The home button is black on the home page.
-    draw_button("Home", layout::home(), view.path == "/", display)?;
+    let home = if view.path == "/" {
+        Fill::Black
+    } else {
+        Fill::White
+    };
+    draw_button("Home", layout::home(), home, display)?;
     draw_arrow_button(layout::next(), true, display)?;
 
     let area = layout::footer_text();
@@ -911,6 +1061,7 @@ pub mod tests {
                 scenes: vec![SceneView {
                     label: "Bright".into(),
                     entity_id: "scene.bright".into(),
+                    pending: false,
                 }],
             }),
             connection: Connection::Online,

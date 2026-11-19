@@ -136,6 +136,39 @@ where
     }
 }
 
+/// Draws `text` as [`draw_fitted`] does. If `outline` has a colour, first
+/// draws the text in that colour, moved by 1 pixel in each of the 8
+/// directions. Thus each glyph has an outline of 1 pixel, which keeps the
+/// text clear on a pattern.
+pub fn draw_fitted_outlined<D>(
+    display: &mut D,
+    fonts: &[&FontRenderer],
+    text: &str,
+    anchor: Anchor,
+    max_width: u32,
+    color: Gray4,
+    outline: Option<Gray4>,
+) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Gray4>,
+{
+    if let Some(outline) = outline {
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                if dx == 0 && dy == 0 {
+                    continue;
+                }
+                let moved = Anchor {
+                    point: anchor.point + Point::new(dx, dy),
+                    ..anchor
+                };
+                draw_fitted(display, fonts, text, moved, max_width, outline)?;
+            }
+        }
+    }
+    draw_fitted(display, fonts, text, anchor, max_width, color)
+}
+
 /// Draws `content` with `font` at `anchor`.
 pub fn draw<D>(
     display: &mut D,

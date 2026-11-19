@@ -49,6 +49,11 @@ pub struct EntityState {
     /// screen. Refer to the module documentation for the reason that the core
     /// uses `last_updated` and not `last_changed`.
     pub last_updated: Option<DateTime<Utc>>,
+    /// The exact time at which Home Assistant last updated the state or an
+    /// attribute. The panel does not show it. The core compares it with the
+    /// time at a tap, to see that Home Assistant confirmed the tap. Refer to
+    /// [`pending`](crate::features::pending).
+    pub last_updated_exact: Option<DateTime<Utc>>,
 }
 
 impl EntityState {
@@ -92,7 +97,8 @@ impl Entities {
     /// The core keeps only the entities on `pages`, the attributes that their
     /// tiles show, and the time of the last update. Returns the entity id if
     /// the message changed the state, an attribute or the minute of the last
-    /// update. The core ignores a time that is not valid ISO 8601 text.
+    /// update. A change of the exact time in the same minute is not a change
+    /// for the return value. The core ignores a time that is not valid ISO 8601 text.
     pub fn apply(&mut self, pages: &[Page], topic: &str, payload: &[u8]) -> Option<String> {
         let (entity_id, key) = parse_topic(topic)?;
         let kind = pages
@@ -107,8 +113,10 @@ impl Entities {
         let text = core::str::from_utf8(payload).ok()?.trim();
 
         if key == LAST_UPDATED {
-            let time = start_of_minute(DateTime::parse_from_rfc3339(text).ok()?.to_utc());
+            let exact = DateTime::parse_from_rfc3339(text).ok()?.to_utc();
+            let time = start_of_minute(exact);
             let entity = self.states.entry(entity_id.clone()).or_default();
+            entity.last_updated_exact = Some(exact);
             let changed = entity.last_updated != Some(time);
             entity.last_updated = Some(time);
             return changed.then_some(entity_id);
@@ -485,10 +493,16 @@ mod tests {
             Some("2026-11-08T14:03:00+00:00")
         );
 
-        // A later time in the same minute is not a change.
+        // A later time in the same minute is not a change, but the core keeps
+        // the exact time.
         assert_eq!(
             entities.apply(PAGES, topic, b"2026-11-08T14:03:59+00:00"),
             None
+        );
+        let exact = entities.get("light.lamp").unwrap().last_updated_exact;
+        assert_eq!(
+            exact.map(|time| time.to_rfc3339()).as_deref(),
+            Some("2026-11-08T14:03:59+00:00")
         );
         // A time in the next minute is a change. Another offset is the same
         // instant in UTC.

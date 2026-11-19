@@ -14,8 +14,11 @@ use serde::{Deserialize, Serialize};
 use crate::{
     Model,
     capabilities::power::PowerSource,
-    entities::{Entities, EntityState},
-    features::connection::{Link, page_time},
+    entities::EntityState,
+    features::{
+        connection::{Link, page_time},
+        pending::is_pending,
+    },
     layout::{Page, Tile, TileKind},
     local_time::uk_time,
     summary::summarise,
@@ -234,6 +237,10 @@ pub struct SceneView {
     pub label: String,
     /// The Home Assistant entity id.
     pub entity_id: String,
+    /// The core sent the service call of the scene and waits a short time.
+    /// A renderer draws the button as a pending tile. Refer to
+    /// [`TileState::Pending`].
+    pub pending: bool,
 }
 
 /// The connection to Home Assistant, as the dashboard shows it.
@@ -317,7 +324,7 @@ fn page_view(page: &Page, model: &Model) -> PageView {
             tiles: page
                 .tiles
                 .iter()
-                .map(|tile| tile_view(tile, entities))
+                .map(|tile| tile_view(tile, model))
                 .collect(),
             scenes: page
                 .scenes
@@ -325,13 +332,14 @@ fn page_view(page: &Page, model: &Model) -> PageView {
                 .map(|scene| SceneView {
                     label: scene.label.into(),
                     entity_id: scene.entity_id.into(),
+                    pending: is_pending(model, scene.entity_id),
                 })
                 .collect(),
         });
     }
     PageView::Index(IndexView {
-        weather: page.weather_tile().map(|tile| tile_view(tile, entities)),
-        all_lights: page.all_lights_tile().map(|tile| tile_view(tile, entities)),
+        weather: page.weather_tile().map(|tile| tile_view(tile, model)),
+        all_lights: page.all_lights_tile().map(|tile| tile_view(tile, model)),
         rooms: model
             .rooms()
             .map(|page| summarise(page, entities))
@@ -340,8 +348,13 @@ fn page_view(page: &Page, model: &Model) -> PageView {
 }
 
 /// Makes the view of one tile.
-fn tile_view(tile: &Tile, entities: &Entities) -> TileView {
-    let entity = entities.get(tile.entity_id);
+///
+/// A tile that is on or off and has a mark has the state
+/// [`TileState::Pending`]. It keeps its text and its detail, so the layout
+/// does not move. A tile in another state keeps that state, because the
+/// renderer draws it with a different layout.
+fn tile_view(tile: &Tile, model: &Model) -> TileView {
+    let entity = model.entities.get(tile.entity_id);
     let Description {
         state,
         text,
@@ -351,6 +364,12 @@ fn tile_view(tile: &Tile, entities: &Entities) -> TileView {
     let detail = match entity.and_then(light_percent) {
         Some(percent) if steps && state == TileState::On => format!("{percent}%"),
         _ => detail,
+    };
+    let on_or_off = matches!(state, TileState::On | TileState::Off);
+    let state = if on_or_off && is_pending(model, tile.entity_id) {
+        TileState::Pending
+    } else {
+        state
     };
     TileView {
         label: tile.label.into(),
@@ -405,6 +424,10 @@ pub enum TileState {
     Unavailable,
     /// The core has no state for the entity yet, or the state is `unknown`.
     Unknown,
+    /// The light or switch was on or off, and the core sent a service call
+    /// for it that Home Assistant did not confirm yet. The tile keeps the
+    /// text of the last state. Refer to [`pending`](crate::features::pending).
+    Pending,
 }
 
 /// How a tile shows its entity, and the text on the tile.
@@ -506,7 +529,7 @@ pub fn describe(kind: TileKind, entity: Option<&EntityState>) -> Description {
 
 /// Returns the brightness of a light as a percentage, or `None` if the
 /// entity has no valid `brightness` attribute.
-fn light_percent(entity: &EntityState) -> Option<u32> {
+pub(crate) fn light_percent(entity: &EntityState) -> Option<u32> {
     entity
         .attribute("brightness")
         .and_then(|value| value.parse::<u32>().ok())

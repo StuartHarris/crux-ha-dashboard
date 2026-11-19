@@ -100,7 +100,9 @@ impl Screen {
                 self.flash.start(now);
                 self.outline = None;
             }
-            Refresh::Partial(area) => {
+            // The simulator shows a clean refresh as a partial refresh. Only
+            // the waveform of the panel is different.
+            Refresh::Partial(area) | Refresh::Clean { area, .. } => {
                 self.counters.partial += 1;
                 self.counters.last_partial = Some(area);
                 self.outline = Some(area);

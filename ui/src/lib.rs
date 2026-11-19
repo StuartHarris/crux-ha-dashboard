@@ -12,8 +12,9 @@
 //! - [`Framebuffer`] is a 4-bit image in memory that `draw` can draw on.
 //! - [`bounding_box`] gives the area that changed between two frames, for a
 //!   partial refresh.
-//! - [`Refresher`] decides between a full and a partial refresh of the
-//!   panel. The simulator and the firmware both use it.
+//! - [`Refresher`] decides between a full, a partial and a clean refresh of
+//!   the panel. The simulator and the firmware both use it.
+//! - [`pattern`] is the pattern of a tile that waits for Home Assistant.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -24,6 +25,7 @@ mod draw;
 mod framebuffer;
 mod hit;
 pub mod layout;
+pub mod pattern;
 mod refresh;
 mod text;
 
@@ -32,7 +34,7 @@ pub use draw::draw;
 pub use framebuffer::Framebuffer;
 pub use hit::hit_test;
 pub use layout::{HEIGHT, WIDTH};
-pub use refresh::{Refresh, Refresher, has_grey};
+pub use refresh::{CLEAN_MIN_DOTS, Refresh, Refresher, has_grey};
 
 #[cfg(test)]
 mod tests {

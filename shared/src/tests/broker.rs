@@ -55,7 +55,8 @@ pub struct Broker {
     /// The topics of the messages that the broker sent to the dashboard.
     pub delivered: Vec<String>,
     /// The clock of Home Assistant, in seconds since the Unix epoch. Home
-    /// Assistant publishes it as `last_updated` with each change.
+    /// Assistant publishes it as `last_updated` with each change. Each
+    /// service call moves the clock one second forward.
     pub time: u64,
 }
 
@@ -125,6 +126,9 @@ impl Broker {
         if publish.topic.ends_with("/cmd")
             && let Ok(call) = serde_json::from_slice::<ServiceCall>(&publish.payload)
         {
+            // A service call comes after the state that the dashboard shows,
+            // so its change has a later `last_updated` time.
+            self.time += 1;
             self.home_assistant(&call);
             self.service_calls.push(call);
         }

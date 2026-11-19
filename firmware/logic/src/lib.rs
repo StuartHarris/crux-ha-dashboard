@@ -16,6 +16,8 @@
 //! - [`wifi`] is the rule of the Wi-Fi task for a request during a join.
 //! - [`sleep`] decides when the chip can go into light sleep, and which
 //!   wake is a real wake.
+//! - [`waveform`] builds the lines and the lookup table of the extra frames
+//!   of a clean refresh of the panel.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -29,4 +31,5 @@ pub mod shell;
 pub mod sleep;
 pub mod timers;
 pub mod touch;
+pub mod waveform;
 pub mod wifi;

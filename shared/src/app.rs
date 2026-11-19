@@ -17,7 +17,7 @@ use crate::{
     },
     entities::Entities,
     features::{
-        connection, power,
+        connection, pending, power,
         refresh::{self, redraw},
         rooms,
     },
@@ -179,6 +179,11 @@ pub enum Event {
     #[serde(skip)]
     #[facet(skip)]
     DrawDue(u32),
+    /// The timer of a mark with this id expired. Refer to
+    /// [`pending`](crate::features::pending).
+    #[serde(skip)]
+    #[facet(skip)]
+    PendingTimeout(u32),
 }
 
 /// A control on the panel.
@@ -276,6 +281,9 @@ pub struct Model {
     pub full_refresh_seq: u32,
     /// The state of the refresh policy. Refer to [`refresh`].
     pub refresh: refresh::State,
+    /// The entities with a service call that Home Assistant did not confirm
+    /// yet. Refer to [`pending`].
+    pub pending: pending::State,
 }
 
 impl Default for Model {
@@ -292,6 +300,7 @@ impl Default for Model {
             unsent: 0,
             full_refresh_seq: 0,
             refresh: refresh::State::default(),
+            pending: pending::State::default(),
         }
     }
 }
@@ -360,6 +369,7 @@ impl App for Dashboard {
             Event::Woke { sleep, wake } => power::woke(sleep, wake, model),
             Event::FullRefreshDue(id) => refresh::timer_expired(id, model),
             Event::DrawDue(id) => refresh::draw_due(id, model),
+            Event::PendingTimeout(id) => pending::timeout(id, model),
         }
     }
 

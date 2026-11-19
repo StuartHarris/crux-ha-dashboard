@@ -6,9 +6,15 @@ use serde::Serialize;
 use crate::{
     Cmd, Control, Model,
     capabilities::mqtt::{Publish, Qos},
-    features::{connection, power, refresh::redraw},
+    features::{
+        connection::{self, Call},
+        pending::{self, Confirm},
+        power,
+        refresh::redraw,
+    },
     layout::{BRIGHTNESS_STEP_PCT, Page},
     route::Route,
+    view::light_percent,
 };
 
 /// The JSON payload of a service call for Home Assistant.
@@ -18,14 +24,14 @@ use crate::{
 #[derive(Serialize)]
 struct ServiceCall<'a> {
     service: &'a str,
-    entity_id: &'a str,
+    entity_id: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     brightness_step_pct: Option<i8>,
 }
 
 impl<'a> ServiceCall<'a> {
     /// Returns a service call with no data.
-    const fn new(service: &'a str, entity_id: &'a str) -> Self {
+    const fn new(service: &'a str, entity_id: &'static str) -> Self {
         Self {
             service,
             entity_id,
@@ -106,7 +112,8 @@ fn tile_tapped(index: usize, model: &mut Model) -> Cmd {
     let Some(service) = tile.kind.tap_service() else {
         return idle;
     };
-    call_service(model, &ServiceCall::new(service, tile.entity_id)).and(idle)
+    let call = ServiceCall::new(service, tile.entity_id);
+    call_service(model, &call, Confirm::Toggle).and(idle)
 }
 
 /// Changes the brightness of the light of the tile by `step` percent. The
@@ -114,9 +121,10 @@ fn tile_tapped(index: usize, model: &mut Model) -> Cmd {
 ///
 /// The core acts only if the tile has the − and + buttons now. Refer to
 /// [`Tile::has_steps`](crate::layout::Tile::has_steps). The core also
-/// ignores a − step on a light that is off, because Home Assistant does
-/// nothing for it. If the core does not act, the tap only starts the idle
-/// time again.
+/// ignores a − step on a light that is off and a + step on a light that is
+/// on at 100%, because Home Assistant does nothing for them. The core reads
+/// the brightness as the tile shows it. If the core does not act, the tap
+/// only starts the idle time again. It sends no call and gives no mark.
 ///
 /// The core sends `light.turn_on` with `brightness_step_pct`. If a light is
 /// off, a + step turns it on at that brightness. Home Assistant turns a light
@@ -128,14 +136,20 @@ fn step_tapped(index: usize, step: i8, model: &mut Model) -> Cmd {
         return idle;
     };
     let state = model.entities.state(tile.entity_id);
-    if !tile.has_steps(state) || (step < 0 && state == Some("off")) {
+    let full = model.entities.get(tile.entity_id).and_then(light_percent) == Some(100);
+    let no_change = match state {
+        Some("off") => step < 0,
+        Some("on") => step > 0 && full,
+        _ => false,
+    };
+    if !tile.has_steps(state) || no_change {
         return idle;
     }
     let call = ServiceCall {
         brightness_step_pct: Some(step),
         ..ServiceCall::new("light.turn_on", tile.entity_id)
     };
-    call_service(model, &call).and(idle)
+    call_service(model, &call, Confirm::Step).and(idle)
 }
 
 /// Turns on the scene. The device is awake.
@@ -144,7 +158,8 @@ fn scene_tapped(index: usize, model: &mut Model) -> Cmd {
     let Some(scene) = current_room(model).and_then(|page| page.scenes.get(index)) else {
         return idle;
     };
-    call_service(model, &ServiceCall::new("scene.turn_on", scene.entity_id)).and(idle)
+    let call = ServiceCall::new("scene.turn_on", scene.entity_id);
+    call_service(model, &call, Confirm::Scene).and(idle)
 }
 
 /// Toggles the All lights tile of the home page: its first light or switch
@@ -157,7 +172,8 @@ fn all_lights_tapped(model: &mut Model) -> Cmd {
     else {
         return idle;
     };
-    call_service(model, &ServiceCall::new(service, tile.entity_id)).and(idle)
+    let call = ServiceCall::new(service, tile.entity_id);
+    call_service(model, &call, Confirm::Toggle).and(idle)
 }
 
 /// Shows the page of the room with `index` in the list of rooms. The core
@@ -193,13 +209,15 @@ pub fn set_read_only(read_only: bool, model: &mut Model) -> Cmd {
     }
 }
 
-/// Publishes a service call to Home Assistant.
+/// Publishes a service call to Home Assistant, and gives its entity a mark
+/// until Home Assistant confirms it. `confirm` tells how Home Assistant
+/// confirms the call. Refer to [`pending`].
 ///
-/// In a dry run, the core sends nothing and keeps nothing in the outbox.
-/// The panel shows no sign of the tap, because the state of the entity does
-/// not change. The view model tells the shell that the dashboard does a dry
-/// run, so the shell can show it.
-fn call_service(model: &mut Model, call: &ServiceCall<'_>) -> Cmd {
+/// In a dry run, the core sends nothing, keeps nothing in the outbox and
+/// gives no mark. The panel shows no sign of the tap, because the state of
+/// the entity does not change. The view model tells the shell that the
+/// dashboard does a dry run, so the shell can show it.
+fn call_service(model: &mut Model, call: &ServiceCall<'_>, confirm: Confirm) -> Cmd {
     let Some(settings) = &model.settings else {
         return Cmd::done();
     };
@@ -215,5 +233,10 @@ fn call_service(model: &mut Model, call: &ServiceCall<'_>) -> Cmd {
         qos: Qos::AtLeastOnce,
         retain: false,
     };
-    connection::send(publish, model)
+    pending::mark(model, call.entity_id, confirm);
+    let call = Call {
+        publish,
+        entity_id: call.entity_id,
+    };
+    connection::send(call, model).and(redraw(model, false))
 }
