@@ -13,7 +13,7 @@
 
 use embedded_graphics::{pixelcolor::Gray4, prelude::*, primitives::Rectangle};
 
-use crate::Framebuffer;
+use crate::{Framebuffer, pattern};
 
 /// How to refresh the panel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -24,7 +24,29 @@ pub enum Refresh {
     Full,
     /// Draw this area of the frame with the black-and-white waveform.
     Partial(Rectangle),
+    /// Draw `area` of the frame with the black-and-white waveform, then
+    /// drive each pixel of `dots` to its level (black or white) for a short
+    /// time more. The panel does not flash. A shell that cannot do this does
+    /// a partial refresh of `area`.
+    ///
+    /// `dots` had the pending pattern, which the next frame removes. The
+    /// waveform drives only the pixels that change, so the small dots of the
+    /// pattern can leave a residue. `dots` is inside `area`, and it does not
+    /// grow with other changes of the frame. Refer to [`pattern`].
+    Clean {
+        /// The area that changed.
+        area: Rectangle,
+        /// The cells of the pattern that the next frame removes.
+        dots: Rectangle,
+    },
 }
+
+/// The smallest number of removed dots that gives [`Refresh::Clean`].
+///
+/// The next frame must remove this number of dots of the pending pattern. A
+/// dot of text or of an icon can look like a dot of the pattern, so one dot
+/// is not enough. A tile has hundreds of dots.
+pub const CLEAN_MIN_DOTS: usize = 8;
 
 /// Keeps the `full_refresh_seq` of the last full refresh, and decides how to
 /// refresh the panel.
@@ -53,10 +75,12 @@ impl Refresher {
     ///   a full refresh clears them.
     /// - The area that changed has a pixel that is not black or white.
     ///
-    /// Otherwise, the refresh is partial, on the area that changed. If no
-    /// pixel changed, there is no refresh. The refresher records a full
-    /// refresh, so call this function only for a refresh that the shell
-    /// does.
+    /// If the next frame removes at least [`CLEAN_MIN_DOTS`] dots of the
+    /// pending pattern in the area that changed, the refresh is
+    /// [`Refresh::Clean`]. Otherwise, the refresh is partial, on the area
+    /// that changed. If no pixel changed, there is no refresh. The refresher
+    /// records a full refresh, so call this function only for a refresh that
+    /// the shell does.
     pub fn decide(&mut self, seq: u32, shown: &Framebuffer, next: &Framebuffer) -> Refresh {
         if self.shown_seq != Some(seq) {
             self.shown_seq = Some(seq);
@@ -65,7 +89,13 @@ impl Refresher {
         match shown.changed_area(next) {
             None => Refresh::None,
             Some(area) if has_grey(next, area) => Refresh::Full,
-            Some(area) => Refresh::Partial(area),
+            Some(area) => match pattern::removed_dots(shown, next, area) {
+                pattern::Removed {
+                    count,
+                    area: Some(dots),
+                } if count >= CLEAN_MIN_DOTS => Refresh::Clean { area, dots },
+                _ => Refresh::Partial(area),
+            },
         }
     }
 
@@ -88,8 +118,10 @@ pub fn has_grey(frame: &Framebuffer, area: Rectangle) -> bool {
 mod tests {
     use embedded_graphics::{pixelcolor::Gray4, prelude::*, primitives::Rectangle};
 
+    use embedded_graphics::primitives::PrimitiveStyle;
+
     use super::{Refresh, Refresher, has_grey};
-    use crate::Framebuffer;
+    use crate::{Framebuffer, pattern::tests::with_pattern};
 
     fn with_pixel(point: Point, color: Gray4) -> Framebuffer {
         let mut frame = Framebuffer::new();
@@ -158,6 +190,84 @@ mod tests {
         refresher.decide(1, &shown, &shown);
         let next = with_pixel(Point::new(10, 20), Gray4::new(7));
         assert_eq!(refresher.decide(1, &shown, &next), Refresh::Full);
+    }
+
+    /// Returns `frame` with a black square at `area`.
+    fn with_black(mut frame: Framebuffer, area: Rectangle) -> Framebuffer {
+        let Ok(()) = area
+            .into_styled(PrimitiveStyle::with_fill(Gray4::BLACK))
+            .draw(&mut frame);
+        frame
+    }
+
+    #[test]
+    fn the_pattern_to_a_solid_fill_is_a_clean_refresh() {
+        let area = Rectangle::new(Point::new(40, 40), Size::new(64, 32));
+        let pattern = with_pattern(area);
+        let black = with_black(Framebuffer::new(), area);
+        let white = Framebuffer::new();
+        assert!(!has_grey(&pattern, area));
+
+        let mut refresher = Refresher::default();
+        refresher.decide(1, &pattern, &pattern);
+        assert_eq!(
+            refresher.decide(1, &pattern, &black),
+            Refresh::Clean { area, dots: area }
+        );
+        assert!(matches!(
+            refresher.decide(1, &pattern, &white),
+            Refresh::Clean { .. }
+        ));
+    }
+
+    #[test]
+    fn the_clean_area_does_not_grow_with_other_changes() {
+        let area = Rectangle::new(Point::new(40, 40), Size::new(64, 32));
+        let pattern = with_pattern(area);
+        // The next frame removes the pattern, and changes a pixel far away.
+        let mut next = Framebuffer::new();
+        let Ok(()) = Pixel(Point::new(900, 500), Gray4::BLACK).draw(&mut next);
+        let mut refresher = Refresher::default();
+        refresher.decide(1, &pattern, &pattern);
+        let Refresh::Clean {
+            area: changed,
+            dots,
+        } = refresher.decide(1, &pattern, &next)
+        else {
+            panic!("not a clean refresh");
+        };
+        assert_eq!(dots, area);
+        assert!(changed.size.width > 800);
+    }
+
+    #[test]
+    fn a_solid_fill_to_the_pattern_is_a_partial_refresh() {
+        let area = Rectangle::new(Point::new(40, 40), Size::new(64, 32));
+        let pattern = with_pattern(area);
+        let black = with_black(Framebuffer::new(), area);
+        let mut refresher = Refresher::default();
+        refresher.decide(1, &black, &black);
+        assert!(matches!(
+            refresher.decide(1, &black, &pattern),
+            Refresh::Partial(_)
+        ));
+        assert!(matches!(
+            refresher.decide(1, &Framebuffer::new(), &pattern),
+            Refresh::Partial(_)
+        ));
+    }
+
+    #[test]
+    fn a_few_dots_that_go_are_a_partial_refresh() {
+        // A dot of text can look like a dot of the pattern.
+        let area = Rectangle::new(Point::new(40, 40), Size::new(4, 4));
+        let dot = with_pattern(area);
+        let mut refresher = Refresher::default();
+        refresher.decide(1, &dot, &dot);
+        assert!(matches!(
+            refresher.decide(1, &dot, &Framebuffer::new()),
+            Refresh::Partial(_)
+        ));
     }
 
     #[test]

@@ -46,7 +46,7 @@ use allocator_api2::vec::Vec;
 use esp_alloc::ExternalMemory;
 
 use embassy_futures::yield_now;
-use logic::touch::Sample;
+use logic::{touch::Sample, waveform};
 use ui::Framebuffer;
 
 pub use ed047tc1::{GT911_ADDR_LOW, PCA9535_ADDR, PinConfig, TPS65185_ADDR};
@@ -153,6 +153,8 @@ const DU_LUT_PHASE: [[u8; 4]; 16] = [
     [0x00, 0x00, 0x00, 0x00],
     [0xAA, 0xAA, 0xAA, 0xA8],
 ];
+/// The frame times of the extra frames of [`Panel::clean`].
+const CLEAN_FRAME_TIMES: [u16; 2] = [1000, 1000];
 
 /// The panel and its touch controller.
 pub struct Panel<'a> {
@@ -279,26 +281,59 @@ impl<'a> Panel<'a> {
         next: &Framebuffer,
         area: Area,
     ) -> Result<()> {
+        update_du_lut(&mut self.lut, &DU_LUT_PHASE);
+        self.drive(area, &DU_FRAME_TIMES, |y, area, line| {
+            let (next_line, shown_line) = (row(next, y), row(shown, y));
+            build_difference_line(next_line, shown_line, area, line)
+        })
+        .await
+    }
+
+    /// Draws `area` of `next` as [`Panel::partial`] does. Then drives each
+    /// pixel of `dots` to its level (black or white) for
+    /// [`CLEAN_FRAME_TIMES`]. The panel does not flash. The extra frames
+    /// remove the residue of small dots that the fast waveform leaves, for
+    /// example when a tile leaves the pending pattern (`ui::Refresh::Clean`).
+    /// `logic::waveform` builds the lines and the lookup table of the extra
+    /// frames.
+    pub async fn clean(
+        &mut self,
+        shown: &Framebuffer,
+        next: &Framebuffer,
+        area: Area,
+        dots: Area,
+    ) -> Result<()> {
+        self.partial(shown, next, area).await?;
+        waveform::fill_clean_lut(&mut self.lut);
+        self.drive(dots, &CLEAN_FRAME_TIMES, |y, dots, line| {
+            let x_start = dots.x as usize;
+            waveform::clean_line(row(next, y), x_start, x_start + dots.width as usize, line);
+            true
+        })
+        .await
+    }
+
+    /// Sends one frame for each of `frame_times` with the lookup table that
+    /// the caller prepared. `build` builds the line of row `y` in `area`, and
+    /// returns `false` if the row has nothing to drive. The rows out of
+    /// `area` are not driven.
+    async fn drive(
+        &mut self,
+        area: Area,
+        frame_times: &[u16],
+        mut build: impl FnMut(u16, Area, &mut [u8; LINE_BYTES_DIFFERENCE]) -> bool,
+    ) -> Result<()> {
         let area = clip(area);
         if area.width == 0 || area.height == 0 {
             return Ok(());
         }
-        update_du_lut(&mut self.lut, &DU_LUT_PHASE);
         let mut line = [0u8; LINE_BYTES_DIFFERENCE];
         let mut output = [0u8; BYTES_PER_LINE];
-        for output_time in DU_FRAME_TIMES {
+        for &output_time in frame_times {
             self.skipping = 0;
             self.epd.frame_start()?;
             for y in 0..HEIGHT {
-                if y < area.y || y >= area.y + area.height {
-                    self.row_skip(output_time)?;
-                    continue;
-                }
-                let start = y as usize * LINE_BYTES_4BPP;
-                let end = start + LINE_BYTES_4BPP;
-                let next_line = &next.as_bytes()[start..end];
-                let shown_line = &shown.as_bytes()[start..end];
-                if !build_difference_line(next_line, shown_line, area, &mut line) {
+                if y < area.y || y >= area.y + area.height || !build(y, area, &mut line) {
                     self.row_skip(output_time)?;
                     continue;
                 }
@@ -524,6 +559,12 @@ fn build_difference_line(
         *slot = (target << 4) | previous;
     }
     dirty
+}
+
+/// Returns row `y` of `frame`.
+fn row(frame: &Framebuffer, y: u16) -> &[u8] {
+    let start = y as usize * LINE_BYTES_4BPP;
+    &frame.as_bytes()[start..start + LINE_BYTES_4BPP]
 }
 
 /// Returns the level of pixel `x` in a row of a `ui::Framebuffer`, which

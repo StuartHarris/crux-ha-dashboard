@@ -504,6 +504,11 @@ async fn render(panel: &mut Panel<'static>, frames: &mut Frames, view: &ViewMode
                 .partial(&frames.shown, &frames.next, to_area(area))
                 .await
         }
+        Refresh::Clean { area, dots } => {
+            panel
+                .clean(&frames.shown, &frames.next, to_area(area), to_area(dots))
+                .await
+        }
         Refresh::None => Ok(()),
     };
     if let Err(error) = panel.power_off() {

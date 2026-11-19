@@ -15,7 +15,10 @@ use crate::{
         network::{Network, WifiStatus},
     },
     entities,
-    features::refresh::{redraw, redraw_soon},
+    features::{
+        pending,
+        refresh::{redraw, redraw_soon},
+    },
     summary,
 };
 
@@ -64,7 +67,17 @@ pub struct State {
     /// The wait before the next reconnect.
     pub backoff: Duration,
     /// The service calls that wait for a connection.
-    pub outbox: Vec<Publish>,
+    pub outbox: Vec<Call>,
+}
+
+/// A service call that waits in the outbox.
+#[derive(Debug)]
+pub struct Call {
+    /// The message to publish.
+    pub publish: Publish,
+    /// The entity of the service call, which has a mark. Refer to
+    /// [`pending`].
+    pub entity_id: &'static str,
 }
 
 impl Default for State {
@@ -120,9 +133,13 @@ pub fn go_online(model: &mut Model) -> Cmd {
 /// Publishes `asleep` on the status topic, if the connection is up, and
 /// forgets the links. The caller then sends `Disconnect` and `WifiOff`, one
 /// after the other.
+///
+/// The core drops the service calls in the outbox and removes their marks.
+/// The device sleeps, so the core does not draw.
 pub fn go_offline(model: &mut Model) -> Cmd {
+    model.connection.outbox.clear();
+    pending::forget_dropped(model);
     let state = &mut model.connection;
-    state.outbox.clear();
     // The core ignores the answers to earlier requests.
     state.reconnect = state.reconnect.wrapping_add(1);
     state.id = state.id.wrapping_add(1);
@@ -142,17 +159,32 @@ pub fn go_offline(model: &mut Model) -> Cmd {
     command
 }
 
-/// Publishes a message now, or keeps it until the core connects.
-pub fn send(publish: Publish, model: &mut Model) -> Cmd {
+/// Publishes a service call now, or keeps it until the core connects.
+///
+/// When the core issues the call, the timeout of the mark of its entity
+/// starts. While the call waits in the outbox, the timeout of the outbox
+/// runs. If the outbox is full, the core drops the oldest call and removes
+/// its mark. Refer to [`pending`].
+pub fn send(call: Call, model: &mut Model) -> Cmd {
     if model.connection.mqtt == Link::Up {
-        return Mqtt::publish(publish);
+        return issue(call, model);
     }
+    let entity_id = call.entity_id;
     let outbox = &mut model.connection.outbox;
-    if outbox.len() == OUTBOX_LIMIT {
+    let full = outbox.len() == OUTBOX_LIMIT;
+    if full {
         outbox.remove(0);
     }
-    outbox.push(publish);
-    go_online(model)
+    outbox.push(call);
+    if full {
+        pending::forget_dropped(model);
+    }
+    pending::queued(entity_id, model).and(go_online(model))
+}
+
+/// Publishes a service call and starts the timer of its mark.
+fn issue(call: Call, model: &mut Model) -> Cmd {
+    Mqtt::publish(call.publish).and(pending::issued(call.entity_id, model))
 }
 
 /// Handles the answer to the `WifiOn` request with the id `request`. The
@@ -243,22 +275,25 @@ pub fn mqtt(id: u32, event: MqttEvent, model: &mut Model) -> Cmd {
         MqttEvent::Connected => connected(model),
         MqttEvent::Message(_) if model.connection.mqtt != Link::Up => Cmd::done(),
         MqttEvent::Message(message) => {
-            // A unit can change, so the check is before and after the change.
-            let shown_before = entities::entity_of(&message.topic)
-                .is_some_and(|entity_id| shows(model, &entity_id));
-            let Some(entity_id) =
-                model
-                    .entities
-                    .apply(model.pages, &message.topic, &message.payload)
-            else {
+            let Some(topic_entity) = entities::entity_of(&message.topic) else {
                 return Cmd::done();
+            };
+            // A unit can change, so the check is before and after the change.
+            let shown_before = shows(model, &topic_entity);
+            let changed = model
+                .entities
+                .apply(model.pages, &message.topic, &message.payload);
+            // A new exact time can confirm a tap also in the same minute.
+            let confirmed = pending::confirm(&topic_entity, model);
+            let Some(entity_id) = changed else {
+                return confirmed;
             };
             // The draw waits for the other messages of the change. Refer to
             // [`redraw_soon`].
             if shown_before || shows(model, &entity_id) {
-                redraw_soon(model)
+                confirmed.and(redraw_soon(model))
             } else {
-                Cmd::done()
+                confirmed
             }
         }
         MqttEvent::Disconnected { .. } => {
@@ -330,12 +365,9 @@ fn connected(model: &mut Model) -> Cmd {
     // topic). The subscribe after the status is safe: the state messages are
     // retained, so the broker sends the newest one of each topic with the
     // subscribe, also if the seed automation publishes before it.
-    let mut commands: Vec<Cmd> = model
-        .connection
-        .outbox
-        .drain(..)
-        .map(Mqtt::publish)
-        .collect();
+    // The timer of each mark starts now. Refer to [`pending`].
+    let calls = core::mem::take(&mut model.connection.outbox);
+    let mut commands: Vec<Cmd> = calls.into_iter().map(|call| issue(call, model)).collect();
     commands.push(Mqtt::publish(status));
     commands.push(Mqtt::subscribe(entities::topics(model.pages)));
     commands.push(redraw(model, false));

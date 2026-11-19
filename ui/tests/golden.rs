@@ -15,10 +15,12 @@
 
 use std::path::{Path, PathBuf};
 
-use embedded_graphics::pixelcolor::Gray4;
-use embedded_graphics::prelude::*;
+use embedded_graphics::{pixelcolor::Gray4, prelude::*, primitives::Rectangle};
 use embedded_graphics_simulator::{OutputSettings, SimulatorDisplay};
-use shared::{Event, PowerSource, TileState, ViewModel, fixtures::FixedShell, pages::PAGES};
+use shared::{
+    Control, Event, PageView, PowerSource, TileState, ViewModel, fixtures::FixedShell, pages::PAGES,
+};
+use ui::{Framebuffer, Refresh, Refresher};
 
 /// Draws `view` and compares the image with the reference image `name`.
 /// Returns a description of the difference, or `None` if the images are the
@@ -196,4 +198,116 @@ fn the_stand_matches_its_reference_image() {
             .into_iter()
             .collect::<Vec<_>>(),
     );
+}
+
+/// Returns a tap on `control`.
+const fn tap(control: Control) -> Event {
+    Event::Tapped(Some(control))
+}
+
+#[test]
+fn pending_tiles_and_a_pending_scene_match_their_reference_image() {
+    let mut shell = FixedShell::start(PowerSource::Stand, "/room/dining_room");
+    shell.set_state("light.dining_room_lights", "on", &[("brightness", "255")]);
+    shell.set_state("light.dining_room_candle_light_right", "off", &[]);
+    // The fixed shell does not answer service calls, so each tap waits.
+    shell.send(tap(Control::Dimmer(0)));
+    shell.send(tap(Control::Tile(3)));
+    shell.send(tap(Control::Scene(0)));
+    let view = shell.view();
+    let tiles = view.tiles();
+    assert_eq!(tiles[0].state, TileState::Pending);
+    assert!(tiles[0].steps);
+    assert_eq!(tiles[0].detail, "100%");
+    assert_eq!(tiles[3].state, TileState::Pending);
+    assert_eq!(tiles[3].text, "Off");
+    assert!(view.scenes()[0].pending);
+    assert_all_match(&check("pending", &view).into_iter().collect::<Vec<_>>());
+}
+
+#[test]
+fn a_pending_all_lights_toggle_matches_its_reference_image() {
+    let path = PAGES[0].route().to_path();
+    let mut shell = FixedShell::start(PowerSource::Stand, &path);
+    shell.send(tap(Control::AllLights));
+    let view = shell.view();
+    let index = view.index().expect("the first page is the home page");
+    let all_lights = index.all_lights.as_ref().expect("the toggle");
+    assert_eq!(all_lights.state, TileState::Pending);
+    assert_all_match(
+        &check("pending-all-lights", &view)
+            .into_iter()
+            .collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn a_tap_from_off_to_pending_is_partial_and_the_confirm_is_a_clean_refresh() {
+    let mut shell = FixedShell::start(PowerSource::Stand, "/room/dining_room");
+    shell.set_state("light.dining_room_candle_light_right", "off", &[]);
+    let off = shell.view();
+    let mut shown = Framebuffer::new();
+    let Ok(()) = ui::draw(&off, &mut shown);
+    let mut refresher = Refresher::default();
+    assert_eq!(
+        refresher.decide(off.full_refresh_seq, &shown, &shown),
+        Refresh::Full
+    );
+
+    // The pattern has black and white pixels only, so the panel does not
+    // flash.
+    shell.send(tap(Control::Tile(3)));
+    let pending = shell.view();
+    assert_eq!(pending.tiles()[3].state, TileState::Pending);
+    assert_eq!(pending.full_refresh_seq, off.full_refresh_seq);
+    let mut next = Framebuffer::new();
+    let Ok(()) = ui::draw(&pending, &mut next);
+    assert!(matches!(
+        refresher.decide(pending.full_refresh_seq, &shown, &next),
+        Refresh::Partial(_)
+    ));
+
+    // Home Assistant confirms the tap, and the light is on. The change from
+    // the pattern removes its dots, so the refresh is clean, with no flash.
+    let mut on = pending.clone();
+    if let PageView::Room(room) = &mut on.page {
+        room.tiles[3].state = TileState::On;
+        room.tiles[3].text = "On".into();
+    }
+    let mut last = Framebuffer::new();
+    let Ok(()) = ui::draw(&on, &mut last);
+    assert!(matches!(
+        refresher.decide(on.full_refresh_seq, &next, &last),
+        Refresh::Clean { .. }
+    ));
+    let panel = Rectangle::new(Point::zero(), Size::new(ui::WIDTH, ui::HEIGHT));
+    assert!(!ui::has_grey(&next, panel));
+}
+
+#[test]
+fn a_scene_button_that_leaves_the_pattern_is_a_clean_refresh_of_the_button() {
+    let mut shell = FixedShell::start(PowerSource::Stand, "/room/dining_room");
+    shell.send(tap(Control::Scene(0)));
+    let pending = shell.view();
+    assert!(pending.scenes()[0].pending);
+    let mut shown = Framebuffer::new();
+    let Ok(()) = ui::draw(&pending, &mut shown);
+    let mut refresher = Refresher::default();
+    let _ = refresher.decide(pending.full_refresh_seq, &shown, &shown);
+
+    // The button has text and a border on the pattern, so not each cell has
+    // a dot. The button still has enough dots for a clean refresh.
+    let mut done = pending.clone();
+    if let PageView::Room(room) = &mut done.page {
+        room.scenes[0].pending = false;
+    }
+    let mut next = Framebuffer::new();
+    let Ok(()) = ui::draw(&done, &mut next);
+    let Refresh::Clean { area, dots } = refresher.decide(done.full_refresh_seq, &shown, &next)
+    else {
+        panic!("not a clean refresh");
+    };
+    let button = ui::layout::scene(0).expect("the first scene button");
+    assert_eq!(area.intersection(&button), area);
+    assert_eq!(dots.intersection(&area), dots);
 }

@@ -150,6 +150,16 @@ The automation ignores a command that does not agree with these conditions. It s
 no reply. The dashboard sees the result as a new state on the state stream. The
 automation runs in `queued` mode, so Home Assistant does each command in sequence.
 
+Until the result comes back, the dashboard shows the tile or the scene button with a
+pattern of black and white pixels. The dashboard removes the pattern when the state
+stream confirms the call. For a toggle, the state changes, and `last_updated` is later
+than the time at the tap. For a step, `last_updated` is later than the time at the
+tap. Thus the state stream must publish `last_updated` (`publish_timestamps: true`).
+If Home Assistant does not confirm the call in 5 seconds, the tile shows the last
+state again. A call that changes nothing shows the pattern for these 5 seconds. A scene
+has no state, so its button shows the pattern for 2 seconds. Refer to
+`shared/src/features/pending.rs`.
+
 ### Status
 
 | Topic | QoS | Retained |

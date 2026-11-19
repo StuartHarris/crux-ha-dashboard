@@ -57,14 +57,14 @@ fn at(seconds: u64) -> chrono::DateTime<chrono::Utc> {
 }
 
 /// Returns the state-stream topic of `key` for the entity `entity_id`.
-fn topic(entity_id: &str, key: &str) -> alloc::string::String {
+pub fn topic(entity_id: &str, key: &str) -> alloc::string::String {
     let (domain, object_id) = entity_id.split_once('.').unwrap();
     format!("homeassistant/statestream/{domain}/{object_id}/{key}")
 }
 
 /// Sends a message on the stream of the connection, and returns the command
 /// of the update.
-fn send(
+pub fn send(
     model: &mut Model,
     cmd: &mut Cmd,
     request: &mut Request<Connect>,
