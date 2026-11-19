@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     capabilities::{
         light::FrontLight,
-        mqtt::{Connect, Credentials, Disconnect, MqttEvent, Publish, Subscribe},
-        network::{WifiOff, WifiOn, WifiStatus},
+        mqtt::{Connect, Credentials, Disconnect, MqttEvent, Publish, Subscribe, SubscribeOutcome},
+        network::{WifiOff, WifiOn, WifiQuiet, WifiStatus},
         power::{PowerSource, Sleep, Wake},
     },
     entities::Entities,
@@ -153,6 +153,17 @@ pub enum Event {
         /// The item from the stream.
         event: MqttEvent,
     },
+    /// The answer to the `Subscribe` request on the MQTT connection with
+    /// this id.
+    #[serde(skip)]
+    #[facet(skip)]
+    Subscribed {
+        /// The id of the connection. The core ignores the answer for an
+        /// older connection.
+        connection: u32,
+        /// The answer.
+        outcome: SubscribeOutcome,
+    },
     /// The wait before the reconnect with this id is over.
     #[serde(skip)]
     #[facet(skip)]
@@ -260,6 +271,8 @@ pub enum Effect {
     WifiOn(WifiOn),
     /// Turn Wi-Fi off.
     WifiOff(WifiOff),
+    /// Tell the shell that the link is quiet.
+    WifiQuiet(WifiQuiet),
     /// Put the device to sleep.
     Sleep(Sleep),
     /// Set the brightness of the front light.
@@ -385,6 +398,10 @@ impl App for Dashboard {
             Event::SetReadOnly(read_only) => rooms::set_read_only(read_only, model),
             Event::Wifi { request, status } => connection::wifi(request, status, model),
             Event::Mqtt { connection, event } => connection::mqtt(connection, event, model),
+            Event::Subscribed {
+                connection,
+                outcome,
+            } => connection::subscribed(connection, outcome, model),
             Event::Reconnect(id) => connection::reconnect(id, model),
             Event::SleepNow => power::sleep_now(model),
             Event::IdleTimeout(id) => power::idle_timeout(id, model),

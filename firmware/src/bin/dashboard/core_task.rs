@@ -5,7 +5,7 @@ use core::time::Duration;
 
 use crux_time::operation::NotifyAfter;
 use logic::{
-    shell::{self, Job, Shell, TimerOp},
+    shell::{self, Job, MqttOp, Shell, TimerOp},
     sleep::Plan,
     wifi::WifiRequest,
 };
@@ -56,9 +56,17 @@ fn dispatch(jobs: alloc::vec::Vec<Job>, display: bool) {
     for job in jobs {
         match job {
             Job::Render(view) => RENDER.signal(view),
-            Job::Mqtt { connection, op } => MQTT.push((connection, op)),
+            Job::Mqtt { connection, op } => {
+                // A disconnect is the first network step of a sleep, so a
+                // scan for a better access point stops.
+                if matches!(op, MqttOp::Disconnect(_)) {
+                    WIFI.push(WifiRequest::Hold);
+                }
+                MQTT.push((connection, op));
+            }
             Job::WifiOn { token, op: WifiOn } => WIFI.push(WifiRequest::On { token }),
             Job::WifiOff(WifiOff) => WIFI.push(WifiRequest::Off),
+            Job::WifiQuiet(_) => WIFI.push(WifiRequest::Roam),
             Job::FrontLight { token, level } if display => LIGHT.push((token, level)),
             Job::FrontLight { token, .. } => SIGNALS.push(shell::Signal::Light { token }),
             Job::Sleep(sleep) => {

@@ -1,9 +1,11 @@
 //! A fake MQTT broker with a fake Home Assistant behind it.
 //!
 //! The broker keeps retained messages, matches topic filters with the `+` and
-//! `#` wildcards, and sends messages to the one client session through the
-//! stream of its `Connect` request. It publishes the last will when a
-//! connection stops without a disconnect.
+//! `#` wildcards, and sends messages to the one client through the stream of
+//! its `Connect` request. It publishes the last will when a connection stops
+//! without a disconnect.
+//! The topic filters belong to the connection, so a new connection has
+//! none.
 //!
 //! The fake Home Assistant publishes entity states as the `mqtt_statestream`
 //! integration does, and answers service calls on `dashboard/<id>/cmd` as the
@@ -20,14 +22,19 @@ use crux_core::Request;
 use serde::Deserialize;
 
 use crate::{
-    capabilities::mqtt::{Connect, LastWill, Message, MqttEvent, Publish},
+    capabilities::mqtt::{
+        Connect, LastWill, Message, MqttEvent, Publish, Subscribe, SubscribeOutcome,
+    },
     entities::STATESTREAM,
 };
 
-/// The connection of the dashboard to the broker.
-struct Session {
+/// The open connection of the dashboard.
+struct Connection {
     request: Request<Connect>,
     filters: Vec<String>,
+    /// The `Subscribe` requests that wait for the acknowledgements that the
+    /// broker holds back. Refer to [`Broker::hold_suback`].
+    subscribes: Vec<Request<Subscribe>>,
 }
 
 /// A service call that the fake Home Assistant got.
@@ -44,8 +51,12 @@ pub struct ServiceCall {
 pub struct Broker {
     /// If `false`, the broker refuses connections.
     pub down: bool,
+    /// If `true`, the broker does not acknowledge a subscribe. It keeps the
+    /// filters, but the `Subscribe` request waits, and ends with `Failed`
+    /// when the connection closes.
+    pub hold_suback: bool,
     retained: BTreeMap<String, Vec<u8>>,
-    session: Option<Session>,
+    connection: Option<Connection>,
     /// The messages that the dashboard published, in order.
     pub published: Vec<Publish>,
     /// The service calls that Home Assistant got, in order.
@@ -61,16 +72,16 @@ pub struct Broker {
 }
 
 impl Broker {
-    /// Returns `true` if the dashboard has a session.
+    /// Returns `true` if the dashboard has an open connection.
     pub const fn is_connected(&self) -> bool {
-        self.session.is_some()
+        self.connection.is_some()
     }
 
-    /// Returns the topic filters of the session.
+    /// Returns the topic filters of the open connection.
     pub fn filters(&self) -> &[String] {
-        self.session
+        self.connection
             .as_ref()
-            .map_or(&[], |session| &session.filters)
+            .map_or(&[], |connection| &connection.filters)
     }
 
     /// Returns the retained payload on `topic` as text.
@@ -89,35 +100,59 @@ impl Broker {
                 .expect("the core listens to the connection");
             return;
         }
-        if let Some(mut old) = self.session.take() {
-            let reason = Some("session taken over".to_string());
-            let _ = old.request.resolve(MqttEvent::Disconnected { reason });
-        }
+        self.close(Some("session taken over".to_string()));
         request
             .resolve(MqttEvent::Connected)
             .expect("the core listens to the connection");
         self.connections += 1;
-        self.session = Some(Session {
+        self.connection = Some(Connection {
             request,
             filters: Vec::new(),
+            subscribes: Vec::new(),
         });
     }
 
-    /// Adds topic filters to the session and sends the retained messages
-    /// that match them.
-    pub fn subscribe(&mut self, topics: &[String]) {
-        let Some(session) = &mut self.session else {
+    /// Adds topic filters to the connection and sends the retained messages
+    /// that match them. Then answers the request with `Done`, unless
+    /// [`Broker::hold_suback`] is `true`. With no open connection, answers
+    /// `Failed`.
+    pub fn subscribe(&mut self, mut request: Request<Subscribe>) {
+        let Some(connection) = &mut self.connection else {
+            request
+                .resolve(SubscribeOutcome::Failed)
+                .expect("the core waits for the subscribe");
             return;
         };
-        for filter in topics {
+        for filter in &request.operation.topics {
             for (topic, payload) in &self.retained {
                 if matches(filter, topic) {
-                    deliver(session, topic, payload);
+                    deliver(connection, topic, payload);
                     self.delivered.push(topic.clone());
                 }
             }
-            session.filters.push(filter.clone());
+            connection.filters.push(filter.clone());
         }
+        if self.hold_suback {
+            connection.subscribes.push(request);
+        } else {
+            request
+                .resolve(SubscribeOutcome::Done)
+                .expect("the core waits for the subscribe");
+        }
+    }
+
+    /// Closes the open connection, if there is one, and ends its stream
+    /// with `reason`. The `Subscribe` requests that wait end with `Failed`.
+    /// Returns the `Connect` request of the connection.
+    fn close(&mut self, reason: Option<String>) -> Option<Request<Connect>> {
+        let mut connection = self.connection.take()?;
+        let _ = connection
+            .request
+            .resolve(MqttEvent::Disconnected { reason });
+        for mut subscribe in connection.subscribes {
+            let _ = subscribe.resolve(SubscribeOutcome::Failed);
+        }
+        Some(connection.request)
     }
 
     /// Takes a message from the dashboard.
@@ -135,29 +170,23 @@ impl Broker {
         self.published.push(publish);
     }
 
-    /// Closes the session after a disconnect from the dashboard. The broker
+    /// Closes the connection after a disconnect from the dashboard. The broker
     /// does not publish the last will.
     pub fn disconnect(&mut self) {
-        if let Some(mut session) = self.session.take() {
-            let _ = session
-                .request
-                .resolve(MqttEvent::Disconnected { reason: None });
-        }
+        self.close(None);
     }
 
-    /// Stops the session without a disconnect, as when the network fails.
+    /// Stops the connection without a disconnect, as when the network fails.
     /// The broker publishes the last will.
     pub fn drop_connection(&mut self) {
-        let Some(mut session) = self.session.take() else {
+        let Some(request) = self.close(Some("connection lost".to_string())) else {
             return;
         };
         let LastWill {
             topic,
             payload,
             retain,
-        } = session.request.operation.last_will.clone();
-        let reason = Some("connection lost".to_string());
-        let _ = session.request.resolve(MqttEvent::Disconnected { reason });
+        } = request.operation.last_will;
         self.publish(&topic, &payload, retain);
     }
 
@@ -171,10 +200,13 @@ impl Broker {
                 self.retained.insert(topic.to_string(), payload.to_vec());
             }
         }
-        if let Some(session) = &mut self.session
-            && session.filters.iter().any(|filter| matches(filter, topic))
+        if let Some(connection) = &mut self.connection
+            && connection
+                .filters
+                .iter()
+                .any(|filter| matches(filter, topic))
         {
-            deliver(session, topic, payload);
+            deliver(connection, topic, payload);
             self.delivered.push(topic.to_string());
         }
     }
@@ -257,12 +289,12 @@ pub fn iso_time(seconds: u64) -> String {
         .to_rfc3339()
 }
 
-fn deliver(session: &mut Session, topic: &str, payload: &[u8]) {
+fn deliver(connection: &mut Connection, topic: &str, payload: &[u8]) {
     let message = Message {
         topic: topic.to_string(),
         payload: payload.to_vec(),
     };
-    let _ = session.request.resolve(MqttEvent::Message(message));
+    let _ = connection.request.resolve(MqttEvent::Message(message));
 }
 
 /// Returns `true` if the topic filter `filter` matches `topic`.

@@ -13,11 +13,24 @@
 //! `Connect` stops the attempt, so the core does not wait for a connection
 //! that it no longer wants.
 //!
-//! Each send waits for the ACK of the broker, because `rust-mqtt` flushes the
-//! socket after each packet. When the Wi-Fi link is down, no ACK comes, and
-//! the TCP timeout does not see the dead link. So each send has a time limit
-//! (`WRITE_TIMEOUT`). A send that is too slow ends the connection. The task
-//! also ends the connection when the broker is silent for too long.
+//! `rust-mqtt` flushes the transport after each packet. The flush of the
+//! transport (`transport::Transport`) does not wait for the TCP ACK of the
+//! broker, so a send returns when the packet is in the send buffer of the
+//! socket. The task finds a dead link in these ways:
+//!
+//! - Each send has a time limit (`WRITE_TIMEOUT`). A send that cannot get
+//!   space in the full send buffer ends the connection.
+//! - If sent data waits for its TCP ACK for `logic::mqtt::ACK_LIMIT`, the task
+//!   ends the connection (`logic::mqtt::AckWatch`).
+//! - The task ends the connection when the broker is silent for too long.
+//!
+//! Each connect has a clean start. The task answers each `Subscribe` job when
+//! the broker acknowledged all its filters (`logic::mqtt::Subacks`). If the
+//! connection closes first, the shell answers the job with `Failed`.
+//!
+//! After a change of access point (`LINK_CHANGED`), the task closes the
+//! connection with a disconnect packet, which can fail if the TCP connection
+//! is dead. The stream ends with a reason, and the core connects again.
 //!
 //! `rust-mqtt` sends no ping by itself, so the task sends one before the
 //! keep-alive interval ends. `Client::poll_header` is the only receive call
@@ -30,15 +43,15 @@ use alloc::{
     string::{String, ToString},
     vec::Vec,
 };
-use core::{net::Ipv4Addr, num::NonZero, pin::pin, str::FromStr};
+use core::{cell::RefCell, net::Ipv4Addr, num::NonZero, pin::pin, str::FromStr};
 
-use embassy_futures::select::{Either, Either4, select, select4};
+use embassy_futures::select::{Either, Either3, Either4, select, select3, select4};
 use embassy_net::{IpAddress, Stack, dns::DnsQueryType, tcp::TcpSocket};
 use embassy_time::{Duration, Instant, Timer};
 use logic::{
     mqtt::{
-        Attempt, Next, Outbox, RETRY_WAIT, Streams, broker_silent, ping_interval, silence_limit,
-        supersede,
+        ACK_LIMIT, AckWatch, Attempt, Next, Outbox, RETRY_WAIT, Streams, Subacks, broker_silent,
+        ping_interval, silence_limit, supersede,
     },
     shell::MqttOp,
 };
@@ -56,9 +69,12 @@ use rust_mqtt::{
     config::KeepAlive,
     types::{MqttBinary, MqttString, QoS, TopicFilter, TopicName},
 };
-use shared::capabilities::mqtt::{Connect, Publish, Qos, Subscribe};
+use shared::capabilities::mqtt::{Connect, Publish, Qos, Subscribe, SubscribeOutcome};
 
-use crate::{MQTT, SIGNALS};
+use crate::{
+    LINK_CHANGED, MQTT, SIGNALS,
+    transport::{Link, Transport},
+};
 
 /// The size of the receive buffer of the socket. The retained states arrive
 /// in a burst after the subscribe.
@@ -67,16 +83,21 @@ const RX_BUFFER: usize = 4096;
 const TX_BUFFER: usize = 2048;
 /// The longest time to open the TCP connection.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// The time limit of one call that sends a packet. `rust-mqtt` flushes the
-/// socket after each packet, and the flush waits for the ACK of the broker.
+/// The time limit of one call that sends a packet. A send waits only while
+/// the send buffer of the socket is full.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// The time limit of the disconnect packet.
 const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// The largest number of subscribe packets in flight. It is the
+/// `SUBSCRIBE_MAXIMUM` of [`MqttClient`].
+const IN_FLIGHT_SUBSCRIBES: usize = 16;
+
 /// The client: up to 16 subscribe packets and 16 received messages in
 /// flight, 4 sent messages in flight, 1 subscription identifier, 2 user
 /// properties, and no topic aliases.
-type MqttClient<'a, 'c> = Client<'a, 'c, TcpSocket<'a>, AllocBuffer, 16, 16, 4, 1, 2, 0, 0>;
+type MqttClient<'s, 'a, 'c> =
+    Client<'s, 'c, Transport<'s, 'a>, AllocBuffer, IN_FLIGHT_SUBSCRIBES, 16, 4, 1, 2, 0, 0>;
 
 /// Jobs that the task took from its queue but did not do yet.
 type Pending = VecDeque<(u32, MqttOp)>;
@@ -174,24 +195,25 @@ async fn session(
     let mut rx = [0; RX_BUFFER];
     let mut tx = [0; TX_BUFFER];
     let mut buffer = AllocBuffer;
-    let mut client = match connect_or_stop(
-        stack,
-        streams,
-        connect,
-        pending,
-        &mut rx,
-        &mut tx,
-        &mut buffer,
-    )
-    .await
-    {
-        Ok(client) => client,
-        Err(end) => return end,
-    };
+    // A change of access point before this connection does not apply to it.
+    // A change during the connect applies, because the TCP connection can
+    // use the old access point, so the reset is before the connect.
+    LINK_CHANGED.reset();
+    let link = RefCell::new(Link {
+        socket: TcpSocket::new(stack, &mut rx, &mut tx),
+        watch: AckWatch::default(),
+        written: 0,
+    });
+    let mut client =
+        match connect_or_stop(stack, streams, connect, pending, &link, &mut buffer).await {
+            Ok(client) => client,
+            Err(end) => return end,
+        };
     log::info!("mqtt: connected");
     if let Some(signal) = streams.connected(connection) {
         SIGNALS.push(signal);
     }
+    let mut subacks = Subacks::default();
 
     let ping_every = ping_interval(connect.keep_alive_secs)
         .and_then(|every| u64::try_from(every.as_millis()).ok())
@@ -202,9 +224,24 @@ async fn session(
     let mut outbox = Outbox::default();
     let mut retry_at: Option<Instant> = None;
     loop {
+        let ack_at = match check_acks(&link) {
+            Ok(deadline) => deadline,
+            Err(end) => return end,
+        };
         let ping = Timer::at(next_ping.unwrap_or(Instant::MAX));
         let retry = Timer::at(retry_at.unwrap_or(Instant::MAX));
-        match select4(next_job(pending), client.poll_header(), ping, retry).await {
+        let work = select4(next_job(pending), client.poll_header(), ping, retry);
+        let ack = Timer::at(ack_at.unwrap_or(Instant::MAX));
+        let work = match select3(work, LINK_CHANGED.wait(), ack).await {
+            Either3::First(work) => work,
+            Either3::Second(()) => {
+                disconnect(&mut client, DISCONNECT_TIMEOUT).await;
+                return End::error("the Wi-Fi access point changed");
+            }
+            // The check at the start of the loop reads the send buffer.
+            Either3::Third(()) => continue,
+        };
+        match work {
             Either4::First((id, op)) => match op {
                 MqttOp::Connect(next) => {
                     disconnect(&mut client, WRITE_TIMEOUT).await;
@@ -216,24 +253,16 @@ async fn session(
                     log::debug!("mqtt: connection {id} is closed");
                 }
                 MqttOp::Subscribe(Subscribe { topics }) => {
-                    for topic in &topics {
-                        if let Err(reason) =
-                            subscribe(&mut client, streams, connection, topic).await
-                        {
-                            return End::error(reason);
-                        }
-                    }
-                    log::info!("mqtt: subscribed to {} topics", topics.len());
-                }
-                MqttOp::Publish(publish) => {
-                    if let Err(reason) = outbox.push(publish) {
+                    let sent =
+                        subscribe_all(&mut client, streams, connection, &mut subacks, &topics);
+                    if let Err(reason) = sent.await {
                         return End::error(reason);
                     }
-                    match flush(&mut client, &mut outbox).await {
-                        Ok(retry) => retry_at = retry,
-                        Err(reason) => return End::error(reason),
-                    }
                 }
+                MqttOp::Publish(publish) => match push(&mut client, &mut outbox, publish).await {
+                    Ok(retry) => retry_at = retry,
+                    Err(reason) => return End::error(reason),
+                },
                 MqttOp::Disconnect(_) => {
                     disconnect(&mut client, DISCONNECT_TIMEOUT).await;
                     return End { reason: None };
@@ -242,7 +271,7 @@ async fn session(
             Either4::Second(Ok(header)) => {
                 last_heard = Instant::now();
                 match client.poll_body(header).await {
-                    Ok(event) => deliver(streams, connection, &event),
+                    Ok(event) => deliver(streams, connection, &mut subacks, &event),
                     Err(error) if error.is_recoverable() => log::warn!("mqtt: {error:?}"),
                     Err(error) => return End::error(format!("receive failed: {error:?}")),
                 }
@@ -271,6 +300,21 @@ async fn session(
     }
 }
 
+/// Reads the send buffer of the socket. Returns the time of the next
+/// check, or the end of the session if sent data waited too long for its
+/// TCP ACK.
+fn check_acks(link: &RefCell<Link<'_>>) -> Result<Option<Instant>, End> {
+    let mut link = link.borrow_mut();
+    let deadline = link.observe();
+    if link.ack_expired() {
+        return Err(End::error(format!(
+            "no TCP ACK for {} s: the link is down",
+            ACK_LIMIT.as_secs()
+        )));
+    }
+    Ok(deadline)
+}
+
 /// Returns the timeout of the TCP socket. It is the same limit as the silence
 /// check, so there is one limit for both.
 fn tcp_timeout(keep_alive_secs: u16) -> Option<Duration> {
@@ -287,7 +331,7 @@ fn tcp_timeout(keep_alive_secs: u16) -> Option<Duration> {
 ///
 /// Returns the reason to close the connection.
 async fn check_and_ping(
-    client: &mut MqttClient<'_, '_>,
+    client: &mut MqttClient<'_, '_, '_>,
     last_heard: Instant,
     keep_alive_secs: u16,
 ) -> Result<(), String> {
@@ -314,7 +358,7 @@ fn timed_out(what: &str) -> String {
 /// For the `Disconnect` request of the core, the limit is
 /// [`DISCONNECT_TIMEOUT`]. The shell answers the request when the session
 /// ends, so a dead link cannot stop the sleep for long.
-async fn disconnect(client: &mut MqttClient<'_, '_>, limit: Duration) {
+async fn disconnect(client: &mut MqttClient<'_, '_, '_>, limit: Duration) {
     match embassy_time::with_timeout(limit, client.disconnect(&DisconnectOptions::new())).await {
         Ok(Ok(_)) => {}
         Ok(Err(error)) => log::warn!("mqtt: disconnect failed: {error:?}"),
@@ -326,21 +370,20 @@ async fn disconnect(client: &mut MqttClient<'_, '_>, limit: Duration) {
 /// `Disconnect` or a new `Connect` stops the attempt, and the function
 /// returns the end of the session. The other jobs of this connection go back
 /// to `pending`, in order, when the connection is open.
-async fn connect_or_stop<'a, 'c>(
+async fn connect_or_stop<'s, 'a, 'c>(
     stack: Stack<'static>,
     streams: &Streams,
     connect: &Connect,
     pending: &mut Pending,
-    rx: &'a mut [u8],
-    tx: &'a mut [u8],
+    link: &'s RefCell<Link<'a>>,
     buffer: &'c mut AllocBuffer,
-) -> Result<MqttClient<'a, 'c>, End> {
+) -> Result<MqttClient<'s, 'a, 'c>, End> {
     let mut early = Vec::new();
-    let client = {
-        let mut attempt = pin!(attempt(stack, connect, rx, tx, buffer));
+    let open = {
+        let mut attempt = pin!(attempt(stack, connect, link, buffer));
         loop {
             match select(attempt.as_mut(), next_job(pending)).await {
-                Either::First(Ok(client)) => break client,
+                Either::First(Ok(open)) => break open,
                 Either::First(Err(reason)) => return Err(End::error(reason)),
                 Either::Second((id, op)) => match op {
                     MqttOp::Connect(next) => {
@@ -362,35 +405,46 @@ async fn connect_or_stop<'a, 'c>(
     for job in early.into_iter().rev() {
         pending.push_front(job);
     }
+    Ok(open)
+}
+
+/// Resolves the host, opens the TCP connection of `link` and sends the MQTT
+/// connect. Returns the client of the open connection, or the reason for
+/// the failure.
+async fn attempt<'s, 'a, 'c>(
+    stack: Stack<'static>,
+    connect: &Connect,
+    link: &'s RefCell<Link<'a>>,
+    buffer: &'c mut AllocBuffer,
+) -> Result<MqttClient<'s, 'a, 'c>, String> {
+    let address = resolve(stack, &connect.host).await?;
+    tcp_connect(link, (address, connect.port), connect.keep_alive_secs).await?;
+    let mut client = MqttClient::new(buffer);
+    open(&mut client, Transport::new(link), connect).await?;
     Ok(client)
 }
 
-/// Resolves the host, opens the TCP connection and sends the MQTT
-/// connect. Returns the client of the open connection, or the reason for
-/// the failure.
-async fn attempt<'a, 'c>(
-    stack: Stack<'static>,
-    connect: &Connect,
-    rx: &'a mut [u8],
-    tx: &'a mut [u8],
-    buffer: &'c mut AllocBuffer,
-) -> Result<MqttClient<'a, 'c>, String> {
-    let address = resolve(stack, &connect.host).await?;
-    let mut socket = TcpSocket::new(stack, rx, tx);
-    // This timeout alone does not see a dead Wi-Fi link. Each send waits for
-    // the ACK of the broker, so each send has its own time limit
-    // (`WRITE_TIMEOUT`). The session also checks the silence of the broker
-    // (see `broker_silent`).
-    socket.set_timeout(tcp_timeout(connect.keep_alive_secs));
-    match embassy_time::with_timeout(CONNECT_TIMEOUT, socket.connect((address, connect.port))).await
-    {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => return Err(format!("TCP connect failed: {error:?}")),
-        Err(_) => return Err("TCP connect timed out".into()),
+/// Opens the TCP connection of `link` to `endpoint`.
+#[expect(
+    clippy::await_holding_refcell_ref,
+    reason = "the client does not exist yet, so nothing else borrows the link"
+)]
+async fn tcp_connect(
+    link: &RefCell<Link<'_>>,
+    endpoint: (IpAddress, u16),
+    keep_alive_secs: u16,
+) -> Result<(), String> {
+    let mut link = link.borrow_mut();
+    // This timeout alone closes a dead connection only after a long silence.
+    // The session also limits each send (`WRITE_TIMEOUT`), watches the TCP
+    // ACKs (`AckWatch`), and checks the silence of the broker (see
+    // `broker_silent`).
+    link.socket.set_timeout(tcp_timeout(keep_alive_secs));
+    match embassy_time::with_timeout(CONNECT_TIMEOUT, link.socket.connect(endpoint)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(format!("TCP connect failed: {error:?}")),
+        Err(_) => Err("TCP connect timed out".into()),
     }
-    let mut client = MqttClient::new(buffer);
-    open(&mut client, socket, connect).await?;
-    Ok(client)
 }
 
 /// Returns the reason to close the connection if the broker was silent for too
@@ -419,10 +473,11 @@ async fn resolve(stack: Stack<'static>, host: &str) -> Result<IpAddress, String>
         .ok_or_else(|| format!("DNS has no address for {host}"))
 }
 
-/// Sends the connect packet with the credentials and the last will.
-async fn open<'a>(
-    client: &mut MqttClient<'a, '_>,
-    socket: TcpSocket<'a>,
+/// Sends the connect packet with a clean start, the credentials and the last
+/// will.
+async fn open<'s, 'a>(
+    client: &mut MqttClient<'s, 'a, '_>,
+    transport: Transport<'s, 'a>,
     connect: &Connect,
 ) -> Result<(), String> {
     let invalid = |what: &str| format!("the {what} is not valid for MQTT");
@@ -458,7 +513,7 @@ async fn open<'a>(
     // The error does not contain the password.
     embassy_time::with_timeout(
         WRITE_TIMEOUT,
-        client.connect(socket, &options, Some(client_id)),
+        client.connect(transport, &options, Some(client_id)),
     )
     .await
     .map_err(|_| timed_out("connect"))?
@@ -466,14 +521,63 @@ async fn open<'a>(
     .map_err(|error| format!("the broker refused the connection: {error:?}"))
 }
 
-/// Subscribes to one topic filter. `rust-mqtt` sends one filter in each
-/// packet, and it keeps a few subscribe packets in flight. If all are in
-/// flight, the task reads packets (the retained states) until the broker
-/// acknowledges one.
-async fn subscribe(
-    client: &mut MqttClient<'_, '_>,
+/// Sends the subscribe packets of one `Subscribe` job, one for each topic
+/// filter. The task answers the job when the broker acknowledged all of
+/// them, also if that happens here.
+///
+/// # Errors
+///
+/// Returns the reason to close the connection if a packet cannot be sent.
+async fn subscribe_all(
+    client: &mut MqttClient<'_, '_, '_>,
     streams: &Streams,
     connection: u32,
+    subacks: &mut Subacks,
+    topics: &[String],
+) -> Result<(), String> {
+    let started = Instant::now();
+    let mut timing = SubscribeTiming::default();
+    subacks.begin();
+    for topic in topics {
+        subscribe(client, streams, connection, subacks, &mut timing, topic).await?;
+    }
+    log::info!(
+        "mqtt: sent the subscribe for {} topics in {} ms ({} ms in sends; \
+         {} packets read while {} were in flight, in {} ms)",
+        topics.len(),
+        started.elapsed().as_millis(),
+        timing.sending.as_millis(),
+        timing.reads,
+        IN_FLIGHT_SUBSCRIBES,
+        timing.reading.as_millis()
+    );
+    answer(streams, connection, subacks.finish());
+    Ok(())
+}
+
+/// Where the time of one subscribe job goes, for the log.
+#[derive(Default)]
+struct SubscribeTiming {
+    /// The time in the calls that send a subscribe packet.
+    sending: Duration,
+    /// The number of packets that the task read while all the subscribe
+    /// packets were in flight.
+    reads: u32,
+    /// The time of these reads, which wait for the broker.
+    reading: Duration,
+}
+
+/// Subscribes to one topic filter. `rust-mqtt` sends one filter in each
+/// packet, and it keeps up to [`IN_FLIGHT_SUBSCRIBES`] subscribe packets in
+/// flight. If all are in flight, the task reads packets (the retained
+/// states) until the broker acknowledges one. `subacks` records the packet,
+/// and `timing` the time of the sends and the reads.
+async fn subscribe(
+    client: &mut MqttClient<'_, '_, '_>,
+    streams: &Streams,
+    connection: u32,
+    subacks: &mut Subacks,
+    timing: &mut SubscribeTiming,
     topic: &str,
 ) -> Result<(), String> {
     let filter = MqttString::try_from(topic)
@@ -482,21 +586,48 @@ async fn subscribe(
         .ok_or_else(|| format!("the topic filter {topic} is not valid"))?;
     let options = SubscriptionOptions::new().at_least_once();
     loop {
+        let started = Instant::now();
         let sent = embassy_time::with_timeout(
             WRITE_TIMEOUT,
             client.subscribe(filter.as_borrowed(), &options),
         )
         .await
         .map_err(|_| timed_out("subscribe"))?;
+        timing.sending += started.elapsed();
         match sent {
-            Ok(_) => return Ok(()),
-            Err(MqttError::SessionBuffer) => match client.poll().await {
-                Ok(event) => deliver(streams, connection, &event),
-                Err(error) => return Err(format!("receive failed: {error:?}")),
-            },
+            Ok(packet) => {
+                subacks.sent(packet.get().get());
+                return Ok(());
+            }
+            Err(MqttError::SessionBuffer) => {
+                let started = Instant::now();
+                let read = client.poll().await;
+                timing.reads += 1;
+                timing.reading += started.elapsed();
+                match read {
+                    Ok(event) => deliver(streams, connection, subacks, &event),
+                    Err(error) => return Err(format!("receive failed: {error:?}")),
+                }
+            }
             Err(error) => return Err(format!("subscribe to {topic} failed: {error:?}")),
         }
     }
+}
+
+/// Adds a message to the outbox and publishes the messages in it. Returns
+/// the time of the next try if the client has no quota now.
+///
+/// # Errors
+///
+/// Returns the reason to close the connection if the outbox is full or a
+/// message cannot be sent.
+async fn push(
+    client: &mut MqttClient<'_, '_, '_>,
+    outbox: &mut Outbox,
+    publish: Publish,
+) -> Result<Option<Instant>, String> {
+    outbox.push(publish)?;
+    flush(client, outbox).await
 }
 
 /// Publishes the messages in the outbox, in order. Returns the time of the
@@ -506,7 +637,7 @@ async fn subscribe(
 ///
 /// Returns the reason to close the connection if a message cannot be sent.
 async fn flush(
-    client: &mut MqttClient<'_, '_>,
+    client: &mut MqttClient<'_, '_, '_>,
     outbox: &mut Outbox,
 ) -> Result<Option<Instant>, String> {
     loop {
@@ -526,7 +657,7 @@ async fn flush(
 }
 
 /// Tries to publish a message once.
-async fn send(client: &mut MqttClient<'_, '_>, publish: &Publish) -> Attempt {
+async fn send(client: &mut MqttClient<'_, '_, '_>, publish: &Publish) -> Attempt {
     let Some(topic) = MqttString::try_from(publish.topic.as_str())
         .ok()
         .and_then(TopicName::new)
@@ -563,10 +694,29 @@ async fn send(client: &mut MqttClient<'_, '_>, publish: &Publish) -> Attempt {
     }
 }
 
-/// Gives a message from the broker to the core. The task ignores the other
-/// events (acknowledgements and the answers to pings).
-fn deliver(streams: &Streams, connection: u32, event: &Event<'_, 1, 2>) {
-    if let Event::Publish(publish) = event {
+/// Gives the answers of the `Subscribe` jobs that are complete to the shell.
+fn answer(streams: &Streams, connection: u32, outcomes: Vec<SubscribeOutcome>) {
+    for signal in streams.subscribed(connection, outcomes) {
+        log::info!("mqtt: {signal:?}");
+        SIGNALS.push(signal);
+    }
+}
+
+/// Gives a message from the broker to the core, and records the
+/// acknowledgement of a subscribe packet. The task ignores the other events
+/// (the other acknowledgements and the answers to pings).
+fn deliver(streams: &Streams, connection: u32, subacks: &mut Subacks, event: &Event<'_, 1, 2>) {
+    if let Event::Suback(suback) = event {
+        let success = suback.reason_code.is_success();
+        if !success {
+            log::warn!(
+                "mqtt: the broker refused a filter: {:?}",
+                suback.reason_code
+            );
+        }
+        let packet = suback.packet_identifier.get().get();
+        answer(streams, connection, subacks.ack(packet, success));
+    } else if let Event::Publish(publish) = event {
         let Some(topic) = publish.topic.name() else {
             log::warn!("mqtt: a message with a topic alias, which the client did not allow");
             return;

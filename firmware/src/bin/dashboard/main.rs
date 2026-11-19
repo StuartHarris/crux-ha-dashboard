@@ -9,8 +9,11 @@
 //! | `core` | owns the shell and routes each job | |
 //! | `timers` | `StartTimer`, `CancelTimer` | `Signal::Timer` |
 //! | `display` | draws the latest view model, reads the touch controller, the charger and the fuel gauge, sets the front light, and runs the `Sleep` job | `Signal::Tap`, `Signal::Event`, `Signal::Woke`, `Signal::Light` |
-//! | `wifi` | `WifiOn`, `WifiOff`, and the radio on and off | `Signal::Wifi`, `Signal::RadioOff` |
-//! | `mqtt` | the MQTT operations, one connection at a time | `Signal::Mqtt` |
+//! | `wifi` | `WifiOn`, `WifiOff`, the radio on and off, and a change to a better access point after `WifiQuiet` | `Signal::Wifi`, `Signal::RadioOff` |
+//! | `mqtt` | the MQTT operations, one connection at a time | `Signal::Mqtt`, `Signal::Subscribed` |
+//!
+//! After a change of access point, the Wi-Fi task sets [`LINK_CHANGED`]. The
+//! MQTT task then closes its connection, and the core connects again.
 //! | `net` | runs the network stack | |
 
 #![no_std]
@@ -23,6 +26,7 @@ mod core_task;
 mod display;
 mod mqtt;
 mod timers;
+mod transport;
 mod wifi;
 
 use dashboard_firmware::{board, lane::Lane, light::FrontLight, panel::Panel, panel_pins};
@@ -62,6 +66,9 @@ pub static TIMERS: Lane<timers::Request> = Lane::new();
 pub static MQTT: Lane<(u32, MqttOp)> = Lane::new();
 /// The work of the Wi-Fi task.
 pub static WIFI: Lane<WifiRequest> = Lane::new();
+/// Set by the Wi-Fi task after it changed to another access point. The MQTT
+/// task closes the open connection, because its TCP connection can be dead.
+pub static LINK_CHANGED: Latest<CriticalSectionRawMutex, ()> = Latest::new();
 /// The `FrontLight` jobs for the display task, with their tokens.
 pub static LIGHT: Lane<(u32, u8)> = Lane::new();
 /// The `Sleep` job for the display task, or `None` when the `Sleep`

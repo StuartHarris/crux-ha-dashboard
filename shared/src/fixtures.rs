@@ -23,7 +23,7 @@ use crux_time::operation::NotifyAfter;
 use crate::{
     Core, Dashboard, Effect, Event, PowerSource, Settings, Start, TileKind, ViewModel,
     capabilities::{
-        mqtt::{Connect, Message, MqttEvent},
+        mqtt::{Connect, Message, MqttEvent, SubscribeOutcome},
         network::WifiStatus,
     },
     pages::PAGES,
@@ -100,7 +100,7 @@ impl FixedShell {
                     self.connection = Some(request);
                     more
                 }
-                Effect::MqttSubscribe(_) => {
+                Effect::MqttSubscribe(mut subscribe) => {
                     let mut more = Vec::new();
                     if let Some(mut request) = self.connection.take() {
                         for (topic, payload) in states() {
@@ -119,6 +119,7 @@ impl FixedShell {
                         }
                         self.connection = Some(request);
                     }
+                    more.extend(self.resolve(&mut subscribe, SubscribeOutcome::Done));
                     more
                 }
                 Effect::MqttDisconnect(mut request) => {
@@ -137,7 +138,10 @@ impl FixedShell {
                     self.timers.retain(|timer| timer.operation.id != id);
                     self.resolve(&mut request, id)
                 }
-                Effect::Render(_) | Effect::MqttPublish(_) | Effect::Sleep(_) => Vec::new(),
+                Effect::Render(_)
+                | Effect::MqttPublish(_)
+                | Effect::Sleep(_)
+                | Effect::WifiQuiet(_) => Vec::new(),
             };
             queue.extend(more);
         }

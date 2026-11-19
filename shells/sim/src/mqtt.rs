@@ -6,14 +6,18 @@
 //! `Disconnected`, because the core, not the shell, decides when to connect
 //! again. (A `rumqttc` event loop connects again by itself if you continue to
 //! poll it after an error.)
+//!
+//! Each connection has a clean session, so the simulator never leaves a
+//! session on the broker. The SUBACK packet of a subscribe gives the answer
+//! to the `Subscribe` request.
 
 use std::time::Duration;
 
 use rumqttc::{
     AsyncClient, ConnectReturnCode, Event, EventLoop, Incoming, MqttOptions, Outgoing, QoS,
-    SubscribeFilter,
+    SubscribeFilter, SubscribeReasonCode,
 };
-use shared::capabilities::mqtt::{Connect, Message, MqttEvent, Publish, Qos};
+use shared::capabilities::mqtt::{Connect, Message, MqttEvent, Publish, Qos, SubscribeOutcome};
 use tokio::{runtime::Handle, task::JoinHandle};
 
 /// The number of requests that can wait for the event loop.
@@ -29,6 +33,8 @@ pub const MAX_PACKET_SIZE: usize = 256 * 1024;
 pub enum Step {
     /// Send this item to the core and continue.
     Send(MqttEvent),
+    /// Answer the `Subscribe` request with this outcome and continue.
+    Subscribed(SubscribeOutcome),
     /// Send this item to the core and stop. It is always `Disconnected`.
     Stop(MqttEvent),
     /// Ignore the event.
@@ -49,6 +55,17 @@ pub fn map_event(event: &Event) -> Step {
             topic: publish.topic.clone(),
             payload: publish.payload.to_vec(),
         })),
+        Event::Incoming(Incoming::SubAck(ack)) => {
+            let done = ack
+                .return_codes
+                .iter()
+                .all(|code| matches!(code, SubscribeReasonCode::Success(_)));
+            Step::Subscribed(if done {
+                SubscribeOutcome::Done
+            } else {
+                SubscribeOutcome::Failed
+            })
+        }
         Event::Incoming(Incoming::Disconnect) => Step::Stop(MqttEvent::Disconnected {
             reason: Some("the broker closed the connection".into()),
         }),
@@ -96,7 +113,8 @@ pub fn options(connect: &Connect) -> MqttOptions {
 /// One MQTT connection, as the shell sees it. [`Connection`] is the real
 /// one. The tests of the shell use a fake one.
 pub trait Link {
-    /// Subscribes to `topics`.
+    /// Subscribes to `topics` with one subscribe packet. The stream answers
+    /// with [`Item::Subscribed`] when the SUBACK packet arrives.
     ///
     /// # Errors
     ///
@@ -123,9 +141,18 @@ pub trait Link {
     fn abort(&self);
 }
 
-/// The function that gives each item of a stream to the shell. The flag is
-/// `true` for a message that the broker retained.
-pub type Sink = Box<dyn Fn(MqttEvent, bool) + Send + 'static>;
+/// What a connection gives to the shell.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Item {
+    /// An item of the stream. The flag is `true` for a message that the
+    /// broker retained.
+    Stream(MqttEvent, bool),
+    /// The answer to the oldest `Subscribe` request of the connection.
+    Subscribed(SubscribeOutcome),
+}
+
+/// The function that gives each item of a connection to the shell.
+pub type Sink = Box<dyn Fn(Item) + Send + 'static>;
 
 /// Opens a connection for a `Connect` request, and gives each item of its
 /// stream to the sink.
@@ -187,15 +214,16 @@ async fn poll(mut event_loop: EventLoop, send: Sink) {
     loop {
         match event_loop.poll().await {
             Ok(event) => match map_event(&event) {
-                Step::Send(item) => send(item, retained(&event)),
+                Step::Send(item) => send(Item::Stream(item, retained(&event))),
+                Step::Subscribed(outcome) => send(Item::Subscribed(outcome)),
                 Step::Stop(item) => {
-                    send(item, false);
+                    send(Item::Stream(item, false));
                     return;
                 }
                 Step::Ignore => {}
             },
             Err(error) => {
-                send(map_error(&error), false);
+                send(Item::Stream(map_error(&error), false));
                 return;
             }
         }
@@ -204,8 +232,13 @@ async fn poll(mut event_loop: EventLoop, send: Sink) {
 
 #[cfg(test)]
 mod tests {
-    use rumqttc::{ConnAck, ConnectReturnCode, Event, Incoming, Outgoing, Publish, QoS};
-    use shared::capabilities::mqtt::{Connect, Credentials, LastWill, Message, MqttEvent};
+    use rumqttc::{
+        ConnAck, ConnectReturnCode, Event, Incoming, Outgoing, Publish, QoS, SubAck,
+        SubscribeReasonCode,
+    };
+    use shared::capabilities::mqtt::{
+        Connect, Credentials, LastWill, Message, MqttEvent, SubscribeOutcome,
+    };
 
     use super::{Step, map_error, map_event, options, retained};
 
@@ -231,6 +264,20 @@ mod tests {
             panic!("a refused connection must stop the stream");
         };
         assert!(reason.contains("NotAuthorized"), "{reason}");
+    }
+
+    #[test]
+    fn a_suback_answers_the_subscribe() {
+        let granted = SubscribeReasonCode::Success(QoS::AtLeastOnce);
+        let suback = |codes| Event::Incoming(Incoming::SubAck(SubAck::new(1, codes)));
+        assert_eq!(
+            map_event(&suback(vec![granted, granted])),
+            Step::Subscribed(SubscribeOutcome::Done)
+        );
+        assert_eq!(
+            map_event(&suback(vec![granted, SubscribeReasonCode::Failure])),
+            Step::Subscribed(SubscribeOutcome::Failed)
+        );
     }
 
     #[test]
@@ -317,6 +364,7 @@ mod tests {
         assert_eq!(options.broker_address(), ("broker".into(), 1884));
         assert_eq!(options.client_id(), "dashboard-sim");
         assert_eq!(options.keep_alive().as_secs(), 60);
+        assert!(options.clean_session());
         assert_eq!(options.max_packet_size(), 256 * 1024);
         let will = options.last_will().unwrap();
         assert_eq!(will.topic, "dashboard/sim/status");

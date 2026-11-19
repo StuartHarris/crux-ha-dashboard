@@ -2,9 +2,13 @@
 
 use esp_radio::wifi::{
     AuthenticationMethodConfig, Config, ControllerConfig, WifiError,
+    scan::ScanConfig,
     sta::{ScanMethod, StationConfig},
 };
-use logic::config::{self, WifiAuth};
+use logic::{
+    config::{self, WifiAuth},
+    wifi::JoinPath,
+};
 
 /// Returns the configuration of the Wi-Fi driver for the build-time
 /// settings.
@@ -22,6 +26,37 @@ pub fn controller_config(settings: &config::Config<'_>) -> ControllerConfig {
             ControllerConfig::default()
         }
     }
+}
+
+/// Returns the station configuration for a join on `path`.
+///
+/// For [`JoinPath::Scan`], it is the configuration of
+/// [`controller_config`]. For [`JoinPath::Cached`], the driver does a fast
+/// scan for the BSSID, which starts on the channel of the access point.
+///
+/// # Errors
+///
+/// Returns the error of the driver if the settings are not valid.
+pub fn join_config(settings: &config::Config<'_>, path: JoinPath) -> Result<Config, WifiError> {
+    let station = station(settings)?;
+    let station = match path {
+        JoinPath::Scan => station,
+        JoinPath::Cached(access_point) => station
+            .with_bssid(access_point.bssid)
+            .with_channel(access_point.channel)
+            .with_scan_method(ScanMethod::Fast),
+    };
+    Ok(Config::Station(station))
+}
+
+/// Returns the configuration of a scan for the access points of the network
+/// (the SSID of the settings) on all the channels.
+///
+/// # Errors
+///
+/// Returns the error of the driver if the SSID is not valid.
+pub fn scan_config(settings: &config::Config<'_>) -> Result<ScanConfig, WifiError> {
+    Ok(ScanConfig::default().with_ssid(settings.wifi_ssid.try_into()?))
 }
 
 fn station(settings: &config::Config<'_>) -> Result<StationConfig, WifiError> {

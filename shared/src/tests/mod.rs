@@ -13,6 +13,7 @@ mod pending;
 mod power;
 mod refresh;
 mod rooms;
+mod subscribe;
 
 mod shell;
 

@@ -1,4 +1,5 @@
-//! The network capability: Wi-Fi on and off.
+//! The network capability: Wi-Fi on and off, and the notification that the
+//! link is quiet.
 //!
 //! On the desktop, the shell answers `WifiOn` with `Connected` at once, and
 //! `WifiOff` at once.
@@ -33,6 +34,19 @@ pub enum WifiStatus {
 #[operation(request, output = ())]
 pub struct WifiOff;
 
+/// Tells the shell that the link is quiet now.
+///
+/// The core sends this notification when the MQTT connection is ready: the
+/// service calls that waited are sent, and the subscribe is complete. The
+/// shell can then do work that can drop the link for a short time, for
+/// example a scan for a better access point. If the link drops, the core
+/// connects again as after any other drop.
+///
+/// A shell with no such work ignores it.
+#[derive(Operation, Facet, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[operation(notify)]
+pub struct WifiQuiet;
+
 /// Makes the commands for the network operations.
 pub struct Network;
 
@@ -56,5 +70,14 @@ impl Network {
         Event: Send + 'static,
     {
         Command::request_from_shell(WifiOff)
+    }
+
+    /// Tells the shell that the link is quiet now. Refer to [`WifiQuiet`].
+    pub fn quiet<Effect, Event>() -> Command<Effect, Event>
+    where
+        Effect: From<Request<WifiQuiet>> + Send + 'static,
+        Event: Send + 'static,
+    {
+        super::notify(WifiQuiet)
     }
 }
