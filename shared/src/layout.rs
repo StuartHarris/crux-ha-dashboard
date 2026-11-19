@@ -6,7 +6,7 @@
 use facet::Facet;
 use serde::{Deserialize, Serialize};
 
-use crate::route::Route;
+use crate::{entities::EntityState, route::Route, temperature};
 
 /// The largest number of tiles on one page. The `ui` grid has this many cells.
 pub const MAX_TILES: usize = 6;
@@ -86,7 +86,10 @@ pub enum TileKind {
     /// A sensor. The tile shows the state and the unit. A tap does nothing.
     Sensor,
     /// A thermostat. The tile shows the current and the target temperature.
-    /// A tap does nothing.
+    /// If the target temperature is known, the tile has a − and a + button,
+    /// which change the target temperature by
+    /// [`STEP`](crate::temperature::STEP). A tap on the other parts of the
+    /// tile does nothing.
     Climate,
     /// A weather entity. The tile shows the condition and the temperature.
     /// A tap does nothing.
@@ -113,26 +116,40 @@ impl TileKind {
             Self::Light => &["brightness"],
             Self::Switch => &[],
             Self::Sensor => &["unit_of_measurement"],
-            Self::Climate => &["current_temperature", "temperature"],
+            Self::Climate => &["current_temperature", temperature::TARGET],
             Self::Weather => &["temperature", "temperature_unit"],
         }
     }
 }
 
 impl Tile {
-    /// Returns `true` if the tile shows the − and + buttons for the entity
-    /// `state`, which is the state from the state stream.
+    /// Returns `true` if the tile shows the − and + buttons for `entity`,
+    /// which is the state from the state stream, or `None` if the core has
+    /// no state for the entity.
     ///
-    /// The tile must be a dimmable light (refer to [`Tile::dimmable`]), and
-    /// the light must be `on` or `off`. A light that is unavailable, or that
-    /// has no state or the state `unknown`, has no buttons. Its tile is a
-    /// toggle, as the tile of an on/off light is.
+    /// - A light tile must be dimmable (refer to [`Tile::dimmable`]), and the
+    ///   light must be `on` or `off`. A light that is unavailable, or that
+    ///   has no state or the state `unknown`, has no buttons. Its tile is a
+    ///   toggle, as the tile of an on/off light is.
+    /// - A climate tile must have a state that is not `unavailable` or
+    ///   `unknown`, and a target temperature. Refer to
+    ///   [`temperature::target`]. A thermostat that is off usually has no
+    ///   target temperature, so its tile has no buttons.
+    /// - Other tiles have no buttons.
     ///
     /// The view and the core both use this function, so the panel shows the
     /// buttons only when the core acts on them.
     #[must_use]
-    pub fn has_steps(&self, state: Option<&str>) -> bool {
-        self.kind == TileKind::Light && self.dimmable && matches!(state, Some("on" | "off"))
+    pub fn has_steps(&self, entity: Option<&EntityState>) -> bool {
+        let state = entity.and_then(|entity| entity.state.as_deref());
+        match self.kind {
+            TileKind::Light => self.dimmable && matches!(state, Some("on" | "off")),
+            TileKind::Climate => {
+                !matches!(state, None | Some("unavailable" | "unknown"))
+                    && entity.and_then(temperature::target).is_some()
+            }
+            TileKind::Switch | TileKind::Sensor | TileKind::Weather => false,
+        }
     }
 }
 

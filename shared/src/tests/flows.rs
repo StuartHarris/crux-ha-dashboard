@@ -5,7 +5,7 @@ use alloc::{string::String, vec, vec::Vec};
 use core::time::Duration;
 
 use super::{
-    shell::Shell, start, start_at, tap_all_lights, tap_brighter, tap_dimmer, tap_room, tap_scene,
+    shell::Shell, start, start_at, tap_all_lights, tap_minus, tap_plus, tap_room, tap_scene,
     tap_tile,
 };
 use crate::{
@@ -15,7 +15,7 @@ use crate::{
     capabilities::power::{Wake, WakeSource},
     features::{
         connection::{RECONNECT_MAX, RECONNECT_MIN},
-        pending::SCENE_TIMEOUT,
+        pending::{PENDING_TIMEOUT, SCENE_TIMEOUT},
         power::IDLE_TIMEOUT,
     },
 };
@@ -716,7 +716,7 @@ fn the_plus_and_minus_buttons_change_the_brightness_of_a_light() {
 
     // Home Assistant adds 25% (64 of 255) to the brightness, and the new
     // brightness comes back on the state stream.
-    shell.send(tap_brighter(1));
+    shell.send(tap_plus(1));
     let call = shell.broker.service_calls.last().unwrap();
     assert_eq!(call.service, "light.turn_on");
     assert_eq!(call.entity_id, "light.living_room_rocket_lamp");
@@ -729,18 +729,18 @@ fn the_plus_and_minus_buttons_change_the_brightness_of_a_light() {
     assert!(!shell.frames.last().unwrap().full);
 
     // Each step down takes 25% off. At 0, Home Assistant turns the light off.
-    shell.send(tap_dimmer(1));
-    shell.send(tap_dimmer(1));
+    shell.send(tap_minus(1));
+    shell.send(tap_minus(1));
     assert_eq!(
         texts(&shell)[1],
         tile("Rocket lamp", TileState::On, "On 25%")
     );
-    shell.send(tap_dimmer(1));
+    shell.send(tap_minus(1));
     assert_eq!(texts(&shell)[1], tile("Rocket lamp", TileState::Off, "Off"));
     assert_eq!(shell.view().tiles()[1].detail, "");
 
     // A step up turns a light that is off on at 25%.
-    shell.send(tap_brighter(1));
+    shell.send(tap_plus(1));
     assert_eq!(
         texts(&shell)[1],
         tile("Rocket lamp", TileState::On, "On 25%")
@@ -779,8 +779,8 @@ fn an_onoff_light_has_no_brightness_steps() {
     assert_eq!(tiles[2].text, "On 50%");
     assert_eq!(tiles[2].detail, "");
 
-    shell.send(tap_brighter(2));
-    shell.send(tap_dimmer(3));
+    shell.send(tap_plus(2));
+    shell.send(tap_minus(3));
     assert_eq!(shell.broker.service_calls.len(), 0);
 
     // A tap on the tile toggles the light.
@@ -807,8 +807,8 @@ fn a_dimmable_light_has_steps_only_while_it_is_on_or_off() {
     );
 
     // A step on the unavailable lamp does nothing.
-    shell.send(tap_brighter(2));
-    shell.send(tap_dimmer(2));
+    shell.send(tap_plus(2));
+    shell.send(tap_minus(2));
     assert_eq!(shell.broker.service_calls.len(), 0);
 
     // When the lamp is back, its tile has the steps again.
@@ -819,9 +819,9 @@ fn a_dimmable_light_has_steps_only_while_it_is_on_or_off() {
     assert_eq!(steps(&shell), [true, true, true, false, false]);
 
     // A − step on a light that is off does nothing. A + step turns it on.
-    shell.send(tap_dimmer(2));
+    shell.send(tap_minus(2));
     assert_eq!(shell.broker.service_calls.len(), 0);
-    shell.send(tap_brighter(2));
+    shell.send(tap_plus(2));
     assert_eq!(shell.broker.service_calls.len(), 1);
     assert_eq!(
         texts(&shell)[2],
@@ -845,7 +845,7 @@ fn on_battery_a_brightness_step_while_asleep_wakes_and_changes_the_light() {
 
     // The tap that wakes the device also steps the brightness. The call
     // waits for the connection, then goes out.
-    shell.send(tap_brighter(1));
+    shell.send(tap_plus(1));
     assert!(!shell.view().asleep);
     assert_eq!(shell.broker.service_calls.len(), 1);
     assert_eq!(
@@ -853,7 +853,7 @@ fn on_battery_a_brightness_step_while_asleep_wakes_and_changes_the_light() {
         tile("Rocket lamp", TileState::On, "On 75%")
     );
 
-    shell.send(tap_brighter(1));
+    shell.send(tap_plus(1));
     assert_eq!(
         texts(&shell)[1],
         tile("Rocket lamp", TileState::On, "On 100%")
@@ -874,8 +874,8 @@ fn a_dry_run_sends_no_service_call_until_it_stops() {
     shell.send(tap_all_lights());
     shell.send(Event::Navigate(Route::room("living_room")));
     shell.send(tap_scene(0));
-    shell.send(tap_brighter(1));
-    shell.send(tap_dimmer(1));
+    shell.send(tap_plus(1));
+    shell.send(tap_minus(1));
     assert_eq!(shell.broker.service_calls.len(), 0);
     assert_eq!(shell.model.connection.outbox.len(), 0);
     // The status message is not a service call, so the core still sends it.
@@ -1012,4 +1012,75 @@ fn the_stand_while_asleep_wakes_and_the_shell_answers_sleep() {
     let events = shell.advance(IDLE_TIMEOUT);
     assert!(!idle_timeouts(&events).contains(&shell.model.power.idle));
     assert_eq!(shell.sleep, None);
+}
+
+#[test]
+fn the_plus_and_minus_buttons_change_the_target_temperature_of_a_thermostat() {
+    let mut shell = house();
+    shell.send(start_at(PowerSource::Stand, Some("/room/dining_room")));
+    let thermostat = |shell: &Shell| shell.view().tiles()[4].clone();
+    let tile = thermostat(&shell);
+    assert!(tile.steps);
+    assert_eq!(tile.text, "19.5°");
+    assert_eq!(tile.detail, "Set 21°");
+
+    // Home Assistant sets the new target, and it comes back on the state
+    // stream. The new target confirms the step, so the mark goes.
+    shell.send(tap_plus(4));
+    let call = shell.broker.service_calls.last().unwrap();
+    assert_eq!(call.service, "climate.set_temperature");
+    assert_eq!(call.entity_id, "climate.dining_room_thermostat");
+    assert_eq!(call.temperature, Some(21.5));
+    let tile = thermostat(&shell);
+    assert_eq!(tile.state, TileState::Value);
+    assert_eq!(tile.detail, "Set 21.5°");
+    assert!(shell.model.pending.marks.is_empty());
+
+    shell.send(tap_minus(4));
+    shell.send(tap_minus(4));
+    assert_eq!(thermostat(&shell).detail, "Set 20.5°");
+    assert_eq!(shell.broker.service_calls.len(), 3);
+
+    // A tap on the rest of the tile does nothing.
+    shell.send(tap_tile(4));
+    assert_eq!(shell.broker.service_calls.len(), 3);
+}
+
+#[test]
+fn a_thermostat_step_past_its_limit_shows_the_mark_until_the_timeout() {
+    let mut shell = house();
+    shell.broker.set_state(
+        "climate.dining_room_thermostat",
+        "heat",
+        &[("current_temperature", "19.5"), ("temperature", "32.0")],
+    );
+    shell.send(start_at(PowerSource::Stand, Some("/room/dining_room")));
+
+    // The core does not know the limit, so it sends the call. Home Assistant
+    // keeps the target at 32 °C and publishes nothing.
+    shell.send(tap_plus(4));
+    assert_eq!(
+        shell.broker.service_calls.last().unwrap().temperature,
+        Some(32.5)
+    );
+    assert_eq!(shell.view().tiles()[4].state, TileState::Pending);
+
+    let events = shell.advance(PENDING_TIMEOUT);
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, Event::PendingTimeout(_))),
+        "{events:?}"
+    );
+    let tile = shell.view().tiles()[4].clone();
+    assert_eq!(tile.state, TileState::Value);
+    assert_eq!(tile.detail, "Set 32.0°");
+
+    // A step down goes from the target of Home Assistant.
+    shell.send(tap_minus(4));
+    assert_eq!(
+        shell.broker.service_calls.last().unwrap().temperature,
+        Some(31.5)
+    );
+    assert_eq!(shell.view().tiles()[4].detail, "Set 31.5°");
 }

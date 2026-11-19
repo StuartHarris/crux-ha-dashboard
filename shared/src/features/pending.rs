@@ -3,8 +3,9 @@
 //!
 //! A service call changes the panel only when the new state comes back on
 //! the state stream. That takes about 0.5 s while the device is awake, and
-//! about 3 s after a wake. Thus a tap on a light tile, a − or + step, a scene
-//! or the All lights toggle gives the entity a mark. The view shows a tile
+//! about 3 s after a wake. Thus a tap on a light tile, a − or + step of a
+//! light or a thermostat, a scene or the All lights toggle gives the entity a
+//! mark. The view shows a tile
 //! or a scene with a mark as [`TileState::Pending`](crate::TileState) or
 //! [`SceneView::pending`](crate::SceneView). The view does not show a state
 //! that Home Assistant did not confirm.
@@ -21,6 +22,12 @@
 //! - A step: the time of the last update is later than the time at the tap.
 //!   The state of a light that is on usually stays `on`, so only the time
 //!   shows the change.
+//! - A step of a thermostat: the time of the last update is later than the
+//!   time at the tap, and the target temperature is the target that the call
+//!   asks for. The current temperature of a thermostat changes on its own,
+//!   and each change moves `last_updated`, so the time alone does not confirm
+//!   the call. Home Assistant also sends `last_updated` before the
+//!   attributes, so the mark stays until the new target arrives.
 //! - A scene: no message. A scene has no state that confirms it.
 //!
 //! If the core had no state (for a toggle) or no time (for a step) at the
@@ -35,7 +42,16 @@
 //!
 //! A call that changes nothing shows the mark until the timeout. An example
 //! is All lights on when all the lights are on. The core sends no + step for
-//! a light at 100%, so that step shows no mark.
+//! a light at 100%, so that step shows no mark. The core does not know the
+//! limits of a thermostat, so it sends each step. If Home Assistant keeps the
+//! target at a limit, the mark shows until the timeout.
+//!
+//! # Steps that wait
+//!
+//! The mark of a step of a thermostat keeps the target that the call asks
+//! for. If the user taps again before Home Assistant confirms the call, the
+//! next step starts from that target, not from the target that the tile
+//! shows. Refer to [`requested_target`].
 //!
 //! # Timers
 //!
@@ -73,7 +89,9 @@ use crux_time::{TimerHandle, clock::Time};
 
 use crate::{
     Cmd, Event, Model,
+    entities::EntityState,
     features::refresh::{redraw, redraw_soon},
+    temperature::{self, Centi},
 };
 
 /// The time after which the core removes the mark of a service call that
@@ -97,6 +115,9 @@ pub enum Confirm {
     /// A brightness step: a time of the last update after the time at the
     /// tap.
     Step,
+    /// A step of a thermostat to this target temperature: a time of the last
+    /// update after the time at the tap, and this target.
+    Target(Centi),
     /// A scene: nothing confirms it.
     Scene,
 }
@@ -155,9 +176,11 @@ impl Mark {
         }
     }
 
-    /// Returns `true` if the entity, with `state` and the exact time
-    /// `updated`, confirms the call. Refer to the module documentation.
-    fn confirmed_by(&self, state: Option<&str>, updated: Option<DateTime<Utc>>) -> bool {
+    /// Returns `true` if `entity` confirms the call. Refer to the module
+    /// documentation.
+    fn confirmed_by(&self, entity: Option<&EntityState>) -> bool {
+        let state = entity.and_then(|entity| entity.state.as_deref());
+        let updated = entity.and_then(|entity| entity.last_updated_exact);
         let newer = match (self.since, updated) {
             (Some(since), Some(updated)) => updated > since,
             (Some(_), None) => false,
@@ -168,6 +191,11 @@ impl Mark {
                 self.state.is_some() && state.is_some() && state != self.state.as_deref() && newer
             }
             Confirm::Step => self.since.is_some() && newer,
+            Confirm::Target(target) => {
+                self.since.is_some()
+                    && newer
+                    && entity.and_then(temperature::target) == Some(target)
+            }
             Confirm::Scene => false,
         }
     }
@@ -208,6 +236,24 @@ pub fn is_pending(model: &Model, entity_id: &str) -> bool {
         .marks
         .iter()
         .any(|mark| mark.entity_id == entity_id)
+}
+
+/// Returns the target of the step of the thermostat `entity_id` that waits.
+///
+/// The target is the target temperature that the newest step asks for, if
+/// Home Assistant did not confirm that step yet. Returns `None` if the entity
+/// has no mark of a step of a thermostat.
+#[must_use]
+pub fn requested_target(model: &Model, entity_id: &str) -> Option<Centi> {
+    model
+        .pending
+        .marks
+        .iter()
+        .find(|mark| mark.entity_id == entity_id)
+        .and_then(|mark| match mark.confirm {
+            Confirm::Target(target) => Some(target),
+            Confirm::Toggle | Confirm::Step | Confirm::Scene => None,
+        })
 }
 
 /// Gives the entity `entity_id` a mark, before the core sends its service
@@ -311,12 +357,10 @@ pub fn forget_dropped(model: &mut Model) -> bool {
 /// once can show the old brightness.
 pub fn confirm(entity_id: &str, model: &mut Model) -> Cmd {
     let entity = model.entities.get(entity_id);
-    let state = entity.and_then(|entity| entity.state.as_deref());
-    let updated = entity.and_then(|entity| entity.last_updated_exact);
     let marks = &mut model.pending.marks;
     let Some(index) = marks
         .iter()
-        .position(|mark| mark.entity_id == entity_id && mark.confirmed_by(state, updated))
+        .position(|mark| mark.entity_id == entity_id && mark.confirmed_by(entity))
     else {
         return Cmd::done();
     };

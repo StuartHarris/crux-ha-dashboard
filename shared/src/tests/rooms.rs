@@ -8,7 +8,8 @@ use crux_core::App;
 use super::{
     ExpectFullRefreshTimer, ExpectLight, ExpectServiceCall,
     connection::{drive_to_connected, drive_to_connecting},
-    set_state, start_at, tap_all_lights, tap_brighter, tap_dimmer, tap_room, tap_scene, tap_tile,
+    set_attribute, set_state, start_at, tap_all_lights, tap_minus, tap_plus, tap_room, tap_scene,
+    tap_tile,
 };
 use crate::{
     Control, Dashboard, EffectTestExt, Event, Model, PowerSource, Route, TileState,
@@ -112,7 +113,7 @@ fn the_plus_and_minus_buttons_of_a_dimmable_light_publish_a_brightness_step() {
     set_state(&mut model, "light.living_room_lights", "on");
     set_state(&mut model, "light.living_room_rocket_lamp", "on");
 
-    app.update(tap_brighter(1), &mut model)
+    app.update(tap_plus(1), &mut model)
         .expect_touch_light(STAND_LEVEL)
         .expect_only_service_call_with(|publish| {
             assert_eq!(publish.topic, "dashboard/hall/cmd");
@@ -125,7 +126,7 @@ fn the_plus_and_minus_buttons_of_a_dimmable_light_publish_a_brightness_step() {
         });
     // The tile already has a mark, so the view does not change and the core
     // does not draw. The call still goes, with a new timer.
-    app.update(tap_dimmer(1), &mut model)
+    app.update(tap_minus(1), &mut model)
         .expect_light_timer()
         .expect_mqtt_publish_with(|publish| {
             assert_eq!(
@@ -136,7 +137,7 @@ fn the_plus_and_minus_buttons_of_a_dimmable_light_publish_a_brightness_step() {
         .expect_pending_timer()
         .expect_no_effects();
     // A light group is dimmable too.
-    app.update(tap_dimmer(0), &mut model)
+    app.update(tap_minus(0), &mut model)
         .expect_light_timer()
         .expect_only_service_call_with(|publish| {
             assert_eq!(
@@ -166,18 +167,19 @@ fn a_brightness_step_on_a_tile_that_is_not_a_dimmable_light_does_nothing() {
     }
 
     // The index page has no tiles.
-    app.update(tap_brighter(0), &mut model)
+    app.update(tap_plus(0), &mut model)
         .expect_touch_light(STAND_LEVEL)
         .expect_no_effects();
 
-    // The candle lights are on/off lights. The thermostat and the humidity
-    // sensor are not lights, and the page has no tile 6.
+    // The candle lights are on/off lights. The thermostat has no target
+    // temperature, the humidity sensor is not a light, and the page has no
+    // tile 6.
     model.route = Route::room("dining_room");
     for index in [2, 3, 4, 5, 6] {
-        app.update(tap_brighter(index), &mut model)
+        app.update(tap_plus(index), &mut model)
             .expect_light_timer()
             .expect_no_effects();
-        app.update(tap_dimmer(index), &mut model)
+        app.update(tap_minus(index), &mut model)
             .expect_light_timer()
             .expect_no_effects();
     }
@@ -185,17 +187,17 @@ fn a_brightness_step_on_a_tile_that_is_not_a_dimmable_light_does_nothing() {
     // The salt lamp is an on/off light. The power sensor is not a light.
     model.route = Route::room("hall");
     for index in [2, 3] {
-        app.update(tap_brighter(index), &mut model)
+        app.update(tap_plus(index), &mut model)
             .expect_light_timer()
             .expect_no_effects();
     }
 
     // The coffee machine is a switch.
     model.route = Route::room("kitchen");
-    app.update(tap_brighter(0), &mut model)
+    app.update(tap_plus(0), &mut model)
         .expect_light_timer()
         .expect_no_effects();
-    app.update(tap_dimmer(0), &mut model)
+    app.update(tap_minus(0), &mut model)
         .expect_light_timer()
         .expect_no_effects();
     assert_eq!(model.connection.outbox.len(), 0);
@@ -217,13 +219,13 @@ fn a_plus_step_on_a_light_at_full_brightness_does_nothing_and_a_minus_step_dims_
 
     // Home Assistant does nothing for the step, so the core sends no call
     // and gives no mark.
-    app.update(tap_brighter(1), &mut model)
+    app.update(tap_plus(1), &mut model)
         .expect_touch_light(STAND_LEVEL)
         .expect_no_effects();
     assert!(model.pending.marks.is_empty());
     assert_eq!(app.view(&model).tiles()[1].state, TileState::On);
 
-    app.update(tap_dimmer(1), &mut model)
+    app.update(tap_minus(1), &mut model)
         .expect_light_timer()
         .expect_only_service_call_with(|publish| {
             assert_eq!(
@@ -240,10 +242,10 @@ fn a_minus_step_on_a_light_that_is_off_does_nothing_and_a_plus_step_turns_it_on(
     model.route = Route::room("living_room");
     set_state(&mut model, "light.living_room_rocket_lamp", "off");
 
-    app.update(tap_dimmer(1), &mut model)
+    app.update(tap_minus(1), &mut model)
         .expect_touch_light(STAND_LEVEL)
         .expect_no_effects();
-    app.update(tap_brighter(1), &mut model)
+    app.update(tap_plus(1), &mut model)
         .expect_light_timer()
         .expect_only_service_call_with(|publish| {
             assert_eq!(
@@ -260,19 +262,19 @@ fn a_brightness_step_on_a_light_with_no_usable_state_does_nothing() {
     model.route = Route::room("living_room");
 
     // The core has no state for the rocket lamp yet.
-    app.update(tap_brighter(1), &mut model)
+    app.update(tap_plus(1), &mut model)
         .expect_touch_light(STAND_LEVEL)
         .expect_no_effects();
-    app.update(tap_dimmer(1), &mut model)
+    app.update(tap_minus(1), &mut model)
         .expect_light_timer()
         .expect_no_effects();
 
     for state in ["unavailable", "unknown"] {
         set_state(&mut model, "light.living_room_rocket_lamp", state);
-        app.update(tap_brighter(1), &mut model)
+        app.update(tap_plus(1), &mut model)
             .expect_light_timer()
             .expect_no_effects();
-        app.update(tap_dimmer(1), &mut model)
+        app.update(tap_minus(1), &mut model)
             .expect_light_timer()
             .expect_no_effects();
     }
@@ -299,6 +301,162 @@ fn a_toggle_has_no_brightness_step() {
             let payload = core::str::from_utf8(&publish.payload).unwrap();
             assert!(!payload.contains("brightness_step_pct"), "{payload}");
         });
+}
+
+/// The thermostat: tile 4 on the page of the dining room.
+const THERMOSTAT: &str = "climate.dining_room_thermostat";
+
+/// Drives the core to an open connection on the stand, on the page of the
+/// dining room. The thermostat heats, and its target temperature is the JSON
+/// value `target`.
+fn thermostat_at(target: &str) -> Model {
+    let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Stand);
+    model.route = Route::room("dining_room");
+    set_state(&mut model, THERMOSTAT, "heat");
+    set_attribute(&mut model, THERMOSTAT, "current_temperature", "20.3");
+    set_attribute(&mut model, THERMOSTAT, "temperature", target);
+    model
+}
+
+/// Returns the JSON payload of `climate.set_temperature` for the thermostat
+/// with the target `temperature`, as text.
+fn set_temperature(temperature: &str) -> alloc::string::String {
+    alloc::format!(
+        r#"{{"service":"climate.set_temperature","entity_id":"{THERMOSTAT}","temperature":{temperature}}}"#
+    )
+}
+
+#[test]
+fn the_plus_and_minus_buttons_of_a_thermostat_publish_the_next_half_degree() {
+    let app = Dashboard;
+    // The target, the button and the target that the call asks for. A
+    // target on a half degree moves by a half degree. Another target moves
+    // to the nearest half degree in the direction of the button.
+    let cases = [
+        ("19.5", true, "20.0"),
+        ("19.5", false, "19.0"),
+        ("19.3", true, "19.5"),
+        ("19.3", false, "19.0"),
+        ("19.7", true, "20.0"),
+        ("19.7", false, "19.5"),
+        ("21", true, "21.5"),
+        ("21", false, "20.5"),
+        ("20.0", true, "20.5"),
+        ("20.0", false, "19.5"),
+        // Home Assistant does the limits, so the core sends each step.
+        ("32", true, "32.5"),
+        ("10", false, "9.5"),
+    ];
+    for (target, up, expected) in cases {
+        let mut model = thermostat_at(target);
+        assert!(app.view(&model).tiles()[4].steps, "{target}");
+        let tap = if up { tap_plus(4) } else { tap_minus(4) };
+        app.update(tap, &mut model)
+            .expect_touch_light(STAND_LEVEL)
+            .expect_only_service_call_with(|publish| {
+                assert_eq!(publish.topic, "dashboard/hall/cmd");
+                assert_eq!(
+                    core::str::from_utf8(&publish.payload).unwrap(),
+                    set_temperature(expected),
+                    "{target} {up}"
+                );
+                assert_eq!(publish.qos, Qos::AtLeastOnce);
+                assert!(!publish.retain);
+            });
+    }
+}
+
+#[test]
+fn a_thermostat_step_publishes_set_temperature_with_a_json_number() {
+    let app = Dashboard;
+    let mut model = thermostat_at("19.5");
+
+    app.update(tap_plus(4), &mut model)
+        .expect_touch_light(STAND_LEVEL)
+        .expect_only_service_call_with(|publish| {
+            assert_eq!(
+                publish.payload,
+                br#"{"service":"climate.set_temperature","entity_id":"climate.dining_room_thermostat","temperature":20.0}"#
+            );
+        });
+}
+
+#[test]
+fn a_second_step_of_a_thermostat_starts_from_the_target_that_waits() {
+    let app = Dashboard;
+    let mut model = thermostat_at("20");
+
+    app.update(tap_plus(4), &mut model)
+        .expect_touch_light(STAND_LEVEL)
+        .expect_only_service_call_with(|publish| {
+            assert_eq!(publish.payload, set_temperature("20.5").as_bytes());
+        });
+    // Home Assistant did not confirm 20.5 °C, so the next step starts from
+    // it. The tile already has a mark, so the core does not draw.
+    app.update(tap_plus(4), &mut model)
+        .expect_light_timer()
+        .expect_mqtt_publish_with(|publish| {
+            assert_eq!(publish.payload, set_temperature("21.0").as_bytes());
+        })
+        .expect_pending_timer()
+        .expect_no_effects();
+    app.update(tap_minus(4), &mut model)
+        .expect_light_timer()
+        .expect_mqtt_publish_with(|publish| {
+            assert_eq!(publish.payload, set_temperature("20.5").as_bytes());
+        })
+        .expect_pending_timer()
+        .expect_no_effects();
+    // The tile still shows the target that Home Assistant gave.
+    let view = app.view(&model);
+    assert_eq!(view.tiles()[4].state, TileState::Pending);
+    assert_eq!(view.tiles()[4].detail, "Set 20°");
+}
+
+#[test]
+fn a_thermostat_with_no_target_temperature_has_no_steps_and_sends_nothing() {
+    let app = Dashboard;
+    let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Stand);
+    model.route = Route::room("dining_room");
+
+    // The first touch turns the front light on. The core has no state for
+    // the thermostat.
+    app.update(tap_plus(4), &mut model)
+        .expect_touch_light(STAND_LEVEL)
+        .expect_no_effects();
+    let assert_no_steps = |model: &mut Model, case: &str| {
+        assert!(!app.view(model).tiles()[4].steps, "{case}");
+        app.update(tap_plus(4), model)
+            .expect_light_timer()
+            .expect_no_effects();
+        app.update(tap_minus(4), model)
+            .expect_light_timer()
+            .expect_no_effects();
+    };
+    assert_no_steps(&mut model, "no state");
+
+    // A thermostat that is off has no target.
+    set_state(&mut model, THERMOSTAT, "off");
+    set_attribute(&mut model, THERMOSTAT, "current_temperature", "20.3");
+    assert_no_steps(&mut model, "off");
+    set_attribute(&mut model, THERMOSTAT, "temperature", "null");
+    assert_no_steps(&mut model, "off, null");
+
+    // A target that is not a number.
+    set_state(&mut model, THERMOSTAT, "heat");
+    set_attribute(&mut model, THERMOSTAT, "temperature", r#""warm""#);
+    assert_no_steps(&mut model, "not a number");
+
+    // A target, but Home Assistant cannot reach the thermostat.
+    set_attribute(&mut model, THERMOSTAT, "temperature", "19.5");
+    set_state(&mut model, THERMOSTAT, "unavailable");
+    assert_no_steps(&mut model, "unavailable");
+    set_state(&mut model, THERMOSTAT, "unknown");
+    assert_no_steps(&mut model, "unknown");
+
+    // A thermostat that is off but keeps a target has steps.
+    set_state(&mut model, THERMOSTAT, "off");
+    assert!(app.view(&model).tiles()[4].steps);
 }
 
 #[test]
@@ -423,10 +581,10 @@ fn a_tap_in_a_dry_run_sends_no_service_call() {
     app.update(tap_scene(2), &mut model)
         .expect_light_timer()
         .expect_no_effects();
-    app.update(tap_brighter(1), &mut model)
+    app.update(tap_plus(1), &mut model)
         .expect_light_timer()
         .expect_no_effects();
-    app.update(tap_dimmer(1), &mut model)
+    app.update(tap_minus(1), &mut model)
         .expect_light_timer()
         .expect_no_effects();
     assert_eq!(model.connection.outbox.len(), 0);

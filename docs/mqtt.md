@@ -152,15 +152,35 @@ while its light is on or off, so the dashboard sends no step for a light that is
 unavailable or has no state. A toggle payload and a
 scene payload have no `brightness_step_pct` key.
 
+A tap on the − or the + button of a climate tile sends `climate.set_temperature` with
+the new target temperature in degrees, as a JSON number:
+
+```json
+{"service":"climate.set_temperature","entity_id":"climate.dining_room_thermostat","temperature":20.0}
+```
+
+The new target is the next mark of 0.5 °C down or up (`STEP` in
+`shared/src/temperature.rs`). For example, + changes 19.5 to 20.0 and 19.3 to 19.5,
+and − changes 19.5 to 19.0 and 19.7 to 19.5. If the user taps again before Home
+Assistant confirms the step, the next step starts from the target of the earlier step.
+The dashboard does not know the limits of the thermostat, so it sends each step. The
+automation keeps the target from `min_temp` to `max_temp` of the entity. A climate
+tile shows the − and + buttons only while the thermostat has a target temperature and
+its state is not `unavailable` or `unknown`.
+
 The Home Assistant automation `dashboard_commands` (Dashboard commands) calls the
 service. It calls the service only if all of these conditions are true:
 
 - The payload is a JSON object.
-- `service` is `light.toggle`, `switch.toggle`, `scene.turn_on` or `light.turn_on`.
+- `service` is `light.toggle`, `switch.toggle`, `scene.turn_on`, `light.turn_on` or
+  `climate.set_temperature`.
 - `entity_id` is one entity id, and its domain is the same as the domain of the
   service. For example, `light.toggle` with `switch.kettle` does nothing.
 - For `light.turn_on`, the payload has `brightness_step_pct`, and its value is an
   integer from -100 to 100. The automation gives it to the service as `data`.
+- For `climate.set_temperature`, the payload has `temperature`, and its value is a
+  number. The automation sets it to a value from `min_temp` to `max_temp` of the
+  entity, and gives it to the service as `data`.
 - The payload has no other keys.
 
 The automation ignores a command that does not agree with these conditions. It sends
@@ -170,8 +190,10 @@ automation runs in `queued` mode, so Home Assistant does each command in sequenc
 Until the result comes back, the dashboard shows the tile or the scene button with a
 pattern of black and white pixels. The dashboard removes the pattern when the state
 stream confirms the call. For a toggle, the state changes, and `last_updated` is later
-than the time at the tap. For a step, `last_updated` is later than the time at the
-tap. Thus the state stream must publish `last_updated` (`publish_timestamps: true`).
+than the time at the tap. For a brightness step, `last_updated` is later than the
+time at the tap. For a step of a thermostat, `last_updated` is later than the time at
+the tap, and the `temperature` attribute is the target of the step. A change of the
+current temperature alone does not confirm the step. Thus the state stream must publish `last_updated` (`publish_timestamps: true`).
 If Home Assistant does not confirm the call in 5 seconds, the tile shows the last
 state again. A call that changes nothing shows the pattern for these 5 seconds. A scene
 has no state, so its button shows the pattern for 2 seconds. Refer to

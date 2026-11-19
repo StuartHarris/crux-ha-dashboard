@@ -73,14 +73,23 @@ fn set_state(model: &mut crate::Model, entity_id: &str, state: &str) {
     model.entities.apply(pages, &topic, state.as_bytes());
 }
 
+/// Gives the entity `entity_id` the attribute `name` with the JSON value
+/// `value` in `model`, as a message on the state stream does.
+fn set_attribute(model: &mut crate::Model, entity_id: &str, name: &str, value: &str) {
+    let (domain, object_id) = entity_id.split_once('.').expect("an entity id");
+    let topic = alloc::format!("{STATESTREAM}/{domain}/{object_id}/{name}");
+    let pages = model.pages;
+    model.entities.apply(pages, &topic, value.as_bytes());
+}
+
 /// A tap on the + button of the tile with `index`.
-const fn tap_brighter(index: usize) -> Event {
-    Event::Tapped(Some(Control::Brighter(index)))
+const fn tap_plus(index: usize) -> Event {
+    Event::Tapped(Some(Control::Plus(index)))
 }
 
 /// A tap on the − button of the tile with `index`.
-const fn tap_dimmer(index: usize) -> Event {
-    Event::Tapped(Some(Control::Dimmer(index)))
+const fn tap_minus(index: usize) -> Event {
+    Event::Tapped(Some(Control::Minus(index)))
 }
 
 /// A tap on the scene button with `index`.

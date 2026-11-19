@@ -210,9 +210,15 @@ fn pending_tiles_and_a_pending_scene_match_their_reference_image() {
     let mut shell = FixedShell::start(PowerSource::Stand, "/room/dining_room");
     shell.set_state("light.dining_room_lights", "on", &[("brightness", "255")]);
     shell.set_state("light.dining_room_candle_light_right", "off", &[]);
+    shell.set_state(
+        "climate.dining_room_thermostat",
+        "heat",
+        &[("current_temperature", "20.3"), ("temperature", "19.5")],
+    );
     // The fixed shell does not answer service calls, so each tap waits.
-    shell.send(tap(Control::Dimmer(0)));
+    shell.send(tap(Control::Minus(0)));
     shell.send(tap(Control::Tile(3)));
+    shell.send(tap(Control::Plus(4)));
     shell.send(tap(Control::Scene(0)));
     let view = shell.view();
     let tiles = view.tiles();
@@ -221,6 +227,12 @@ fn pending_tiles_and_a_pending_scene_match_their_reference_image() {
     assert_eq!(tiles[0].detail, "100%");
     assert_eq!(tiles[3].state, TileState::Pending);
     assert_eq!(tiles[3].text, "Off");
+    // The thermostat keeps the target of Home Assistant until it confirms
+    // the step.
+    assert_eq!(tiles[4].state, TileState::Pending);
+    assert!(tiles[4].steps);
+    assert_eq!(tiles[4].text, "20.3°");
+    assert_eq!(tiles[4].detail, "Set 19.5°");
     assert!(view.scenes()[0].pending);
     assert_all_match(&check("pending", &view).into_iter().collect::<Vec<_>>());
 }
