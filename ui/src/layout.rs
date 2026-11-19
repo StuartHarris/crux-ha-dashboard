@@ -43,8 +43,9 @@ pub const STEP_HEIGHT: u32 = 72;
 /// The width of the − and + buttons, about 10 mm.
 ///
 /// The − button is at the left end of the tile and the + button is at the
-/// right end. The space between them has the brightness, and a tap in it
-/// toggles the light.
+/// right end. On a light tile, the space between them has the brightness,
+/// and a tap in it toggles the light. On a climate tile, the space has the
+/// target temperature.
 pub const STEP_WIDTH: u32 = 96;
 
 /// The top of the row of scene buttons.
@@ -165,7 +166,7 @@ pub const fn tile(index: usize) -> Option<Rectangle> {
 /// The button is at the bottom left of the tile. Only a tile with steps
 /// (`TileView::steps`) has it.
 #[must_use]
-pub const fn tile_dimmer(index: usize) -> Option<Rectangle> {
+pub const fn tile_minus(index: usize) -> Option<Rectangle> {
     let Some(tile) = tile(index) else {
         return None;
     };
@@ -180,7 +181,7 @@ pub const fn tile_dimmer(index: usize) -> Option<Rectangle> {
 /// The button is at the bottom right of the tile. Only a tile with steps
 /// (`TileView::steps`) has it.
 #[must_use]
-pub const fn tile_brighter(index: usize) -> Option<Rectangle> {
+pub const fn tile_plus(index: usize) -> Option<Rectangle> {
     let Some(tile) = tile(index) else {
         return None;
     };
@@ -302,24 +303,21 @@ mod tests {
     fn the_step_buttons_are_at_the_bottom_corners_of_their_tile() {
         for index in 0..MAX_TILES {
             let tile = tile(index).unwrap();
-            let dimmer = tile_dimmer(index).unwrap();
-            let brighter = tile_brighter(index).unwrap();
-            for button in [dimmer, brighter] {
+            let minus = tile_minus(index).unwrap();
+            let plus = tile_plus(index).unwrap();
+            for button in [minus, plus] {
                 assert_eq!(tile.intersection(&button), button);
                 assert_eq!(bottom(button), bottom(tile));
                 assert_eq!(button.size, Size::new(STEP_WIDTH, STEP_HEIGHT));
             }
-            assert_eq!(dimmer.top_left.x, tile.top_left.x);
-            assert_eq!(
-                brighter.bottom_right().unwrap(),
-                tile.bottom_right().unwrap()
-            );
+            assert_eq!(minus.top_left.x, tile.top_left.x);
+            assert_eq!(plus.bottom_right().unwrap(), tile.bottom_right().unwrap());
             // The space between the two buttons is at least one button wide.
-            let gap = brighter.top_left.x - dimmer.bottom_right().unwrap().x - 1;
+            let gap = plus.top_left.x - minus.bottom_right().unwrap().x - 1;
             assert!(gap >= STEP_WIDTH.cast_signed(), "{gap}");
         }
-        assert_eq!(tile_dimmer(MAX_TILES), None);
-        assert_eq!(tile_brighter(MAX_TILES), None);
+        assert_eq!(tile_minus(MAX_TILES), None);
+        assert_eq!(tile_plus(MAX_TILES), None);
     }
 
     #[test]

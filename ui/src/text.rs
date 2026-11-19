@@ -68,6 +68,15 @@ impl Anchor {
         }
     }
 
+    /// The point is at the top right of the text.
+    pub const fn top_right(point: Point) -> Self {
+        Self {
+            point,
+            vertical: VerticalPosition::Top,
+            horizontal: HorizontalAlignment::Right,
+        }
+    }
+
     /// The point is at the centre of the text.
     pub const fn center(point: Point) -> Self {
         Self {

@@ -117,10 +117,12 @@ const _: () = assert!(layout::STEP_HEIGHT >= 2 * STEP_INSET + SIGN_LENGTH);
 ///   button has the name of the room and its summary.
 /// - The footer, as on a room page.
 ///
-/// A dimmable light tile that is on or off (`TileView::steps`) has its label
-/// at the top. Below the label is a
-/// strip with a − button at the left end, a + button at the right end, and
-/// the brightness and the on/off indicator between them.
+/// A tile with steps (`TileView::steps`) has its label at the top. Below the
+/// label is a strip with a − button at the left end and a + button at the
+/// right end. On a dimmable light tile, the strip has the brightness and the
+/// on/off indicator between the buttons. On a climate tile, the current
+/// temperature is at the right end of the line of the label, and the strip
+/// has the target temperature between the buttons.
 ///
 /// The screen is black and white, so a partial refresh of the panel is clean.
 /// A light or a switch that is on is a black tile with white text. A tile
@@ -150,10 +152,10 @@ where
                     draw_tile(tile, area, display)?;
                 }
                 if tile.steps
-                    && let (Some(dimmer), Some(brighter)) =
-                        (layout::tile_dimmer(index), layout::tile_brighter(index))
+                    && let (Some(minus), Some(plus)) =
+                        (layout::tile_minus(index), layout::tile_plus(index))
                 {
-                    draw_steps(tile, dimmer, brighter, display)?;
+                    draw_steps(tile, minus, plus, display)?;
                 }
             }
             for (index, scene) in room.scenes.iter().enumerate().take(MAX_SCENES) {
@@ -599,10 +601,19 @@ where
     let top = area.top_left.y.unsigned_abs();
     let inner = area.size.width - 2 * PADDING;
 
-    // A tile with steps shows its indicator and its brightness in the strip
-    // with the − and + buttons. Refer to `draw_steps`.
+    // A light tile with steps shows its indicator and its brightness in the
+    // strip with the − and + buttons. A climate tile with steps shows its
+    // value at the right end of the line of the label, and its detail in the
+    // strip. Refer to `draw_steps`.
+    let value_width = if tile.steps && !toggle {
+        text::width(&VALUE_SMALL, &tile.text).min(inner / 2)
+    } else {
+        0
+    };
     let label_width = if toggle && !tile.steps {
         inner - INDICATOR - PADDING
+    } else if value_width > 0 {
+        inner - value_width - PADDING
     } else {
         inner
     };
@@ -616,6 +627,19 @@ where
         outline,
     )?;
     if tile.steps {
+        if value_width > 0 {
+            // `VALUE_SMALL` has the same height as `LABEL`, so the two texts
+            // have the same top and the same baseline.
+            text::draw_fitted_outlined(
+                display,
+                &[&VALUE_SMALL],
+                &tile.text,
+                Anchor::top_right(point(left + inner, top + 12)),
+                value_width,
+                ink,
+                outline,
+            )?;
+        }
         return Ok(());
     }
 
@@ -655,14 +679,15 @@ where
     Ok(())
 }
 
-/// Draws the strip of a tile with steps: the − button in `dimmer`, the +
-/// button in `brighter`, and the brightness and the on/off indicator in the
-/// middle. The tile is black when the light is on, so the strip uses the ink
-/// of the tile.
+/// Draws the strip of a tile with steps: the − button in `minus`, the +
+/// button in `plus`, and the detail in the middle. The detail of a light is
+/// its brightness, and the on/off indicator follows it. The detail of a
+/// thermostat is its target temperature, with no indicator. The tile is
+/// black when the light is on, so the strip uses the ink of the tile.
 fn draw_steps<D>(
     tile: &TileView,
-    dimmer: Rectangle,
-    brighter: Rectangle,
+    minus: Rectangle,
+    plus: Rectangle,
     display: &mut D,
 ) -> Result<(), D::Error>
 where
@@ -672,42 +697,60 @@ where
     let ink = if on { WHITE } else { BLACK };
     let outline = pending_outline(tile.state == TileState::Pending);
     let fill = outline;
-    draw_step_button(dimmer, false, ink, fill, display)?;
-    draw_step_button(brighter, true, ink, fill, display)?;
+    draw_step_button(minus, false, ink, fill, display)?;
+    draw_step_button(plus, true, ink, fill, display)?;
 
     // The middle of the strip, between the two buttons. The borders of the
     // buttons are inside their touch areas, so the text can use all the
     // space between the touch areas.
-    let middle_left = dimmer.top_left.x.unsigned_abs() + layout::STEP_WIDTH;
+    let middle_left = minus.top_left.x.unsigned_abs() + layout::STEP_WIDTH;
     let center_x = middle_left + STRIP_MIDDLE / 2;
-    let center_y = dimmer.center().y.unsigned_abs();
+    let center_y = minus.center().y.unsigned_abs();
 
-    let fonts = [&BUTTON, &DETAIL];
+    // Only a light or a switch has the on/off indicator, with a gap before
+    // it.
+    let indicator = matches!(tile.kind, TileKind::Light | TileKind::Switch);
+    let (indicator_width, gap) = if indicator {
+        (INDICATOR, STRIP_GAP)
+    } else {
+        (0, 0)
+    };
+    // The target of a thermostat, for example `Set 21.5°`, does not fit in
+    // `BUTTON`. It always uses `DETAIL`, so the font does not change from one
+    // step to the next.
+    let fonts: &[_] = if indicator {
+        &[&BUTTON, &DETAIL]
+    } else {
+        &[&DETAIL]
+    };
     let text_width = if tile.detail.is_empty() {
         0
     } else {
-        let max_width = STRIP_MIDDLE - INDICATOR - STRIP_GAP;
-        let width = fonts
+        let max_width = STRIP_MIDDLE - indicator_width - gap;
+        fonts
             .iter()
             .map(|font| text::width(font, &tile.detail))
             .find(|width| *width <= max_width)
-            .unwrap_or(max_width);
-        width + STRIP_GAP
+            .unwrap_or(max_width)
     };
-    let start = center_x - u32::midpoint(text_width, INDICATOR);
+    let gap = if text_width > 0 { gap } else { 0 };
+    let start = center_x - (text_width + gap + indicator_width) / 2;
     if text_width > 0 {
         text::draw_fitted_outlined(
             display,
-            &fonts,
+            fonts,
             &tile.detail,
             Anchor::center_left(point(start, center_y)),
-            text_width - STRIP_GAP,
+            text_width,
             ink,
             outline,
         )?;
     }
+    if !indicator {
+        return Ok(());
+    }
     let indicator = Circle::new(
-        point(start + text_width, center_y - INDICATOR / 2),
+        point(start + text_width + gap, center_y - INDICATOR / 2),
         INDICATOR,
     );
     draw_indicator(tile.state, indicator, display)
@@ -1031,8 +1074,9 @@ pub mod tests {
     }
 
     pub fn view() -> ViewModel {
-        let mut climate = tile("Thermostat", TileKind::Climate, TileState::Value, "19.5°");
-        climate.detail = "Set 21°".into();
+        let mut climate = tile("Thermostat", TileKind::Climate, TileState::Value, "20.3°");
+        climate.detail = "Set 19.5°".into();
+        climate.steps = true;
         ViewModel {
             path: "/room/living_room".into(),
             title: "Living room".into(),
@@ -1248,23 +1292,23 @@ pub mod tests {
             (0, Gray4::WHITE, Gray4::BLACK),
             (1, Gray4::BLACK, Gray4::WHITE),
         ] {
-            let dimmer = layout::tile_dimmer(index).unwrap();
-            let brighter = layout::tile_brighter(index).unwrap();
+            let minus = layout::tile_minus(index).unwrap();
+            let plus = layout::tile_plus(index).unwrap();
             // Both signs have a bar across the centre. Only the + has a bar
             // above the centre.
             let above = Point::new(0, 10);
-            assert_eq!(frame.pixel(dimmer.center()), Some(ink), "{index}");
-            assert_eq!(frame.pixel(brighter.center()), Some(ink), "{index}");
-            assert_eq!(frame.pixel(dimmer.center() - above), Some(paper), "{index}");
-            assert_eq!(frame.pixel(brighter.center() - above), Some(ink), "{index}");
+            assert_eq!(frame.pixel(minus.center()), Some(ink), "{index}");
+            assert_eq!(frame.pixel(plus.center()), Some(ink), "{index}");
+            assert_eq!(frame.pixel(minus.center() - above), Some(paper), "{index}");
+            assert_eq!(frame.pixel(plus.center() - above), Some(ink), "{index}");
             // The border of each button is inside its touch area.
             let border = |area: embedded_graphics::primitives::Rectangle| {
                 Point::new(area.center().x, area.top_left.y + 9)
             };
-            assert_eq!(frame.pixel(border(dimmer)), Some(ink), "{index}");
-            assert_eq!(frame.pixel(border(brighter)), Some(ink), "{index}");
+            assert_eq!(frame.pixel(border(minus)), Some(ink), "{index}");
+            assert_eq!(frame.pixel(border(plus)), Some(ink), "{index}");
             assert_eq!(
-                frame.pixel(Point::new(dimmer.center().x, dimmer.top_left.y + 4)),
+                frame.pixel(Point::new(minus.center().x, minus.top_left.y + 4)),
                 Some(paper),
                 "{index}"
             );
@@ -1283,7 +1327,7 @@ pub mod tests {
 
         // The strip of the tile that is off has a ring in its centre. The
         // strip of the tile that is on has the brightness and a white dot.
-        let strip_middle = layout::tile_dimmer(0).unwrap().center().y;
+        let strip_middle = layout::tile_minus(0).unwrap().center().y;
         let middle = |area: embedded_graphics::primitives::Rectangle| {
             Point::new(area.center().x, strip_middle)
         };
@@ -1457,6 +1501,28 @@ pub mod tests {
     #[test]
     fn the_widest_percent_fits_in_its_box() {
         assert!(crate::text::width(&crate::text::LABEL, "100%") <= super::PERCENT_WIDTH);
+    }
+
+    #[test]
+    fn the_text_of_each_climate_tile_with_steps_fits() {
+        use crate::text::{DETAIL, LABEL, VALUE_SMALL, width};
+        let inner = layout::CELL_WIDTH - 2 * super::PADDING;
+        // The widest usual values: a current temperature with one decimal
+        // place, and a target with one decimal place.
+        let value = width(&VALUE_SMALL, "88.8°");
+        let tiles = shared::pages::PAGES
+            .iter()
+            .flat_map(|page| page.tiles)
+            .filter(|tile| tile.kind == TileKind::Climate);
+        for tile in tiles {
+            assert!(
+                width(&LABEL, tile.label) + super::PADDING + value <= inner,
+                "{}",
+                tile.label
+            );
+        }
+        assert!(value <= inner / 2);
+        assert!(width(&DETAIL, "Set 88.8°") <= super::STRIP_MIDDLE);
     }
 
     #[test]

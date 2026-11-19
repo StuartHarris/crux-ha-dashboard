@@ -237,20 +237,26 @@ pub enum Control {
     Room(usize),
     /// The + button of the tile with this index on the current page.
     ///
-    /// Only a dimmable light that is on or off has this button. Refer to
-    /// [`Tile::has_steps`](crate::layout::Tile::has_steps). A tap increases
-    /// the brightness by
-    /// [`BRIGHTNESS_STEP_PCT`](crate::layout::BRIGHTNESS_STEP_PCT) percent.
-    /// If the light is off, the tap turns it on at that brightness.
-    Brighter(usize),
+    /// Only a tile with steps has this button. Refer to
+    /// [`Tile::has_steps`](crate::layout::Tile::has_steps).
+    ///
+    /// - On a dimmable light, a tap increases the brightness by
+    ///   [`BRIGHTNESS_STEP_PCT`](crate::layout::BRIGHTNESS_STEP_PCT) percent.
+    ///   If the light is off, the tap turns it on at that brightness.
+    /// - On a thermostat, a tap sets the target temperature to the next mark
+    ///   of [`STEP`](crate::temperature::STEP) up.
+    Plus(usize),
     /// The − button of the tile with this index on the current page.
     ///
-    /// Only a dimmable light that is on or off has this button. A tap
-    /// decreases the brightness by
-    /// [`BRIGHTNESS_STEP_PCT`](crate::layout::BRIGHTNESS_STEP_PCT) percent.
-    /// If the brightness gets to 0, Home Assistant turns the light off. A tap
-    /// on a light that is off does nothing.
-    Dimmer(usize),
+    /// Only a tile with steps has this button.
+    ///
+    /// - On a dimmable light, a tap decreases the brightness by
+    ///   [`BRIGHTNESS_STEP_PCT`](crate::layout::BRIGHTNESS_STEP_PCT) percent.
+    ///   If the brightness gets to 0, Home Assistant turns the light off. A
+    ///   tap on a light that is off does nothing.
+    /// - On a thermostat, a tap sets the target temperature to the next mark
+    ///   of [`STEP`](crate::temperature::STEP) down.
+    Minus(usize),
 }
 
 /// The effects that the core asks the shell to do.

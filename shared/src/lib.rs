@@ -12,6 +12,8 @@
 //!   crate draws.
 //! - [`summary`] makes the summary of each room on the index page.
 //! - [`pages`] is the layout data. Edit it to change the dashboard.
+//! - [`temperature`] reads the target temperature of a thermostat and
+//!   gives the steps of the − and + buttons of a climate tile.
 //! - [`local_time`] gives the UK time, with summer time, for each time that
 //!   the view shows.
 //! - `fixtures` (with the `fixtures` feature) is a shell with fixed answers,
@@ -34,6 +36,7 @@ pub mod local_time;
 pub mod pages;
 pub mod route;
 pub mod summary;
+pub mod temperature;
 pub mod view;
 
 #[cfg(test)]

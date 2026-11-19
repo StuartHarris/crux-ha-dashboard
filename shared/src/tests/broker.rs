@@ -38,13 +38,21 @@ struct Connection {
 }
 
 /// A service call that the fake Home Assistant got.
-#[derive(Deserialize, Debug, PartialEq, Eq)]
+#[derive(Deserialize, Debug, PartialEq)]
 pub struct ServiceCall {
     pub service: String,
     pub entity_id: String,
     /// The change in brightness of a `light.turn_on` call, in percent.
     pub brightness_step_pct: Option<i8>,
+    /// The target temperature of a `climate.set_temperature` call, in
+    /// degrees.
+    pub temperature: Option<f64>,
 }
+
+/// The lowest target temperature of a thermostat (`min_temp`).
+pub const MIN_TEMP: f64 = 10.0;
+/// The highest target temperature of a thermostat (`max_temp`).
+pub const MAX_TEMP: f64 = 32.0;
 
 /// The fake broker.
 #[derive(Default)]
@@ -239,6 +247,11 @@ impl Broker {
             self.step_brightness(&call.entity_id.clone(), step);
             return;
         }
+        if let ("climate.set_temperature", Some(target)) = (call.service.as_str(), call.temperature)
+        {
+            self.set_temperature(&call.entity_id.clone(), target);
+            return;
+        }
         let Some((domain, action)) = call.service.split_once('.') else {
             return;
         };
@@ -278,6 +291,28 @@ impl Broker {
         } else {
             self.set_state(entity_id, "on", &[("brightness", &next.to_string())]);
         }
+    }
+}
+
+impl Broker {
+    /// Sets the target temperature of a thermostat, as
+    /// `climate.set_temperature` does through the command automation. The
+    /// automation keeps the target from [`MIN_TEMP`] to [`MAX_TEMP`]. If the
+    /// target does not change, Home Assistant publishes nothing.
+    fn set_temperature(&mut self, entity_id: &str, target: f64) {
+        let Some(object_id) = entity_id.strip_prefix("climate.") else {
+            return;
+        };
+        let topic = format!("{STATESTREAM}/climate/{object_id}/temperature");
+        // Home Assistant publishes a float attribute as JSON, for example
+        // `20.0`.
+        let value =
+            serde_json::to_string(&target.clamp(MIN_TEMP, MAX_TEMP)).expect("a float as JSON");
+        if self.retained(&topic) == Some(value.as_str()) {
+            return;
+        }
+        let state = self.state(entity_id).unwrap_or("heat").to_string();
+        self.set_state(entity_id, &state, &[("temperature", &value)]);
     }
 }
 

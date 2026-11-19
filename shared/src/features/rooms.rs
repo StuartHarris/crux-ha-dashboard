@@ -13,21 +13,27 @@ use crate::{
         power,
         refresh::redraw,
     },
-    layout::{BRIGHTNESS_STEP_PCT, Page},
+    layout::{BRIGHTNESS_STEP_PCT, Page, Tile, TileKind},
     route::Route,
+    temperature,
     view::light_percent,
 };
 
 /// The JSON payload of a service call for Home Assistant.
 ///
 /// The payload has `brightness_step_pct` only for a step of a dimmable
-/// light. Refer to `docs/mqtt.md`.
+/// light, and `temperature` only for a step of a thermostat. Refer to
+/// `docs/mqtt.md`.
 #[derive(Serialize)]
 struct ServiceCall<'a> {
     service: &'a str,
     entity_id: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     brightness_step_pct: Option<i8>,
+    /// The target temperature in degrees. It is always a mark of
+    /// [`temperature::STEP`], so the float is exact.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
 }
 
 impl<'a> ServiceCall<'a> {
@@ -37,6 +43,7 @@ impl<'a> ServiceCall<'a> {
             service,
             entity_id,
             brightness_step_pct: None,
+            temperature: None,
         }
     }
 }
@@ -61,8 +68,8 @@ pub fn tapped(control: Option<Control>, model: &mut Model) -> Cmd {
         Some(Control::Scene(index)) => scene_tapped(index, model),
         Some(Control::AllLights) => all_lights_tapped(model),
         Some(Control::Room(index)) => room_tapped(index, model),
-        Some(Control::Brighter(index)) => step_tapped(index, BRIGHTNESS_STEP_PCT, model),
-        Some(Control::Dimmer(index)) => step_tapped(index, -BRIGHTNESS_STEP_PCT, model),
+        Some(Control::Plus(index)) => step_tapped(index, true, model),
+        Some(Control::Minus(index)) => step_tapped(index, false, model),
     };
     light.and(action)
 }
@@ -120,40 +127,101 @@ fn tile_tapped(index: usize, model: &mut Model) -> Cmd {
     call_service(model, &call, Confirm::Toggle).and(idle)
 }
 
-/// Changes the brightness of the light of the tile by `step` percent. The
-/// device is awake.
+/// Acts on a tap on the + button (if `up` is `true`) or the − button of the
+/// tile with `index`. The device is awake.
 ///
 /// The core acts only if the tile has the − and + buttons now. Refer to
-/// [`Tile::has_steps`](crate::layout::Tile::has_steps). The core also
-/// ignores a − step on a light that is off and a + step on a light that is
-/// on at 100%, because Home Assistant does nothing for them. The core reads
-/// the brightness as the tile shows it. If the core does not act, the tap
-/// only starts the idle time again. It sends no call and gives no mark.
-///
-/// The core sends `light.turn_on` with `brightness_step_pct`. If a light is
-/// off, a + step turns it on at that brightness. Home Assistant turns a light
-/// off when its brightness gets to 0. The tile shows the new brightness when
-/// it comes back on the state stream.
-fn step_tapped(index: usize, step: i8, model: &mut Model) -> Cmd {
+/// [`Tile::has_steps`]. If the core does not act, the tap only starts the
+/// idle time again. It sends no call and gives no mark.
+fn step_tapped(index: usize, up: bool, model: &mut Model) -> Cmd {
     let idle = power::restart_idle_timer(model);
     let Some(tile) = current_room(model).and_then(|page| page.tiles.get(index)) else {
         return idle;
     };
-    let state = model.entities.state(tile.entity_id);
-    let full = model.entities.get(tile.entity_id).and_then(light_percent) == Some(100);
-    let no_change = match state {
-        Some("off") => step < 0,
-        Some("on") => step > 0 && full,
-        _ => false,
-    };
-    if !tile.has_steps(state) || no_change {
+    if !tile.has_steps(model.entities.get(tile.entity_id)) {
         return idle;
     }
+    let step = match tile.kind {
+        TileKind::Climate => temperature_step(tile, up, model),
+        _ => brightness_step(tile, up, model),
+    };
+    match step {
+        Some((call, confirm)) => call_service(model, &call, confirm).and(idle),
+        None => idle,
+    }
+}
+
+/// Returns the call that changes the brightness of the light of the tile by
+/// [`BRIGHTNESS_STEP_PCT`], up or down.
+///
+/// Returns `None` for a − step on a light that is off and a + step on a
+/// light that is on at 100%, because Home Assistant does nothing for them.
+/// The core reads the brightness as the tile shows it.
+///
+/// The call is `light.turn_on` with `brightness_step_pct`. If a light is
+/// off, a + step turns it on at that brightness. Home Assistant turns a light
+/// off when its brightness gets to 0. The tile shows the new brightness when
+/// it comes back on the state stream.
+fn brightness_step(
+    tile: &Tile,
+    up: bool,
+    model: &Model,
+) -> Option<(ServiceCall<'static>, Confirm)> {
+    let entity = model.entities.get(tile.entity_id);
+    let full = entity.and_then(light_percent) == Some(100);
+    let no_change = match entity.and_then(|entity| entity.state.as_deref()) {
+        Some("off") => !up,
+        Some("on") => up && full,
+        _ => false,
+    };
+    if no_change {
+        return None;
+    }
+    let step = if up {
+        BRIGHTNESS_STEP_PCT
+    } else {
+        -BRIGHTNESS_STEP_PCT
+    };
     let call = ServiceCall {
         brightness_step_pct: Some(step),
         ..ServiceCall::new("light.turn_on", tile.entity_id)
     };
-    call_service(model, &call, Confirm::Step).and(idle)
+    Some((call, Confirm::Step))
+}
+
+/// Returns the call that sets the target temperature of the thermostat of
+/// the tile to the next mark of [`temperature::STEP`], up or down. Returns
+/// `None` if the core has no target temperature, but a tile with steps
+/// always has one.
+///
+/// If an earlier step waits for Home Assistant, the step starts from the
+/// target of that step. Refer to [`pending::requested_target`]. Thus two
+/// quick taps on + change 20 °C to 21 °C, not to 20.5 °C twice.
+///
+/// The call is `climate.set_temperature` with `temperature`. The core does
+/// not know the limits of the thermostat, so it always sends the call. Home
+/// Assistant keeps the target in the limits.
+fn temperature_step(
+    tile: &Tile,
+    up: bool,
+    model: &Model,
+) -> Option<(ServiceCall<'static>, Confirm)> {
+    let from = pending::requested_target(model, tile.entity_id).or_else(|| {
+        model
+            .entities
+            .get(tile.entity_id)
+            .and_then(temperature::target)
+    })?;
+    let target = if up {
+        temperature::up(from)
+    } else {
+        temperature::down(from)
+    };
+    let call = ServiceCall {
+        temperature: Some(temperature::degrees(target)),
+        ..ServiceCall::new("climate.set_temperature", tile.entity_id)
+    };
+    Some((call, Confirm::Target(target)))
 }
 
 /// Turns on the scene. The device is awake.

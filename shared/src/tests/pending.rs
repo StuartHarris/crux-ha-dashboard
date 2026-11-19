@@ -11,7 +11,7 @@ use super::{
     connection::{drive_to_connected, drive_to_connecting, send, topic},
     set_state,
     shell::Shell,
-    start_at, tap_brighter, tap_scene, tap_tile,
+    start_at, tap_minus, tap_plus, tap_scene, tap_tile,
 };
 use crate::{
     Cmd, Dashboard, EffectTestExt, Event, Model, PowerSource, Route, TileState,
@@ -132,7 +132,7 @@ fn a_tap_marks_the_tile_until_a_newer_last_updated_confirms_it() {
 fn a_confirm_with_no_other_change_draws_after_the_draw_delay() {
     let app = Dashboard;
     let (mut model, mut cmd, mut request) = lamp_on();
-    let _ = app.update(tap_brighter(1), &mut model);
+    let _ = app.update(tap_plus(1), &mut model);
 
     // Home Assistant changed the brightness. The state and the minute did not
     // change, but the time of the last update confirms the step. Only the
@@ -190,7 +190,7 @@ fn a_step_keeps_the_brightness_text_while_it_waits() {
         "128",
     );
 
-    app.update(tap_brighter(1), &mut model)
+    app.update(tap_plus(1), &mut model)
         .expect_touch_light(STAND_LEVEL)
         .expect_only_service_call();
     let view = app.view(&model);
@@ -483,7 +483,7 @@ fn a_step_with_no_time_at_the_tap_ends_only_at_the_timeout() {
     model.route = Route::room("living_room");
     // The core has the state of the lamp, but no time.
     set_state(&mut model, LAMP, "on");
-    let _ = app.update(tap_brighter(1), &mut model);
+    let _ = app.update(tap_plus(1), &mut model);
 
     let _ = lamp_updated(&mut model, &mut cmd, &mut request, BEFORE + 1);
     assert_eq!(tile_state(&model, 1), TileState::Pending);
@@ -557,4 +557,177 @@ fn a_mark_whose_call_cannot_go_out_ends_after_the_queued_timeout() {
         .expect_mqtt_publish()
         .expect_mqtt_subscribe();
     assert!(model.pending.marks.is_empty());
+}
+
+/// The thermostat: tile 4 on the page of the dining room.
+const THERMOSTAT: &str = "climate.dining_room_thermostat";
+
+/// Drives the core to an open connection on the stand, on the page of the
+/// dining room. The thermostat heats at 20.3 °C, with the target 19.5 °C and
+/// a `last_updated` time of [`BEFORE`].
+fn thermostat_heats() -> (Model, Cmd, Request<Connect>) {
+    let (mut model, mut cmd, mut request) = drive_to_connected(PowerSource::Stand);
+    model.route = Route::room("dining_room");
+    let updated = iso_time(BEFORE);
+    let mut first = Cmd::done();
+    for (index, (key, payload)) in [
+        ("state", "heat"),
+        ("last_updated", updated.as_str()),
+        ("current_temperature", "20.3"),
+        ("temperature", "19.5"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let command = send(
+            &mut model,
+            &mut cmd,
+            &mut request,
+            &topic(THERMOSTAT, key),
+            payload,
+        );
+        if index == 0 {
+            first = command;
+        }
+    }
+    let _ = fire_draw_timer(&mut model, &mut first);
+    let view = Dashboard.view(&model);
+    let tile = &view.tiles()[4];
+    assert_eq!(tile.state, TileState::Value);
+    assert_eq!(tile.text, "20.3°");
+    assert_eq!(tile.detail, "Set 19.5°");
+    assert!(tile.steps);
+    (model, cmd, request)
+}
+
+#[test]
+fn a_thermostat_step_waits_for_the_new_target_and_not_only_a_newer_time() {
+    let app = Dashboard;
+    let (mut model, mut cmd, mut request) = thermostat_heats();
+
+    app.update(tap_plus(4), &mut model)
+        .expect_touch_light(STAND_LEVEL)
+        .expect_only_service_call();
+    // The tile shows the mark, with the target that Home Assistant gave.
+    let view = app.view(&model);
+    assert_eq!(view.tiles()[4].state, TileState::Pending);
+    assert_eq!(view.tiles()[4].detail, "Set 19.5°");
+
+    // The room gets warmer. The time of the last update is newer, but the
+    // target did not change, so the step waits.
+    let new = iso_time(BEFORE + 1);
+    let _ = send(
+        &mut model,
+        &mut cmd,
+        &mut request,
+        &topic(THERMOSTAT, "last_updated"),
+        &new,
+    );
+    let mut warmer = send(
+        &mut model,
+        &mut cmd,
+        &mut request,
+        &topic(THERMOSTAT, "current_temperature"),
+        "20.4",
+    );
+    assert_eq!(tile_state(&model, 4), TileState::Pending);
+    let _ = fire_draw_timer(&mut model, &mut warmer);
+
+    // Home Assistant sets the target. The time comes first, then the new
+    // target confirms the step.
+    let newer = iso_time(BEFORE + 2);
+    send(
+        &mut model,
+        &mut cmd,
+        &mut request,
+        &topic(THERMOSTAT, "last_updated"),
+        &newer,
+    )
+    .expect_no_effects();
+    assert_eq!(tile_state(&model, 4), TileState::Pending);
+    let mut target = send(
+        &mut model,
+        &mut cmd,
+        &mut request,
+        &topic(THERMOSTAT, "temperature"),
+        "20.0",
+    );
+    assert!(model.pending.marks.is_empty());
+    fire_draw_timer(&mut model, &mut target).expect_only_render();
+    let view = app.view(&model);
+    assert_eq!(view.tiles()[4].state, TileState::Value);
+    assert_eq!(view.tiles()[4].detail, "Set 20.0°");
+}
+
+#[test]
+fn the_target_of_an_earlier_step_does_not_confirm_a_later_step() {
+    let app = Dashboard;
+    let (mut model, mut cmd, mut request) = thermostat_heats();
+
+    // Two taps on + before Home Assistant answers ask for 20 °C, then 20.5 °C.
+    let _ = app.update(tap_plus(4), &mut model);
+    app.update(tap_plus(4), &mut model)
+        .expect_light_timer()
+        .expect_mqtt_publish_with(|publish| {
+            let payload = core::str::from_utf8(&publish.payload).unwrap();
+            assert!(payload.ends_with(r#""temperature":20.5}"#), "{payload}");
+        })
+        .expect_pending_timer()
+        .expect_no_effects();
+
+    // Home Assistant does the first call. Its target is not the target of
+    // the last step, so the mark stays.
+    let first = iso_time(BEFORE + 1);
+    let _ = send(
+        &mut model,
+        &mut cmd,
+        &mut request,
+        &topic(THERMOSTAT, "last_updated"),
+        &first,
+    );
+    let _ = send(
+        &mut model,
+        &mut cmd,
+        &mut request,
+        &topic(THERMOSTAT, "temperature"),
+        "20.0",
+    );
+    assert_eq!(tile_state(&model, 4), TileState::Pending);
+
+    // A third tap starts from the target that waits, not from 20 °C. The
+    // tap also draws the target that Home Assistant gave, 20 °C, with the
+    // mark.
+    app.update(tap_minus(4), &mut model)
+        .expect_light_timer()
+        .expect_mqtt_publish_with(|publish| {
+            let payload = core::str::from_utf8(&publish.payload).unwrap();
+            assert!(payload.ends_with(r#""temperature":20.0}"#), "{payload}");
+        })
+        .expect_pending_timer()
+        .expect_only_render();
+    let view = app.view(&model);
+    assert_eq!(view.tiles()[4].state, TileState::Pending);
+    assert_eq!(view.tiles()[4].detail, "Set 20.0°");
+}
+
+#[test]
+fn after_the_timeout_a_thermostat_step_starts_from_the_target_of_home_assistant() {
+    let app = Dashboard;
+    let (mut model, _cmd, _request) = thermostat_heats();
+
+    // Home Assistant does not answer, for example because the target is at
+    // its limit.
+    let _ = app.update(tap_plus(4), &mut model);
+    app.update(Event::PendingTimeout(model.pending.timer), &mut model)
+        .expect_only_render();
+    assert!(model.pending.marks.is_empty());
+    assert_eq!(tile_state(&model, 4), TileState::Value);
+
+    // The mark is gone, so the next step starts from 19.5 °C again.
+    app.update(tap_plus(4), &mut model)
+        .expect_light_timer()
+        .expect_only_service_call_with(|publish| {
+            let payload = core::str::from_utf8(&publish.payload).unwrap();
+            assert!(payload.ends_with(r#""temperature":20.0}"#), "{payload}");
+        });
 }

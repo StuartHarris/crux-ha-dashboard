@@ -223,10 +223,15 @@ pub struct TileView {
     /// it in a smaller font.
     pub detail: String,
     /// The tile has the − and + buttons: it is a dimmable light that is on
-    /// or off. Refer to [`Tile::has_steps`]. On a room page, a renderer
-    /// draws the buttons, and a tap on them sends `Control::Dimmer` and
-    /// `Control::Brighter`. If `steps` is `false`, a renderer draws the tile
-    /// as the tile of an on/off light.
+    /// or off, or a thermostat with a target temperature. Refer to
+    /// [`Tile::has_steps`]. On a room page, a renderer draws the buttons, and
+    /// a tap on them sends `Control::Minus` and `Control::Plus`.
+    ///
+    /// - A light tile with steps shows its brightness and its indicator
+    ///   between the buttons. If `steps` is `false`, a renderer draws the
+    ///   tile as the tile of an on/off light.
+    /// - A climate tile with steps shows the current temperature after its
+    ///   label and the target temperature (the detail) between the buttons.
     pub steps: bool,
 }
 
@@ -350,9 +355,10 @@ fn page_view(page: &Page, model: &Model) -> PageView {
 /// Makes the view of one tile.
 ///
 /// A tile that is on or off and has a mark has the state
-/// [`TileState::Pending`]. It keeps its text and its detail, so the layout
-/// does not move. A tile in another state keeps that state, because the
-/// renderer draws it with a different layout.
+/// [`TileState::Pending`]. A thermostat tile that shows a value and has a
+/// mark also has this state. The tile keeps its text and its detail, so the
+/// layout does not move. A tile in another state keeps that state, because
+/// the renderer draws it with a different layout.
 fn tile_view(tile: &Tile, model: &Model) -> TileView {
     let entity = model.entities.get(tile.entity_id);
     let Description {
@@ -360,13 +366,18 @@ fn tile_view(tile: &Tile, model: &Model) -> TileView {
         text,
         detail,
     } = describe(tile.kind, entity);
-    let steps = tile.has_steps(entity.and_then(|entity| entity.state.as_deref()));
+    let steps = tile.has_steps(entity);
     let detail = match entity.and_then(light_percent) {
         Some(percent) if steps && state == TileState::On => format!("{percent}%"),
         _ => detail,
     };
-    let on_or_off = matches!(state, TileState::On | TileState::Off);
-    let state = if on_or_off && is_pending(model, tile.entity_id) {
+    // A thermostat with a value has the layout of a tile that is off.
+    let markable = match state {
+        TileState::On | TileState::Off => true,
+        TileState::Value => tile.kind == TileKind::Climate,
+        TileState::Unavailable | TileState::Unknown | TileState::Pending => false,
+    };
+    let state = if markable && is_pending(model, tile.entity_id) {
         TileState::Pending
     } else {
         state
@@ -424,9 +435,9 @@ pub enum TileState {
     Unavailable,
     /// The core has no state for the entity yet, or the state is `unknown`.
     Unknown,
-    /// The light or switch was on or off, and the core sent a service call
-    /// for it that Home Assistant did not confirm yet. The tile keeps the
-    /// text of the last state. Refer to [`pending`](crate::features::pending).
+    /// The light or switch was on or off, or the thermostat showed a value,
+    /// and the core sent a service call for it that Home Assistant did not
+    /// confirm yet. The tile keeps the text of the last state. Refer to [`pending`](crate::features::pending).
     Pending,
 }
 
