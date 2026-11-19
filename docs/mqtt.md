@@ -108,6 +108,23 @@ the automation. Run `just ha-entities` for a bare list to compare with the Pi.
 The dashboard uses the client id `dashboard-<device_id>` and a keep-alive of 60
 seconds. `<device_id>` comes from `Settings::device_id`, for example `hall`.
 
+### The connect and the subscribe
+
+Each connect has a clean start, so the broker keeps no session for the dashboard.
+After each connect, the dashboard publishes the service calls that wait, then
+`online`, and then subscribes to all its exact topics. The broker sends the retained
+state of each topic with the subscribe.
+
+The `Subscribe` request of the core ends when the broker acknowledged each topic
+filter. If the broker refuses a filter, or the connection closes first, the shell
+answers `Failed`. After a `Done` answer, the core sends `WifiQuiet`. The firmware can
+then scan for a better access point. A change of access point closes the MQTT
+connection, and the core connects again.
+
+The firmware does not wait for the TCP ACK of the broker after each packet (refer to
+"MQTT transport" in `firmware/README.md`). Thus the 115 subscribe packets and the
+acknowledgements of the retained states do not each wait for a round trip.
+
 ### Commands
 
 | Topic | QoS | Retained |

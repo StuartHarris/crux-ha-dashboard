@@ -18,6 +18,9 @@
 //! - `Disconnect` ends when the stream of its connection ends, or at once if
 //!   no connection is current. `WifiOff` ends at [`Signal::RadioOff`], in the
 //!   order of the requests.
+//! - `Subscribe` ends at [`Signal::Subscribed`] for its connection. If the
+//!   stream of the connection ends first, the shell answers `Failed`. If no
+//!   connection is current, the shell answers `Failed` at once.
 //! - `Sleep` ends at [`Signal::Woke`]. While it waits, a tap is the wake
 //!   (`Wake::Touch` with the control at the point), and a change of the
 //!   power source also ends it (`Wake::PowerSource`). [`Shell::is_sleeping`] tells
@@ -41,8 +44,8 @@ use shared::{
     Core, Dashboard, Effect, Event, PowerSource, Settings, Start, ViewModel,
     capabilities::{
         light::FrontLight,
-        mqtt::{Connect, Credentials, Disconnect, MqttEvent, Publish, Subscribe},
-        network::{WifiOff, WifiOn, WifiStatus},
+        mqtt::{Connect, Credentials, Disconnect, MqttEvent, Publish, Subscribe, SubscribeOutcome},
+        network::{WifiOff, WifiOn, WifiQuiet, WifiStatus},
         power::{Sleep, Wake},
     },
 };
@@ -79,6 +82,14 @@ pub enum Signal {
     /// the tap answers it with `Wake::Touch` and the control, in place of a
     /// tap.
     Tap(Point),
+    /// The answer to the oldest `Subscribe` job of the MQTT connection with
+    /// this id.
+    Subscribed {
+        /// The id of the connection in the shell.
+        connection: u32,
+        /// The answer.
+        outcome: SubscribeOutcome,
+    },
     /// The radio is off. The answer to the oldest `WifiOff` job that waits.
     RadioOff,
     /// The device woke from a real wake. The answer to the `Sleep` job.
@@ -100,7 +111,8 @@ pub enum MqttOp {
     /// Open the connection. The MQTT task answers with the items of its
     /// stream, and the last item is always `Disconnected`.
     Connect(Connect),
-    /// Subscribe to the topic filters.
+    /// Subscribe to the topic filters. The MQTT task answers with
+    /// [`Signal::Subscribed`] when the broker acknowledged all of them.
     Subscribe(Subscribe),
     /// Publish a message.
     Publish(Publish),
@@ -146,6 +158,9 @@ pub enum Job {
         /// The operation.
         op: WifiOn,
     },
+    /// The link is quiet. The Wi-Fi task can scan for a better access point
+    /// now. No answer.
+    WifiQuiet(WifiQuiet),
     /// Turn Wi-Fi off. Stop a join that is in progress, and do not answer it.
     /// Answer with [`Signal::RadioOff`] when the radio is off.
     WifiOff(WifiOff),
@@ -195,6 +210,9 @@ pub struct Shell {
     /// The `Disconnect` requests that wait for the end of the stream of their
     /// connection.
     disconnects: Vec<(u32, Request<Disconnect>)>,
+    /// The `Subscribe` requests that wait for their answers, from the
+    /// oldest, with the ids of their connections.
+    subscribes: Vec<(u32, Request<Subscribe>)>,
     /// The `WifiOff` requests that wait for the radio, from the oldest.
     wifi_off: VecDeque<Request<WifiOff>>,
     /// The `Sleep` request that waits for a wake.
@@ -224,6 +242,7 @@ impl Shell {
             wifi: Vec::new(),
             last_wifi_token: 0,
             disconnects: Vec::new(),
+            subscribes: Vec::new(),
             wifi_off: VecDeque::new(),
             sleep: None,
             lights: Vec::new(),
@@ -277,7 +296,29 @@ impl Shell {
                     for (_, mut request) in done {
                         effects.extend(resolve(&self.core, &mut request, ()));
                     }
+                    // Its `Subscribe` requests did not get all the
+                    // acknowledgements.
+                    let (failed, waiting) = core::mem::take(&mut self.subscribes)
+                        .into_iter()
+                        .partition(|(id, _)| *id == connection);
+                    self.subscribes = waiting;
+                    for (_, mut request) in failed {
+                        let outcome = SubscribeOutcome::Failed;
+                        effects.extend(resolve(&self.core, &mut request, outcome));
+                    }
                 }
+                self.process(effects)
+            }
+            Signal::Subscribed {
+                connection,
+                outcome,
+            } => {
+                let Some(index) = self.subscribes.iter().position(|(id, _)| *id == connection)
+                else {
+                    return Vec::new();
+                };
+                let (_, mut request) = self.subscribes.remove(index);
+                let effects = resolve(&self.core, &mut request, outcome);
                 self.process(effects)
             }
             Signal::Timer { id, token } => {
@@ -402,13 +443,15 @@ impl Shell {
                 self.current = Some(id);
                 Vec::new()
             }
-            Effect::MqttSubscribe(request) => {
-                if let Some(current) = self.current {
-                    let subscribe = request.operation;
+            Effect::MqttSubscribe(mut request) => match self.current {
+                Some(current) => {
+                    let subscribe = request.operation.clone();
                     jobs.push(mqtt(current, MqttOp::Subscribe(subscribe)));
+                    self.subscribes.push((current, request));
+                    Vec::new()
                 }
-                Vec::new()
-            }
+                None => resolve(&self.core, &mut request, SubscribeOutcome::Failed),
+            },
             Effect::MqttPublish(request) => {
                 if let Some(current) = self.current {
                     jobs.push(mqtt(current, MqttOp::Publish(request.operation)));
@@ -435,6 +478,10 @@ impl Shell {
                 jobs.push(Job::WifiOff(request.operation.clone()));
                 self.wifi_off.push_back(request);
                 self.answer_wifi(|_| true, WifiStatus::Failed)
+            }
+            Effect::WifiQuiet(request) => {
+                jobs.push(Job::WifiQuiet(request.operation));
+                Vec::new()
             }
             Effect::Sleep(request) => {
                 jobs.push(Job::Sleep(request.operation.clone()));

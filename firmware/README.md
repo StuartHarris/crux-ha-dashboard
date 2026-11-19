@@ -41,9 +41,34 @@ cannot block each other. This is the pattern of the `cpb` example in Crux.
 | core (`main`) | Owns the shell. Sends `Start` with the power source `Stand`. | |
 | `timers` | Starts and cancels the timers of the core. | `Signal::Timer` |
 | `display` | Draws the newest view model with `ui::draw`, and refreshes the panel as `ui::Refresher` decides. Reads the touch controller every 30 ms between refreshes. Sets the front light. Runs the `Sleep` job. | `Signal::Tap`, `Signal::Event`, `Signal::Woke`, `Signal::Light` |
-| `wifi` | For `WifiOn`, turns the radio on, joins the network and waits for DHCP. For `WifiOff`, leaves the network and turns the radio off. | `Signal::Wifi`, `Signal::RadioOff` |
-| `mqtt` | Opens one connection at a time with `rust-mqtt` (MQTT 5) over TCP. Subscribes, publishes, sends pings, and closes. | `Signal::Mqtt` |
+| `wifi` | For `WifiOn`, turns the radio on, joins the network and waits for DHCP. For `WifiOff`, leaves the network and turns the radio off. Keeps the access point of the last good join, and joins it again with no scan of all the channels. After `WifiQuiet`, scans all the channels once, and changes to an access point that is at least 10 dB stronger. | `Signal::Wifi`, `Signal::RadioOff` |
+| `mqtt` | Opens one connection at a time with `rust-mqtt` (MQTT 5) over TCP, with a clean start. Subscribes, publishes, sends pings, and closes. | `Signal::Mqtt`, `Signal::Subscribed` |
 | `net` | Runs the network stack. | |
+
+### MQTT transport
+
+`rust-mqtt` flushes its transport after each packet, also after each automatic
+PUBACK. The `flush` of the embassy-net `TcpSocket` waits until the broker acknowledged
+all the sent data (the TCP ACK). With Wi-Fi power save, each ACK takes 30 ms to 50 ms.
+Thus the subscribe of 115 topics took about 6.5 s.
+
+The MQTT task gives `rust-mqtt` its own transport (`src/bin/dashboard/transport.rs`).
+Its `flush` returns at once if the socket can send. A `write` returns when the data is
+in the send buffer of the socket (2048 bytes), and smoltcp sends it from there.
+
+A send does not wait for the ACK, so the task finds a dead link in these ways:
+
+- A `write` waits while the send buffer is full. Each send has a limit of 10 s
+  (`WRITE_TIMEOUT`), so a send that cannot get buffer space ends the connection.
+- `logic::mqtt::AckWatch` reads the send buffer before and after each write, and when
+  its deadline comes. If data waits and no new data gets an ACK for 10 s (`ACK_LIMIT`),
+  the task ends the connection. Each new ACK starts the time again, so a long burst on
+  a slow link continues. A tap on a dead link ends the connection after about 10 s.
+- Before each ping, the task checks the silence of the broker. After 120 s with no
+  packet, the task ends the connection. The TCP timeout of the socket has the same
+  limit.
+
+The core then connects again, as after any other drop.
 
 ### Light sleep
 
@@ -286,7 +311,8 @@ Do the steps in this order. Each step needs the steps before it.
    `logic/src/touch.rs` and its tests.
 9. **Wi-Fi.** Find `step 7`. The log shows `joined` and an address.
 10. **MQTT and the retained states.** Set `read_only = true` in `cfg.toml`. Run
-    `just flash`. The log shows `mqtt: connected` and `mqtt: subscribed to N topics`,
+    `just flash`. The log shows `mqtt: connected` and
+    `mqtt: sent the subscribe for N topics`,
     and the tiles show the states from Home Assistant. The footer shows "Last changed
     HH:MM" in UK time: the latest `last_updated` time of the entities on the page. On the
     Pi, run
@@ -328,8 +354,10 @@ These items stay open:
 - VCOM is 1600 mV, the value of the vendor firmware (`src/panel/ed047tc1.rs`).
 - The core asks for a full refresh after 30 partial renders and after 30 minutes
   (`shared/src/features/refresh.rs`). Change the numbers if ghost images show.
-- `rust-mqtt` sends one topic filter in each subscribe packet. Measure the time to get
-  all retained states, and the size of the receive buffer (4096 bytes).
+- `rust-mqtt` sends one topic filter in each subscribe packet, and keeps up to 16
+  subscribe packets in flight. Measure the time to get all retained states with the
+  transport that does not wait for each TCP ACK, and the size of the receive buffer
+  (4096 bytes).
 
 ## Power check (phase 6)
 

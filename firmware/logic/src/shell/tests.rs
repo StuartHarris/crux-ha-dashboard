@@ -5,7 +5,7 @@ use embedded_graphics::prelude::Point;
 use shared::{
     Connection, Event, PowerSource,
     capabilities::{
-        mqtt::{Message, MqttEvent},
+        mqtt::{Message, MqttEvent, SubscribeOutcome},
         network::WifiStatus,
         power::Wake,
     },
@@ -47,6 +47,7 @@ fn names(jobs: &[Job]) -> Vec<String> {
             },
             Job::WifiOn { token, .. } => alloc::format!("wifi on {token}"),
             Job::WifiOff(_) => "wifi off".into(),
+            Job::WifiQuiet(_) => "wifi quiet".into(),
             Job::Sleep(_) => "sleep".into(),
             Job::FrontLight { token, level } => alloc::format!("light {level} {token}"),
             Job::Timer {
@@ -147,6 +148,85 @@ fn wifi_then_mqtt_connect_publish_the_status_and_subscribe() {
         ["publish dashboard/test/status 1", "subscribe 1", "render"]
     );
     assert_eq!(shell.view().connection, Connection::Online);
+}
+
+/// Ends the stream of connection `connection` with a lost link, fires the
+/// reconnect timer, and answers the new `WifiOn` with `wifi_token`. Returns
+/// the jobs after the broker accepts the new connection `next`.
+fn reconnect(shell: &mut Shell, connection: u32, wifi_token: u32, next: u32) -> Vec<Job> {
+    let jobs = shell.handle(Signal::Mqtt {
+        connection,
+        event: MqttEvent::Disconnected {
+            reason: Some("connection lost".into()),
+        },
+    });
+    // The only timer that the end of the stream starts is the reconnect
+    // timer.
+    let [(id, token, _)] = started_timers(&jobs)[..] else {
+        panic!("not one timer: {:?}", names(&jobs));
+    };
+    shell.handle(Signal::Timer { id, token });
+    let jobs = shell.handle(joined(wifi_token));
+    assert_eq!(names(&jobs), [alloc::format!("connect {next}")]);
+    shell.handle(Signal::Mqtt {
+        connection: next,
+        event: MqttEvent::Connected,
+    })
+}
+
+#[test]
+fn each_connection_subscribes_again() {
+    let mut shell = online(true);
+    shell.handle(Signal::Subscribed {
+        connection: 1,
+        outcome: SubscribeOutcome::Done,
+    });
+
+    let jobs = reconnect(&mut shell, 1, 2, 2);
+    assert_eq!(
+        names(&jobs),
+        ["publish dashboard/test/status 2", "subscribe 2", "render"]
+    );
+}
+
+#[test]
+fn the_subscribe_answer_makes_the_link_quiet() {
+    let mut shell = online(true);
+    let jobs = shell.handle(Signal::Subscribed {
+        connection: 1,
+        outcome: SubscribeOutcome::Done,
+    });
+    assert_eq!(names(&jobs), ["wifi quiet"]);
+}
+
+#[test]
+fn the_end_of_the_stream_fails_the_subscribe_that_waits() {
+    let mut shell = online(true);
+
+    // The stream ends before the answer, so the shell answers `Failed`, and
+    // the link is not quiet. The new connection subscribes again.
+    let jobs = reconnect(&mut shell, 1, 2, 2);
+    assert!(!names(&jobs).contains(&"wifi quiet".into()));
+    assert_eq!(
+        names(&jobs),
+        ["publish dashboard/test/status 2", "subscribe 2", "render"]
+    );
+    // A late answer for the old connection has no request.
+    let late = Signal::Subscribed {
+        connection: 1,
+        outcome: SubscribeOutcome::Done,
+    };
+    assert_eq!(shell.handle(late), Vec::new());
+}
+
+#[test]
+fn a_refused_subscribe_does_not_make_the_link_quiet() {
+    let mut shell = online(true);
+    let jobs = shell.handle(Signal::Subscribed {
+        connection: 1,
+        outcome: SubscribeOutcome::Failed,
+    });
+    assert_eq!(names(&jobs), [] as [String; 0]);
 }
 
 #[test]

@@ -1,5 +1,11 @@
 //! The connection feature: Wi-Fi, the MQTT connection, reconnects, and the
 //! messages from the Home Assistant state stream.
+//!
+//! After each connect, the core subscribes to all the topics. The
+//! subscribe is a request, and the shell answers it when the broker
+//! acknowledged each topic filter. Then the link is quiet, and the core sends
+//! `WifiQuiet`. The shell can then look for a better access point. A change
+//! of access point can drop the connection, and the core connects again.
 
 use alloc::vec::Vec;
 use core::time::Duration;
@@ -11,7 +17,7 @@ use futures::StreamExt;
 use crate::{
     Cmd, Event, Model,
     capabilities::{
-        mqtt::{Connect, LastWill, Mqtt, MqttEvent, Publish, Qos},
+        mqtt::{Connect, LastWill, Mqtt, MqttEvent, Publish, Qos, SubscribeOutcome},
         network::{Network, WifiStatus},
     },
     entities,
@@ -346,6 +352,18 @@ pub fn page_time(model: &Model) -> Option<DateTime<Utc>> {
         .or(model.last_sync)
 }
 
+/// Handles the answer to the `Subscribe` request on the connection `id`.
+/// The core ignores the answer for an older connection.
+///
+/// After `Done`, the link is quiet, so the core sends `WifiQuiet`.
+pub fn subscribed(id: u32, outcome: SubscribeOutcome, model: &mut Model) -> Cmd {
+    let state = &mut model.connection;
+    if id != state.id || state.mqtt != Link::Up || outcome != SubscribeOutcome::Done {
+        return Cmd::done();
+    }
+    Network::quiet()
+}
+
 fn connected(model: &mut Model) -> Cmd {
     let Some(settings) = &model.settings else {
         return Cmd::done();
@@ -356,8 +374,10 @@ fn connected(model: &mut Model) -> Cmd {
         qos: Qos::AtLeastOnce,
         retain: true,
     };
-    model.connection.mqtt = Link::Up;
-    model.connection.backoff = RECONNECT_MIN;
+    let state = &mut model.connection;
+    state.mqtt = Link::Up;
+    state.backoff = RECONNECT_MIN;
+    let connection = state.id;
     model.unsent = 0;
 
     // The service calls of the outbox go first, so a tap that waits for the
@@ -369,7 +389,14 @@ fn connected(model: &mut Model) -> Cmd {
     let calls = core::mem::take(&mut model.connection.outbox);
     let mut commands: Vec<Cmd> = calls.into_iter().map(|call| issue(call, model)).collect();
     commands.push(Mqtt::publish(status));
-    commands.push(Mqtt::subscribe(entities::topics(model.pages)));
+    commands.push(
+        Mqtt::subscribe(entities::topics(model.pages)).then_send(move |outcome| {
+            Event::Subscribed {
+                connection,
+                outcome,
+            }
+        }),
+    );
     commands.push(redraw(model, false));
     Cmd::all(commands)
 }

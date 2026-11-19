@@ -318,7 +318,7 @@ impl Shell {
             }
             Effect::MqttSubscribe(request) => {
                 self.log.push("MqttSubscribe".into());
-                self.broker.subscribe(&request.operation.topics);
+                self.broker.subscribe(request);
             }
             Effect::MqttPublish(request) => {
                 let publish = request.operation;
@@ -351,6 +351,7 @@ impl Shell {
                 self.broker.drop_connection();
                 request.resolve(()).expect("the core waits for Wi-Fi off");
             }
+            Effect::WifiQuiet(_) => self.log.push("WifiQuiet".into()),
             Effect::Sleep(request) => {
                 self.log.push("Sleep".into());
                 self.sleep = Some(request.operation.clone());

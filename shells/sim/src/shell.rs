@@ -11,6 +11,10 @@
 //! the last will, and the old stream ends with `Disconnected`. The core
 //! ignores the items of an older connection.
 //!
+//! A `Subscribe` request ends when the SUBACK packet of its connection
+//! arrives. If the stream of the connection ends first, the shell answers
+//! `Failed`.
+//!
 //! The shell writes each effect and each MQTT packet to an [`Inspector`],
 //! which the window shows.
 
@@ -27,7 +31,7 @@ use crux_time::{TimerId, operation::NotifyAfter};
 use shared::{
     Core, Dashboard, Effect, Event, PowerSource, Settings, Start, ViewModel,
     capabilities::{
-        mqtt::{Connect, Disconnect, MqttEvent, Publish},
+        mqtt::{Connect, Disconnect, MqttEvent, Publish, Subscribe, SubscribeOutcome},
         network::WifiStatus,
         power::{Sleep, Wake},
     },
@@ -36,7 +40,7 @@ use tokio::{runtime::Handle, task::JoinHandle};
 
 use crate::{
     inspector::{Delivery, Direction, Inspector, Packet, truncate},
-    mqtt::{Link, Opener},
+    mqtt::{Item, Link, Opener},
 };
 
 /// An answer from a task on the runtime.
@@ -50,6 +54,14 @@ pub enum Signal {
         event: MqttEvent,
         /// `true` for a message that the broker retained.
         retained: bool,
+    },
+    /// The answer to the oldest `Subscribe` request of the MQTT connection
+    /// with this id.
+    Subscribed {
+        /// The id of the connection in the shell.
+        connection: u64,
+        /// The answer.
+        outcome: SubscribeOutcome,
     },
     /// The timer with this id expired.
     Timer {
@@ -118,6 +130,9 @@ pub struct Shell {
     /// The `Disconnect` requests that wait for the end of the stream of
     /// their connection.
     disconnects: Vec<(u64, Request<Disconnect>)>,
+    /// The `Subscribe` requests that wait for their SUBACK packets, from the
+    /// oldest, with the ids of their connections.
+    subscribes: Vec<(u64, Request<Subscribe>)>,
     /// The `Sleep` request that waits for a wake.
     sleep: Option<Request<Sleep>>,
     /// The level of the front light, in percent. The window shows the
@@ -157,6 +172,7 @@ impl Shell {
             inspector: Inspector::default(),
             settings: None,
             disconnects: Vec::new(),
+            subscribes: Vec::new(),
             sleep: None,
             light: 0,
         }
@@ -220,6 +236,7 @@ impl Shell {
         }
         self.current = None;
         self.disconnects.clear();
+        self.subscribes.clear();
         self.sleep = None;
         self.core = Core::new();
         self.send(Event::Start(Start {
@@ -389,7 +406,39 @@ impl Shell {
                         );
                         effects.extend(resolve(&self.core, &mut request, ()));
                     }
+                    // Its `Subscribe` requests got no SUBACK packet.
+                    let (failed, waiting) = std::mem::take(&mut self.subscribes)
+                        .into_iter()
+                        .partition(|(id, _)| *id == connection);
+                    self.subscribes = waiting;
+                    for (_, mut request) in failed {
+                        self.inspector.effect(
+                            "MqttSubscribe",
+                            format!("connection {connection}"),
+                            "resolved: Failed (closed before the SUBACK)",
+                        );
+                        let outcome = SubscribeOutcome::Failed;
+                        effects.extend(resolve(&self.core, &mut request, outcome));
+                    }
                 }
+                self.process(effects);
+            }
+            Signal::Subscribed {
+                connection,
+                outcome,
+            } => {
+                let Some(index) = self.subscribes.iter().position(|(id, _)| *id == connection)
+                else {
+                    return;
+                };
+                let (_, mut request) = self.subscribes.remove(index);
+                eprintln!("mqtt: subscribe {outcome:?}");
+                self.inspector.effect(
+                    "MqttSubscribe",
+                    format!("connection {connection}"),
+                    format!("resolved: {outcome:?}"),
+                );
+                let effects = resolve(&self.core, &mut request, outcome);
                 self.process(effects);
             }
             Signal::Timer { id, token } => {
@@ -479,10 +528,7 @@ impl Shell {
                 Vec::new()
             }
             Effect::MqttConnect(request) => self.connect(request),
-            Effect::MqttSubscribe(request) => {
-                self.subscribe(&request.operation.topics);
-                Vec::new()
-            }
+            Effect::MqttSubscribe(request) => self.subscribe(request),
             Effect::MqttPublish(request) => {
                 self.publish(&request.operation);
                 Vec::new()
@@ -510,6 +556,7 @@ impl Shell {
                 );
                 resolve(&self.core, &mut request, ())
             }
+            Effect::WifiQuiet(_) => self.quiet(),
             Effect::Sleep(request) => {
                 eprintln!("power: asleep. Click the panel or press W to wake it.");
                 self.inspector.effect(
@@ -570,6 +617,17 @@ impl Shell {
         }
     }
 
+    /// Logs `WifiQuiet`. The simulator has no access points, so it does
+    /// nothing else.
+    fn quiet(&mut self) -> Vec<Effect> {
+        self.inspector.effect(
+            "WifiQuiet",
+            String::new(),
+            "ignored: the simulator has no access points",
+        );
+        Vec::new()
+    }
+
     /// Returns the connection to which subscribe, publish and disconnect
     /// apply.
     fn current(&self) -> Option<&Live> {
@@ -577,8 +635,12 @@ impl Shell {
         self.connections.iter().find(|live| live.id == current)
     }
 
-    /// Subscribes to `topics` on the current connection.
-    fn subscribe(&mut self, topics: &[String]) {
+    /// Subscribes to the topics of `request` on the current connection. The
+    /// request waits for the SUBACK packet. If the request cannot go to the
+    /// client, the shell answers `Failed` at once.
+    fn subscribe(&mut self, mut request: Request<Subscribe>) -> Vec<Effect> {
+        let topics = &request.operation.topics;
+        let current = self.current;
         let delivery = self.current().map_or(Delivery::NoConnection, |live| {
             eprintln!("mqtt: subscribe to {} topics", topics.len());
             delivery("subscribe", live.link.subscribe(topics))
@@ -588,7 +650,14 @@ impl Shell {
             format!("{} topics", topics.len()),
             outcome(&delivery),
         );
-        self.inspector.subscribe(topics, delivery);
+        self.inspector.subscribe(topics, delivery.clone());
+        match (current, delivery) {
+            (Some(connection), Delivery::Sent) => {
+                self.subscribes.push((connection, request));
+                Vec::new()
+            }
+            _ => resolve(&self.core, &mut request, SubscribeOutcome::Failed),
+        }
     }
 
     /// Publishes a message on the current connection.
@@ -661,11 +730,17 @@ impl Shell {
         let notifier = self.notifier.clone();
         let link = (self.open)(
             connect,
-            Box::new(move |event, retained| {
-                notifier.send(Signal::Mqtt {
-                    connection: id,
-                    event,
-                    retained,
+            Box::new(move |item| {
+                notifier.send(match item {
+                    Item::Stream(event, retained) => Signal::Mqtt {
+                        connection: id,
+                        event,
+                        retained,
+                    },
+                    Item::Subscribed(outcome) => Signal::Subscribed {
+                        connection: id,
+                        outcome,
+                    },
                 });
             }),
         );
@@ -720,7 +795,7 @@ mod tests {
     use embedded_graphics::prelude::Point;
     use shared::{
         Control, Event, PowerSource, Settings,
-        capabilities::mqtt::{Connect, Credentials, Message, MqttEvent, Publish},
+        capabilities::mqtt::{Connect, Credentials, Message, MqttEvent, Publish, SubscribeOutcome},
         features::{
             power::IDLE_TIMEOUT,
             refresh::{DRAW_DELAY, FULL_REFRESH_INTERVAL},
@@ -941,6 +1016,47 @@ mod tests {
             fixture.shell().view().connection,
             shared::Connection::Online
         );
+    }
+
+    /// Returns the number of `WifiQuiet` entries in the effect log.
+    fn quiet_count(fixture: &mut Fixture) -> usize {
+        fixture
+            .shell()
+            .inspector()
+            .effects
+            .iter()
+            .filter(|entry| entry.effect == "WifiQuiet")
+            .count()
+    }
+
+    #[test]
+    fn a_suback_answers_the_subscribe_and_the_link_is_quiet() {
+        let mut fixture = Fixture::new();
+        fixture.start(PowerSource::Stand);
+        fixture.mqtt(1, MqttEvent::Connected);
+        assert_eq!(quiet_count(&mut fixture), 0);
+
+        fixture.shell().handle(Signal::Subscribed {
+            connection: 1,
+            outcome: SubscribeOutcome::Done,
+        });
+        assert_eq!(quiet_count(&mut fixture), 1);
+    }
+
+    #[test]
+    fn a_stream_that_ends_before_the_suback_fails_the_subscribe() {
+        let mut fixture = Fixture::new();
+        fixture.start(PowerSource::Stand);
+        fixture.mqtt(1, MqttEvent::Connected);
+        fixture.mqtt(1, MqttEvent::Disconnected { reason: None });
+
+        // The shell answered `Failed` at the end of the stream, so a late
+        // SUBACK has no request, and the link is not quiet.
+        fixture.shell().handle(Signal::Subscribed {
+            connection: 1,
+            outcome: SubscribeOutcome::Done,
+        });
+        assert_eq!(quiet_count(&mut fixture), 0);
     }
 
     #[test]

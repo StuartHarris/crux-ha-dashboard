@@ -5,10 +5,11 @@
 //! sequence of [`MqttEvent`] values: `Connected` when the broker accepts the
 //! connection, a `Message` for each message on a subscribed topic, and one
 //! `Disconnected` as the last item. Messages for all subscriptions arrive on
-//! the stream of their connection. [`Subscribe`] and [`Publish`] are
-//! notifications. [`Disconnect`] is a request, and the shell answers it when
-//! the connection is closed. These three operations apply to the open
-//! connection.
+//! the stream of their connection. [`Publish`] is a notification.
+//! [`Subscribe`] is a request, and the shell answers it when the broker
+//! acknowledged all the topic filters. [`Disconnect`] is a request, and the
+//! shell answers it when the connection is closed. These three operations
+//! apply to the open connection.
 
 use alloc::{string::String, vec::Vec};
 use core::fmt;
@@ -92,11 +93,27 @@ pub struct Connect {
 /// Subscribes the open connection to topic filters.
 ///
 /// Messages on these topics arrive on the stream of the [`Connect`] request.
+/// The shell answers with [`SubscribeOutcome::Done`] when the broker
+/// acknowledged each filter with success. The shell answers with
+/// [`SubscribeOutcome::Failed`] if the broker refuses a filter, or if the
+/// connection closes before all the acknowledgements arrive. If no connection
+/// is open, the shell answers `Failed` at once.
 #[derive(Operation, Facet, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[operation(notify)]
+#[operation(request, output = SubscribeOutcome)]
 pub struct Subscribe {
     /// The topic filters, which can contain the `+` and `#` wildcards.
     pub topics: Vec<String>,
+}
+
+/// The answer to a [`Subscribe`] request.
+#[derive(Facet, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub enum SubscribeOutcome {
+    /// The broker acknowledged each topic filter with success.
+    Done,
+    /// The broker refused a topic filter, or the connection closed before
+    /// all the acknowledgements arrived.
+    Failed,
 }
 
 /// Publishes a message on the open connection.
@@ -168,13 +185,17 @@ impl Mqtt {
         Command::stream_from_shell(connect)
     }
 
-    /// Subscribes the open connection to `topics`.
-    pub fn subscribe<Effect, Event>(topics: Vec<String>) -> Command<Effect, Event>
+    /// Subscribes the open connection to `topics`. The request ends when the
+    /// broker acknowledged all the filters, or when the connection closes.
+    #[must_use]
+    pub fn subscribe<Effect, Event>(
+        topics: Vec<String>,
+    ) -> RequestBuilder<Effect, Event, impl Future<Output = SubscribeOutcome>>
     where
         Effect: From<Request<Subscribe>> + Send + 'static,
         Event: Send + 'static,
     {
-        notify(Subscribe { topics })
+        Command::request_from_shell(Subscribe { topics })
     }
 
     /// Publishes a message on the open connection.

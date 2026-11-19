@@ -15,12 +15,15 @@
 //!
 //! [`supersede`] removes the queued work that a later job makes
 //! useless. [`Outbox`] keeps the messages that wait to be published, and
-//! decides when a failed publish ends the connection.
+//! decides when a failed publish ends the connection. [`Subacks`] counts the
+//! acknowledgements of the subscribe packets, and gives the answer to each
+//! `Subscribe` job. [`AckWatch`] finds sent data that waits too long for the
+//! TCP ACK of the broker, which means that the link is dead.
 
 use alloc::{collections::VecDeque, format, string::String, vec::Vec};
 use core::time::Duration;
 
-use shared::capabilities::mqtt::{Message, MqttEvent, Publish};
+use shared::capabilities::mqtt::{Message, MqttEvent, Publish, SubscribeOutcome};
 
 use crate::shell::{MqttOp, Signal};
 
@@ -62,6 +65,23 @@ impl Streams {
             connection,
             event: MqttEvent::Connected,
         })
+    }
+
+    /// Returns the signals that answer the `Subscribe` jobs of `connection`
+    /// with `outcomes`, or none if its stream ended. If the stream ended,
+    /// the shell already answered the jobs with `Failed`.
+    #[must_use]
+    pub fn subscribed(&self, connection: u32, outcomes: Vec<SubscribeOutcome>) -> Vec<Signal> {
+        if !self.accepts(connection) {
+            return Vec::new();
+        }
+        outcomes
+            .into_iter()
+            .map(|outcome| Signal::Subscribed {
+                connection,
+                outcome,
+            })
+            .collect()
     }
 
     /// Returns the signal for a message on `connection`, or `None` if its
@@ -271,6 +291,142 @@ impl Outbox {
     }
 }
 
+/// The longest time for which sent data can wait for the TCP ACK of the
+/// broker. After this time, the task closes the connection, because the
+/// link is dead.
+pub const ACK_LIMIT: Duration = Duration::from_secs(10);
+
+/// Watches the progress of the TCP ACKs of the broker for the data in the
+/// send buffer of the TCP socket.
+///
+/// A send does not wait for the ACK, so the task must find a dead link in a
+/// different way. The task reports the send buffer with
+/// [`AckWatch::observe`]: before and after each write, and at the deadline
+/// that `observe` returns. Each report gives the number of bytes that the
+/// task wrote to the socket since it opened, and the number of bytes in the
+/// send buffer. The difference is the number of bytes that the broker
+/// acknowledged.
+///
+/// The time starts when data waits and the broker acknowledged no new data.
+/// Each report that shows new acknowledged data starts the time again, so a
+/// long burst on a slow link does not end the connection while the ACKs
+/// continue. If there is no progress for [`ACK_LIMIT`] while data waits,
+/// [`AckWatch::expired`] is `true`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AckWatch {
+    /// The number of acknowledged bytes at the last report.
+    acked: u64,
+    /// The time of the last progress while data waits, or `None` if no data
+    /// waits.
+    since: Option<Duration>,
+}
+
+impl AckWatch {
+    /// Records the send buffer at `now`. `written` is the number of bytes
+    /// that the task wrote since the socket opened, and `queued` the number
+    /// of bytes in the send buffer. Returns the time at which the task must
+    /// report again, or `None` if no data waits.
+    pub fn observe(&mut self, now: Duration, written: u64, queued: usize) -> Option<Duration> {
+        let queued = u64::try_from(queued).unwrap_or(u64::MAX);
+        let acked = written.saturating_sub(queued);
+        let progress = acked > self.acked;
+        self.acked = self.acked.max(acked);
+        if queued == 0 {
+            self.since = None;
+        } else if progress || self.since.is_none() {
+            self.since = Some(now);
+        }
+        self.since.map(|since| since + ACK_LIMIT)
+    }
+
+    /// Returns `true` if data waited with no new ACK for [`ACK_LIMIT`] or
+    /// more at `now`.
+    #[must_use]
+    pub fn expired(&self, now: Duration) -> bool {
+        self.since.is_some_and(|since| now >= since + ACK_LIMIT)
+    }
+}
+
+/// The subscribe packets of one `Subscribe` job.
+#[derive(Clone, Debug, Default)]
+struct Batch {
+    /// The packet identifiers that wait for an acknowledgement.
+    waiting: Vec<u16>,
+    /// The broker refused a topic filter of the job.
+    refused: bool,
+    /// The task sent all the packets of the job.
+    sent_all: bool,
+}
+
+/// The acknowledgements (SUBACK packets) that the `Subscribe` jobs of one
+/// connection wait for.
+///
+/// `rust-mqtt` sends one topic filter in each subscribe packet. A job is
+/// `Done` when the broker acknowledged each of its packets with success. If
+/// the broker refuses a filter, the job is `Failed`. The answers come in the
+/// order of the jobs. If the connection closes first, the job gets no answer
+/// here. The shell then answers it with `Failed` at the end of the stream.
+#[derive(Clone, Debug, Default)]
+pub struct Subacks {
+    batches: VecDeque<Batch>,
+}
+
+impl Subacks {
+    /// Starts a new `Subscribe` job.
+    pub fn begin(&mut self) {
+        self.batches.push_back(Batch::default());
+    }
+
+    /// Records that the task sent the subscribe packet with the identifier
+    /// `packet` for the newest job.
+    pub fn sent(&mut self, packet: u16) {
+        if let Some(batch) = self.batches.back_mut() {
+            batch.waiting.push(packet);
+        }
+    }
+
+    /// Records that the task sent all the packets of the newest job.
+    /// Returns the answers of the jobs that are complete now, in order.
+    pub fn finish(&mut self) -> Vec<SubscribeOutcome> {
+        if let Some(batch) = self.batches.back_mut() {
+            batch.sent_all = true;
+        }
+        self.complete()
+    }
+
+    /// Records the acknowledgement of the packet `packet`. `success` is
+    /// `false` if the reason code is an error. Returns the answers of the
+    /// jobs that are complete now, in order.
+    pub fn ack(&mut self, packet: u16, success: bool) -> Vec<SubscribeOutcome> {
+        let batch = self
+            .batches
+            .iter_mut()
+            .find(|batch| batch.waiting.contains(&packet));
+        if let Some(batch) = batch {
+            batch.waiting.retain(|waiting| *waiting != packet);
+            batch.refused |= !success;
+        }
+        self.complete()
+    }
+
+    /// Removes the complete jobs at the front, and returns their answers.
+    fn complete(&mut self) -> Vec<SubscribeOutcome> {
+        let mut outcomes = Vec::new();
+        while let Some(batch) = self.batches.front() {
+            if !batch.sent_all || !batch.waiting.is_empty() {
+                break;
+            }
+            outcomes.push(if batch.refused {
+                SubscribeOutcome::Failed
+            } else {
+                SubscribeOutcome::Done
+            });
+            self.batches.pop_front();
+        }
+        outcomes
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use core::time::Duration;
@@ -282,10 +438,13 @@ mod tests {
     use shared::capabilities::mqtt::Publish;
 
     use super::{
-        Attempt, MAX_TRIES, Next, OUTBOX_LIMIT, Outbox, Streams, broker_silent, ping_interval,
-        silence_limit, supersede,
+        ACK_LIMIT, AckWatch, Attempt, MAX_TRIES, Next, OUTBOX_LIMIT, Outbox, Streams, Subacks,
+        broker_silent, ping_interval, silence_limit, supersede,
     };
-    use shared::capabilities::mqtt::{Disconnect, Subscribe};
+    use shared::capabilities::mqtt::{
+        Disconnect, Subscribe,
+        SubscribeOutcome::{Done, Failed},
+    };
 
     use crate::shell::MqttOp;
     use crate::shell::Signal;
@@ -311,6 +470,7 @@ mod tests {
         ));
         assert_eq!(streams.end(1, None), None);
         assert_eq!(streams.connected(1), None);
+        assert_eq!(streams.subscribed(1, vec![Done]), []);
         assert_eq!(streams.message(1, "a", b"b"), None);
         assert_eq!(streams.open(), None);
     }
@@ -340,6 +500,142 @@ mod tests {
         };
         assert_eq!(message.topic, "topic/a");
         assert_eq!(message.payload, b"on");
+    }
+
+    const fn secs(seconds: u64) -> Duration {
+        Duration::from_secs(seconds)
+    }
+
+    #[test]
+    fn an_empty_send_buffer_has_no_deadline() {
+        let mut watch = AckWatch::default();
+        assert_eq!(watch.observe(secs(5), 100, 0), None);
+        assert!(!watch.expired(secs(100)));
+    }
+
+    #[test]
+    fn data_with_no_progress_expires() {
+        let mut watch = AckWatch::default();
+        assert_eq!(watch.observe(secs(5), 100, 100), Some(secs(5) + ACK_LIMIT));
+        // A later write with no new ACK keeps the first time.
+        assert_eq!(watch.observe(secs(8), 150, 150), Some(secs(5) + ACK_LIMIT));
+        assert!(!watch.expired(secs(14)));
+        assert_eq!(watch.observe(secs(15), 150, 150), Some(secs(15)));
+        assert!(watch.expired(secs(15)));
+    }
+
+    #[test]
+    fn a_long_burst_with_steady_progress_does_not_expire() {
+        let mut watch = AckWatch::default();
+        let mut written = 0;
+        // For 60 s, the task writes 2000 bytes each second, and the broker
+        // acknowledges all but the newest 1500 bytes. The buffer is never
+        // empty.
+        for second in 0..60 {
+            written += 2000;
+            let deadline = watch.observe(secs(second), written, 1500);
+            assert_eq!(deadline, Some(secs(second) + ACK_LIMIT));
+            assert!(!watch.expired(secs(second)));
+        }
+    }
+
+    #[test]
+    fn a_burst_that_stops_making_progress_expires() {
+        let mut watch = AckWatch::default();
+        watch.observe(secs(0), 2000, 1500);
+        watch.observe(secs(1), 4000, 1500);
+        // The ACKs stop. The buffer holds the same unacknowledged data.
+        watch.observe(secs(2), 4000, 1500);
+        watch.observe(secs(6), 4000, 1500);
+        assert!(!watch.expired(secs(10)));
+        assert!(watch.expired(secs(11)));
+    }
+
+    #[test]
+    fn an_ack_clears_the_deadline() {
+        let mut watch = AckWatch::default();
+        watch.observe(secs(5), 100, 100);
+        assert_eq!(watch.observe(secs(6), 100, 0), None);
+        assert!(!watch.expired(secs(20)));
+        // New data starts a new time.
+        assert_eq!(watch.observe(secs(20), 150, 50), Some(secs(20) + ACK_LIMIT));
+    }
+
+    #[test]
+    fn subscribed_answers_the_jobs_of_the_open_connection() {
+        let mut streams = Streams::default();
+        streams.begin(5);
+        assert_eq!(
+            streams.subscribed(5, vec![Done, Failed]),
+            [
+                Signal::Subscribed {
+                    connection: 5,
+                    outcome: Done
+                },
+                Signal::Subscribed {
+                    connection: 5,
+                    outcome: Failed
+                },
+            ]
+        );
+        assert_eq!(streams.subscribed(4, vec![Done]), []);
+    }
+
+    #[test]
+    fn a_subscribe_is_done_when_each_packet_is_acknowledged() {
+        let mut subacks = Subacks::default();
+        subacks.begin();
+        subacks.sent(1);
+        subacks.sent(2);
+        // An acknowledgement can arrive while the task still sends.
+        assert_eq!(subacks.ack(1, true), []);
+        subacks.sent(3);
+        assert_eq!(subacks.finish(), []);
+        assert_eq!(subacks.ack(3, true), []);
+        assert_eq!(subacks.ack(2, true), [Done]);
+        // The job is complete, so a late or unknown packet changes nothing.
+        assert_eq!(subacks.ack(2, true), []);
+    }
+
+    #[test]
+    fn a_subscribe_with_all_acknowledgements_before_the_end_is_done_at_the_end() {
+        let mut subacks = Subacks::default();
+        subacks.begin();
+        subacks.sent(1);
+        assert_eq!(subacks.ack(1, true), []);
+        assert_eq!(subacks.finish(), [Done]);
+    }
+
+    #[test]
+    fn a_subscribe_with_no_filters_is_done() {
+        let mut subacks = Subacks::default();
+        subacks.begin();
+        assert_eq!(subacks.finish(), [Done]);
+    }
+
+    #[test]
+    fn a_refused_filter_fails_the_subscribe() {
+        let mut subacks = Subacks::default();
+        subacks.begin();
+        subacks.sent(1);
+        subacks.sent(2);
+        assert_eq!(subacks.finish(), []);
+        assert_eq!(subacks.ack(1, false), []);
+        assert_eq!(subacks.ack(2, true), [Failed]);
+    }
+
+    #[test]
+    fn the_answers_come_in_the_order_of_the_jobs() {
+        let mut subacks = Subacks::default();
+        subacks.begin();
+        subacks.sent(1);
+        assert_eq!(subacks.finish(), []);
+        subacks.begin();
+        subacks.sent(2);
+        assert_eq!(subacks.finish(), []);
+        // The second job is complete first, but its answer waits.
+        assert_eq!(subacks.ack(2, false), []);
+        assert_eq!(subacks.ack(1, true), [Done, Failed]);
     }
 
     #[test]
