@@ -1,5 +1,6 @@
 use alloc::{format, string::String, vec, vec::Vec};
 use core::{
+    cell::RefCell,
     ops::{Deref, DerefMut},
     time::Duration,
 };
@@ -27,6 +28,8 @@ use shared::{
         framer::{Frame, Framer},
     },
 };
+
+use crux_time::TimerId;
 
 use super::{Job, RadioAnswer, RadioOp, Shell, Signal, StreamOp, TimerOp, start};
 use crate::config::Config;
@@ -58,6 +61,8 @@ struct Device {
     radio: FakeRadio,
     /// The radio jobs that wait for the radio task, from the oldest.
     radio_jobs: Vec<(u32, RadioOp)>,
+    /// The token of the last timer of a feature that the core started.
+    last_timer: u32,
 }
 
 impl Deref for Device {
@@ -76,19 +81,32 @@ impl DerefMut for Device {
 
 impl Device {
     /// Sends an event to the core, as [`Shell::send`] does, and keeps the
-    /// radio jobs for [`Device::link`].
+    /// radio jobs for [`Device::link`] and the token of the last timer of a
+    /// feature.
     fn send(&mut self, event: Event) -> Vec<Job> {
         let jobs = self.shell.send(event);
         self.keep_radio_jobs(&jobs);
+        self.keep_last_timer(&jobs);
+        keep_stream_timers(&jobs);
         jobs
     }
 
     /// Gives a signal to the shell, as [`Shell::handle`] does, and keeps the
-    /// radio jobs for [`Device::link`].
+    /// radio jobs for [`Device::link`] and the token of the last timer of a
+    /// feature.
     fn handle(&mut self, signal: Signal) -> Vec<Job> {
         let jobs = self.shell.handle(signal);
         self.keep_radio_jobs(&jobs);
+        self.keep_last_timer(&jobs);
+        keep_stream_timers(&jobs);
         jobs
+    }
+
+    /// Keeps the token of the last timer of a feature that `jobs` starts.
+    fn keep_last_timer(&mut self, jobs: &[Job]) {
+        if let Some((_, token, _)) = started_timers(jobs).last() {
+            self.last_timer = *token;
+        }
     }
 
     fn keep_radio_jobs(&mut self, jobs: &[Job]) {
@@ -210,6 +228,33 @@ fn packets(bytes: &[u8]) -> Vec<Packet> {
     packets
 }
 
+std::thread_local! {
+    /// The ids of the stream timers that the core started. Refer to
+    /// [`is_stream_timer`]. Each timer id is new in the process, so the ids
+    /// of two devices do not mix.
+    static STREAM_TIMERS: RefCell<Vec<TimerId>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Keeps the id of each stream timer that `jobs` starts, so that [`names`]
+/// can leave out the jobs that cancel it.
+fn keep_stream_timers(jobs: &[Job]) {
+    for job in jobs {
+        if let Job::Timer {
+            op: TimerOp::NotifyAfter(notify),
+            ..
+        } = job
+            && is_stream_timer(notify.duration.into())
+        {
+            STREAM_TIMERS.with_borrow_mut(|timers| timers.push(notify.id));
+        }
+    }
+}
+
+/// Returns `true` if the timer `id` is a stream timer.
+fn is_stream_timer_id(id: TimerId) -> bool {
+    STREAM_TIMERS.with_borrow(|timers| timers.contains(&id))
+}
+
 /// Returns `true` if `duration` is the duration of a timer of the MQTT
 /// session or of the wait for the answer to a `Close` request. No timer of
 /// a feature has one of these durations. The tests leave these timers out.
@@ -227,8 +272,9 @@ fn stream_job(jobs: &[Job]) -> Option<(u32, &StreamOp)> {
 
 /// A short name for each job, to compare lists of jobs. A `Write` job has
 /// one name for each packet in it, but one name for the SUBSCRIBE packets
-/// that follow each other. The names leave out the timers of the MQTT
-/// session and the lines of the log. Refer to [`logs`].
+/// that follow each other. The names leave out the stream timers (the
+/// timers of the MQTT session and of `Close`), the jobs that cancel them,
+/// and the lines of the log. Refer to [`logs`].
 fn names(jobs: &[Job]) -> Vec<String> {
     jobs.iter()
         .flat_map(|job| match job {
@@ -277,6 +323,10 @@ fn names(jobs: &[Job]) -> Vec<String> {
                 op: TimerOp::NotifyAfter(_),
             } => vec![format!("start timer {token}")],
             Job::Timer {
+                op: TimerOp::ClearTimer(clear),
+                ..
+            } if is_stream_timer_id(clear.id) => Vec::new(),
+            Job::Timer {
                 token,
                 op: TimerOp::ClearTimer(_),
             } => vec![format!("cancel timer {token}")],
@@ -297,6 +347,8 @@ fn logs(jobs: &[Job]) -> Vec<String> {
 
 fn started(power: PowerSource, read_only: bool) -> (Device, Vec<Job>) {
     let shell = Shell::new();
+    // A new device starts with no stream timers.
+    STREAM_TIMERS.with_borrow_mut(Vec::clear);
     let config = Config {
         read_only,
         ..CONFIG
@@ -307,6 +359,7 @@ fn started(power: PowerSource, read_only: bool) -> (Device, Vec<Job>) {
         broker: Broker::default(),
         radio: FakeRadio::default(),
         radio_jobs: Vec::new(),
+        last_timer: 0,
     };
     let jobs = device.send(Event::Start(start));
     (device, jobs)
@@ -365,7 +418,13 @@ fn start_draws_and_joins() {
 fn wifi_then_the_stream_opens_and_the_core_connects_publishes_the_status_and_subscribes() {
     let (mut device, _) = started(PowerSource::Stand, true);
     let jobs = device.link();
-    assert_eq!(names(&jobs), [format!("open {FIRST}")]);
+    // The lease clears the time limit of `Address`, and the core opens the
+    // stream.
+    let address = device.last_timer;
+    assert_eq!(
+        names(&jobs),
+        [format!("cancel timer {address}"), format!("open {FIRST}")]
+    );
     let Some((_, StreamOp::Open(open))) = stream_job(&jobs) else {
         panic!("not an open");
     };
@@ -419,7 +478,12 @@ fn reconnect(device: &mut Device, connection: u32, next: u32) -> Vec<Job> {
     device.broker.drop_connection();
     device.handle(Signal::Timer { id, token });
     let jobs = device.link();
-    assert_eq!(names(&jobs), [format!("open {next}")]);
+    // The lease clears the time limit of `Address`.
+    let address = device.last_timer;
+    assert_eq!(
+        names(&jobs),
+        [format!("cancel timer {address}"), format!("open {next}")]
+    );
     device.connect(next)
 }
 
@@ -544,7 +608,12 @@ fn a_new_stream_opens_only_after_the_end_of_the_old_stream() {
     let next = SECOND;
     device.closed(FIRST, "closed");
     let jobs = device.link();
-    assert_eq!(names(&jobs), [format!("open {next}")]);
+    // The lease clears the time limit of `Address`.
+    let address = device.last_timer;
+    assert_eq!(
+        names(&jobs),
+        [format!("cancel timer {address}"), format!("open {next}")]
+    );
     let jobs = device.connect(next);
     assert!(names(&jobs).contains(&format!("subscribe {next}")));
 }
@@ -689,13 +758,21 @@ fn a_light_answer_is_also_for_the_older_requests() {
     let (mut device, _) = started(PowerSource::Battery, true);
     device.handle(Signal::Tap(Point::new(100, 20)));
     let jobs = device.handle(sleep_now());
-    assert_eq!(names(&jobs), ["light 0 3"]);
+    // The core clears the idle timer (3) and the light timer of the tap (4).
+    assert_eq!(
+        names(&jobs),
+        ["cancel timer 3", "cancel timer 4", "light 0 3"]
+    );
 
     // No answer came for jobs 1 to 3. An answer with a newer token answers
-    // all of them, so the sleep continues. Timer 6 is the time limit of
+    // all of them, so the sleep continues. `Off` stops the join, so the core
+    // clears the time limit of the join (2). Timer 6 is the time limit of
     // `Off`.
     let jobs = device.handle(Signal::Light { token: 5 });
-    assert_eq!(names(&jobs), ["wifi off", "start timer 6"]);
+    assert_eq!(
+        names(&jobs),
+        ["cancel timer 2", "wifi off", "start timer 6"]
+    );
     // Each request ended, so a second answer does nothing.
     assert_eq!(device.handle(Signal::Light { token: 5 }), Vec::new());
 }
@@ -712,8 +789,17 @@ fn on_battery_the_sleep_waits_for_the_light_before_it_disconnects() {
     device.handle(Signal::Light { token: 2 });
 
     // The first step of the sleep turns the light off, and the core waits.
+    // The core clears the idle timer (3) and the light timer of the tap.
+    let light = device.last_timer;
     let jobs = device.handle(sleep_now());
-    assert_eq!(names(&jobs), ["light 0 3"]);
+    assert_eq!(
+        names(&jobs),
+        [
+            "cancel timer 3".into(),
+            format!("cancel timer {light}"),
+            "light 0 3".into()
+        ]
+    );
     assert!(device.view().asleep);
 
     // An answer for an older job does not answer job 3.
@@ -735,7 +821,11 @@ fn a_tap_while_the_light_goes_off_for_the_sleep_wakes_and_the_late_answer_is_ign
     let (mut device, _) = started(PowerSource::Battery, true);
     device.handle(Signal::Tap(Point::new(100, 20)));
     let jobs = device.handle(sleep_now());
-    assert_eq!(names(&jobs), ["light 0 3"]);
+    // The core clears the idle timer (3) and the light timer of the tap (4).
+    assert_eq!(
+        names(&jobs),
+        ["cancel timer 3", "cancel timer 4", "light 0 3"]
+    );
 
     // The tap wakes the device and turns the light on again.
     let jobs = device.handle(Signal::Tap(Point::new(100, 20)));
@@ -956,7 +1046,11 @@ fn an_answer_with_an_unknown_token_or_of_another_kind_is_dropped() {
     };
     assert_eq!(device.handle(wrong), Vec::new());
     let jobs = device.link();
-    assert_eq!(names(&jobs), [format!("open {FIRST}")]);
+    let address = device.last_timer;
+    assert_eq!(
+        names(&jobs),
+        [format!("cancel timer {address}"), format!("open {FIRST}")]
+    );
 }
 
 #[test]
@@ -978,19 +1072,27 @@ fn a_batch_has_at_most_one_render_with_the_last_view() {
 #[test]
 fn the_render_before_sleep_stays_before_sleep() {
     let (mut device, _) = started(PowerSource::Battery, true);
-    // No stream is open, so the close ends at once. Timer 5 is the time
-    // limit of `Off`.
+    // No stream is open, so the close ends at once. The core clears the
+    // idle timer (3) and the time limit of the join (2), which `Off` stops.
+    // Timer 5 is the time limit of `Off`.
     let jobs = device.handle(sleep_now());
-    assert_eq!(names(&jobs), ["wifi off", "start timer 5"]);
+    assert_eq!(
+        names(&jobs),
+        [
+            "cancel timer 3",
+            "cancel timer 2",
+            "wifi off",
+            "start timer 5"
+        ]
+    );
     let jobs = device.link();
     let names = names(&jobs);
     // The core clears the full-refresh timer before it sleeps.
     assert!(names.contains(&"cancel timer 1".into()), "{names:?}");
-    // Only the idle timer of the start, the timer of the `Close` request
-    // and the time limits of `Join` and `Off` run. Each is stale:
-    // `SleepNow` ended the idle time, and the shell answered the `Close`
-    // request, the `Join` request and the `Off` request.
-    assert_eq!(device.timer_count(), 4);
+    // No timer runs. The core cleared the idle timer at `SleepNow`, and
+    // the timer of the `Close` request and the time limits of `Join` and
+    // `Off` when their answers came.
+    assert_eq!(device.timer_count(), 0);
     let render = names.iter().position(|name| name == "render").unwrap();
     let sleep = names.iter().position(|name| name == "sleep").unwrap();
     assert!(render < sleep, "{names:?}");
@@ -1036,10 +1138,12 @@ fn asleep_with(read_only: bool) -> Device {
 #[test]
 fn each_step_of_the_sleep_waits_for_the_answer_of_its_task() {
     let (mut device, jobs) = idle_timeout();
-    // Step 1: `asleep`, then the disconnect, in one write.
+    // Step 1: the core clears the idle timer (3). Then `asleep` and the
+    // disconnect go in one write.
     assert_eq!(
         names(&jobs),
         [
+            "cancel timer 3".into(),
             format!("publish dashboard/test/status {FIRST}"),
             format!("disconnect {FIRST}"),
         ]
@@ -1092,8 +1196,17 @@ fn a_close_with_no_stream_ends_at_once() {
     let (mut device, _) = started(PowerSource::Battery, true);
     let jobs = device.handle(sleep_now());
     // The close ends at once, so `Off` and its time limit follow in the
-    // same batch.
-    assert_eq!(names(&jobs), ["wifi off", "start timer 5"]);
+    // same batch. The core clears the idle timer (3) and the time limit of
+    // the join (2), which `Off` stops.
+    assert_eq!(
+        names(&jobs),
+        [
+            "cancel timer 3",
+            "cancel timer 2",
+            "wifi off",
+            "start timer 5"
+        ]
+    );
 }
 
 #[test]
@@ -1184,7 +1297,11 @@ fn each_radio_job_has_a_new_token_and_its_answer_continues_the_link() {
         token: 2,
         answer: RadioAnswer::Lease(lease),
     });
-    assert_eq!(names(&jobs), [format!("open {FIRST}")]);
+    // The lease clears the time limit of `Address`, which is timer 3.
+    assert_eq!(
+        names(&jobs),
+        ["cancel timer 3".into(), format!("open {FIRST}")]
+    );
 }
 
 #[test]
@@ -1237,16 +1354,20 @@ fn a_stuck_driver_gives_a_restart_job_after_3_joins_with_no_address() {
     };
     device.handle(Signal::Timer { id, token });
 
-    // The third join gets no address. The core logs the count, and then
-    // asks for a restart.
+    // The third join gets no address. The answer clears the time limit of
+    // `Address`. The core logs the count, and then asks for a restart.
     let jobs = device.link();
-    assert_eq!(names(&jobs), ["restart"]);
+    let address = device.last_timer;
+    assert_eq!(
+        names(&jobs),
+        [format!("cancel timer {address}"), "restart".into()]
+    );
     assert_eq!(
         logs(&jobs),
         ["warn wifi: 3 of 3 joins got no new address while the link is suspect"]
     );
     assert_eq!(
-        jobs[1..],
+        jobs[2..],
         [Job::Restart(Restart {
             reason: "no address after 3 joins".into(),
         })]
@@ -1261,11 +1382,19 @@ fn a_change_of_access_point_leaves_only_after_the_end_of_the_stream() {
     let jobs = device.deliver(&jobs);
     assert!(scans(&jobs), "{:?}", names(&jobs));
 
-    // The scan finds a better access point. The core logs the reason, and
-    // then it sends a DISCONNECT.
+    // The scan finds a better access point. The answer clears the time
+    // limit of `Scan`. The core logs the reason, and then it sends a
+    // DISCONNECT.
     device.radio.move_strongest();
     let jobs = device.link();
-    assert_eq!(names(&jobs), [format!("disconnect {SECOND}")]);
+    let scan = device.last_timer;
+    assert_eq!(
+        names(&jobs),
+        [
+            format!("cancel timer {scan}"),
+            format!("disconnect {SECOND}")
+        ]
+    );
     assert_eq!(
         logs(&jobs),
         [
@@ -1273,7 +1402,9 @@ fn a_change_of_access_point_leaves_only_after_the_end_of_the_stream() {
              of 02:00:00:00:00:01 on channel 6 is -75 dBm"
         ]
     );
-    assert!(matches!(jobs[0], Job::Log(_)), "{jobs:?}");
+    // The clear of the time limit comes first. The line comes before the
+    // effects of the decision.
+    assert!(matches!(jobs[1], Job::Log(_)), "{jobs:?}");
     // The session ended, so the view shows `Connecting`.
     let jobs = device.deliver(&jobs);
     assert_eq!(names(&jobs), [format!("close {SECOND}"), "render".into()]);
@@ -1332,7 +1463,12 @@ fn a_join_with_no_answer_is_stopped_by_the_next_join() {
         answer: RadioAnswer::Joined(Joined::Failed("no access point found".into())),
     };
     assert_eq!(device.handle(late), Vec::new());
-    assert_eq!(names(&device.link()), [format!("open {FIRST}")]);
+    let jobs = device.link();
+    let address = device.last_timer;
+    assert_eq!(
+        names(&jobs),
+        [format!("cancel timer {address}"), format!("open {FIRST}")]
+    );
 }
 
 #[test]

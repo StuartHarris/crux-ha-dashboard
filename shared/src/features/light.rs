@@ -8,18 +8,18 @@
 //!   of the sleep.
 //! - If the power source changes while the light is on, the light changes to
 //!   the level of the new source.
-//! - Each light timer has an id. A touch starts a new timer, and the core
-//!   then ignores the older timers.
+//! - Each light timer has an id. A touch clears the light timer that runs
+//!   and starts a new one. If the expiry of an older timer still arrives,
+//!   the core ignores it.
 //!
 //! The shell only sets the level that the core gives in `FrontLight`.
 
 use core::time::Duration;
 
-use crux_time::clock::Time;
-
 use crate::{
     Cmd, Event, Model,
     capabilities::{light::Light, power::PowerSource},
+    features::timer::Slot,
 };
 
 /// The level of the front light on the stand, in percent.
@@ -46,6 +46,8 @@ pub struct State {
     pub level: u8,
     /// The id of the newest light timer.
     pub timer: u32,
+    /// The light timer that runs.
+    running: Slot,
 }
 
 /// Returns the level of the front light for the power source `source`.
@@ -71,31 +73,37 @@ pub const fn is_on(model: &Model) -> bool {
 pub fn touched(model: &mut Model) -> Cmd {
     model.light.timer = model.light.timer.wrapping_add(1);
     let id = model.light.timer;
-    let (timer, _handle) = Time::notify_after(LIGHT_TIMEOUT);
-    set(level_for(model.power.source), model).and(timer.then_send(move |_| Event::LightTimeout(id)))
+    let timer = model
+        .light
+        .running
+        .start(id, LIGHT_TIMEOUT, Event::LightTimeout(id));
+    set(level_for(model.power.source), model).and(timer)
 }
 
 /// The light timer with the id `id` expired. If it is the newest timer,
 /// turns the light off.
 pub fn timeout(id: u32, model: &mut Model) -> Cmd {
-    if id != model.light.timer {
+    if !model.light.running.expired(id) {
         return Cmd::done();
     }
     set(0, model)
 }
 
-/// Turns the light off. The core then ignores the light timer that runs.
+/// Turns the light off, and clears the light timer that runs.
 ///
 /// If the light is already off, the command has no effect.
 pub fn off(model: &mut Model) -> Cmd {
     model.light.timer = model.light.timer.wrapping_add(1);
+    model.light.running.stop();
     set(0, model)
 }
 
 /// Turns the light off after a start. The core does not know the state of
-/// the light after a reset, so it always sends `FrontLight`.
+/// the light after a reset, so it always sends `FrontLight`. The core
+/// clears the light timer that runs.
 pub fn reset(model: &mut Model) -> Cmd {
     model.light.timer = model.light.timer.wrapping_add(1);
+    model.light.running.stop();
     model.light.level = 0;
     Light::set(0).build()
 }

@@ -232,15 +232,16 @@ fn on_battery_the_dashboard_wakes_syncs_accepts_taps_then_sleeps() {
     );
     assert_eq!(shell.view().tiles()[1].text, "On");
 
-    // The tap started the light timer and the idle timer again. The idle
-    // timer of the start is now stale.
-    shell.take_log();
+    // The tap started the light timer and the idle timer again. The core
+    // cleared the idle timer of the start, so only the new one fires.
+    let log = shell.take_log();
+    assert!(log.contains(&"TimeClear".into()), "{log:?}");
     let events = shell.advance(IDLE_TIMEOUT);
     let idle = events
         .iter()
         .filter(|event| matches!(event, Event::IdleTimeout(_)))
         .count();
-    assert_eq!(idle, 2, "{events:?}");
+    assert_eq!(idle, 1, "{events:?}");
 
     // The last image shows the time of the last update from Home Assistant.
     assert_eq!(
@@ -255,11 +256,13 @@ fn on_battery_the_dashboard_wakes_syncs_accepts_taps_then_sleeps() {
             // sent the DISCONNECT packet.
             "StreamClose",
             // The core does not wait for the answer for longer than
-            // `CLOSE_TIMEOUT`.
+            // `CLOSE_TIMEOUT`. The answer clears that timer.
             "TimeNotifyAfter 6000ms",
+            "TimeClear",
             "WifiOff",
-            // The time limit of the `Off` request.
+            // The time limit of the `Off` request. The answer clears it.
             "TimeNotifyAfter 3000ms",
+            "TimeClear",
             // No full-refresh timer runs while the device sleeps.
             "TimeClear",
             "Render",
@@ -359,13 +362,16 @@ fn a_move_to_the_stand_cancels_the_idle_timeout() {
     shell.send(start(PowerSource::Battery));
     let idle = shell.model.power.idle;
 
-    // The move makes the idle timer of the start stale.
+    // The move clears the idle timer of the start.
+    shell.take_log();
     shell.send(Event::PowerSourceChanged(PowerSource::Stand));
     assert_ne!(shell.model.power.idle, idle);
+    let log = shell.take_log();
+    assert!(log.contains(&"TimeClear".into()), "{log:?}");
 
-    // The stale timer fires, and the core ignores it.
+    // The timer does not fire.
     let events = shell.advance(IDLE_TIMEOUT);
-    assert_eq!(idle_timeouts(&events), [idle]);
+    assert_eq!(idle_timeouts(&events), [] as [u32; 0]);
     assert_eq!(shell.sleep, None);
     assert!(shell.broker.is_connected());
 }
@@ -481,9 +487,8 @@ fn taps_without_a_connection_are_sent_when_the_core_connects() {
     shell.send(tap_scene(0));
     assert_eq!(shell.broker.service_calls.len(), 0);
 
-    // Each tap also tried to connect, so some reconnect timers are stale.
-    // The reconnect timers fire in the order in which the core started
-    // them. A stale timer does nothing. The first live timer connects and
+    // Each tap also tried to connect. Each new reconnect timer cleared the
+    // timer before it, so only one reconnect timer fires. It connects and
     // sends the calls.
     shell.broker.down = false;
     let mut fired = vec![];
@@ -494,7 +499,7 @@ fn taps_without_a_connection_are_sent_when_the_core_connects() {
         };
         fired.push(id);
     }
-    assert!(fired.is_sorted(), "{fired:?}");
+    assert_eq!(fired.len(), 1, "{fired:?}");
     let calls: Vec<_> = shell
         .broker
         .service_calls
@@ -526,12 +531,12 @@ fn a_join_that_fails_on_battery_is_tried_again_until_the_device_sleeps() {
     // The core never connected, so it has no time of an update.
     assert_eq!(shell.view().updated, "");
 
-    // A reconnect timer from before the sleep is stale, so the device stays
-    // asleep with the radio off.
+    // The sleep cleared the reconnect timer, so no reconnect comes and the
+    // device stays asleep with the radio off.
     shell.take_log();
     let events = shell.advance(RECONNECT_MAX);
     assert!(
-        events
+        !events
             .iter()
             .any(|event| matches!(event, Event::Reconnect(_))),
         "{events:?}"

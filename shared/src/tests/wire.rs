@@ -280,6 +280,16 @@ pub trait ExpectWrite {
         check: impl FnOnce(&[Packet]),
     ) -> &mut Self;
 
+    /// Expects the next effect to clear a timer of the session, and answers
+    /// it. The session clears its send timer when the shell sent the bytes
+    /// of a `Write`.
+    fn expect_session_clear(&mut self, wire: &Wire) -> &mut Self;
+
+    /// Expects the next effect to clear a timer of the session, as
+    /// [`ExpectWrite::expect_session_clear`] does, and then no other effect
+    /// or event.
+    fn expect_only_session_clear(&mut self, wire: &Wire);
+
     /// Expects a `Write` with one PUBLISH packet, and calls `check` with its
     /// message.
     #[track_caller]
@@ -320,6 +330,25 @@ pub trait ExpectWrite {
 }
 
 impl ExpectWrite for Cmd {
+    #[track_caller]
+    fn expect_only_session_clear(&mut self, wire: &Wire) {
+        self.expect_session_clear(wire).expect_no_effect_or_events();
+    }
+
+    #[track_caller]
+    fn expect_session_clear(&mut self, wire: &Wire) -> &mut Self {
+        match self.expect_effect() {
+            Effect::TimeClear(mut request)
+                if wire.session_timers.contains(&request.operation.id) =>
+            {
+                let id = request.operation.id;
+                request.resolve(id).unwrap();
+            }
+            effect => panic!("the clear of a session timer, not {effect:?}"),
+        }
+        self
+    }
+
     #[track_caller]
     fn expect_write_with(
         &mut self,

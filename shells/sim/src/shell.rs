@@ -23,8 +23,8 @@
 //!   id of the request, the shell answers `Failed` at once.
 //! - A `Close` ends at the end of the stream, after the `Closed` item. If no
 //!   stream has the connection id of the request, the shell answers at once.
-//! - The core does not clear the timers of the session. Such a timer runs
-//!   until it expires, and the core then ignores it.
+//! - The core clears a timer of the session when the session no longer
+//!   uses it, and all of them when the session ends.
 //!
 //! The shell answers each radio request at once with a [`FakeRadio`]. The
 //! window can change the fake radio: it drops the link, blocks the device,
@@ -2052,10 +2052,9 @@ mod tests {
         assert!(fixture.shell().sleep_now());
         assert!(fixture.shell().view().asleep);
         fixture.sleep();
-        // The core clears the full-refresh timer before it sleeps. The draw
-        // timer and the idle timer still run. They are now stale, and they
-        // do nothing when they fire.
-        assert_eq!(durations(fixture.shell()), [DRAW_DELAY, IDLE_TIMEOUT]);
+        // The core clears the idle timer, the draw timer and the
+        // full-refresh timer before it sleeps, so no timer runs.
+        assert_eq!(durations(fixture.shell()), [] as [Duration; 0]);
     }
 
     #[test]

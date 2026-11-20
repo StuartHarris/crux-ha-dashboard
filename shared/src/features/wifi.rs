@@ -22,9 +22,9 @@
 //!
 //! The core sends one radio request at a time. Each request has a new id
 //! and a time limit, which is an ordinary timer. The first of the answer
-//! and the timer counts. The core then takes a new id, so it ignores the
-//! other one. A time limit that expires acts as a failure of the request,
-//! but it never counts toward a restart.
+//! and the timer counts. The core then clears the timer and takes a new id,
+//! so it ignores the other one. A time limit that expires acts as a failure
+//! of the request, but it never counts toward a restart.
 //!
 //! Each decision writes a line through the log capability
 //! ([`crate::capabilities::log`]), with the area `wifi`. The core writes only
@@ -37,15 +37,13 @@ pub mod rules;
 use alloc::{format, string::String};
 use core::time::Duration;
 
-use crux_time::clock::Time;
-
 use crate::{
     Cmd, Event, Model,
     capabilities::{
         log::{self, Area},
         radio::{AccessPoint, Joined, Lease, Radio, Scanned, Target, signal},
     },
-    features::{connection, power},
+    features::{connection, power, timer::Slot},
     mqtt::End,
 };
 
@@ -144,13 +142,15 @@ pub enum Then {
 }
 
 /// The state of the Wi-Fi feature.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default)]
 pub struct State {
     /// What the radio does now.
     pub phase: Phase,
     /// The id of the newest radio request. The core ignores an answer or a
     /// time limit with another id.
     pub radio: u32,
+    /// The time limit of the radio request that waits.
+    limit: Slot,
     /// The access point of the last good join. Light sleep keeps it.
     pub cache: ApCache,
     /// The health of the link. A start makes a new one.
@@ -169,6 +169,7 @@ pub fn reset(model: &mut Model) {
     let state = &mut model.wifi;
     state.phase = Phase::Off;
     state.radio = state.radio.wrapping_add(1);
+    state.limit.stop();
     state.health = Health::default();
     state.wanted = false;
     state.ready = false;
@@ -304,7 +305,7 @@ pub fn quiet(model: &mut Model) -> Cmd {
     let radio = next_id(model);
     Radio::scan(radio)
         .then_send(move |scanned| Event::Scanned { radio, scanned })
-        .and(limit(radio, SCAN_TIMEOUT))
+        .and(limit(radio, SCAN_TIMEOUT, model))
 }
 
 /// Stops a scan before the sleep `sleep` disconnects. Returns `None` if no
@@ -319,7 +320,7 @@ pub fn stop_scan(sleep: u32, model: &mut Model) -> Option<Cmd> {
     };
     let radio = next_id(model);
     let stop = Radio::stop_scan(radio).then_send(move |()| Event::ScanStopped(radio));
-    Some(stop.and(limit(radio, STOP_SCAN_TIMEOUT)))
+    Some(stop.and(limit(radio, STOP_SCAN_TIMEOUT, model)))
 }
 
 /// Turns the radio off for the sleep `sleep`. The answer starts the next
@@ -341,7 +342,7 @@ pub fn off(sleep: u32, model: &mut Model) -> Cmd {
     let radio = next_id(model);
     Radio::off(radio)
         .then_send(move |()| Event::RadioOff(radio))
-        .and(limit(radio, OFF_TIMEOUT))
+        .and(limit(radio, OFF_TIMEOUT, model))
 }
 
 /// Handles the answer to the `Join` request `radio`.
@@ -561,7 +562,7 @@ fn after_join(joined: &Joined, model: &mut Model) -> Cmd {
     let radio = next_id(model);
     Radio::address(radio)
         .then_send(move |lease| Event::Leased { radio, lease })
-        .and(limit(radio, ADDRESS_TIMEOUT))
+        .and(limit(radio, ADDRESS_TIMEOUT, model))
 }
 
 /// Records an association with `access_point` after a sleep started. The
@@ -696,7 +697,7 @@ fn join(target: Target, keep: bool, model: &mut Model) -> Cmd {
     let radio = next_id(model);
     Radio::join(radio, target, keep)
         .then_send(move |joined| Event::Joined { radio, joined })
-        .and(limit(radio, JOIN_TIMEOUT))
+        .and(limit(radio, JOIN_TIMEOUT, model))
 }
 
 /// Sends a `Leave` request. After the answer, the core does `then`.
@@ -705,7 +706,7 @@ fn leave(then: Then, model: &mut Model) -> Cmd {
     let radio = next_id(model);
     Radio::leave(radio)
         .then_send(move |()| Event::Left(radio))
-        .and(limit(radio, LEAVE_TIMEOUT))
+        .and(limit(radio, LEAVE_TIMEOUT, model))
 }
 
 /// Asks the shell to restart the chip, for `reason`.
@@ -715,25 +716,30 @@ fn restart(reason: String, model: &mut Model) -> Cmd {
     Radio::restart(reason)
 }
 
-/// Takes a new id for a radio request.
-const fn next_id(model: &mut Model) -> u32 {
+/// Takes a new id for a radio request, and clears the time limit of the
+/// request before it.
+fn next_id(model: &mut Model) -> u32 {
+    model.wifi.limit.stop();
     model.wifi.radio = model.wifi.radio.wrapping_add(1);
     model.wifi.radio
 }
 
 /// Returns `true` if `radio` is the id of the newest request. The core then
-/// takes a new id, so it ignores the other one of the answer and the time
-/// limit.
-const fn accept(radio: u32, model: &mut Model) -> bool {
+/// clears the time limit and takes a new id, so it ignores the other one of
+/// the answer and the time limit.
+fn accept(radio: u32, model: &mut Model) -> bool {
     if radio != model.wifi.radio {
         return false;
     }
+    model.wifi.limit.stop();
     model.wifi.radio = model.wifi.radio.wrapping_add(1);
     true
 }
 
 /// Starts the time limit `after` of the request `radio`.
-fn limit(radio: u32, after: Duration) -> Cmd {
-    let (timer, _handle) = Time::notify_after(after);
-    timer.then_send(move |_| Event::RadioTimeout(radio))
+fn limit(radio: u32, after: Duration, model: &mut Model) -> Cmd {
+    model
+        .wifi
+        .limit
+        .start(radio, after, Event::RadioTimeout(radio))
 }

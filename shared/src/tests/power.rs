@@ -8,6 +8,7 @@ use crux_core::App;
 use super::{
     ExpectFullRefreshTimer, ExpectLight, ExpectRadioLimit,
     connection::{drive_to_connected, drive_to_connecting},
+    shell::Shell,
     start, tap_tile,
     wire::ExpectWrite,
 };
@@ -49,6 +50,7 @@ fn the_idle_timeout_sleeps_in_steps_and_a_touch_wakes() {
     // answer to the close of the stream.
     app.update(Event::IdleTimeout(model.power.idle), &mut model)
         .expect_disconnect(&mut wire, &mut model)
+        .expect_session_clear(&wire)
         .expect_no_effects();
     let offline = wire.take_event();
     assert!(matches!(offline, Event::Offline(_)), "{offline:?}");
@@ -123,6 +125,7 @@ fn a_tap_during_the_steps_wakes_and_the_late_answers_are_ignored() {
     // continue the sleep. The link is still up, so it connects at once.
     sleep
         .expect_disconnect(&mut wire, &mut model)
+        .expect_session_clear(&wire)
         .expect_no_effects();
     let offline = wire.take_event();
     app.update(offline, &mut model).expect_no_effects();
@@ -223,6 +226,7 @@ fn on_the_stand_while_asleep_wakes_and_connects() {
     // the core connects at once.
     sleep
         .expect_disconnect(&mut wire, &mut model)
+        .expect_session_clear(&wire)
         .expect_no_effects();
     assert!(
         wire.effects
@@ -490,6 +494,7 @@ fn sleep_now_on_battery_sleeps_at_once() {
     // The first step of the sleep, as after the idle timeout.
     app.update(Event::SleepNow, &mut model)
         .expect_disconnect(&mut wire, &mut model)
+        .expect_session_clear(&wire)
         .expect_no_effects();
     assert!(model.power.asleep);
 }
@@ -546,8 +551,8 @@ fn an_idle_timer_that_expires_after_sleep_now_is_ignored() {
     let _ = app.update(Event::SleepNow, &mut model);
     let sleep = model.power.sleep;
 
-    // The idle timer of the start expires later. It is stale, so the core
-    // ignores it.
+    // The core cleared the idle timer of the start. If its expiry still
+    // arrives, the core ignores it.
     assert_ne!(model.power.idle, idle);
     app.update(Event::IdleTimeout(idle), &mut model)
         .expect_no_effects();
@@ -564,4 +569,50 @@ fn sleep_now_before_start_does_nothing() {
 
     app.update(Event::SleepNow, &mut model).expect_no_effects();
     assert!(!model.power.asleep);
+}
+
+/// Returns the number of idle timers that expired in `events`.
+fn idle_timeouts(events: &[Event]) -> usize {
+    events
+        .iter()
+        .filter(|event| matches!(event, Event::IdleTimeout(_)))
+        .count()
+}
+
+#[test]
+fn a_page_turn_clears_the_idle_timer_and_only_the_new_timer_fires() {
+    let mut shell = Shell::new();
+    shell.send(start(PowerSource::Battery));
+    let half = IDLE_TIMEOUT / 2;
+    shell.advance(half);
+    shell.take_log();
+
+    shell.send(Event::NextPage);
+    let log = shell.take_log();
+    assert!(log.contains(&"TimeClear".into()), "{log:?}");
+
+    // The idle timer of the start does not fire.
+    assert_eq!(idle_timeouts(&shell.advance(half)), 0);
+    assert!(shell.sleep.is_none());
+    // The new timer fires, and the device sleeps.
+    assert_eq!(idle_timeouts(&shell.advance(half)), 1);
+    assert!(shell.sleep.is_some());
+}
+
+#[test]
+fn sleep_now_clears_the_idle_timer() {
+    let mut shell = Shell::new();
+    shell.send(start(PowerSource::Battery));
+    shell.take_log();
+
+    shell.send(Event::SleepNow);
+    let log = shell.take_log();
+    assert_eq!(
+        log.first().map(String::as_str),
+        Some("TimeClear"),
+        "{log:?}"
+    );
+    assert!(shell.sleep.is_some());
+
+    assert_eq!(idle_timeouts(&shell.advance(IDLE_TIMEOUT)), 0);
 }

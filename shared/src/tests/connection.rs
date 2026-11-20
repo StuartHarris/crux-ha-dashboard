@@ -8,7 +8,8 @@ use crux_core::App;
 use super::{
     ExpectFullRefreshTimer, ExpectLight, ExpectRadioLimit,
     broker::publish_of,
-    link_up, start,
+    flows::house,
+    link_up, start, tap_all_lights,
     wire::{ExpectWrite, Wire},
 };
 use crate::{
@@ -211,7 +212,8 @@ fn connected_publishes_online_subscribes_and_draws() {
             assert!(!topics.iter().any(|topic| topic.contains("scene")));
             assert!(!topics.iter().any(|topic| topic.contains('#')));
         })
-        .expect_only_render();
+        .expect_render()
+        .expect_only_session_clear(&wire);
 
     let view = app.view(&model);
     assert_eq!(view.connection, Connection::Online);
@@ -894,6 +896,78 @@ fn a_service_call_that_is_too_long_in_the_outbox_is_dropped_with_a_line_when_the
                 "mqtt: the service call for light.all_lights is too long for a packet, so the core dropped it"
             );
         })
-        .expect_only_render();
+        .expect_render()
+        .expect_only_session_clear(&wire);
     assert!(model.connection.outbox.is_empty());
+}
+
+#[test]
+fn the_answer_to_close_clears_the_close_timeout() {
+    let mut shell = house();
+    shell.send(start(PowerSource::Battery));
+    shell.take_log();
+
+    shell.send(Event::SleepNow);
+    let log = shell.take_log();
+    let close = format!("TimeNotifyAfter {}ms", CLOSE_TIMEOUT.as_millis());
+    let timer = log
+        .iter()
+        .position(|effect| *effect == close)
+        .unwrap_or_else(|| panic!("no close timeout in {log:?}"));
+    assert_eq!(log[timer + 1], "TimeClear", "{log:?}");
+
+    let events = shell.advance(CLOSE_TIMEOUT);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, Event::CloseTimeout { .. })),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn a_sleep_clears_the_reconnect_timer() {
+    let mut shell = house();
+    shell.send(start(PowerSource::Battery));
+    shell.broker.down = true;
+    shell.take_log();
+    shell.broker.drop_connection();
+    shell.run();
+    let wait = format!("TimeNotifyAfter {}ms", RECONNECT_MIN.as_millis());
+    let log = shell.take_log();
+    assert!(log.contains(&wait), "{log:?}");
+    let reconnect = shell.model.connection.reconnect;
+
+    shell.send(Event::SleepNow);
+    assert!(shell.sleep.is_some());
+    let log = shell.take_log();
+    assert!(log.contains(&"TimeClear".into()), "{log:?}");
+    let events = shell.advance(RECONNECT_MAX);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, Event::Reconnect(id) if *id == reconnect)),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn the_core_clears_the_session_timers_that_the_session_no_longer_uses() {
+    let mut shell = house();
+    shell.send(start(PowerSource::Stand));
+    // The ping, silence and ack timers wait. The core cleared the open,
+    // CONNACK and send timers.
+    assert_eq!(shell.session_timer_count(), 3);
+
+    // Each write starts a send timer, and the answer to the write cancels
+    // it.
+    for _ in 0..3 {
+        shell.send(tap_all_lights());
+    }
+    assert_eq!(shell.session_timer_count(), 3);
+
+    // The session ends, so the core clears all its timers.
+    shell.broker.drop_connection();
+    shell.run();
+    assert_eq!(shell.session_timer_count(), 0);
 }

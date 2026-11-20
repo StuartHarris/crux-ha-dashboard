@@ -31,6 +31,8 @@ pub struct Wire {
     pub log: Vec<Action>,
     /// The timers that the session started, in order.
     pub timers: Vec<(Timer, Duration)>,
+    /// The kinds of the timers that the session cancelled, in order.
+    pub cancels: Vec<TimerKind>,
     /// The bytes of each `Send`, in order.
     pub sends: Vec<Vec<u8>>,
 }
@@ -52,6 +54,7 @@ impl Wire {
             chunks: Chunks::Whole,
             log: Vec::new(),
             timers: Vec::new(),
+            cancels: Vec::new(),
             sends: Vec::new(),
         }
     }
@@ -81,8 +84,8 @@ impl Wire {
     }
 
     /// Does the actions of the session until there are none. Calls `react`
-    /// with each action that is not `Send` or `StartTimer`, before the next
-    /// poll. A `Close` stops the connection to the broker.
+    /// with each action that is not `Send`, `StartTimer` or `CancelTimer`,
+    /// before the next poll. A `Close` stops the connection to the broker.
     pub fn run_with(&mut self, mut react: impl FnMut(&mut Session, &Action)) {
         while let Some(action) = self.session.poll() {
             match action {
@@ -93,6 +96,7 @@ impl Wire {
                     self.deliver(&answer);
                 }
                 Action::StartTimer { timer, after } => self.timers.push((timer, after)),
+                Action::CancelTimer(kind) => self.cancels.push(kind),
                 action => {
                     if action == Action::Close {
                         self.broker.drop_connection();

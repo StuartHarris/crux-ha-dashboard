@@ -29,7 +29,7 @@ use alloc::{
 use core::{mem, time::Duration};
 
 use chrono::{DateTime, Utc};
-use crux_time::clock::Time;
+use crux_time::TimerHandle;
 use futures::StreamExt;
 
 use crate::{
@@ -42,11 +42,12 @@ use crate::{
     features::{
         pending,
         refresh::{redraw, redraw_soon},
+        timer::{self, Running, Slot},
         wifi,
     },
     mqtt::{
         Action, Connect, End, Input, LastWill, Limits, Message, Publish, Qos, Refused, Session,
-        SubscribeId, SubscribeOutcome, Timer,
+        SubscribeId, SubscribeOutcome, Timer, TimerKind,
     },
     summary,
 };
@@ -116,6 +117,12 @@ pub struct State {
     pub skipped: usize,
     /// The id of the newest reconnect timer.
     pub reconnect: u32,
+    /// The reconnect timer that runs.
+    reconnect_timer: Slot,
+    /// The timers of [`CLOSE_TIMEOUT`] that run. The id of each timer is
+    /// the id of the connection of its `Close` request. Two can run at the
+    /// same time: one for the stream that drains, and one for a sleep.
+    closes: Vec<Running>,
     /// The wait before the next reconnect.
     pub backoff: Duration,
     /// The service calls that wait for a connection.
@@ -133,6 +140,44 @@ pub struct Live {
     /// connection. Later messages on the connection only count in
     /// [`State::skipped`].
     pub skip_logged: bool,
+    /// The handle of the timer of each kind that runs, at the index of its
+    /// kind.
+    timers: [Option<TimerHandle>; TimerKind::COUNT],
+}
+
+impl Live {
+    /// Makes the state of a new session.
+    fn new(session: Session) -> Self {
+        Self {
+            session,
+            subscribe: None,
+            skip_logged: false,
+            timers: Default::default(),
+        }
+    }
+
+    /// Keeps the handle of the timer of `kind` that the session started.
+    /// Clears the timer of that kind before it, because the session no
+    /// longer uses that timer.
+    fn timer_started(&mut self, kind: TimerKind, handle: TimerHandle) {
+        if let Some(old) = self.timers[kind.index()].replace(handle) {
+            old.clear();
+        }
+    }
+
+    /// Clears the timer of `kind`, if it runs.
+    fn cancel_timer(&mut self, kind: TimerKind) {
+        if let Some(handle) = self.timers[kind.index()].take() {
+            handle.clear();
+        }
+    }
+
+    /// Clears all the timers of the session.
+    fn clear_timers(&mut self) {
+        for handle in self.timers.iter_mut().filter_map(Option::take) {
+            handle.clear();
+        }
+    }
 }
 
 /// A service call that waits in the outbox.
@@ -156,6 +201,8 @@ impl Default for State {
             connect_waits: false,
             skipped: 0,
             reconnect: 0,
+            reconnect_timer: Slot::default(),
+            closes: Vec::new(),
             backoff: RECONNECT_MIN,
             outbox: Vec::new(),
         }
@@ -167,13 +214,17 @@ impl Default for State {
 pub fn reset(model: &mut Model) {
     wifi::reset(model);
     let state = &mut model.connection;
-    state.session = None;
+    end_session(state);
+    for timer in mem::take(&mut state.closes) {
+        timer.clear();
+    }
     state.closing = None;
     state.draining = None;
     state.connect_waits = false;
     state.mqtt = Link::Down;
     state.id = state.id.wrapping_add(1);
     state.reconnect = state.reconnect.wrapping_add(1);
+    state.reconnect_timer.stop();
     state.backoff = RECONNECT_MIN;
 }
 
@@ -264,12 +315,13 @@ pub fn go_offline(sleep: u32, model: &mut Model) -> Cmd {
     let state = &mut model.connection;
     // The core ignores the answers to earlier requests.
     state.reconnect = state.reconnect.wrapping_add(1);
+    state.reconnect_timer.stop();
     let up = state.mqtt == Link::Up;
     state.mqtt = Link::Down;
     let id = state.id;
     state.closing = Some((id, sleep));
     let Some(live) = &mut state.session else {
-        return close_stream(id, true, STATUS_ASLEEP.to_string());
+        return close_stream(id, true, STATUS_ASLEEP.to_string(), state);
     };
     if up && let Some(status) = status {
         // A publish that the session refuses cannot stop the sleep, so the
@@ -363,7 +415,7 @@ fn drain_outbox(model: &mut Model) -> Cmd {
 
 /// Tries to connect again after the wait for the reconnect `id`.
 pub fn reconnect(id: u32, model: &mut Model) -> Cmd {
-    if id == model.connection.reconnect {
+    if model.connection.reconnect_timer.expired(id) {
         go_online(model)
     } else {
         Cmd::done()
@@ -408,13 +460,10 @@ fn connect(model: &mut Model) -> Cmd {
     let (host, port) = (request.host.clone(), request.port);
     state.mqtt = Link::Starting;
     state.id = state.id.wrapping_add(1);
-    // The core ignores a reconnect timer that runs now.
+    // The core clears a reconnect timer that runs now.
     state.reconnect = state.reconnect.wrapping_add(1);
-    state.session = Some(Live {
-        session: Session::new(&request, Limits::default()),
-        subscribe: None,
-        skip_logged: false,
-    });
+    state.reconnect_timer.stop();
+    state.session = Some(Live::new(Session::new(&request, Limits::default())));
     let connection = state.id;
 
     let open = Cmd::new(move |ctx| async move {
@@ -475,13 +524,21 @@ pub fn session_timer(id: u32, timer: Timer, model: &mut Model) -> Cmd {
     handle(id, Input::Timer(timer), model)
 }
 
-/// Handles the answer to the `Close` request on the connection `id`.
+/// Handles the answer to the `Close` request on the connection `id`, and
+/// clears its timer of [`CLOSE_TIMEOUT`].
 ///
 /// If the core closed the stream for a sleep, it sends [`Event::Offline`]
 /// for the sleep. If the core wanted to connect while the `Close` request
 /// waited, it connects now. Refer to [`connect`].
 pub fn stream_closed(id: u32, model: &mut Model) -> Cmd {
     let state = &mut model.connection;
+    let (done, waiting) = mem::take(&mut state.closes)
+        .into_iter()
+        .partition(|timer| timer.id() == id);
+    state.closes = waiting;
+    for timer in done {
+        timer.clear();
+    }
     let offline = match state.closing {
         Some((connection, sleep)) if connection == id => {
             state.closing = None;
@@ -503,19 +560,28 @@ pub fn stream_closed(id: u32, model: &mut Model) -> Cmd {
 /// connection `id`.
 ///
 /// If the answer did not arrive, the core acts as if it
-/// arrived now. After the answer, the core ignores the timer, and after the
-/// timer, the core ignores the answer. Refer to [`CLOSE_TIMEOUT`].
+/// arrived now. The answer clears the timer. If the timer expires first,
+/// the core ignores the answer. Refer to [`CLOSE_TIMEOUT`].
 pub fn close_timeout(id: u32, model: &mut Model) -> Cmd {
     stream_closed(id, model)
 }
 
 /// Sends the `Close` request for the stream of the connection `id`, and
 /// starts the timer of [`CLOSE_TIMEOUT`].
-fn close_stream(id: u32, clean: bool, reason: String) -> Cmd {
+fn close_stream(id: u32, clean: bool, reason: String, state: &mut State) -> Cmd {
     let close = Stream::close(id, clean, reason)
         .then_send(move |()| Event::StreamClosed { connection: id });
-    let (timer, _handle) = Time::notify_after(CLOSE_TIMEOUT);
-    close.and(timer.then_send(move |_| Event::CloseTimeout { connection: id }))
+    let (timer, running) =
+        Running::start(id, CLOSE_TIMEOUT, Event::CloseTimeout { connection: id });
+    state.closes.push(running);
+    close.and(timer)
+}
+
+/// Forgets the session, and clears its timers.
+fn end_session(state: &mut State) {
+    if let Some(mut live) = state.session.take() {
+        live.clear_timers();
+    }
 }
 
 /// Gives `input` to the session of the connection `id`, and does the
@@ -536,9 +602,12 @@ fn handle(id: u32, input: Input, model: &mut Model) -> Cmd {
 ///
 /// - `Send` becomes a `Write` request. Its answer is [`Event::Written`].
 /// - `StartTimer` starts a timer. The expiry is [`Event::SessionTimer`].
-///   The core does not clear a timer that the session no longer uses. The
-///   session ignores an old timer, and the core ignores a timer of an older
-///   connection. Thus the shell gets no `TimeClear` for the session.
+///   The timer replaces the timer of the same kind, so the core clears the
+///   old timer.
+/// - `CancelTimer` clears the timer of its kind. When the session ends, the
+///   core clears all the timers of the session. If the expiry of a cleared
+///   timer still arrives, the session ignores an old timer, and the core
+///   ignores a timer of an older connection.
 /// - `Connected` publishes the outbox and `online`, and subscribes, so all
 ///   three go in one `Write`.
 /// - `Message` changes the state of an entity.
@@ -573,7 +642,18 @@ pub fn pump(model: &mut Model) -> Cmd {
                         outcome,
                     },
                 )),
-                Action::StartTimer { timer, after } => timers.push(start_timer(id, timer, after)),
+                Action::StartTimer { timer, after } => {
+                    let (command, handle) = start_timer(id, timer, after);
+                    if let Some(live) = &mut model.connection.session {
+                        live.timer_started(timer.kind, handle);
+                    }
+                    timers.push(command);
+                }
+                Action::CancelTimer(kind) => {
+                    if let Some(live) = &mut model.connection.session {
+                        live.cancel_timer(kind);
+                    }
+                }
                 // The core closes the stream when the session ends.
                 Action::Close => {}
                 Action::Connected => rest.push(connected(model)),
@@ -613,12 +693,15 @@ pub fn pump(model: &mut Model) -> Cmd {
 }
 
 /// Starts the timer `timer` of the session on the connection `id`.
-fn start_timer(id: u32, timer: Timer, after: Duration) -> Cmd {
-    let (builder, _handle) = Time::notify_after(after);
-    builder.then_send(move |_| Event::SessionTimer {
-        connection: id,
-        timer,
-    })
+/// Returns its command and its handle.
+fn start_timer(id: u32, timer: Timer, after: Duration) -> (Cmd, TimerHandle) {
+    timer::notify_after(
+        after,
+        Event::SessionTimer {
+            connection: id,
+            timer,
+        },
+    )
 }
 
 /// The broker accepted the connection: publish the outbox and `online`,
@@ -718,11 +801,11 @@ fn subscribed(id: SubscribeId, outcome: SubscribeOutcome, model: &mut Model) -> 
 fn ended(end: &End, model: &mut Model) -> Cmd {
     let health = wifi::session_ended(end, model);
     let state = &mut model.connection;
-    state.session = None;
+    end_session(state);
     let id = state.id;
     state.draining = Some(id);
     state.connect_waits = false;
-    let close = close_stream(id, *end == End::Clean, end.to_string());
+    let close = close_stream(id, *end == End::Clean, end.to_string(), state);
     state.id = state.id.wrapping_add(1);
     state.mqtt = Link::Down;
     if model.power.asleep {
@@ -785,7 +868,7 @@ fn schedule_reconnect(model: &mut Model) -> Cmd {
     let id = state.reconnect;
     let wait = state.backoff;
     state.backoff = (wait * 2).min(RECONNECT_MAX);
-    let (timer, _handle) = Time::notify_after(wait);
+    let timer = state.reconnect_timer.start(id, wait, Event::Reconnect(id));
     let reason = log::info(Area::Mqtt, format!("connect again in {} s", wait.as_secs()));
-    reason.and(timer.then_send(move |_| Event::Reconnect(id)))
+    reason.and(timer)
 }

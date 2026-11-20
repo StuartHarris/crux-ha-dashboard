@@ -64,7 +64,8 @@ fn quiet_after_connect(refuse: Option<String>) -> usize {
     wire.broker.refuse = refuse;
     wire.connect(&mut model)
         .expect_write_with(&mut wire, &mut model, |_| {})
-        .expect_only_render();
+        .expect_render()
+        .expect_only_session_clear(&wire);
     wire.effects
         .iter()
         .filter(|effect| matches!(effect, Effect::RadioScan(_)))

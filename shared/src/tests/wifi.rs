@@ -953,12 +953,12 @@ fn a_session_that_fails_during_a_scan_leaves_and_joins_and_the_scan_stays_due() 
 
 #[test]
 fn a_time_limit_after_the_answer_does_nothing() {
-    // The radio requests of the start got their answers, so their time
-    // limits expire with the link up.
+    // The radio requests of the start got their answers, and each answer
+    // cleared its time limit. No time limit expires.
     let mut shell = online();
     let events = shell.advance(JOIN_TIMEOUT);
     assert!(
-        events
+        !events
             .iter()
             .any(|event| matches!(event, Event::RadioTimeout(_))),
         "{events:?}"
@@ -967,7 +967,8 @@ fn a_time_limit_after_the_answer_does_nothing() {
     assert_eq!(shell.model.wifi.phase, Phase::Up(HALL));
     assert_eq!(shell.view().connection, Connection::Online);
 
-    // The time limit of `Off` expires while the device sleeps.
+    // The answer to `Off` cleared its time limit, so nothing happens while
+    // the device sleeps.
     let mut shell = asleep();
     let radio_off = shell.model.wifi.radio;
     shell.advance(OFF_TIMEOUT);
@@ -1281,4 +1282,29 @@ fn a_strongest_join_that_fails_after_the_sleep_started_writes_no_line() {
         .update(Event::Joined { radio: 9, joined }, &mut model)
         .expect_no_effects();
     assert_eq!(model.wifi.phase, Phase::Idle);
+}
+
+#[test]
+fn an_answer_clears_the_time_limit_of_its_request() {
+    let mut shell = house();
+    shell.hold_radio = true;
+    shell.send(start(PowerSource::Stand));
+    let join = shell.model.wifi.radio;
+    shell.take_log();
+
+    shell.answer_radio();
+    let log = shell.take_log();
+    assert_eq!(
+        log.first().map(String::as_str),
+        Some("TimeClear"),
+        "{log:?}"
+    );
+
+    let events = shell.advance(JOIN_TIMEOUT);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, Event::RadioTimeout(radio) if *radio == join)),
+        "{events:?}"
+    );
 }

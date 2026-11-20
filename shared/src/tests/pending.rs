@@ -132,6 +132,7 @@ fn the_timeout_shows_the_last_state_and_an_old_timer_is_ignored() {
         .expect_light_timer()
         .expect_publish(&mut wire, &mut model)
         .expect_pending_timer()
+        .expect_session_clear(&wire)
         .expect_no_effects();
     assert_ne!(model.pending.timer, first);
 
@@ -175,7 +176,8 @@ fn a_scene_mark_ends_after_the_scene_timeout() {
         .expect_time_notify_after_with(|notify| {
             assert_eq!(Duration::from(notify.duration), SCENE_TIMEOUT);
         })
-        .expect_only_render();
+        .expect_render()
+        .expect_only_session_clear(&wire);
     let scenes = app.view(&model).scenes().to_vec();
     assert!(scenes[2].pending);
     assert!(!scenes[0].pending);
@@ -588,6 +590,7 @@ fn the_target_of_an_earlier_step_does_not_confirm_a_later_step() {
             assert!(payload.ends_with(r#""temperature":20.5}"#), "{payload}");
         })
         .expect_pending_timer()
+        .expect_session_clear(&wire)
         .expect_no_effects();
 
     // Home Assistant does the first call. Its target is not the target of
@@ -617,7 +620,8 @@ fn the_target_of_an_earlier_step_does_not_confirm_a_later_step() {
             assert!(payload.ends_with(r#""temperature":20.0}"#), "{payload}");
         })
         .expect_pending_timer()
-        .expect_only_render();
+        .expect_render()
+        .expect_only_session_clear(&wire);
     let view = app.view(&model);
     assert_eq!(view.tiles()[4].state, TileState::Pending);
     assert_eq!(view.tiles()[4].detail, "Set 20.0°");
@@ -643,4 +647,26 @@ fn after_the_timeout_a_thermostat_step_starts_from_the_target_of_home_assistant(
             let payload = core::str::from_utf8(&publish.payload).unwrap();
             assert!(payload.ends_with(r#""temperature":20.0}"#), "{payload}");
         });
+}
+
+#[test]
+fn a_second_call_clears_the_timeout_of_the_first_and_only_the_new_timeout_fires() {
+    let mut shell = super::flows::house();
+    // Home Assistant does not answer, so no state confirms a call.
+    shell.broker.ignore_calls = true;
+    shell.send(start_at(PowerSource::Stand, Some("/room/living_room")));
+    shell.send(tap_tile(1));
+    shell.take_log();
+
+    shell.send(tap_tile(1));
+    let log = shell.take_log();
+    assert!(log.contains(&"TimeClear".into()), "{log:?}");
+
+    let events = shell.advance(PENDING_TIMEOUT);
+    let timeouts = events
+        .iter()
+        .filter(|event| matches!(event, Event::PendingTimeout(_)))
+        .count();
+    assert_eq!(timeouts, 1, "{events:?}");
+    assert_eq!(shell.view().tiles()[1].state, TileState::On);
 }

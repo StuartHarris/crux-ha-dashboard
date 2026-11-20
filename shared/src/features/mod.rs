@@ -7,4 +7,5 @@ pub mod pending;
 pub mod power;
 pub mod refresh;
 pub mod rooms;
+pub mod timer;
 pub mod wifi;

@@ -117,6 +117,7 @@ fn the_sleep_turns_the_light_off_before_it_disconnects() {
     let mut disconnect = app.update(light_off, &mut model);
     disconnect
         .expect_disconnect(&mut wire, &mut model)
+        .expect_session_clear(&wire)
         .expect_no_effects();
 
     // The light timer of the tap expires during the sleep. It does nothing.
@@ -170,6 +171,7 @@ fn a_tap_on_no_control_lights_the_light_but_the_sleep_comes_on_time_and_turns_it
     let light_off = sleep.expect_one_event();
     app.update(light_off, &mut model)
         .expect_disconnect(&mut wire, &mut model)
+        .expect_session_clear(&wire)
         .expect_no_effects();
     assert_eq!(model.light.level, 0);
 }
@@ -181,6 +183,7 @@ fn a_sleep_with_the_light_off_disconnects_at_once() {
 
     app.update(Event::IdleTimeout(model.power.idle), &mut model)
         .expect_disconnect(&mut wire, &mut model)
+        .expect_session_clear(&wire)
         .expect_no_effects();
 }
 
@@ -248,10 +251,12 @@ fn the_sleep_turns_the_light_off_and_a_wake_tap_turns_it_on_again() {
     let disconnect = log.iter().position(|effect| effect == "MqttDisconnect");
     assert!(light.is_some() && light < disconnect, "{log:?}");
 
-    // The light timer of the tap expires during the sleep. It does nothing.
+    // The sleep turned the light off, so it cleared the light timer of the
+    // tap.
+    assert!(log.contains(&"TimeClear".into()), "{log:?}");
     let events = shell.advance(LIGHT_TIMEOUT);
     assert!(
-        events
+        !events
             .iter()
             .any(|event| matches!(event, Event::LightTimeout(_))),
         "{events:?}"
@@ -267,4 +272,24 @@ fn the_sleep_turns_the_light_off_and_a_wake_tap_turns_it_on_again() {
     shell.advance(LIGHT_TIMEOUT);
     assert_eq!(shell.light, 0);
     assert!(!shell.model.power.asleep);
+}
+
+#[test]
+fn a_second_tap_clears_the_light_timer_and_only_the_new_timer_fires() {
+    let mut shell = Shell::new();
+    shell.send(start(PowerSource::Stand));
+    shell.send(Event::Tapped(None));
+    shell.take_log();
+
+    shell.send(Event::Tapped(None));
+    let log = shell.take_log();
+    assert!(log.contains(&"TimeClear".into()), "{log:?}");
+
+    let events = shell.advance(LIGHT_TIMEOUT);
+    let timeouts = events
+        .iter()
+        .filter(|event| matches!(event, Event::LightTimeout(_)))
+        .count();
+    assert_eq!(timeouts, 1, "{events:?}");
+    assert_eq!(shell.light, 0);
 }
