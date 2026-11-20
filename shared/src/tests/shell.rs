@@ -37,6 +37,10 @@
 //! keeps each radio request, and obeys the stop rule of the radio
 //! capability: a new request stops each request that waits.
 //! [`Shell::answer_radio`] answers the requests that wait.
+//!
+//! The shell keeps each `Log` notification in [`Shell::logs`], not in
+//! [`Shell::log`], so a line of the log does not change the effects that a
+//! test checks.
 
 use alloc::{format, string::String, vec::Vec};
 use core::time::Duration;
@@ -108,6 +112,9 @@ pub struct Shell {
     held: Vec<Held>,
     /// The reason of each `Restart` notification, in order.
     pub restarts: Vec<String>,
+    /// Each `Log` notification as `{level} {area}: {message}`, in order. For
+    /// example `warn wifi: the scan failed, so stay on ...`.
+    pub logs: Vec<String>,
     /// The timers that wait, in the order in which the core started them.
     timers: Vec<Timer>,
     /// The time on the clock of the shell.
@@ -148,6 +155,7 @@ impl Shell {
             hold_radio: false,
             held: Vec::new(),
             restarts: Vec::new(),
+            logs: Vec::new(),
             timers: Vec::new(),
             now: Duration::ZERO,
             light: 0,
@@ -379,6 +387,12 @@ impl Shell {
         core::mem::take(&mut self.log)
     }
 
+    /// Returns the lines of the log of the core and clears them. Refer to
+    /// [`Shell::logs`].
+    pub fn take_logs(&mut self) -> Vec<String> {
+        core::mem::take(&mut self.logs)
+    }
+
     fn handle(&mut self, effect: Effect) {
         match effect {
             Effect::Render(_) => {
@@ -432,6 +446,10 @@ impl Shell {
             Effect::RadioRestart(request) => {
                 self.log.push("RadioRestart".into());
                 self.restarts.push(request.operation.reason);
+            }
+            Effect::Log(request) => {
+                let log = request.operation;
+                self.logs.push(format!("{} {log}", log.level));
             }
             Effect::Sleep(request) => {
                 self.log.push("Sleep".into());

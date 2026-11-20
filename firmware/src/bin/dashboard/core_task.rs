@@ -15,7 +15,7 @@ use logic::{
     sleep::Plan,
     stream::UpdateStats,
 };
-use shared::{Event, PowerSource};
+use shared::{Event, PowerSource, capabilities::log::Level};
 
 use crate::{LIGHT, RADIO, RENDER, SIGNALS, SLEEP, STREAM, TIMERS, config::CONFIG, radio, timers};
 
@@ -84,6 +84,10 @@ fn record(stats: &mut UpdateStats, started: Instant) {
 /// The radio task does the radio jobs and the `Restart` job, and answers
 /// with `Signal::Radio`.
 ///
+/// This task writes each line of the log of the core as `{area}: {message}`,
+/// with no prefix of its own. Thus a `wifi:` line comes between the lines of
+/// the radio task.
+///
 /// An `Open` starts new update statistics. The first `Close` of the same
 /// connection logs them. A `Close` of an older connection, or a second
 /// `Close`, logs no statistics.
@@ -124,6 +128,10 @@ fn dispatch(jobs: alloc::vec::Vec<Job>, display: bool, stats: &mut Stats) {
             }
             Job::Radio { token, stop, op } => RADIO.push(radio::Request::Job { token, stop, op }),
             Job::Restart(restart) => RADIO.push(radio::Request::Restart(restart)),
+            Job::Log(line) => match line.level {
+                Level::Info => log::info!("{line}"),
+                Level::Warn => log::warn!("{line}"),
+            },
             Job::FrontLight { token, level } if display => LIGHT.push((token, level)),
             Job::FrontLight { token, .. } => SIGNALS.push(shell::Signal::Light { token }),
             Job::Sleep(sleep) => {

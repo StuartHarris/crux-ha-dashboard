@@ -4,6 +4,7 @@
 //! Each shell has the other half, which performs the operations.
 
 pub mod light;
+pub mod log;
 pub mod power;
 pub mod radio;
 pub mod stream;

@@ -30,6 +30,9 @@
 //!   drops the late answers of those jobs.
 //! - `Restart` is a notification. The shell gives it to a task as
 //!   [`Job::Restart`].
+//! - `Log` is a notification. The shell gives it to a task as [`Job::Log`],
+//!   in the order of the effects. Thus a line of the log comes before the
+//!   job of the next effect, for example before a `Restart`.
 //! - `Sleep` ends at [`Signal::Woke`]. While it waits, a tap is the wake
 //!   (`Wake::Touch` with the control at the point), and a change of the
 //!   power source also ends it (`Wake::PowerSource`). [`Shell::is_sleeping`] tells
@@ -57,6 +60,7 @@ use shared::{
     Core, Dashboard, Effect, Event, PowerSource, Settings, Start, ViewModel,
     capabilities::{
         light::FrontLight,
+        log::Log,
         power::{Sleep, Wake},
         radio::{Address, Join, Joined, Lease, Leave, Off, Restart, Scan, Scanned, StopScan},
         stream::{Close, Open, StreamItem, Write, Written},
@@ -220,6 +224,9 @@ pub enum Job {
     /// Write the reason to the log, wait for the log to go, and restart the
     /// chip. No answer.
     Restart(Restart),
+    /// Write the line to the log as `{area}: {message}`, at its level. No
+    /// answer.
+    Log(Log),
     /// Draw the view model that waits, then put the device to sleep. Answer
     /// with [`Signal::Woke`] at the first real wake. After another wake,
     /// sleep again.
@@ -583,10 +590,8 @@ impl Shell {
                 let op = RadioOp::Off(request.operation);
                 self.radio(RadioRequest::Off(request), op, jobs)
             }
-            Effect::RadioRestart(request) => {
-                jobs.push(Job::Restart(request.operation));
-                Vec::new()
-            }
+            Effect::RadioRestart(request) => notification(Job::Restart(request.operation), jobs),
+            Effect::Log(request) => notification(Job::Log(request.operation), jobs),
             Effect::Sleep(request) => {
                 jobs.push(Job::Sleep(request.operation.clone()));
                 self.sleep = Some(request);
@@ -630,6 +635,13 @@ impl Shell {
 
 /// The reason in the answer to a `Write` for a stream that ended.
 const NOT_OPEN: &str = "the stream is not open";
+
+/// Adds the job of a notification to `jobs`. A notification has no answer,
+/// so it gives no new effects.
+fn notification(job: Job, jobs: &mut Vec<Job>) -> Vec<Effect> {
+    jobs.push(job);
+    Vec::new()
+}
 
 const fn stream(connection: u32, op: StreamOp) -> Job {
     Job::Stream { connection, op }

@@ -7,13 +7,13 @@
 //! from the test. The wire sends the events of the stream to the core at once. It
 //! keeps the other effects and events for the test, in
 //! [`Wire::effects`] and [`Wire::events`]. It ignores the timers of the MQTT
-//! session.
+//! session. It keeps each `Log` notification in [`Wire::logs`].
 //!
 //! A test checks a `Write` in a command with the [`ExpectWrite`] helpers.
 //! They skip the timers of the session, take the `Write`, answer it, and
 //! leave the other effects of the command for the next helpers.
 
-use alloc::{collections::VecDeque, vec::Vec};
+use alloc::{collections::VecDeque, format, string::String, vec::Vec};
 use core::time::Duration;
 
 use crux_core::{App, Request};
@@ -49,6 +49,8 @@ pub struct Wire {
     pub events: VecDeque<Event>,
     /// The packets that the core wrote, in order.
     pub packets: Vec<Packet>,
+    /// Each `Log` notification as `{level} {area}: {message}`, in order.
+    pub logs: Vec<String>,
 }
 
 impl Wire {
@@ -83,6 +85,7 @@ impl Wire {
             effects: VecDeque::new(),
             events: VecDeque::new(),
             packets: Vec::new(),
+            logs: Vec::new(),
         }
     }
 
@@ -233,6 +236,10 @@ impl Wire {
             }
             Effect::TimeNotifyAfter(request) if is_session_timer(&request) => {
                 self.session_timers.push(request.operation.id);
+            }
+            Effect::Log(request) => {
+                let log = request.operation;
+                self.logs.push(format!("{} {log}", log.level));
             }
             Effect::TimeClear(mut request)
                 if self.session_timers.contains(&request.operation.id) =>
