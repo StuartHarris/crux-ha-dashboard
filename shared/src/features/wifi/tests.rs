@@ -11,7 +11,7 @@ use core::time::Duration;
 
 use crux_core::App;
 
-use crate::tests::{flows::house, settings, shell::Shell, start};
+use crate::tests::{asleep as is_asleep, flows::house, settings, shell::Shell, start};
 use crate::{
     Connection, Dashboard, Effect, EffectTestExt, Event, Model, PowerSource,
     capabilities::{
@@ -1320,4 +1320,61 @@ fn an_answer_clears_the_time_limit_of_its_request() {
         ),
         "{events:?}"
     );
+}
+
+#[test]
+fn a_wake_during_the_scan_stop_of_a_sleep_does_not_disconnect() {
+    let mut shell = scanning();
+    // The sleep first stops the scan.
+    shell.send(Event::SleepNow);
+    assert!(is_asleep(&shell.model));
+    // A tap wakes the device before the answer to `StopScan`.
+    shell.send(Event::Tapped(None));
+    assert!(!is_asleep(&shell.model));
+    shell.take_log();
+
+    // The answer does not continue the sleep.
+    shell.answer_radio();
+    let log = shell.take_log();
+    assert!(
+        !log.iter().any(|entry| entry == "MqttDisconnect"),
+        "{log:?}"
+    );
+    assert_eq!(
+        shell.model.connection.link(),
+        crate::features::connection::Link::Up
+    );
+    assert!(!is_asleep(&shell.model));
+}
+
+#[test]
+fn a_chip_restart_during_a_sleep_leaves_the_core_asleep_with_no_step_that_waits() {
+    let mut shell = house();
+    shell.send(start(PowerSource::Battery));
+    shell.take_log();
+    // A stuck driver makes the core ask for a restart of the chip, before
+    // the idle time ends.
+    shell.radio.stuck = true;
+    shell.radio.drop_link();
+    fail_the_session(&mut shell);
+    shell.advance(RECONNECT_MIN + RECONNECT_MIN * 2);
+    assert_eq!(shell.restarts, ["no address after 3 joins"]);
+    assert_eq!(shell.model.wifi.phase, Phase::Restarting);
+    shell.take_log();
+
+    // The sleep does not turn the radio off, because the restart wins. No
+    // `Sleep` request follows.
+    shell.send(Event::SleepNow);
+    let log = shell.take_log();
+    assert!(!log.iter().any(|entry| entry == "WifiOff"), "{log:?}");
+    assert!(is_asleep(&shell.model));
+    assert!(shell.sleep.is_none());
+    assert_eq!(shell.held_radio(), 0);
+
+    // Time passes, and nothing continues the sleep. The core stays asleep
+    // until the shell sends `Start` after the restart.
+    shell.advance(IDLE_TIMEOUT);
+    assert!(is_asleep(&shell.model));
+    assert!(shell.sleep.is_none());
+    assert_eq!(shell.view().status, "Asleep");
 }

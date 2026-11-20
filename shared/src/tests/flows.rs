@@ -1150,3 +1150,83 @@ fn a_thermostat_step_past_its_limit_shows_the_mark_until_the_timeout() {
     );
     assert_eq!(shell.view().tiles()[4].detail, "Set 31.5°");
 }
+
+#[test]
+fn a_move_to_the_stand_sets_the_backoff_to_the_minimum() {
+    let mut shell = house();
+    shell.broker.down = true;
+    shell.send(start(PowerSource::Stand));
+    while shell.model.connection.backoff < RECONNECT_MAX {
+        shell.advance_to_next();
+    }
+
+    // A move to battery does not change the backoff.
+    shell.send(Event::PowerSourceChanged(PowerSource::Battery));
+    assert_eq!(shell.model.connection.backoff, RECONNECT_MAX);
+
+    // A move back to the stand sets the backoff to the minimum. The core
+    // tries at once, and again after the shortest wait.
+    shell.take_log();
+    shell.send(Event::PowerSourceChanged(PowerSource::Stand));
+    shell.advance(RECONNECT_MIN);
+    let log = shell.take_log();
+    assert_eq!(count(&log, "MqttConnect"), 2, "{log:?}");
+}
+
+#[test]
+fn a_second_start_without_a_last_sync_keeps_the_footer_time() {
+    let mut shell = house();
+    shell.broker.down = true;
+    shell.send(Event::Start(crate::Start {
+        last_sync: Some(super::NOW),
+        ..start_parts(PowerSource::Stand)
+    }));
+    assert_eq!(shell.view().updated, "Last changed 09:41");
+
+    // The shell has no time of a state message to give.
+    shell.send(Event::Start(crate::Start {
+        last_sync: None,
+        ..start_parts(PowerSource::Stand)
+    }));
+    assert_eq!(shell.view().last_sync, Some(super::NOW));
+    assert_eq!(shell.view().updated, "Last changed 09:41");
+}
+
+#[test]
+fn before_start_the_core_draws_pages_but_sends_no_calls_and_does_not_sleep() {
+    let mut shell = house();
+
+    // A move to battery draws and starts an idle timer.
+    shell.send(Event::PowerSourceChanged(PowerSource::Battery));
+    let log = shell.take_log();
+    assert!(log.contains(&"Render".into()), "{log:?}");
+    let idle = alloc::format!("TimeNotifyAfter {}ms", IDLE_TIMEOUT.as_millis());
+    assert_eq!(count(&log, &idle), 1, "{log:?}");
+
+    // The idle timer expires, but the device does not sleep.
+    let events = shell.advance(IDLE_TIMEOUT);
+    assert_eq!(idle_timeouts(&events).len(), 1);
+    assert_eq!(shell.take_log(), [] as [String; 0]);
+    assert!(!super::asleep(&shell.model));
+    assert_eq!(shell.sleep, None);
+
+    // A page turn changes the route and draws.
+    let frames = shell.frames.len();
+    let route = shell.model.route.clone();
+    shell.send(Event::NextPage);
+    assert_ne!(shell.model.route, route);
+    assert_eq!(shell.frames.len(), frames + 1);
+
+    // A tap on a tile sends nothing and keeps nothing for later.
+    shell.send(Event::Navigate(Route::room("living_room")));
+    shell.take_log();
+    shell.send(tap_tile(0));
+    let log = shell.take_log();
+    assert!(
+        !log.iter().any(|entry| entry.starts_with("Mqtt")),
+        "{log:?}"
+    );
+    assert_eq!(shell.model.connection.outbox.len(), 0);
+    assert_eq!(shell.broker.service_calls.len(), 0);
+    assert!(!shell.broker.is_connected());
+}

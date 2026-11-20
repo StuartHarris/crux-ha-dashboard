@@ -662,6 +662,34 @@ fn a_request_to_stop_the_dry_run_before_the_start_does_not_stop_it() {
 }
 
 #[test]
+fn start_uses_up_the_dry_run_request() {
+    let app = Dashboard;
+    let mut model = Model::default();
+    let _ = app.update(Event::SetReadOnly(true), &mut model);
+    let _ = app.update(start_at(PowerSource::Stand, None), &mut model);
+    assert!(app.view(&model).read_only);
+
+    // The user stops the dry run. A later `Start` with settings that do not
+    // ask for a dry run does not use the old request.
+    let _ = app.update(Event::SetReadOnly(false), &mut model);
+    let _ = app.update(start_at(PowerSource::Stand, None), &mut model);
+    assert!(!app.view(&model).read_only);
+}
+
+#[test]
+fn a_second_start_takes_the_dry_run_of_the_shell_again() {
+    let app = Dashboard;
+    let (mut model, _wire) = drive_to_connected(PowerSource::Stand);
+    let _ = app.update(Event::SetReadOnly(true), &mut model);
+    assert!(app.view(&model).read_only);
+
+    // The settings of the shell do not ask for a dry run, so the core drops
+    // the dry run that the user set after the first `Start`.
+    let _ = app.update(start_at(PowerSource::Stand, None), &mut model);
+    assert!(!app.view(&model).read_only);
+}
+
+#[test]
 fn set_read_only_while_asleep_does_not_draw() {
     let app = Dashboard;
     let (mut model, _wire) = drive_to_connected(PowerSource::Battery);

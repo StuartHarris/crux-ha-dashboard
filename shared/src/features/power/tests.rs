@@ -7,8 +7,8 @@ use core::time::Duration;
 use crux_core::App;
 
 use crate::tests::{
-    ExpectFullRefreshTimer, ExpectLight, ExpectRadioLimit, drive_to_connected, drive_to_connecting,
-    shell::Shell, start, tap_tile, wire::ExpectWrite,
+    ExpectFullRefreshTimer, ExpectLight, ExpectRadioLimit, asleep, drive_to_connected,
+    drive_to_connecting, shell::Shell, start, tap_tile, wire::ExpectWrite,
 };
 use crate::{
     Connection, Control, Dashboard, Effect, EffectTestExt, Event, Model, PowerSource,
@@ -638,4 +638,230 @@ fn sleep_now_clears_the_idle_timer() {
     assert!(shell.sleep.is_some());
 
     assert_eq!(idle_timeouts(&shell.advance(IDLE_TIMEOUT)), 0);
+}
+
+/// Returns the number of idle timers that the core cleared while they
+/// waited. Refer to [`Shell::take_cleared`]. The queued timer of the
+/// pending feature has the same duration, so a test that uses this function
+/// must not queue a service call.
+fn idle_clears(shell: &mut Shell) -> usize {
+    shell
+        .take_cleared()
+        .into_iter()
+        .filter(|duration| *duration == IDLE_TIMEOUT)
+        .count()
+}
+
+#[test]
+fn sleep_now_before_start_clears_the_idle_timer_once() {
+    let mut shell = Shell::new();
+    // Before `Start`, a move to battery starts an idle timer.
+    shell.send(Event::PowerSourceChanged(PowerSource::Battery));
+    shell.take_log();
+    shell.take_cleared();
+
+    // `SleepNow` does not sleep before `Start`, but it clears the timer.
+    shell.send(Event::SleepNow);
+    let log = shell.take_log();
+    assert_eq!(log, ["TimeClear"], "{log:?}");
+    assert_eq!(idle_clears(&mut shell), 1);
+    assert_eq!(idle_timeouts(&shell.advance(IDLE_TIMEOUT)), 0);
+}
+
+#[test]
+fn sleep_now_on_battery_clears_the_idle_timer_once() {
+    let mut shell = Shell::new();
+    shell.send(start(PowerSource::Battery));
+    shell.take_cleared();
+
+    // The sleep and `SleepNow` both stop the idle timer, but the shell gets
+    // only one `TimeClear` for it.
+    shell.send(Event::SleepNow);
+    assert_eq!(idle_clears(&mut shell), 1);
+    assert!(shell.sleep.is_some());
+}
+
+#[test]
+fn a_second_start_on_battery_clears_the_old_idle_timer_once_and_starts_one() {
+    let mut shell = Shell::new();
+    shell.send(start(PowerSource::Battery));
+    let half = IDLE_TIMEOUT / 2;
+    shell.advance(half);
+    shell.take_cleared();
+    shell.take_log();
+
+    shell.send(start(PowerSource::Battery));
+    assert_eq!(idle_clears(&mut shell), 1);
+    let log = shell.take_log();
+    let idle = alloc::format!("TimeNotifyAfter {}ms", IDLE_TIMEOUT.as_millis());
+    assert_eq!(
+        log.iter().filter(|entry| **entry == idle).count(),
+        1,
+        "{log:?}"
+    );
+
+    // The idle timer of the first start does not fire. Only the new timer
+    // fires, and the device sleeps.
+    assert_eq!(idle_timeouts(&shell.advance(half)), 0);
+    assert!(shell.sleep.is_none());
+    assert_eq!(idle_timeouts(&shell.advance(half)), 1);
+    assert!(shell.sleep.is_some());
+}
+
+#[test]
+fn an_old_light_off_answer_during_the_next_sleep_does_nothing() {
+    let app = Dashboard;
+    let (mut model, _wire) = drive_to_connected(PowerSource::Battery);
+    // The tap turns the light on, so the sleep first turns it off.
+    let _ = app.update(Event::Tapped(None), &mut model);
+    let mut first = app.update(
+        Event::Power(power::Event::IdleTimeout(model.power.idle)),
+        &mut model,
+    );
+    let mut first_light = first.expect_one_effect().expect_front_light();
+
+    // A tap wakes the device and turns the light on again. The next sleep
+    // also waits for the light.
+    let _ = app.update(Event::Tapped(None), &mut model);
+    assert!(!asleep(&model));
+    let mut second = app.update(
+        Event::Power(power::Event::IdleTimeout(model.power.idle)),
+        &mut model,
+    );
+    let _second_light = second.expect_one_effect().expect_front_light();
+    assert!(asleep(&model));
+
+    // The answer of the first sleep arrives late. It does not start the
+    // next step of the second sleep.
+    first_light.resolve(()).unwrap();
+    let old = first.expect_one_event();
+    assert!(
+        matches!(old, Event::Power(power::Event::LightOffForSleep(_))),
+        "{old:?}"
+    );
+    app.update(old, &mut model).expect_no_effect_or_events();
+    assert!(asleep(&model));
+}
+
+#[test]
+fn an_old_woke_answer_during_the_next_sleep_does_nothing() {
+    let app = Dashboard;
+    let (mut model, _wire) = drive_to_connected(PowerSource::Battery);
+    let _ = app.update(Event::SleepNow, &mut model);
+    let first = model.power.sleep;
+    let _ = app.update(Event::Tapped(None), &mut model);
+    let _ = app.update(Event::SleepNow, &mut model);
+    assert!(asleep(&model));
+
+    // The answer to the `Sleep` request of the first sleep does not wake
+    // the device from the second sleep.
+    app.update(
+        Event::Power(power::Event::Woke {
+            sleep: first,
+            wake: Wake::Touch(None),
+        }),
+        &mut model,
+    )
+    .expect_no_effect_or_events();
+    assert!(asleep(&model));
+}
+
+#[test]
+fn start_while_asleep_wakes_and_the_old_step_answers_do_nothing() {
+    let app = Dashboard;
+    let (mut model, _wire) = drive_to_connected(PowerSource::Battery);
+    let _sleep = app.update(
+        Event::Power(power::Event::IdleTimeout(model.power.idle)),
+        &mut model,
+    );
+    let old = model.power.sleep;
+    assert!(asleep(&model));
+
+    let _ = app.update(start(PowerSource::Battery), &mut model);
+    assert!(!asleep(&model));
+    for event in [
+        Event::Power(power::Event::LightOffForSleep(old)),
+        Event::Power(power::Event::Offline(old)),
+        Event::Power(power::Event::Woke {
+            sleep: old,
+            wake: Wake::Timer,
+        }),
+    ] {
+        app.update(event, &mut model).expect_no_effect_or_events();
+    }
+    assert!(!asleep(&model));
+}
+
+#[test]
+fn a_touch_after_the_extension_lets_the_next_idle_end_extend_again() {
+    let app = Dashboard;
+    let (mut model, _wire) = drive_to_connecting(PowerSource::Battery);
+    model.route = crate::Route::room("living_room");
+    // The connection is not open, so the call waits in the outbox.
+    let _ = app.update(tap_tile(0), &mut model);
+
+    // The first end of the idle time extends it once.
+    app.update(Event::SleepNow, &mut model)
+        .expect_only_time_notify_after();
+    assert!(!asleep(&model));
+
+    // A touch starts a new idle time. Its end extends again, because the
+    // call still waits.
+    let _ = app.update(Event::NextPage, &mut model);
+    app.update(Event::SleepNow, &mut model)
+        .expect_only_time_notify_after();
+    assert!(!asleep(&model));
+
+    // The next end sleeps.
+    let _ = app.update(Event::SleepNow, &mut model);
+    assert!(asleep(&model));
+}
+
+/// Drives the core on battery to a sleep that follows an older sleep. The
+/// first sleep is at the disconnect step when a tap wakes the device. The
+/// tap turns the light on, so the second sleep waits for the light. Returns
+/// the model and the id of the first sleep.
+fn second_sleep() -> (Model, u32) {
+    let app = Dashboard;
+    let (mut model, _wire) = drive_to_connected(PowerSource::Battery);
+    let _ = app.update(Event::SleepNow, &mut model);
+    let first = model.power.sleep;
+    let _ = app.update(Event::Tapped(None), &mut model);
+    let _ = app.update(Event::SleepNow, &mut model);
+    assert!(asleep(&model));
+    assert_ne!(model.power.sleep, first);
+    (model, first)
+}
+
+#[test]
+fn offline_ignores_the_id_of_an_older_sleep() {
+    let (mut model, first) = second_sleep();
+    // The radio is still on. The answer of the first sleep does not turn
+    // it off.
+    power::offline(first, &mut model).expect_no_effect_or_events();
+    assert!(asleep(&model));
+}
+
+#[test]
+fn radio_off_ignores_the_id_of_an_older_sleep() {
+    let (mut model, first) = second_sleep();
+    // The answer of the first sleep does not draw the last image or sleep.
+    power::radio_off(first, &mut model).expect_no_effect_or_events();
+    assert!(asleep(&model));
+}
+
+#[test]
+fn woke_while_awake_on_battery_does_nothing() {
+    let app = Dashboard;
+    let (mut model, _wire) = drive_to_connected(PowerSource::Battery);
+    let _ = app.update(Event::SleepNow, &mut model);
+    let sleep = model.power.sleep;
+    let _ = app.update(Event::Tapped(None), &mut model);
+    assert!(!asleep(&model));
+
+    // The id is the id of the newest sleep, but a tap woke the device
+    // first. The answer does not wake the device again or start a new idle
+    // timer.
+    power::woke(sleep, Wake::Timer, &mut model).expect_no_effect_or_events();
+    assert!(!asleep(&model));
 }

@@ -317,3 +317,10 @@ pub fn topic(entity_id: &str, key: &str) -> alloc::string::String {
 pub fn send(model: &mut Model, wire: &mut Wire, topic: &str, payload: &str) -> Cmd {
     wire.send(model, topic, payload)
 }
+
+/// Returns `true` if the view shows that the device is asleep. A test that
+/// reads the sleep state through this function does not depend on the
+/// fields of the power state.
+pub fn asleep(model: &Model) -> bool {
+    Dashboard.view(model).asleep
+}

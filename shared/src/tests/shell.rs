@@ -46,7 +46,7 @@ use alloc::{format, string::String, vec::Vec};
 use core::time::Duration;
 
 use crux_core::{App, Request};
-use crux_time::operation::NotifyAfter;
+use crux_time::{TimerId, operation::NotifyAfter};
 
 use super::broker::{Broker, publish_of};
 use crate::{
@@ -136,6 +136,9 @@ pub struct Shell {
     sleep_request: Option<Request<Sleep>>,
     /// A short name for each effect, in order.
     pub log: Vec<String>,
+    /// The duration of each timer that the core cleared while the timer
+    /// waited, in order. The timers of the session are not in this list.
+    pub cleared: Vec<Duration>,
     /// The `Close` requests, in order.
     pub closes: Vec<Close>,
     /// The packets of each `Write` request, in order.
@@ -166,6 +169,7 @@ impl Shell {
             sleep: None,
             sleep_request: None,
             log: Vec::new(),
+            cleared: Vec::new(),
             closes: Vec::new(),
             writes: Vec::new(),
         }
@@ -393,6 +397,12 @@ impl Shell {
         core::mem::take(&mut self.log)
     }
 
+    /// Returns the durations of the timers that the core cleared, and
+    /// clears the list. Refer to [`Shell::cleared`].
+    pub fn take_cleared(&mut self) -> Vec<Duration> {
+        core::mem::take(&mut self.cleared)
+    }
+
     /// Returns the lines of the log of the core and clears them. Refer to
     /// [`Shell::logs`].
     pub fn take_logs(&mut self) -> Vec<String> {
@@ -490,10 +500,24 @@ impl Shell {
                     .any(|timer| timer.session && timer.request.operation.id == id);
                 if !session {
                     self.log.push("TimeClear".into());
+                    self.record_clear(id);
                 }
                 self.timers.retain(|timer| timer.request.operation.id != id);
                 request.resolve(id).expect("the core waits for the clear");
             }
+        }
+    }
+
+    /// Adds the duration of the timer `id` to [`Shell::cleared`], if the
+    /// timer waits.
+    fn record_clear(&mut self, id: TimerId) {
+        let waits = self
+            .timers
+            .iter()
+            .find(|timer| timer.request.operation.id == id);
+        if let Some(timer) = waits {
+            self.cleared
+                .push(Duration::from(timer.request.operation.duration));
         }
     }
 
