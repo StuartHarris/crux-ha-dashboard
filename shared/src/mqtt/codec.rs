@@ -339,8 +339,8 @@ pub fn decode(first: u8, body: &[u8]) -> Result<Inbound<'_>, Malformed> {
     }
 }
 
-/// The broker side of the codec, for the fake broker in the tests.
-#[cfg(test)]
+/// The broker side of the codec, for the fake broker in [`crate::fake`].
+#[cfg(any(test, feature = "fixtures"))]
 pub mod server {
     use alloc::{string::String, vec::Vec};
 

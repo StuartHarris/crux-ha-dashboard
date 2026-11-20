@@ -1,158 +1,17 @@
-//! A fake MQTT 3.1.1 broker that reads and writes bytes, and a harness that
-//! runs a [`Session`] against it.
-//!
-//! The broker keeps retained messages and the topic filters of the one
-//! client. It matches filters with [`matches`] from the fake broker of the
-//! app tests. Its `publish` has the same form as the one of that fake
-//! broker, so a fake Home Assistant can publish through it.
+//! A harness that runs a [`Session`] against the fake broker of
+//! [`crate::fake`].
 
-use alloc::{
-    collections::BTreeMap,
-    string::{String, ToString},
-    vec::Vec,
-};
+use alloc::vec::Vec;
 use core::time::Duration;
 
 use crate::{
+    fake::Broker,
     mqtt::{
-        Action, Input, Limits, Qos, Session, Timer, TimerKind,
-        codec::{
-            self, Flags,
-            server::{self, Packet},
-        },
+        Action, Input, Limits, Session, Timer, TimerKind,
+        codec::server::{self, Packet},
         framer::{Frame, Framer},
     },
-    tests::broker::matches,
 };
-
-/// The fake broker.
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "each flag is a separate rule of the fake broker"
-)]
-#[derive(Default)]
-pub struct WireBroker {
-    framer: Option<Framer>,
-    retained: BTreeMap<String, Vec<u8>>,
-    /// The topic filters of the client.
-    pub filters: Vec<String>,
-    /// The session-present flag of the CONNACK packet.
-    pub session_present: bool,
-    /// The return code of the CONNACK packet.
-    pub code: u8,
-    /// The broker refuses this filter with the code 0x80.
-    pub refuse: Option<String>,
-    /// If `true`, the broker does not answer a SUBSCRIBE.
-    pub hold_suback: bool,
-    /// If `true`, the broker keeps the PUBACK of each publish in
-    /// [`WireBroker::held_pubacks`].
-    pub hold_puback: bool,
-    /// If `true`, the broker does not answer a PINGREQ.
-    pub hold_pingresp: bool,
-    /// The packet ids of the PUBACK packets that the broker held back.
-    pub held_pubacks: Vec<u16>,
-    /// The packets from the client, in order.
-    pub packets: Vec<Packet>,
-}
-
-impl WireBroker {
-    /// Keeps a retained message, as if another client published it.
-    pub fn retain(&mut self, topic: &str, payload: &[u8]) {
-        self.retained.insert(topic.to_string(), payload.to_vec());
-    }
-
-    /// Reads bytes from the client, and returns the bytes of the answers.
-    pub fn receive(&mut self, bytes: Vec<u8>) -> Vec<u8> {
-        let framer = self
-            .framer
-            .get_or_insert_with(|| Framer::new(super::super::MAX_PACKET));
-        framer.push(bytes);
-        let mut packets = Vec::new();
-        while let Some(frame) = framer.next_packet().expect("valid framing from the client") {
-            let Frame::Packet { first, body } = frame else {
-                panic!("an oversize packet from the client");
-            };
-            packets.push(server::decode(first, body).expect("a valid packet from the client"));
-        }
-        let mut out = Vec::new();
-        for packet in packets {
-            self.answer(&packet, &mut out);
-            self.packets.push(packet);
-        }
-        out
-    }
-
-    /// Publishes a message from another client, and returns the bytes for
-    /// the client if one of its filters matches the topic.
-    pub fn publish(&mut self, topic: &str, payload: &[u8], retain: bool) -> Vec<u8> {
-        if retain {
-            self.retain(topic, payload);
-        }
-        let mut out = Vec::new();
-        if self.filters.iter().any(|filter| matches(filter, topic)) {
-            let flags = Flags {
-                qos: Qos::AtMostOnce,
-                retain: false,
-            };
-            codec::publish(&mut out, topic, payload, flags, None).expect("a short publish");
-        }
-        out
-    }
-
-    fn answer(&mut self, packet: &Packet, out: &mut Vec<u8>) {
-        match packet {
-            Packet::Connect { .. } => server::connack(out, self.session_present, self.code),
-            Packet::Publish {
-                flags,
-                topic,
-                id,
-                payload,
-            } => {
-                if flags & 0x01 != 0 {
-                    self.retain(topic, payload);
-                }
-                if let Some(id) = *id {
-                    if self.hold_puback {
-                        self.held_pubacks.push(id);
-                    } else {
-                        server::puback(out, id);
-                    }
-                }
-            }
-            Packet::Subscribe { id, filters } => self.subscribe(*id, filters, out),
-            Packet::PingReq if !self.hold_pingresp => server::pingresp(out),
-            Packet::PubAck(_) | Packet::PingReq | Packet::Disconnect => {}
-        }
-    }
-
-    /// Adds the filters, answers with a SUBACK and then sends the retained
-    /// messages that match, as a broker does.
-    fn subscribe(&mut self, id: u16, filters: &[(String, u8)], out: &mut Vec<u8>) {
-        let mut codes = Vec::new();
-        for (filter, _qos) in filters {
-            if self.refuse.as_ref() == Some(filter) {
-                codes.push(codec::SUBACK_FAILURE);
-            } else {
-                codes.push(0);
-                self.filters.push(filter.clone());
-            }
-        }
-        if !self.hold_suback {
-            server::suback(out, id, &codes);
-        }
-        let flags = Flags {
-            qos: Qos::AtMostOnce,
-            retain: true,
-        };
-        for (filter, _qos) in filters {
-            for (topic, payload) in &self.retained {
-                if matches(filter, topic) {
-                    codec::publish(out, topic, payload, flags, None).expect("a short publish");
-                }
-            }
-        }
-    }
-}
 
 /// How the harness gives the bytes from the broker to the session.
 #[derive(Clone, Copy)]
@@ -163,10 +22,10 @@ pub enum Chunks {
     Random(u64, usize),
 }
 
-/// Runs a session against a [`WireBroker`].
+/// Runs a session against a fake [`Broker`].
 pub struct Wire {
     pub session: Session,
-    pub broker: WireBroker,
+    pub broker: Broker,
     pub chunks: Chunks,
     /// The actions that are not `Send` or `StartTimer`, in order.
     pub log: Vec<Action>,
@@ -182,11 +41,14 @@ impl Wire {
         Self::with(Limits::default())
     }
 
-    /// Makes a session for [`super::connect`] with `limits`.
+    /// Makes a session for [`super::connect`] with `limits`, and opens a
+    /// connection to the broker for it.
     pub fn with(limits: Limits) -> Self {
+        let mut broker = Broker::default();
+        broker.open().expect("the broker is up");
         Self {
             session: Session::new(&super::connect(), limits),
-            broker: WireBroker::default(),
+            broker,
             chunks: Chunks::Whole,
             log: Vec::new(),
             timers: Vec::new(),
@@ -220,7 +82,7 @@ impl Wire {
 
     /// Does the actions of the session until there are none. Calls `react`
     /// with each action that is not `Send` or `StartTimer`, before the next
-    /// poll.
+    /// poll. A `Close` stops the connection to the broker.
     pub fn run_with(&mut self, mut react: impl FnMut(&mut Session, &Action)) {
         while let Some(action) = self.session.poll() {
             match action {
@@ -232,6 +94,9 @@ impl Wire {
                 }
                 Action::StartTimer { timer, after } => self.timers.push((timer, after)),
                 action => {
+                    if action == Action::Close {
+                        self.broker.drop_connection();
+                    }
                     react(&mut self.session, &action);
                     self.log.push(action);
                 }
