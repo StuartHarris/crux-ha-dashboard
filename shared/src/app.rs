@@ -11,9 +11,9 @@ use crate::{
     capabilities::{
         light::FrontLight,
         log::Log,
-        power::{PowerSource, Sleep, Wake},
-        radio::{Address, Join, Joined, Lease, Leave, Off, Restart, Scan, Scanned, StopScan},
-        stream::{Close, Open, StreamItem, Write, Written},
+        power::{PowerSource, Sleep},
+        radio::{Address, Join, Leave, Off, Restart, Scan, StopScan},
+        stream::{Close, Open, Write},
     },
     entities::Entities,
     features::{
@@ -22,7 +22,7 @@ use crate::{
         rooms, wifi,
     },
     layout::Page,
-    mqtt::{Credentials, Timer},
+    mqtt::Credentials,
     pages::PAGES,
     route::Route,
     view::{self, ViewModel},
@@ -86,8 +86,8 @@ pub struct Start {
 /// The events that the shells send to the core.
 ///
 /// The public variants are facts from the shell and intents from the user.
-/// The skipped variants are internal. The core makes them from the answers to
-/// its effects.
+/// The wrapper variants at the end hold the internal events of the features.
+/// The core makes them from the answers to its effects.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
     /// The shell started. On battery, the device also starts after a deep
@@ -132,103 +132,24 @@ pub enum Event {
     /// or while the device sleeps, the event does nothing.
     SleepNow,
 
-    /// The answer to the `Join` request with this id.
-    Joined {
-        /// The id of the radio request. The core ignores the answer to an
-        /// older request.
-        radio: u32,
-        /// The answer.
-        joined: Joined,
-    },
-    /// The answer to the `Address` request with this id.
-    Leased {
-        /// The id of the radio request. The core ignores the answer to an
-        /// older request.
-        radio: u32,
-        /// The answer.
-        lease: Lease,
-    },
-    /// The answer to the `Leave` request with this id.
-    Left(u32),
-    /// The answer to the `Scan` request with this id.
-    Scanned {
-        /// The id of the radio request. The core ignores the answer to an
-        /// older request.
-        radio: u32,
-        /// The answer.
-        scanned: Scanned,
-    },
-    /// The answer to the `StopScan` request with this id.
-    ScanStopped(u32),
-    /// The time limit of the radio request with this id expired. Refer to
-    /// [`wifi`].
-    RadioTimeout(u32),
-    /// An item from the byte stream of the MQTT connection with this id.
-    Stream {
-        /// The id of the connection. The core ignores an item from an older
-        /// connection.
-        connection: u32,
-        /// The item from the stream.
-        item: StreamItem,
-    },
-    /// The answer to a `Write` request on the MQTT connection with this id.
-    Written {
-        /// The id of the connection. The core ignores the answer for an
-        /// older connection.
-        connection: u32,
-        /// The answer.
-        outcome: Written,
-    },
-    /// The answer to the `Close` request for the MQTT connection with this
-    /// id.
-    StreamClosed {
-        /// The id of the connection.
-        connection: u32,
-    },
-    /// The wait for the answer to the `Close` request for the MQTT
-    /// connection with this id is over. Refer to
-    /// [`connection::CLOSE_TIMEOUT`].
-    CloseTimeout {
-        /// The id of the connection.
-        connection: u32,
-    },
-    /// A timer of the MQTT session of the connection with this id expired.
-    SessionTimer {
-        /// The id of the connection. The core ignores the timer of an older
-        /// connection.
-        connection: u32,
-        /// The timer.
-        timer: Timer,
-    },
-    /// The wait before the reconnect with this id is over.
-    Reconnect(u32),
-    /// The idle timer with this id expired.
-    IdleTimeout(u32),
-    /// The front light is off for the sleep with this id. Refer to
-    /// [`power::light_off`].
-    LightOffForSleep(u32),
-    /// The stream of the MQTT connection closed for the sleep with this id.
-    Offline(u32),
-    /// The answer to the `Off` request with this id.
-    RadioOff(u32),
-    /// The `Sleep` request of the sleep with this id ended.
-    Woke {
-        /// The id of the sleep. The core ignores the answer of an older
-        /// sleep.
-        sleep: u32,
-        /// What ended the sleep.
-        wake: Wake,
-    },
-    /// The full-refresh timer with this id expired.
-    FullRefreshDue(u32),
-    /// The draw timer with this id expired. Refer to
-    /// [`refresh::redraw_soon`].
-    DrawDue(u32),
-    /// The timer of a mark with this id expired. Refer to
-    /// [`pending`](crate::features::pending).
-    PendingTimeout(u32),
-    /// The light timer with this id expired. Refer to [`light`].
-    LightTimeout(u32),
+    /// The internal events of the Wi-Fi feature. The core makes them from the
+    /// answers to its effects. The shell never sends them.
+    Wifi(wifi::Event),
+    /// The internal events of the MQTT connection. The core makes them from
+    /// the answers to its effects. The shell never sends them.
+    Connection(connection::Event),
+    /// The internal events of the power feature. The core makes them from the
+    /// answers to its effects. The shell never sends them.
+    Power(power::Event),
+    /// The internal events of the refresh policy. The core makes them from the
+    /// answers to its effects. The shell never sends them.
+    Refresh(refresh::Event),
+    /// The internal events of the pending marks. The core makes them from the
+    /// answers to its effects. The shell never sends them.
+    Pending(pending::Event),
+    /// The internal events of the front light. The core makes them from the
+    /// answers to its effects. The shell never sends them.
+    Light(light::Event),
 }
 
 /// A control on the panel.
@@ -429,33 +350,13 @@ impl App for Dashboard {
             Event::PreviousPage => rooms::turn_page(model, false),
             Event::Navigate(route) => rooms::navigate(route, model),
             Event::SetReadOnly(read_only) => rooms::set_read_only(read_only, model),
-            Event::Joined { radio, joined } => wifi::joined(radio, &joined, model),
-            Event::Leased { radio, lease } => wifi::leased(radio, lease, model),
-            Event::Left(radio) => wifi::left(radio, model),
-            Event::Scanned { radio, scanned } => wifi::scanned(radio, &scanned, model),
-            Event::ScanStopped(radio) => wifi::scan_stopped(radio, model),
-            Event::RadioTimeout(radio) => wifi::timeout(radio, model),
-            Event::Stream { connection, item } => connection::stream(connection, item, model),
-            Event::Written {
-                connection,
-                outcome,
-            } => connection::written(connection, &outcome, model),
-            Event::StreamClosed { connection } => connection::stream_closed(connection, model),
-            Event::CloseTimeout { connection } => connection::close_timeout(connection, model),
-            Event::SessionTimer { connection, timer } => {
-                connection::session_timer(connection, timer, model)
-            }
-            Event::Reconnect(id) => connection::reconnect(id, model),
             Event::SleepNow => power::sleep_now(model),
-            Event::IdleTimeout(id) => power::idle_timeout(id, model),
-            Event::LightOffForSleep(id) => power::light_off(id, model),
-            Event::Offline(id) => power::offline(id, model),
-            Event::RadioOff(radio) => wifi::radio_off(radio, model),
-            Event::Woke { sleep, wake } => power::woke(sleep, wake, model),
-            Event::FullRefreshDue(id) => refresh::timer_expired(id, model),
-            Event::DrawDue(id) => refresh::draw_due(id, model),
-            Event::PendingTimeout(id) => pending::timeout(id, model),
-            Event::LightTimeout(id) => light::timeout(id, model),
+            Event::Wifi(event) => wifi::update(event, model),
+            Event::Connection(event) => connection::update(event, model),
+            Event::Power(event) => power::update(event, model),
+            Event::Refresh(event) => refresh::update(event, model),
+            Event::Pending(event) => pending::update(event, model),
+            Event::Light(event) => light::update(event, model),
         }
     }
 

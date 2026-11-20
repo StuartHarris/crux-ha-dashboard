@@ -9,6 +9,7 @@
 //! The step tests drive the core one update at a time. The flow tests run
 //! the core in the test shell, against the fake broker.
 
+use crate::features::connection;
 use alloc::{string::String, vec::Vec};
 
 use crux_core::App;
@@ -79,10 +80,10 @@ fn only_an_answer_for_the_current_connection_makes_the_link_quiet() {
     // session.
     let (mut model, _wire) = drive_to_connected(PowerSource::Stand);
     let older = model.connection.id.wrapping_sub(1);
-    let event = Event::Stream {
+    let event = Event::Connection(connection::Event::Stream {
         connection: older,
         item: StreamItem::Received(alloc::vec![0x90, 0x03, 0x00, 0x01, 0x00]),
-    };
+    });
     Dashboard.update(event, &mut model).expect_no_effects();
 }
 

@@ -1,6 +1,7 @@
 //! Flow tests: the core runs in the test shell against the fake broker and
 //! the fake Home Assistant.
 
+use crate::features::{connection, pending, power, wifi};
 use alloc::{string::String, vec, vec::Vec};
 use core::time::Duration;
 
@@ -107,7 +108,7 @@ fn idle_timeouts(events: &[Event]) -> Vec<u32> {
     events
         .iter()
         .filter_map(|event| match event {
-            Event::IdleTimeout(id) => Some(*id),
+            Event::Power(power::Event::IdleTimeout(id)) => Some(*id),
             _ => None,
         })
         .collect()
@@ -201,7 +202,7 @@ fn on_the_stand_the_dashboard_shows_live_state_and_controls_lights() {
     assert!(
         events
             .iter()
-            .any(|event| matches!(event, Event::PendingTimeout(_))),
+            .any(|event| matches!(event, Event::Pending(pending::Event::Timeout(_)))),
         "{events:?}"
     );
     assert!(!shell.view().scenes()[1].pending);
@@ -239,7 +240,7 @@ fn on_battery_the_dashboard_wakes_syncs_accepts_taps_then_sleeps() {
     let events = shell.advance(IDLE_TIMEOUT);
     let idle = events
         .iter()
-        .filter(|event| matches!(event, Event::IdleTimeout(_)))
+        .filter(|event| matches!(event, Event::Power(power::Event::IdleTimeout(_))))
         .count();
     assert_eq!(idle, 1, "{events:?}");
 
@@ -402,7 +403,7 @@ fn on_the_stand_a_lost_connection_reconnects_after_a_backoff() {
     assert!(
         events
             .iter()
-            .any(|event| matches!(event, Event::Reconnect(_)))
+            .any(|event| matches!(event, Event::Connection(connection::Event::Reconnect(_))))
     );
     assert!(shell.broker.is_connected());
     assert_eq!(
@@ -432,12 +433,16 @@ fn while_the_broker_is_down_the_wait_doubles_up_to_a_limit() {
             let events = shell.advance_to_next();
             let reconnects = events
                 .iter()
-                .filter(|event| matches!(event, Event::Reconnect(_)))
+                .filter(|event| matches!(event, Event::Connection(connection::Event::Reconnect(_))))
                 .count();
             let closes = events
                 .iter()
                 .filter(|event| {
-                    matches!(event, Event::CloseTimeout { .. } | Event::RadioTimeout(_))
+                    matches!(
+                        event,
+                        Event::Connection(connection::Event::CloseTimeout { .. })
+                            | Event::Wifi(wifi::Event::RadioTimeout(_))
+                    )
                 })
                 .count();
             assert!(
@@ -471,7 +476,13 @@ fn while_the_broker_is_down_the_wait_doubles_up_to_a_limit() {
     shell.advance(RECONNECT_MAX.saturating_sub(Duration::from_millis(1)));
     assert!(!shell.broker.is_connected());
     let events = shell.advance(Duration::from_millis(1));
-    assert!(matches!(events[..], [Event::Reconnect(_)]), "{events:?}");
+    assert!(
+        matches!(
+            events[..],
+            [Event::Connection(connection::Event::Reconnect(_))]
+        ),
+        "{events:?}"
+    );
     assert!(shell.broker.is_connected());
     assert_eq!(shell.model.connection.backoff, RECONNECT_MIN);
 }
@@ -494,7 +505,7 @@ fn taps_without_a_connection_are_sent_when_the_core_connects() {
     let mut fired = vec![];
     while !shell.broker.is_connected() {
         let events = shell.advance_to_next();
-        let [Event::Reconnect(id)] = events[..] else {
+        let [Event::Connection(connection::Event::Reconnect(id))] = events[..] else {
             panic!("one reconnect timer: {events:?}");
         };
         fired.push(id);
@@ -538,7 +549,7 @@ fn a_join_that_fails_on_battery_is_tried_again_until_the_device_sleeps() {
     assert!(
         !events
             .iter()
-            .any(|event| matches!(event, Event::Reconnect(_))),
+            .any(|event| matches!(event, Event::Connection(connection::Event::Reconnect(_)))),
         "{events:?}"
     );
     assert!(shell.model.power.asleep);
@@ -631,10 +642,10 @@ fn on_battery_a_tap_that_is_sent_before_the_extra_period_ends_is_not_lost() {
     let events = shell.advance(second);
     let idle = events
         .iter()
-        .rposition(|event| matches!(event, Event::IdleTimeout(_)));
+        .rposition(|event| matches!(event, Event::Power(power::Event::IdleTimeout(_))));
     let reconnect = events
         .iter()
-        .position(|event| matches!(event, Event::Reconnect(_)));
+        .position(|event| matches!(event, Event::Connection(connection::Event::Reconnect(_))));
     assert!(idle.is_some() && idle < reconnect, "{events:?}");
     assert_eq!(shell.broker.service_calls.len(), 1);
     assert_eq!(shell.sleep, None);
@@ -1115,7 +1126,7 @@ fn a_thermostat_step_past_its_limit_shows_the_mark_until_the_timeout() {
     assert!(
         !events
             .iter()
-            .any(|event| matches!(event, Event::PendingTimeout(_))),
+            .any(|event| matches!(event, Event::Pending(pending::Event::Timeout(_)))),
         "{events:?}"
     );
     assert_eq!(shell.view().tiles()[4].state, TileState::Pending);
@@ -1124,7 +1135,7 @@ fn a_thermostat_step_past_its_limit_shows_the_mark_until_the_timeout() {
     assert!(
         events
             .iter()
-            .any(|event| matches!(event, Event::PendingTimeout(_))),
+            .any(|event| matches!(event, Event::Pending(pending::Event::Timeout(_)))),
         "{events:?}"
     );
     let tile = shell.view().tiles()[4].clone();

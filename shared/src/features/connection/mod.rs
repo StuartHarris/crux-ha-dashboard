@@ -33,14 +33,14 @@ use crux_time::TimerHandle;
 use futures::StreamExt;
 
 use crate::{
-    Cmd, Event, Model,
+    Cmd, Model,
     capabilities::{
         log::{self, Area},
         stream::{Stream, StreamItem, Written},
     },
     entities,
     features::{
-        pending,
+        pending, power,
         refresh::{redraw, redraw_soon},
         timer::{self, Running, Slot},
         wifi,
@@ -51,6 +51,71 @@ use crate::{
     },
     summary,
 };
+
+/// The internal events of the MQTT connection. The core makes them from the
+/// answers to its stream requests and from its timers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Event {
+    /// An item from the byte stream of the MQTT connection with this id.
+    Stream {
+        /// The id of the connection. The core ignores an item from an older
+        /// connection.
+        connection: u32,
+        /// The item from the stream.
+        item: StreamItem,
+    },
+    /// The answer to a `Write` request on the MQTT connection with this id.
+    Written {
+        /// The id of the connection. The core ignores the answer for an
+        /// older connection.
+        connection: u32,
+        /// The answer.
+        outcome: Written,
+    },
+    /// The answer to the `Close` request for the MQTT connection with this
+    /// id.
+    StreamClosed {
+        /// The id of the connection.
+        connection: u32,
+    },
+    /// The wait for the answer to the `Close` request for the MQTT
+    /// connection with this id is over. Refer to [`CLOSE_TIMEOUT`].
+    CloseTimeout {
+        /// The id of the connection.
+        connection: u32,
+    },
+    /// A timer of the MQTT session of the connection with this id expired.
+    SessionTimer {
+        /// The id of the connection. The core ignores the timer of an older
+        /// connection.
+        connection: u32,
+        /// The timer.
+        timer: Timer,
+    },
+    /// The wait before the reconnect with this id is over.
+    Reconnect(u32),
+}
+
+impl From<Event> for crate::Event {
+    fn from(event: Event) -> Self {
+        Self::Connection(event)
+    }
+}
+
+/// Handles an internal event of the MQTT connection.
+pub fn update(event: Event, model: &mut Model) -> Cmd {
+    match event {
+        Event::Stream { connection, item } => stream(connection, item, model),
+        Event::Written {
+            connection,
+            outcome,
+        } => written(connection, &outcome, model),
+        Event::StreamClosed { connection } => stream_closed(connection, model),
+        Event::CloseTimeout { connection } => close_timeout(connection, model),
+        Event::SessionTimer { connection, timer } => session_timer(connection, timer, model),
+        Event::Reconnect(id) => reconnect(id, model),
+    }
+}
 
 /// The first wait before the core connects again after a failure.
 pub const RECONNECT_MIN: Duration = Duration::from_secs(1);
@@ -294,7 +359,7 @@ pub fn close_for_roam(model: &mut Model) -> Cmd {
 }
 
 /// Closes the connection for the sleep `sleep`. The answer to the `Close`
-/// request starts the next step of the sleep ([`Event::Offline`]).
+/// request starts the next step of the sleep ([`power::Event::Offline`]).
 ///
 /// If the connection is up, the core publishes `asleep` on the status topic
 /// and then sends a DISCONNECT packet, so the broker does not publish the
@@ -470,14 +535,14 @@ fn connect(model: &mut Model) -> Cmd {
         let mut items = Stream::open(connection, host, port).into_stream(ctx.clone());
         while let Some(item) = items.next().await {
             let last = matches!(item, StreamItem::Closed { .. });
-            ctx.send_event(Event::Stream { connection, item });
+            ctx.send_event(Event::Stream { connection, item }.into());
             if last {
                 return;
             }
         }
         // The shell ended the stream without `Closed`.
         let item = StreamItem::closed("the stream ended");
-        ctx.send_event(Event::Stream { connection, item });
+        ctx.send_event(Event::Stream { connection, item }.into());
     });
     open.and(pump(model))
 }
@@ -527,7 +592,7 @@ pub fn session_timer(id: u32, timer: Timer, model: &mut Model) -> Cmd {
 /// Handles the answer to the `Close` request on the connection `id`, and
 /// clears its timer of [`CLOSE_TIMEOUT`].
 ///
-/// If the core closed the stream for a sleep, it sends [`Event::Offline`]
+/// If the core closed the stream for a sleep, it sends [`power::Event::Offline`]
 /// for the sleep. If the core wanted to connect while the `Close` request
 /// waited, it connects now. Refer to [`connect`].
 pub fn stream_closed(id: u32, model: &mut Model) -> Cmd {
@@ -542,7 +607,7 @@ pub fn stream_closed(id: u32, model: &mut Model) -> Cmd {
     let offline = match state.closing {
         Some((connection, sleep)) if connection == id => {
             state.closing = None;
-            Cmd::event(Event::Offline(sleep))
+            Cmd::event(power::Event::Offline(sleep).into())
         }
         _ => Cmd::done(),
     };
@@ -570,9 +635,12 @@ pub fn close_timeout(id: u32, model: &mut Model) -> Cmd {
 /// starts the timer of [`CLOSE_TIMEOUT`].
 fn close_stream(id: u32, clean: bool, reason: String, state: &mut State) -> Cmd {
     let close = Stream::close(id, clean, reason)
-        .then_send(move |()| Event::StreamClosed { connection: id });
-    let (timer, running) =
-        Running::start(id, CLOSE_TIMEOUT, Event::CloseTimeout { connection: id });
+        .then_send(move |()| Event::StreamClosed { connection: id }.into());
+    let (timer, running) = Running::start(
+        id,
+        CLOSE_TIMEOUT,
+        Event::CloseTimeout { connection: id }.into(),
+    );
     state.closes.push(running);
     close.and(timer)
 }
@@ -636,12 +704,15 @@ pub fn pump(model: &mut Model) -> Cmd {
         {
             let id = model.connection.id;
             match action {
-                Action::Send(bytes) => writes.push(Stream::write(id, bytes).then_send(
-                    move |outcome| Event::Written {
-                        connection: id,
-                        outcome,
-                    },
-                )),
+                Action::Send(bytes) => {
+                    writes.push(Stream::write(id, bytes).then_send(move |outcome| {
+                        Event::Written {
+                            connection: id,
+                            outcome,
+                        }
+                        .into()
+                    }));
+                }
                 Action::StartTimer { timer, after } => {
                     let (command, handle) = start_timer(id, timer, after);
                     if let Some(live) = &mut model.connection.session {
@@ -700,7 +771,8 @@ fn start_timer(id: u32, timer: Timer, after: Duration) -> (Cmd, TimerHandle) {
         Event::SessionTimer {
             connection: id,
             timer,
-        },
+        }
+        .into(),
     )
 }
 
@@ -868,7 +940,9 @@ fn schedule_reconnect(model: &mut Model) -> Cmd {
     let id = state.reconnect;
     let wait = state.backoff;
     state.backoff = (wait * 2).min(RECONNECT_MAX);
-    let timer = state.reconnect_timer.start(id, wait, Event::Reconnect(id));
+    let timer = state
+        .reconnect_timer
+        .start(id, wait, Event::Reconnect(id).into());
     let reason = log::info(Area::Mqtt, format!("connect again in {} s", wait.as_secs()));
     reason.and(timer)
 }

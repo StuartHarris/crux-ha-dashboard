@@ -69,7 +69,31 @@
 
 use core::time::Duration;
 
-use crate::{Cmd, Event, Model, ViewModel, features::timer::Slot, view::view};
+use crate::{Cmd, Model, ViewModel, features::timer::Slot, view::view};
+
+/// The internal events of the refresh policy. The core makes them from its
+/// timers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Event {
+    /// The full-refresh timer with this id expired.
+    FullRefreshDue(u32),
+    /// The draw timer with this id expired. Refer to [`redraw_soon`].
+    DrawDue(u32),
+}
+
+impl From<Event> for crate::Event {
+    fn from(event: Event) -> Self {
+        Self::Refresh(event)
+    }
+}
+
+/// Handles an internal event of the refresh policy.
+pub fn update(event: Event, model: &mut Model) -> Cmd {
+    match event {
+        Event::FullRefreshDue(id) => timer_expired(id, model),
+        Event::DrawDue(id) => draw_due(id, model),
+    }
+}
 use crux_core::render::render;
 
 /// The number of partial renders after which the core asks for a full
@@ -162,7 +186,9 @@ pub fn redraw_soon(model: &mut Model) -> Cmd {
     }
     state.draw = state.draw.wrapping_add(1);
     let id = state.draw;
-    state.draw_timer.start(id, DRAW_DELAY, Event::DrawDue(id))
+    state
+        .draw_timer
+        .start(id, DRAW_DELAY, Event::DrawDue(id).into())
 }
 
 /// The draw timer `id` expired, so the core draws the changes that arrived
@@ -210,7 +236,7 @@ fn restart_timer(model: &mut Model) -> Cmd {
     let id = state.timer;
     state
         .full
-        .start(id, FULL_REFRESH_INTERVAL, Event::FullRefreshDue(id))
+        .start(id, FULL_REFRESH_INTERVAL, Event::FullRefreshDue(id).into())
 }
 
 #[cfg(test)]
@@ -218,6 +244,7 @@ mod tests {
     //! Tests of the refresh feature: the full refresh after a number of partial
     //! renders and after a time.
 
+    use crate::features::refresh;
     use core::time::Duration;
 
     use crux_core::App;
@@ -316,14 +343,20 @@ mod tests {
         let seq = model.full_refresh_seq;
         let id = model.refresh.timer;
 
-        app.update(Event::FullRefreshDue(id), &mut model)
-            .expect_render()
-            .expect_full_refresh_timer();
+        app.update(
+            Event::Refresh(refresh::Event::FullRefreshDue(id)),
+            &mut model,
+        )
+        .expect_render()
+        .expect_full_refresh_timer();
         assert_eq!(model.full_refresh_seq, seq + 1);
 
         // The old timer is stale.
-        app.update(Event::FullRefreshDue(id), &mut model)
-            .expect_no_effects();
+        app.update(
+            Event::Refresh(refresh::Event::FullRefreshDue(id)),
+            &mut model,
+        )
+        .expect_no_effects();
     }
 
     #[test]
@@ -335,10 +368,13 @@ mod tests {
         let seq = model.full_refresh_seq;
         let id = model.refresh.timer;
 
-        app.update(Event::FullRefreshDue(id), &mut model)
-            .expect_only_time_notify_after_with(|notify| {
-                assert_eq!(Duration::from(notify.duration), FULL_REFRESH_INTERVAL);
-            });
+        app.update(
+            Event::Refresh(refresh::Event::FullRefreshDue(id)),
+            &mut model,
+        )
+        .expect_only_time_notify_after_with(|notify| {
+            assert_eq!(Duration::from(notify.duration), FULL_REFRESH_INTERVAL);
+        });
         assert_eq!(model.full_refresh_seq, seq);
         assert_ne!(model.refresh.timer, id);
     }
@@ -350,8 +386,11 @@ mod tests {
         let id = model.refresh.timer;
         model.power.asleep = true;
 
-        app.update(Event::FullRefreshDue(id), &mut model)
-            .expect_no_effects();
+        app.update(
+            Event::Refresh(refresh::Event::FullRefreshDue(id)),
+            &mut model,
+        )
+        .expect_no_effects();
     }
 
     #[test]
@@ -381,7 +420,7 @@ mod tests {
         shell
             .advance(FULL_REFRESH_INTERVAL)
             .iter()
-            .filter(|event| matches!(event, Event::FullRefreshDue(_)))
+            .filter(|event| matches!(event, Event::Refresh(refresh::Event::FullRefreshDue(_))))
             .count()
     }
 
@@ -492,7 +531,10 @@ mod tests {
 
         // The timer draws all the changes once.
         let events = shell.advance(DRAW_DELAY);
-        assert!(matches!(events[..], [Event::DrawDue(_)]), "{events:?}");
+        assert!(
+            matches!(events[..], [Event::Refresh(refresh::Event::DrawDue(_))]),
+            "{events:?}"
+        );
         assert_eq!(shell.frames.len(), frames + 1);
         assert_eq!(shell.take_log(), ["Render"]);
         let view = &shell.frames.last().unwrap().view;
@@ -510,7 +552,7 @@ mod tests {
         let id = model.refresh.draw;
         model.power.asleep = true;
 
-        app.update(Event::DrawDue(id), &mut model)
+        app.update(Event::Refresh(refresh::Event::DrawDue(id)), &mut model)
             .expect_no_effects();
 
         // The timer no longer waits, so the next change after the wake starts a
@@ -567,12 +609,12 @@ mod tests {
         let second = model.refresh.draw;
         assert_ne!(first, second);
 
-        app.update(Event::DrawDue(first), &mut model)
+        app.update(Event::Refresh(refresh::Event::DrawDue(first)), &mut model)
             .expect_no_effects();
-        app.update(Event::DrawDue(second), &mut model)
+        app.update(Event::Refresh(refresh::Event::DrawDue(second)), &mut model)
             .expect_only_render();
         // A timer draws only once.
-        app.update(Event::DrawDue(second), &mut model)
+        app.update(Event::Refresh(refresh::Event::DrawDue(second)), &mut model)
             .expect_no_effects();
     }
 
@@ -598,7 +640,7 @@ mod tests {
         assert!(
             !events
                 .iter()
-                .any(|event| matches!(event, Event::DrawDue(_))),
+                .any(|event| matches!(event, Event::Refresh(refresh::Event::DrawDue(_)))),
             "{events:?}"
         );
     }

@@ -2,6 +2,7 @@
 //! broker: dead links, the close for a sleep, refused connections, long
 //! messages and a full session.
 
+use crate::features::connection;
 use alloc::{string::String, vec, vec::Vec};
 use core::time::Duration;
 
@@ -448,7 +449,12 @@ fn an_answer_or_a_timer_of_an_older_connection_is_ignored() {
     let events = shell.advance_session(Duration::from_secs(45));
     let timer = events
         .into_iter()
-        .find(|event| matches!(event, Event::SessionTimer { .. }))
+        .find(|event| {
+            matches!(
+                event,
+                Event::Connection(connection::Event::SessionTimer { .. })
+            )
+        })
         .expect("the ping timer");
     let old = shell.model.connection.id;
 
@@ -462,14 +468,14 @@ fn an_answer_or_a_timer_of_an_older_connection_is_ignored() {
 
     let stale: Vec<Event> = vec![
         timer,
-        Event::Written {
+        Event::Connection(connection::Event::Written {
             connection: old,
             outcome: Written::Sent,
-        },
-        Event::Stream {
+        }),
+        Event::Connection(connection::Event::Stream {
             connection: old,
             item: StreamItem::closed("late"),
-        },
+        }),
     ];
     for event in stale {
         shell.send(event);

@@ -288,14 +288,14 @@ fn a_failed_write_does_not_hide_an_end_by_the_host_in_either_order() {
         let (mut model, _wire) = drive_to_connected(PowerSource::Stand);
         model.wifi.health.failed();
         let connection = model.connection.id;
-        let write = Event::Written {
+        let write = Event::Connection(connection::Event::Written {
             connection,
             outcome: Written::Failed("write failed".into()),
-        };
-        let end = Event::Stream {
+        });
+        let end = Event::Connection(connection::Event::Stream {
             connection,
             item: StreamItem::by_host("the broker closed the stream"),
-        };
+        });
         let events = if failed_first {
             [write, end]
         } else {
@@ -359,8 +359,11 @@ fn a_lost_connection_shows_the_time_of_the_last_message_and_retries_after_a_back
     assert_eq!(view.updated, "Last changed 09:41");
 
     // The shell answers the `Close` request. The core waits for the backoff.
-    app.update(Event::StreamClosed { connection }, &mut model)
-        .expect_no_effects();
+    app.update(
+        Event::Connection(connection::Event::StreamClosed { connection }),
+        &mut model,
+    )
+    .expect_no_effects();
 
     // The lost connection makes the link suspect, so the reconnect leaves
     // and joins again first.
@@ -385,10 +388,10 @@ fn the_backoff_doubles_up_to_a_limit_and_resets_on_connect() {
         let refused = StreamItem::by_host("connection refused");
         let event = app
             .update(
-                Event::Stream {
+                Event::Connection(connection::Event::Stream {
                     connection,
                     item: refused,
-                },
+                }),
                 &mut model,
             )
             .expect_stream_close_with(|close| assert!(!close.clean))
@@ -407,8 +410,11 @@ fn the_backoff_doubles_up_to_a_limit_and_resets_on_connect() {
                 notify.id
             })
             .expect_event();
-        app.update(Event::StreamClosed { connection }, &mut model)
-            .expect_no_effects();
+        app.update(
+            Event::Connection(connection::Event::StreamClosed { connection }),
+            &mut model,
+        )
+        .expect_no_effects();
         expected = (expected * 2).min(RECONNECT_MAX);
         let mut cmd = app.update(event, &mut model);
         wire = Wire::new(link_up(&mut cmd, &mut model));
@@ -426,10 +432,10 @@ fn an_item_from_an_old_connection_is_ignored() {
     let old = model.connection.id.wrapping_sub(1);
 
     app.update(
-        Event::Stream {
+        Event::Connection(connection::Event::Stream {
             connection: old,
             item: StreamItem::closed("connection lost"),
-        },
+        }),
         &mut model,
     )
     .expect_no_effects();
@@ -442,8 +448,11 @@ fn a_stale_reconnect_timer_is_ignored() {
     let (mut model, _wire) = drive_to_connected(PowerSource::Stand);
     let stale = model.connection.reconnect.wrapping_sub(1);
 
-    app.update(Event::Reconnect(stale), &mut model)
-        .expect_no_effects();
+    app.update(
+        Event::Connection(connection::Event::Reconnect(stale)),
+        &mut model,
+    )
+    .expect_no_effects();
 }
 
 #[test]
@@ -556,10 +565,10 @@ fn bytes_before_the_stream_opens_are_ignored() {
         None,
     )
     .unwrap();
-    let event = Event::Stream {
+    let event = Event::Connection(connection::Event::Stream {
         connection: wire.connection(),
         item: StreamItem::Received(bytes),
-    };
+    });
     app.update(event, &mut model).expect_no_effects();
     assert_eq!(model.entities.get("light.all_lights"), None);
 }
@@ -902,9 +911,10 @@ fn the_answer_to_close_clears_the_close_timeout() {
 
     let events = shell.advance(CLOSE_TIMEOUT);
     assert!(
-        !events
-            .iter()
-            .any(|event| matches!(event, Event::CloseTimeout { .. })),
+        !events.iter().any(|event| matches!(
+            event,
+            Event::Connection(connection::Event::CloseTimeout { .. })
+        )),
         "{events:?}"
     );
 }
@@ -930,7 +940,7 @@ fn a_sleep_clears_the_reconnect_timer() {
     assert!(
         !events
             .iter()
-            .any(|event| matches!(event, Event::Reconnect(id) if *id == reconnect)),
+            .any(|event| matches!(event, Event::Connection(connection::Event::Reconnect(id)) if *id == reconnect)),
         "{events:?}"
     );
 }

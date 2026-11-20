@@ -1,5 +1,6 @@
 //! Tests of the rooms feature: pages, routes and taps.
 
+use crate::features::power;
 use alloc::vec::Vec;
 use core::time::Duration;
 
@@ -664,7 +665,10 @@ fn a_request_to_stop_the_dry_run_before_the_start_does_not_stop_it() {
 fn set_read_only_while_asleep_does_not_draw() {
     let app = Dashboard;
     let (mut model, _wire) = drive_to_connected(PowerSource::Battery);
-    let _ = app.update(Event::IdleTimeout(model.power.idle), &mut model);
+    let _ = app.update(
+        Event::Power(power::Event::IdleTimeout(model.power.idle)),
+        &mut model,
+    );
     assert!(model.power.asleep);
 
     app.update(Event::SetReadOnly(true), &mut model)
