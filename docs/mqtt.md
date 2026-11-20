@@ -147,7 +147,7 @@ these timers:
 | Silence | 120 s | The session ends if no bytes arrive. This timer is a backstop. |
 
 When the session ends with an error, the core closes the stream and connects again
-after a backoff.
+after a backoff and after the close of the stream.
 
 ### Close the stream
 
@@ -161,6 +161,13 @@ When the dashboard goes to sleep on battery, the core does these steps in order:
 The core waits for the close of the stream before it reports offline. Thus the
 broker has `asleep` and the DISCONNECT before the Wi-Fi turns off, and the last will
 does not replace `asleep` with `offline`.
+
+After a session ends, the core does not open a new stream until the shell closed the
+old stream. A new stream makes the shell abort the old stream, and an abort can make
+the broker lose the DISCONNECT. Thus a tap during the close for a sleep wakes the
+device, but the core connects only after the close.
+If the shell does not answer the `Close` request in 6 seconds (`CLOSE_TIMEOUT`), the
+core acts as if the answer arrived. Thus a shell cannot stop a reconnect or a sleep.
 
 A change of access point (a Wi-Fi roam) closes the stream with no DISCONNECT. The
 broker then publishes the last will. Home Assistant sees a short retained `offline`,

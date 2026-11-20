@@ -15,7 +15,7 @@ use crate::{
     Cmd, Connection, Dashboard, Effect, EffectTestExt, Event, Model, PowerSource, Route, TileState,
     capabilities::{network::WifiStatus, stream::StreamItem},
     features::{
-        connection::{Link, RECONNECT_MAX, RECONNECT_MIN},
+        connection::{CLOSE_TIMEOUT, Link, RECONNECT_MAX, RECONNECT_MIN},
         refresh::DRAW_DELAY,
     },
     mqtt::{
@@ -301,12 +301,16 @@ fn a_lost_connection_shows_the_time_of_the_last_message_and_retries_after_a_back
     let app = Dashboard;
     let (mut model, mut wire) = drive_to_connected(PowerSource::Stand);
     let _ = change_and_draw(&mut model, &mut wire, VISIBLE, "on", super::NOW);
+    let connection = model.connection.id;
 
     // The time is the time of the last update from Home Assistant, not the
     // time of the disconnect. The core closes the stream, which failed.
     let reconnect = wire
         .drop_connection(&mut model, "connection lost")
         .expect_stream_close_with(|close| assert!(!close.clean))
+        .expect_time_notify_after_with(|notify| {
+            assert_eq!(Duration::from(notify.duration), CLOSE_TIMEOUT);
+        })
         .expect_render()
         .resolve_time_notify_after(|notify| {
             assert_eq!(Duration::from(notify.duration), RECONNECT_MIN);
@@ -316,6 +320,10 @@ fn a_lost_connection_shows_the_time_of_the_last_message_and_retries_after_a_back
     let view = app.view(&model);
     assert_eq!(view.connection, Connection::Connecting);
     assert_eq!(view.updated, "Last changed 09:41");
+
+    // The shell answers the `Close` request. The core waits for the backoff.
+    app.update(Event::StreamClosed { connection }, &mut model)
+        .expect_no_effects();
 
     // Wi-Fi can be the cause, so the reconnect asks for Wi-Fi first.
     let event = app
@@ -343,12 +351,17 @@ fn the_backoff_doubles_up_to_a_limit_and_resets_on_connect() {
                 &mut model,
             )
             .expect_stream_close_with(|close| assert!(!close.clean))
+            .expect_time_notify_after_with(|notify| {
+                assert_eq!(Duration::from(notify.duration), CLOSE_TIMEOUT);
+            })
             // The view still shows `Connecting`, so the core does not draw.
             .resolve_time_notify_after(|notify| {
                 assert_eq!(Duration::from(notify.duration), expected);
                 notify.id
             })
             .expect_event();
+        app.update(Event::StreamClosed { connection }, &mut model)
+            .expect_no_effects();
         expected = (expected * 2).min(RECONNECT_MAX);
         let event = app
             .update(event, &mut model)

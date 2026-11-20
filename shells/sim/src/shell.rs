@@ -1176,7 +1176,7 @@ mod tests {
     }
 
     #[test]
-    fn a_wake_during_the_close_replaces_the_stream_that_closes() {
+    fn a_wake_during_the_close_opens_a_stream_after_the_answer_to_the_close() {
         let mut fixture = Fixture::new();
         fixture.start(PowerSource::Battery);
         fixture.connect();
@@ -1188,12 +1188,13 @@ mod tests {
         assert!(fixture.shell().view().asleep);
 
         // A tap before the DISCONNECT packet is sent wakes the core. When the
-        // packet is sent, the core closes the stream and connects again at
-        // once. The new stream replaces the stream that closes.
+        // packet is sent, the core closes the stream. The core opens a new
+        // stream only after the answer to the `Close` request, so no stream
+        // is replaced.
         fixture.shell().tap(Point::new(1, 1));
         fixture.connect();
         let replaced = format!("connection {old}: item: Closed ({REPLACED})");
-        assert!(fixture.outcomes("StreamOpen").contains(&replaced));
+        assert!(!fixture.outcomes("StreamOpen").contains(&replaced));
         assert_eq!(
             fixture.take_log(),
             [
@@ -1205,9 +1206,34 @@ mod tests {
                 "subscribe 2"
             ]
         );
-        fixture.until("the close of stream 1", |fixture| {
-            fixture.net().closed == [1]
-        });
+        assert_eq!(fixture.net().closed, [1]);
+        let new = fixture.shell().current_connection().unwrap();
+
+        // The log of the inspector starts with the newest entry.
+        let entries: Vec<(&str, String)> = fixture
+            .shell()
+            .inspector()
+            .effects
+            .iter()
+            .map(|entry| {
+                (
+                    entry.effect,
+                    format!("{}: {}", entry.request, entry.outcome),
+                )
+            })
+            .collect();
+        let place = |effect: &str, text: &str| {
+            entries
+                .iter()
+                .position(|(name, entry)| *name == effect && entry.starts_with(text))
+                .unwrap_or_else(|| panic!("{effect} {text} in {entries:?}"))
+        };
+        let answered = place(
+            "StreamClose",
+            &format!("connection {old}: resolved: closed"),
+        );
+        let opened = place("StreamOpen", &format!("connection {new}: localhost"));
+        assert!(opened < answered, "{entries:?}");
         assert_eq!(
             fixture.shell().view().connection,
             shared::Connection::Online

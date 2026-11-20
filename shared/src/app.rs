@@ -172,6 +172,15 @@ pub enum Event {
         /// The id of the connection.
         connection: u32,
     },
+    /// The wait for the answer to the `Close` request for the MQTT
+    /// connection with this id is over. Refer to
+    /// [`connection::CLOSE_TIMEOUT`].
+    #[serde(skip)]
+    #[facet(skip)]
+    CloseTimeout {
+        /// The id of the connection.
+        connection: u32,
+    },
     /// A timer of the MQTT session of the connection with this id expired.
     #[serde(skip)]
     #[facet(skip)]
@@ -425,6 +434,7 @@ impl App for Dashboard {
                 outcome,
             } => connection::written(connection, outcome, model),
             Event::StreamClosed { connection } => connection::stream_closed(connection, model),
+            Event::CloseTimeout { connection } => connection::close_timeout(connection, model),
             Event::SessionTimer { connection, timer } => {
                 connection::session_timer(connection, timer, model)
             }

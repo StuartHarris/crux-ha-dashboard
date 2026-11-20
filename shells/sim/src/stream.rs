@@ -40,6 +40,9 @@ pub const PEER_CLOSED: &str = "the broker closed the stream";
 /// The longest time that a close waits for the bytes to go and for the peer
 /// to close its side.
 pub const FLUSH_LIMIT: Duration = Duration::from_secs(2);
+/// The longest time that the opener waits for a TCP connection, as on the
+/// device.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// The size of the buffer of the read loop, in bytes.
 const READ_BUFFER: usize = 8 * 1024;
 
@@ -55,12 +58,22 @@ pub type Connecting = Pin<Box<dyn Future<Output = io::Result<Box<dyn Io>>> + Sen
 pub type Opener = Box<dyn FnMut(&str, u16) -> Connecting>;
 
 /// Returns an opener that opens a TCP stream. The future finds the address
-/// of the host (DNS) and then connects.
+/// of the host (DNS) and then connects. If there is no connection in
+/// [`CONNECT_TIMEOUT`], the future fails, and the stream ends with `Closed`.
 pub fn tcp_opener() -> Opener {
     Box::new(|host, port| {
         let host = host.to_string();
         Box::pin(async move {
-            let stream = TcpStream::connect((host.as_str(), port)).await?;
+            let connecting = TcpStream::connect((host.as_str(), port));
+            let stream = tokio::time::timeout(CONNECT_TIMEOUT, connecting)
+                .await
+                .map_err(|_| {
+                    let secs = CONNECT_TIMEOUT.as_secs();
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("no TCP connection in {secs} s"),
+                    )
+                })??;
             // MQTT sends small packets, and the core waits for each answer.
             stream.set_nodelay(true)?;
             Ok(Box::new(stream) as Box<dyn Io>)

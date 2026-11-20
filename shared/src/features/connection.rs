@@ -14,7 +14,10 @@
 //! change of access point can drop the connection, and the core connects
 //! again.
 
-use alloc::{string::ToString, vec::Vec};
+use alloc::{
+    string::{String, ToString},
+    vec::Vec,
+};
 use core::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -43,6 +46,13 @@ use crate::{
 pub const RECONNECT_MIN: Duration = Duration::from_secs(1);
 /// The longest wait before the core connects again after a failure.
 pub const RECONNECT_MAX: Duration = Duration::from_secs(60);
+/// The longest time that the core waits for the answer to a `Close`
+/// request.
+///
+/// After this time, the core acts as if the answer arrived, so a
+/// shell that does not answer cannot stop a reconnect or a sleep. No other
+/// timer of the core has this duration.
+pub const CLOSE_TIMEOUT: Duration = Duration::from_secs(6);
 /// The largest number of service calls that the core keeps while it is
 /// offline. If there are more, the core removes the oldest call.
 pub const OUTBOX_LIMIT: usize = 8;
@@ -86,6 +96,14 @@ pub struct State {
     /// id of the sleep. The answer to the `Close` request starts the next
     /// step of the sleep. Refer to [`go_offline`].
     pub closing: Option<(u32, u32)>,
+    /// The id of the connection of a session that ended, while the `Close`
+    /// request for its stream waits for its answer. Until the answer
+    /// arrives, the core does not open a new stream. Refer to [`connect`].
+    pub draining: Option<u32>,
+    /// The core wanted to connect while the `Close` request of
+    /// [`State::draining`] waited. The core connects when the answer
+    /// arrives.
+    pub connect_waits: bool,
     /// The number of messages that the session skipped, because they were
     /// too long.
     pub skipped: usize,
@@ -125,6 +143,8 @@ impl Default for State {
             id: 0,
             session: None,
             closing: None,
+            draining: None,
+            connect_waits: false,
             skipped: 0,
             reconnect: 0,
             backoff: RECONNECT_MIN,
@@ -139,6 +159,8 @@ pub fn reset(model: &mut Model) {
     let state = &mut model.connection;
     state.session = None;
     state.closing = None;
+    state.draining = None;
+    state.connect_waits = false;
     state.wifi = Link::Down;
     state.mqtt = Link::Down;
     state.id = state.id.wrapping_add(1);
@@ -200,8 +222,7 @@ pub fn go_offline(sleep: u32, model: &mut Model) -> Cmd {
     let id = state.id;
     state.closing = Some((id, sleep));
     let Some(live) = &mut state.session else {
-        return Stream::close(id, true, STATUS_ASLEEP.to_string())
-            .then_send(move |()| Event::StreamClosed { connection: id });
+        return close_stream(id, true, STATUS_ASLEEP.to_string());
     };
     if up && let Some(status) = status {
         // A publish that the session refuses cannot stop the sleep, so the
@@ -326,12 +347,23 @@ pub fn reconnect(id: u32, model: &mut Model) -> Cmd {
 ///
 /// A session that closes for a sleep is still there after a wake during the
 /// close. The core connects again when that session ends.
+///
+/// After a session ends, the core does not open a stream until the shell
+/// answers the `Close` request for the old stream. A new `Open` makes the
+/// shell abort the old stream. An abort can send a TCP reset, and then the
+/// broker can lose bytes that it did not read, for example the DISCONNECT.
+/// Without the DISCONNECT, the broker publishes the last will. Refer to
+/// [`stream_closed`].
 fn connect(model: &mut Model) -> Cmd {
     let Some(settings) = &model.settings else {
         return Cmd::done();
     };
     let state = &mut model.connection;
     if state.mqtt != Link::Down || state.session.is_some() {
+        return Cmd::done();
+    }
+    if state.draining.is_some() {
+        state.connect_waits = true;
         return Cmd::done();
     }
     let request = Connect {
@@ -399,17 +431,47 @@ pub fn session_timer(id: u32, timer: Timer, model: &mut Model) -> Cmd {
     handle(id, Input::Timer(timer), model)
 }
 
-/// Handles the answer to the `Close` request on the connection `id`. If the
-/// core closed the stream for a sleep, it sends [`Event::Offline`] for the
-/// sleep.
+/// Handles the answer to the `Close` request on the connection `id`.
+///
+/// If the core closed the stream for a sleep, it sends [`Event::Offline`]
+/// for the sleep. If the core wanted to connect while the `Close` request
+/// waited, it connects now. Refer to [`connect`].
 pub fn stream_closed(id: u32, model: &mut Model) -> Cmd {
-    match model.connection.closing {
+    let state = &mut model.connection;
+    let offline = match state.closing {
         Some((connection, sleep)) if connection == id => {
-            model.connection.closing = None;
+            state.closing = None;
             Cmd::event(Event::Offline(sleep))
         }
         _ => Cmd::done(),
+    };
+    if state.draining != Some(id) {
+        return offline;
     }
+    state.draining = None;
+    if !core::mem::take(&mut state.connect_waits) {
+        return offline;
+    }
+    offline.and(go_online(model))
+}
+
+/// Handles the end of the wait for the answer to the `Close` request on the
+/// connection `id`.
+///
+/// If the answer did not arrive, the core acts as if it
+/// arrived now. After the answer, the core ignores the timer, and after the
+/// timer, the core ignores the answer. Refer to [`CLOSE_TIMEOUT`].
+pub fn close_timeout(id: u32, model: &mut Model) -> Cmd {
+    stream_closed(id, model)
+}
+
+/// Sends the `Close` request for the stream of the connection `id`, and
+/// starts the timer of [`CLOSE_TIMEOUT`].
+fn close_stream(id: u32, clean: bool, reason: String) -> Cmd {
+    let close = Stream::close(id, clean, reason)
+        .then_send(move |()| Event::StreamClosed { connection: id });
+    let (timer, _handle) = Time::notify_after(CLOSE_TIMEOUT);
+    close.and(timer.then_send(move |_| Event::CloseTimeout { connection: id }))
 }
 
 /// Gives `input` to the session of the connection `id`, and does the
@@ -439,7 +501,8 @@ fn handle(id: u32, input: Input, model: &mut Model) -> Cmd {
 /// - `Subscribed` with `Done` for the subscribe of the connection sends
 ///   `WifiQuiet`.
 /// - `Ended` closes the stream, and connects again if the core wants a
-///   connection.
+///   connection. The new stream opens after the answer to the `Close`
+///   request.
 ///
 /// While the connection is up, the outbox drains after the actions. The
 /// command has the timers first, then the `Write`, then the other effects.
@@ -569,16 +632,18 @@ fn subscribed(id: SubscribeId, outcome: SubscribeOutcome, model: &Model) -> Cmd 
 /// The session ended: close the stream, and connect again if the core wants
 /// a connection.
 ///
-/// After a clean end, the core connects again at once. This happens if the
-/// device woke during the close for a sleep. After a failure, the core waits
-/// first. Refer to [`schedule_reconnect`]. During a sleep, the core does not
-/// draw.
+/// After a clean end, the core connects again without a wait. This happens
+/// if the device woke during the close for a sleep. After a failure, the
+/// core waits first. Refer to [`schedule_reconnect`]. In both cases, the new
+/// stream opens only after the answer to the `Close` request. Refer to
+/// [`connect`]. During a sleep, the core does not draw.
 fn ended(end: &End, model: &mut Model) -> Cmd {
     let state = &mut model.connection;
     state.session = None;
     let id = state.id;
-    let close = Stream::close(id, *end == End::Clean, end.to_string())
-        .then_send(move |()| Event::StreamClosed { connection: id });
+    state.draining = Some(id);
+    state.connect_waits = false;
+    let close = close_stream(id, *end == End::Clean, end.to_string());
     state.id = state.id.wrapping_add(1);
     state.mqtt = Link::Down;
     // Wi-Fi can be the cause, so the reconnect asks for Wi-Fi again. If

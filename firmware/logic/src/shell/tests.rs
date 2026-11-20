@@ -14,6 +14,7 @@ use shared::{
     },
     fake::{Broker, session_timers},
     features::{
+        connection::CLOSE_TIMEOUT,
         light::{BATTERY_LEVEL, LIGHT_TIMEOUT, STAND_LEVEL},
         power::IDLE_TIMEOUT,
         refresh::DRAW_DELAY,
@@ -144,9 +145,10 @@ fn packets(bytes: &[u8]) -> Vec<Packet> {
 }
 
 /// Returns `true` if `duration` is the duration of a timer of the MQTT
-/// session. No timer of a feature has one of these durations.
-fn is_session_timer(duration: Duration) -> bool {
-    session_timers().contains(&duration)
+/// session or of the wait for the answer to a `Close` request. No timer of
+/// a feature has one of these durations. The tests leave these timers out.
+fn is_stream_timer(duration: Duration) -> bool {
+    session_timers().contains(&duration) || duration == CLOSE_TIMEOUT
 }
 
 /// Returns the first stream job in `jobs`.
@@ -196,7 +198,7 @@ fn names(jobs: &[Job]) -> Vec<String> {
             Job::Timer {
                 op: TimerOp::NotifyAfter(notify),
                 ..
-            } if is_session_timer(notify.duration.into()) => Vec::new(),
+            } if is_stream_timer(notify.duration.into()) => Vec::new(),
             Job::Timer {
                 token,
                 op: TimerOp::NotifyAfter(_),
@@ -243,7 +245,8 @@ const fn joined(token: u32) -> Signal {
 }
 
 /// Returns the id, the token and the duration of each timer that `jobs`
-/// start, in order. The list leaves out the timers of the MQTT session.
+/// start, in order. The list leaves out the timers that [`is_stream_timer`]
+/// finds.
 fn started_timers(jobs: &[Job]) -> Vec<(crux_time::TimerId, u32, Duration)> {
     jobs.iter()
         .filter_map(|job| match job {
@@ -253,7 +256,7 @@ fn started_timers(jobs: &[Job]) -> Vec<(crux_time::TimerId, u32, Duration)> {
             } => Some((notify.id, *token, Duration::from(notify.duration))),
             _ => None,
         })
-        .filter(|(_, _, duration)| !is_session_timer(*duration))
+        .filter(|(_, _, duration)| !is_stream_timer(*duration))
         .collect()
 }
 
@@ -410,12 +413,13 @@ fn a_failed_write_ends_the_session_and_closes_the_stream() {
 }
 
 #[test]
-fn the_end_of_an_old_stream_after_a_new_open_ends_only_the_old_stream() {
+fn a_new_stream_opens_only_after_the_end_of_the_old_stream() {
     let (mut device, _) = started(PowerSource::Stand, true);
     device.handle(joined(1));
     device.connect(FIRST);
-    // The write fails. The core closes the stream, and opens a new one
-    // before the old stream ends.
+    // The write fails. The core closes the stream. The backoff ends and
+    // Wi-Fi is up before the old stream ends, so the core does not open a
+    // new stream yet.
     let jobs = device.handle(Signal::Written {
         connection: FIRST,
         outcome: Written::Failed("timeout".into()),
@@ -424,14 +428,14 @@ fn the_end_of_an_old_stream_after_a_new_open_ends_only_the_old_stream() {
         panic!("not one timer: {:?}", names(&jobs));
     };
     device.handle(Signal::Timer { id, token });
-    let next = SECOND;
-    let jobs = device.handle(joined(2));
-    assert_eq!(names(&jobs), [format!("open {next}")]);
+    assert_eq!(device.handle(joined(2)), Vec::new());
 
-    // The old stream ends. The shell answers its `Close`, and the core
-    // ignores the answer. The new stream continues.
+    // The old stream ends, and the shell answers its `Close`. Then the core
+    // opens the new stream.
     device.broker.drop_connection();
-    assert_eq!(device.closed(FIRST, "closed"), Vec::new());
+    let next = SECOND;
+    let jobs = device.closed(FIRST, "closed");
+    assert_eq!(names(&jobs), [format!("open {next}")]);
     let jobs = device.connect(next);
     assert!(names(&jobs).contains(&format!("subscribe {next}")));
 }
@@ -829,9 +833,10 @@ fn the_render_before_sleep_stays_before_sleep() {
     let names = names(&jobs);
     // The core clears the full-refresh timer before it sleeps.
     assert!(names.contains(&"cancel timer 1".into()), "{names:?}");
-    // Only the idle timer of the start runs. It is stale, because
-    // `SleepNow` ended the idle time.
-    assert_eq!(device.timer_count(), 1);
+    // Only the idle timer of the start and the timer of the `Close`
+    // request run. Both are stale: `SleepNow` ended the idle time, and the
+    // shell answered the `Close` request.
+    assert_eq!(device.timer_count(), 2);
     let render = names.iter().position(|name| name == "render").unwrap();
     let sleep = names.iter().position(|name| name == "sleep").unwrap();
     assert!(render < sleep, "{names:?}");

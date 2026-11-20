@@ -82,6 +82,10 @@ pub struct Broker {
     /// link that is dead. The `Write` requests wait until the stream ends.
     pub hold_writes: bool,
     held: Vec<Request<Write>>,
+    /// If `true`, the shell does not answer a `Close` request until
+    /// [`Broker::release_closes`]. The stream closes at once.
+    pub hold_closes: bool,
+    held_closes: Vec<Request<Close>>,
     /// The answers of the broker to the writes, which wait for
     /// [`Broker::deliver_answers`].
     answers: Vec<u8>,
@@ -175,7 +179,20 @@ impl Broker {
             self.inner.drop_connection();
             self.end("closed");
         }
+        if self.hold_closes {
+            self.held_closes.push(request);
+            return;
+        }
         request.resolve(()).expect("the core waits for the close");
+    }
+
+    /// Answers the `Close` requests that wait. Refer to
+    /// [`Broker::hold_closes`].
+    pub fn release_closes(&mut self) {
+        self.hold_closes = false;
+        for mut request in core::mem::take(&mut self.held_closes) {
+            request.resolve(()).expect("the core waits for the close");
+        }
     }
 
     /// Stops the stream, as when the network fails. The broker publishes the
