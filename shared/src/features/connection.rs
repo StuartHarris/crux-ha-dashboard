@@ -1,5 +1,5 @@
-//! The connection feature: Wi-Fi, the MQTT session, reconnects, and the
-//! messages from the Home Assistant state stream.
+//! The connection feature: the MQTT session, reconnects, and the messages
+//! from the Home Assistant state stream.
 //!
 //! The core runs the MQTT session ([`Session`]), and the shell gives it only
 //! a byte stream. Refer to [`crate::capabilities::stream`]. Each wait of the
@@ -8,11 +8,12 @@
 //! the session: it writes the bytes, starts the timers and handles the
 //! results.
 //!
-//! After each connect, the core subscribes to all the topics. When the
-//! broker acknowledged each topic filter, the link is quiet, and the core
-//! sends `WifiQuiet`. The shell can then look for a better access point. A
-//! change of access point can drop the connection, and the core connects
-//! again.
+//! Before it connects, the core gets a link from the Wi-Fi feature
+//! ([`wifi::link`]). After each connect, the core subscribes to all the
+//! topics. When the broker acknowledged each topic filter, the link is
+//! quiet ([`wifi::quiet`]). The Wi-Fi feature can then scan for a better
+//! access point. To change to it, the core closes the session with a
+//! DISCONNECT packet ([`close_for_roam`]), and connects again.
 
 use alloc::{
     string::{String, ToString},
@@ -26,14 +27,12 @@ use futures::StreamExt;
 
 use crate::{
     Cmd, Event, Model,
-    capabilities::{
-        network::{Network, WifiStatus},
-        stream::{Stream, StreamItem, Written},
-    },
+    capabilities::stream::{Stream, StreamItem, Written},
     entities,
     features::{
         pending,
         refresh::{redraw, redraw_soon},
+        wifi,
     },
     mqtt::{
         Action, Connect, End, Input, LastWill, Limits, Message, Publish, Qos, Refused, Session,
@@ -66,7 +65,7 @@ pub const STATUS_ASLEEP: &str = "asleep";
 /// The status payload that the broker publishes if the connection stops.
 pub const STATUS_OFFLINE: &str = "offline";
 
-/// The state of a link (Wi-Fi or the MQTT connection).
+/// The state of the MQTT connection.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Link {
     /// The link is down.
@@ -78,13 +77,9 @@ pub enum Link {
     Up,
 }
 
-/// The state of Wi-Fi and of the MQTT connection.
+/// The state of the MQTT connection.
 #[derive(Debug)]
 pub struct State {
-    /// The state of Wi-Fi.
-    pub wifi: Link,
-    /// The id of the newest `WifiOn` request.
-    pub wifi_request: u32,
     /// The state of the MQTT connection, as the view shows it.
     pub mqtt: Link,
     /// The id of the newest MQTT connection. Each stream operation carries
@@ -137,8 +132,6 @@ pub struct Call {
 impl Default for State {
     fn default() -> Self {
         Self {
-            wifi: Link::Down,
-            wifi_request: 0,
             mqtt: Link::Down,
             id: 0,
             session: None,
@@ -153,18 +146,17 @@ impl Default for State {
     }
 }
 
-/// Forgets the links after the shell starts. The core ignores the answers to
-/// earlier requests.
+/// Forgets the connection and the radio after the shell starts. The core
+/// ignores the answers to earlier requests.
 pub fn reset(model: &mut Model) {
+    wifi::reset(model);
     let state = &mut model.connection;
     state.session = None;
     state.closing = None;
     state.draining = None;
     state.connect_waits = false;
-    state.wifi = Link::Down;
     state.mqtt = Link::Down;
     state.id = state.id.wrapping_add(1);
-    state.wifi_request = state.wifi_request.wrapping_add(1);
     state.reconnect = state.reconnect.wrapping_add(1);
     state.backoff = RECONNECT_MIN;
 }
@@ -175,22 +167,63 @@ pub const fn restart(model: &mut Model) {
     model.connection.backoff = RECONNECT_MIN;
 }
 
-/// Turns Wi-Fi on and connects, if the core wants a connection.
+/// Gets a link and connects, if the core wants a connection and has no
+/// session. Refer to [`wifi::link`].
+///
+/// While the `Close` request of an old stream waits for its answer, the
+/// core does not ask for the link yet. A radio request, for example a
+/// `Leave` for a change of access point, can stop the old stream before the
+/// DISCONNECT packet goes. The answer to the `Close` request continues.
+/// Refer to [`stream_closed`].
 pub fn go_online(model: &mut Model) -> Cmd {
-    if !model.wants_online() {
+    let wants_online = model.wants_online();
+    let state = &mut model.connection;
+    if !wants_online || state.mqtt != Link::Down || state.session.is_some() {
         return Cmd::done();
     }
-    match model.connection.wifi {
-        Link::Down => {
-            let state = &mut model.connection;
-            state.wifi = Link::Starting;
-            state.wifi_request = state.wifi_request.wrapping_add(1);
-            let request = state.wifi_request;
-            Network::wifi_on().then_send(move |status| Event::Wifi { request, status })
-        }
-        Link::Starting => Cmd::done(),
-        Link::Up => connect(model),
+    if state.draining.is_some() {
+        state.connect_waits = true;
+        return Cmd::done();
     }
+    wifi::link(model)
+}
+
+/// The Wi-Fi feature has a link: connect, if the core wants a connection.
+pub fn link_up(model: &mut Model) -> Cmd {
+    if model.wants_online() {
+        connect(model)
+    } else {
+        Cmd::done()
+    }
+}
+
+/// The Wi-Fi feature did not get a link: wait for the backoff, and then try
+/// again, if the core wants a connection.
+pub fn link_failed(model: &mut Model) -> Cmd {
+    if model.wants_online() {
+        schedule_reconnect(model)
+    } else {
+        Cmd::done()
+    }
+}
+
+/// Closes the session with a DISCONNECT packet, so that the reconnect goes
+/// to a better access point. Refer to [`wifi::quiet`].
+///
+/// The end is clean, so the broker keeps `online` and does not publish the
+/// last will. The core connects again after the answer to the `Close`
+/// request. Refer to [`ended`]. With no session that is up, the next
+/// connect goes to the better access point, so the core does nothing now.
+pub fn close_for_roam(model: &mut Model) -> Cmd {
+    let state = &mut model.connection;
+    if state.mqtt != Link::Up {
+        return Cmd::done();
+    }
+    let Some(live) = &mut state.session else {
+        return Cmd::done();
+    };
+    live.session.disconnect();
+    pump(model)
 }
 
 /// Closes the connection for the sleep `sleep`. The answer to the `Close`
@@ -215,10 +248,8 @@ pub fn go_offline(sleep: u32, model: &mut Model) -> Cmd {
     let state = &mut model.connection;
     // The core ignores the answers to earlier requests.
     state.reconnect = state.reconnect.wrapping_add(1);
-    state.wifi_request = state.wifi_request.wrapping_add(1);
     let up = state.mqtt == Link::Up;
     state.mqtt = Link::Down;
-    state.wifi = Link::Down;
     let id = state.id;
     state.closing = Some((id, sleep));
     let Some(live) = &mut state.session else {
@@ -306,34 +337,6 @@ fn drain_outbox(model: &mut Model) -> Cmd {
     Cmd::all(commands)
 }
 
-/// Handles the answer to the `WifiOn` request with the id `request`. The
-/// core ignores the answer to an older request.
-pub fn wifi(request: u32, status: WifiStatus, model: &mut Model) -> Cmd {
-    if request != model.connection.wifi_request {
-        return Cmd::done();
-    }
-    match status {
-        WifiStatus::Connected if model.wants_online() => {
-            model.connection.wifi = Link::Up;
-            connect(model)
-        }
-        WifiStatus::Connected => {
-            // The device went to sleep while Wi-Fi started. The steps of the
-            // sleep turn Wi-Fi off.
-            model.connection.wifi = Link::Down;
-            Cmd::done()
-        }
-        WifiStatus::Failed => {
-            model.connection.wifi = Link::Down;
-            if model.wants_online() {
-                schedule_reconnect(model)
-            } else {
-                Cmd::done()
-            }
-        }
-    }
-}
-
 /// Tries to connect again after the wait for the reconnect `id`.
 pub fn reconnect(id: u32, model: &mut Model) -> Cmd {
     if id == model.connection.reconnect {
@@ -392,14 +395,14 @@ fn connect(model: &mut Model) -> Cmd {
     let open = Cmd::new(move |ctx| async move {
         let mut items = Stream::open(connection, host, port).into_stream(ctx.clone());
         while let Some(item) = items.next().await {
-            let last = matches!(item, StreamItem::Closed(_));
+            let last = matches!(item, StreamItem::Closed { .. });
             ctx.send_event(Event::Stream { connection, item });
             if last {
                 return;
             }
         }
         // The shell ended the stream without `Closed`.
-        let item = StreamItem::Closed("the stream ended".to_string());
+        let item = StreamItem::closed("the stream ended");
         ctx.send_event(Event::Stream { connection, item });
     });
     open.and(pump(model))
@@ -407,23 +410,38 @@ fn connect(model: &mut Model) -> Cmd {
 
 /// Handles an item from the stream of the connection `id`. The core ignores
 /// an item for an older connection.
+///
+/// Bytes from the broker prove that the link moves data in both
+/// directions. Refer to [`wifi::traffic`]. An end of the stream by the
+/// broker host proves it too. The session then ends with [`End::ByHost`],
+/// and [`wifi::session_ended`] records the proof.
 pub fn stream(id: u32, item: StreamItem, model: &mut Model) -> Cmd {
     let input = match item {
         StreamItem::Opened => Input::Opened,
-        StreamItem::Received(bytes) => Input::Received(bytes),
-        StreamItem::Closed(reason) => Input::Closed(reason),
+        StreamItem::Received(bytes) => {
+            if id == model.connection.id && model.connection.session.is_some() {
+                wifi::traffic(model);
+            }
+            Input::Received(bytes)
+        }
+        StreamItem::Closed { reason, by_host } => Input::Closed { reason, by_host },
     };
     handle(id, input, model)
 }
 
-/// Handles the answer to a `Write` request on the connection `id`. A write
-/// that failed ends the session, as a closed stream does.
-pub fn written(id: u32, outcome: Written, model: &mut Model) -> Cmd {
-    let input = match outcome {
-        Written::Sent => Input::Sent,
-        Written::Failed(reason) => Input::Closed(reason),
-    };
-    handle(id, input, model)
+/// Handles the answer to a `Write` request on the connection `id`.
+///
+/// The core ignores `Failed`. A write fails only when the stream ended or
+/// has no stream, and the `Closed` item of the stream ends the session. The
+/// `Closed` item also tells if the broker host ended the stream, and
+/// `Failed` does not. Thus the session ends in the same way if `Failed`
+/// arrives before or after `Closed`. If no `Closed` item arrives, the send
+/// timer of the session ends it.
+pub fn written(id: u32, outcome: &Written, model: &mut Model) -> Cmd {
+    match outcome {
+        Written::Sent => handle(id, Input::Sent, model),
+        Written::Failed(_) => Cmd::done(),
+    }
 }
 
 /// Handles the expiry of a timer of the session on the connection `id`.
@@ -499,8 +517,9 @@ fn handle(id: u32, input: Input, model: &mut Model) -> Cmd {
 ///   three go in one `Write`.
 /// - `Message` changes the state of an entity.
 /// - `Subscribed` with `Done` or `Refused` for the subscribe of the
-///   connection sends `WifiQuiet`. After `Refused`, the link is up and
-///   quiet, but the core has no effect to report the refused filter.
+///   connection makes the link quiet ([`wifi::quiet`]). After `Refused`,
+///   the link is up and quiet, but the core has no effect to report the
+///   refused filter.
 /// - `Ended` closes the stream, and connects again if the core wants a
 ///   connection. The new stream opens after the answer to the `Close`
 ///   request.
@@ -620,27 +639,33 @@ fn on_message(message: &Message, model: &mut Model) -> Cmd {
 }
 
 /// Handles the result of a subscribe job. After `Done` or `Refused` for the
-/// subscribe of the connection, the link is quiet, so the core sends
-/// `WifiQuiet`. After `Failed`, the connection ended or never got the
-/// acknowledgements, so the core sends nothing.
-fn subscribed(id: SubscribeId, outcome: SubscribeOutcome, model: &Model) -> Cmd {
+/// subscribe of the connection, the link is quiet ([`wifi::quiet`]). After
+/// `Failed`, the connection ended or never got the acknowledgements, so the
+/// link is not quiet.
+fn subscribed(id: SubscribeId, outcome: SubscribeOutcome, model: &mut Model) -> Cmd {
     let state = &model.connection;
     let current = state.session.as_ref().and_then(|live| live.subscribe);
     if current != Some(id) || state.mqtt != Link::Up || outcome == SubscribeOutcome::Failed {
         return Cmd::done();
     }
-    Network::quiet()
+    wifi::quiet(model)
 }
 
 /// The session ended: close the stream, and connect again if the core wants
 /// a connection.
 ///
 /// After a clean end, the core connects again without a wait. This happens
-/// if the device woke during the close for a sleep. After a failure, the
-/// core waits first. Refer to [`schedule_reconnect`]. In both cases, the new
-/// stream opens only after the answer to the `Close` request. Refer to
+/// after a close for a change of access point ([`close_for_roam`]), and if
+/// the device woke during the close for a sleep. The core gets the link
+/// only after the answer to the `Close` request, so a `Leave` request
+/// cannot stop the DISCONNECT packet. After a failure, the core waits
+/// first. Refer to [`schedule_reconnect`]. In both cases, the new stream
+/// opens only after the answer to the `Close` request. Refer to
 /// [`connect`]. During a sleep, the core does not draw.
+///
+/// The Wi-Fi feature records the end. Refer to [`wifi::session_ended`].
 fn ended(end: &End, model: &mut Model) -> Cmd {
+    wifi::session_ended(end, model);
     let state = &mut model.connection;
     state.session = None;
     let id = state.id;
@@ -649,16 +674,17 @@ fn ended(end: &End, model: &mut Model) -> Cmd {
     let close = close_stream(id, *end == End::Clean, end.to_string());
     state.id = state.id.wrapping_add(1);
     state.mqtt = Link::Down;
-    // Wi-Fi can be the cause, so the reconnect asks for Wi-Fi again. If
-    // Wi-Fi is on, the shell answers at once.
-    state.wifi = Link::Down;
-    state.wifi_request = state.wifi_request.wrapping_add(1);
     if model.power.asleep {
         return close;
     }
     let retry = match end {
         _ if !model.wants_online() => Cmd::done(),
-        End::Clean => go_online(model),
+        End::Clean => {
+            // The answer to the `Close` request connects. Refer to
+            // [`stream_closed`].
+            model.connection.connect_waits = true;
+            Cmd::done()
+        }
         _ => schedule_reconnect(model),
     };
     close.and(redraw(model, false)).and(retry)

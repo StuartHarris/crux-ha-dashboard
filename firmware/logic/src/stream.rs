@@ -57,7 +57,7 @@ impl Streams {
     /// its `Closed` signal. The task must then close the old socket.
     pub fn begin(&mut self, connection: u32) -> Option<Signal> {
         let old = self.open.replace(connection)?;
-        (old != connection).then(|| closed(old, REPLACED.into()))
+        (old != connection).then(|| closed(old, REPLACED))
     }
 
     /// Returns the `Opened` signal when the socket of `connection` is
@@ -88,14 +88,20 @@ impl Streams {
         })
     }
 
-    /// Ends the stream of `connection`. Returns its `Closed` signal, or
-    /// `None` if the stream already ended.
-    pub fn end(&mut self, connection: u32, reason: String) -> Option<Signal> {
+    /// Ends the stream of `connection` for `reason`. Returns its `Closed`
+    /// signal, or `None` if the stream already ended.
+    ///
+    /// `by_host` is `true` only if the broker host ended the stream with a
+    /// TCP reset or a FIN. Refer to [`StreamItem::Closed`].
+    pub fn end(&mut self, connection: u32, reason: String, by_host: bool) -> Option<Signal> {
         if !self.accepts(connection) {
             return None;
         }
         self.open = None;
-        Some(closed(connection, reason))
+        Some(Signal::Stream {
+            connection,
+            item: StreamItem::Closed { reason, by_host },
+        })
     }
 
     fn item(self, connection: u32, item: StreamItem) -> Option<Signal> {
@@ -104,10 +110,12 @@ impl Streams {
     }
 }
 
-const fn closed(connection: u32, reason: String) -> Signal {
+/// Returns the `Closed` signal of `connection` for `reason`, which the
+/// broker host did not cause.
+fn closed(connection: u32, reason: &str) -> Signal {
     Signal::Stream {
         connection,
-        item: StreamItem::Closed(reason),
+        item: StreamItem::closed(reason),
     }
 }
 
@@ -134,10 +142,7 @@ pub fn supersede(queue: Vec<(u32, StreamOp)>) -> (Vec<Signal>, Vec<(u32, StreamO
         return (Vec::new(), queue);
     };
     let mut skipped: Vec<u32> = opens.iter().copied().filter(|id| *id != last).collect();
-    let mut signals: Vec<Signal> = skipped
-        .iter()
-        .map(|id| closed(*id, REPLACED.into()))
-        .collect();
+    let mut signals: Vec<Signal> = skipped.iter().map(|id| closed(*id, REPLACED)).collect();
     let open_at = queue
         .iter()
         .rposition(|(id, op)| *id == last && matches!(op, StreamOp::Open(_)));
@@ -145,7 +150,7 @@ pub fn supersede(queue: Vec<(u32, StreamOp)>) -> (Vec<Signal>, Vec<(u32, StreamO
         *id == last && matches!(op, StreamOp::Close(_)) && Some(index) > open_at
     });
     if closed_after {
-        signals.push(closed(last, CLOSED.into()));
+        signals.push(closed(last, CLOSED));
         skipped.push(last);
     }
     let kept = queue
@@ -200,13 +205,17 @@ mod tests {
     use super::{CLOSED, REPLACED, SLOW_UPDATE, Streams, UpdateStats, supersede};
     use crate::shell::{Signal, StreamOp};
 
-    /// Returns the connection id and the reason of a `Closed` signal, or
-    /// `None` for another signal.
+    /// Returns the connection id and the reason of a `Closed` signal that
+    /// the broker host did not cause, or `None` for another signal.
     fn closed(signal: Option<&Signal>) -> Option<(u32, &str)> {
         match signal {
             Some(Signal::Stream {
                 connection,
-                item: StreamItem::Closed(reason),
+                item:
+                    StreamItem::Closed {
+                        reason,
+                        by_host: false,
+                    },
             }) => Some((*connection, reason.as_str())),
             _ => None,
         }
@@ -217,13 +226,27 @@ mod tests {
         let mut streams = Streams::default();
         assert_eq!(streams.begin(1), None);
         assert!(streams.opened(1).is_some());
-        let signal = streams.end(1, "reset by peer".into());
-        assert_eq!(closed(signal.as_ref()), Some((1, "reset by peer")));
-        assert_eq!(streams.end(1, "again".into()), None);
+        let signal = streams.end(1, "read failed".into(), false);
+        assert_eq!(closed(signal.as_ref()), Some((1, "read failed")));
+        assert_eq!(streams.end(1, "again".into(), false), None);
         assert_eq!(streams.opened(1), None);
         assert_eq!(streams.received(1, b"a"), None);
         assert_eq!(streams.written(1, Written::Sent), None);
         assert_eq!(streams.open(), None);
+    }
+
+    #[test]
+    fn an_end_by_the_host_is_in_the_closed_item() {
+        let mut streams = Streams::default();
+        streams.begin(1);
+        let signal = streams.end(1, "TCP connect failed: ConnectionReset".into(), true);
+        assert_eq!(
+            signal,
+            Some(Signal::Stream {
+                connection: 1,
+                item: StreamItem::by_host("TCP connect failed: ConnectionReset"),
+            })
+        );
     }
 
     #[test]
@@ -234,7 +257,7 @@ mod tests {
         assert!(!streams.accepts(1));
         assert!(streams.accepts(2));
         // The old socket closes later. Its stream already ended.
-        assert_eq!(streams.end(1, "closed".into()), None);
+        assert_eq!(streams.end(1, "closed".into(), false), None);
         assert!(streams.accepts(2));
     }
 

@@ -11,12 +11,12 @@
 //! the stream is open, it also listens for its jobs:
 //!
 //! - The DNS query has a limit of [`DNS_TIMEOUT`], and the TCP connect has a
-//!   limit of [`CONNECT_TIMEOUT`]. A newer `Open`, a `Close` and a change of
-//!   access point (`LINK_CHANGED`) stop each of them.
+//!   limit of [`CONNECT_TIMEOUT`]. A newer `Open` and a `Close` stop each of
+//!   them.
 //! - While the stream is open, one select waits for the next job, the next
-//!   bytes from the broker, the write of the oldest `Write` job and
-//!   `LINK_CHANGED`. Each of these futures is safe to cancel. A `Write` that
-//!   gets no space in the send buffer for [`WRITE_STALL`] ends the stream.
+//!   bytes from the broker and the write of the oldest `Write` job. Each of
+//!   these futures is safe to cancel. A `Write` that gets no space in the
+//!   send buffer for [`WRITE_STALL`] ends the stream.
 //! - A `Close` sends a TCP FIN, waits for no more than [`CLOSE_FLUSH`] for the
 //!   broker to acknowledge the bytes that wait, and then aborts the socket.
 //!   The task then waits for no more than [`ABORT_FLUSH`] for the RST. It
@@ -27,12 +27,20 @@
 //! smoltcp sends them from there. The core finds a link that stopped with
 //! its own timers, and closes the stream.
 //!
-//! The task records the health of the link in `HEALTH`. The first bytes on a
-//! stream prove traffic. A socket error, a reset from the broker, a write
-//! that stalls, and a stream that does not open make the link suspect. A FIN
-//! from the broker does not, because the broker closed the stream on
-//! purpose. The core task records a `Close` with `clean: false` from the
-//! core.
+//! The core decides the health of the link from the items of the stream, so
+//! the task only writes each end to the log. A socket error, a reset from
+//! the broker, a write that stalls and a stream that does not open are
+//! warnings.
+//!
+//! The task sets `by_host` in the `Closed` item only when the broker host
+//! ended the stream: with a FIN (a read of no bytes) or with a TCP reset.
+//! embassy-net gives the error `ConnectionReset` for a reset from the host,
+//! and also when smoltcp closes the socket because the network stack lost
+//! its address (the link dropped). For that reason the task counts the
+//! error as a reset only while the link is up and the stack has an address.
+//! Refer to [`host_reset`]. The socket has no smoltcp timeout and no
+//! keep-alive, so no timer of the socket gives the error. Only a FIN from
+//! the host gives a read of no bytes.
 //!
 //! The receive and send buffers of the socket are 8 KiB each. The task takes
 //! them from the heap once and keeps them, so the allocator puts them in
@@ -42,8 +50,12 @@
 use alloc::{boxed::Box, collections::VecDeque, format, string::String, vec, vec::Vec};
 use core::{net::Ipv4Addr, str::FromStr};
 
-use embassy_futures::select::{Either, Either3, Either4, select, select3, select4};
-use embassy_net::{IpAddress, Stack, dns::DnsQueryType, tcp::TcpSocket};
+use embassy_futures::select::{Either, Either3, select, select3};
+use embassy_net::{
+    IpAddress, Stack,
+    dns::DnsQueryType,
+    tcp::{ConnectError, Error, TcpSocket},
+};
 use embassy_time::{Duration, Instant, Timer, with_timeout};
 use logic::{
     shell::StreamOp,
@@ -51,7 +63,7 @@ use logic::{
 };
 use shared::capabilities::stream::{Open, Written};
 
-use crate::{HEALTH, LINK_CHANGED, SIGNALS, STREAM};
+use crate::{SIGNALS, STREAM};
 
 /// The size of each buffer of the socket.
 const BUFFER: usize = 8 * 1024;
@@ -77,8 +89,6 @@ const WRITE_STALL: Duration = Duration::from_secs(10);
 const CLOSE_FLUSH: Duration = Duration::from_secs(2);
 /// The longest time for which the task waits for the RST after an abort.
 const ABORT_FLUSH: Duration = Duration::from_millis(500);
-/// The reason in the `Closed` item after a change of access point.
-const ACCESS_POINT_CHANGED: &str = "access point changed";
 
 /// Jobs that the task took from its queue but did not do yet.
 type Pending = VecDeque<(u32, StreamOp)>;
@@ -87,9 +97,12 @@ type Pending = VecDeque<(u32, StreamOp)>;
 struct End {
     /// The reason for the `Closed` item.
     reason: String,
-    /// `true` if the link or the broker did not work. The Wi-Fi task then
-    /// leaves and joins again.
+    /// `true` if the link or the broker did not work. The task then writes
+    /// the end to the log as a warning.
     failed: bool,
+    /// `true` if the broker host ended the stream with a FIN or a TCP
+    /// reset. Refer to [`host_reset`].
+    by_host: bool,
     /// `true` if the task sends a FIN and waits for the bytes that wait
     /// before it aborts the socket.
     graceful: bool,
@@ -101,7 +114,18 @@ impl End {
         Self {
             reason: reason.into(),
             failed: true,
+            by_host: false,
             graceful: false,
+        }
+    }
+
+    /// A stream that failed with the error `ConnectionReset` from
+    /// embassy-net. The end is a reset only if the host sent it. Refer to
+    /// [`host_reset`]. The task aborts the socket at once.
+    fn reset(stack: Stack<'static>, reason: impl Into<String>) -> Self {
+        Self {
+            by_host: host_reset(stack),
+            ..Self::error(reason)
         }
     }
 
@@ -110,9 +134,26 @@ impl End {
         Self {
             reason: reason.into(),
             failed: false,
+            by_host: false,
             graceful: true,
         }
     }
+}
+
+/// Returns `true` if the error `ConnectionReset` that the task just got came
+/// from the broker host: the link is up, and the network stack has an
+/// address.
+///
+/// smoltcp also closes a socket when the stack loses the address of the
+/// socket, and embassy-net then gives the same error. This check relies on
+/// the order of events in embassy-net 0.9.1 and smoltcp 0.13.1. In the poll
+/// in which embassy-net sees the link drop, it clears the address. smoltcp
+/// resets the socket only in the next poll. Thus such a close always finds
+/// no link or no address here. A new address needs a DHCP exchange, which
+/// takes much longer than the task needs to see the error. Examine this
+/// order again after an update of either crate.
+fn host_reset(stack: Stack<'static>) -> bool {
+    stack.is_link_up() && stack.config_v4().is_some()
 }
 
 /// Returns the next job: a pending one, or the next one from the queue. The
@@ -176,14 +217,13 @@ pub async fn task(stack: Stack<'static>) {
         }
         log::info!("stream: open {connection} to {}:{}", open.host, open.port);
         let end = session(stack, rx, tx, &streams, connection, &open, &mut pending).await;
+        let by_host = if end.by_host { " (by the host)" } else { "" };
         if end.failed {
-            log::warn!("stream: {connection} failed: {}", end.reason);
-            // The Wi-Fi task must know before the core asks for Wi-Fi again.
-            HEALTH.lock(|health| health.borrow_mut().session_failed());
+            log::warn!("stream: {connection} failed: {}{by_host}", end.reason);
         } else {
-            log::info!("stream: {connection} closed: {}", end.reason);
+            log::info!("stream: {connection} closed: {}{by_host}", end.reason);
         }
-        if let Some(signal) = streams.end(connection, end.reason) {
+        if let Some(signal) = streams.end(connection, end.reason, end.by_host) {
             SIGNALS.push(signal);
         }
     }
@@ -200,10 +240,6 @@ async fn session(
     open: &Open,
     pending: &mut Pending,
 ) -> End {
-    // A change of access point before this stream does not apply to it. A
-    // change during the connect applies, because the TCP connection can use
-    // the old access point, so the reset is before the connect.
-    LINK_CHANGED.reset();
     let mut socket = TcpSocket::new(stack, rx, tx);
     // The `Write` jobs of the stream, from the oldest.
     let mut writes = VecDeque::new();
@@ -213,7 +249,7 @@ async fn session(
             if let Some(signal) = streams.opened(connection) {
                 SIGNALS.push(signal);
             }
-            exchange(&mut socket, streams, connection, pending, writes).await
+            exchange(stack, &mut socket, streams, connection, pending, writes).await
         }
         // The socket sent nothing, so it needs no FIN.
         Err(end) => End {
@@ -226,7 +262,7 @@ async fn session(
 }
 
 /// Finds the address of the host and opens the TCP connection. A newer
-/// `Open`, a `Close` for `connection` and `LINK_CHANGED` stop the attempt.
+/// `Open` and a `Close` for `connection` stop the attempt.
 /// A `Write` for `connection` goes to `writes`.
 ///
 /// # Errors
@@ -242,39 +278,28 @@ async fn connect(
 ) -> Result<(), End> {
     let host = open.host.as_str();
     let query = with_timeout(DNS_TIMEOUT, resolve(stack, host));
-    let address = match select3(
-        query,
-        stop(connection, pending, writes),
-        LINK_CHANGED.wait(),
-    )
-    .await
-    {
-        Either3::First(Ok(Ok(address))) => address,
-        Either3::First(Ok(Err(reason))) => return Err(End::error(reason)),
-        Either3::First(Err(_)) => {
+    let address = match select(query, stop(connection, pending, writes)).await {
+        Either::First(Ok(Ok(address))) => address,
+        Either::First(Ok(Err(reason))) => return Err(End::error(reason)),
+        Either::First(Err(_)) => {
             let secs = DNS_TIMEOUT.as_secs();
             return Err(End::error(format!("no DNS answer for {host} in {secs} s")));
         }
-        Either3::Second(end) => return Err(end),
-        Either3::Third(()) => return Err(End::closed(ACCESS_POINT_CHANGED)),
+        Either::Second(end) => return Err(end),
     };
     let endpoint = (address, open.port);
     let attempt = with_timeout(CONNECT_TIMEOUT, socket.connect(endpoint));
-    match select3(
-        attempt,
-        stop(connection, pending, writes),
-        LINK_CHANGED.wait(),
-    )
-    .await
-    {
-        Either3::First(Ok(Ok(()))) => Ok(()),
-        Either3::First(Ok(Err(error))) => Err(End::error(format!("TCP connect failed: {error:?}"))),
-        Either3::First(Err(_)) => {
+    match select(attempt, stop(connection, pending, writes)).await {
+        Either::First(Ok(Ok(()))) => Ok(()),
+        Either::First(Ok(Err(error @ ConnectError::ConnectionReset))) => {
+            Err(End::reset(stack, format!("TCP connect failed: {error:?}")))
+        }
+        Either::First(Ok(Err(error))) => Err(End::error(format!("TCP connect failed: {error:?}"))),
+        Either::First(Err(_)) => {
             let secs = CONNECT_TIMEOUT.as_secs();
             Err(End::error(format!("no TCP connection in {secs} s")))
         }
-        Either3::Second(end) => Err(end),
-        Either3::Third(()) => Err(End::closed(ACCESS_POINT_CHANGED)),
+        Either::Second(end) => Err(end),
     }
 }
 
@@ -303,6 +328,7 @@ async fn stop(connection: u32, pending: &mut Pending, writes: &mut VecDeque<Vec<
 /// cancel. A write that returns puts some bytes in the send buffer, and the
 /// next pass writes the rest.
 async fn exchange(
+    stack: Stack<'static>,
     socket: &mut TcpSocket<'_>,
     streams: &Streams,
     connection: u32,
@@ -315,7 +341,6 @@ async fn exchange(
     let mut sent = 0;
     // The time at which the oldest write stalls, if it gets no space.
     let mut stall = Instant::now() + WRITE_STALL;
-    let mut heard = false;
     loop {
         let write = async {
             match writes.front() {
@@ -329,47 +354,39 @@ async fn exchange(
                 None => core::future::pending().await,
             }
         };
-        let event = select4(
-            next_job(pending),
-            reader.read(&mut chunk),
-            write,
-            LINK_CHANGED.wait(),
-        )
-        .await;
+        let event = select3(next_job(pending), reader.read(&mut chunk), write).await;
         match event {
-            Either4::First((id, StreamOp::Open(open))) => {
+            Either3::First((id, StreamOp::Open(open))) => {
                 pending.push_front((id, StreamOp::Open(open)));
                 return End::closed(REPLACED);
             }
-            Either4::First((id, StreamOp::Close(_))) if id == connection => {
+            Either3::First((id, StreamOp::Close(_))) if id == connection => {
                 return End::closed(CLOSED);
             }
-            Either4::First((id, StreamOp::Write(write))) if id == connection => {
+            Either3::First((id, StreamOp::Write(write))) if id == connection => {
                 if writes.is_empty() {
                     stall = Instant::now() + WRITE_STALL;
                 }
                 writes.push_back(write.bytes);
             }
-            Either4::First((id, _)) => {
+            Either3::First((id, _)) => {
                 log::debug!("stream: {id} is not open, so the task skips its job");
             }
-            Either4::Second(Ok(0)) => {
+            Either3::Second(Ok(0)) => {
                 let mut end = End::closed("the broker closed the stream");
                 end.graceful = false;
+                end.by_host = true;
                 return end;
             }
-            Either4::Second(Ok(count)) => {
-                if !heard {
-                    heard = true;
-                    // The bytes prove that the link moves data both ways.
-                    HEALTH.lock(|health| health.borrow_mut().traffic());
-                }
+            Either3::Second(Ok(count)) => {
                 if let Some(signal) = streams.received(connection, &chunk[..count]) {
                     SIGNALS.push(signal);
                 }
             }
-            Either4::Second(Err(error)) => return End::error(format!("read failed: {error:?}")),
-            Either4::Third(Some(Ok(count))) => {
+            Either3::Second(Err(error @ Error::ConnectionReset)) => {
+                return End::reset(stack, format!("read failed: {error:?}"));
+            }
+            Either3::Third(Some(Ok(count))) => {
                 sent += count;
                 stall = Instant::now() + WRITE_STALL;
                 if writes.front().is_some_and(|bytes| sent >= bytes.len()) {
@@ -380,14 +397,13 @@ async fn exchange(
                     }
                 }
             }
-            Either4::Third(Some(Err(error))) => {
-                return End::error(format!("write failed: {error:?}"));
+            Either3::Third(Some(Err(error @ Error::ConnectionReset))) => {
+                return End::reset(stack, format!("write failed: {error:?}"));
             }
-            Either4::Third(None) => {
+            Either3::Third(None) => {
                 let secs = WRITE_STALL.as_secs();
                 return End::error(format!("no space in the send buffer for {secs} s"));
             }
-            Either4::Fourth(()) => return End::closed(ACCESS_POINT_CHANGED),
         }
     }
 }

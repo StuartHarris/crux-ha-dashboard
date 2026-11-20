@@ -9,16 +9,14 @@
 //! | `core` | owns the shell and routes each job | |
 //! | `timers` | `StartTimer`, `CancelTimer` | `Signal::Timer` |
 //! | `display` | draws the latest view model, reads the touch controller, the charger and the fuel gauge, sets the front light, and runs the `Sleep` job | `Signal::Tap`, `Signal::Event`, `Signal::Woke`, `Signal::Light` |
-//! | `wifi` | `WifiOn`, `WifiOff`, the radio on and off, and a change to a better access point after `WifiQuiet` | `Signal::Wifi`, `Signal::RadioOff` |
+//! | `radio` | the radio jobs (`Join`, `Address`, `Leave`, `Scan`, `StopScan`, `Off`) and `Restart`, with no Wi-Fi policy | `Signal::Radio` |
 //! | `stream` | the TCP stream to the broker, one at a time: `Open`, `Write`, `Close` | `Signal::Stream`, `Signal::Written` |
 //! | `net` | runs the network stack | |
 //!
-//! The core runs the MQTT session, and the stream task moves only bytes.
-//!
-//! After a change of access point, the Wi-Fi task sets [`LINK_CHANGED`]. The
-//! stream task then closes its stream, and the core connects again. The core
-//! task, the stream task and the Wi-Fi task share [`HEALTH`], so the Wi-Fi
-//! task joins again after an MQTT session failed.
+//! The core runs the MQTT session, and the stream task moves only bytes. The
+//! core also decides each Wi-Fi step (the access point, the scan, the change
+//! of access point and the restart of the chip), and the radio task only does
+//! the work of the Wi-Fi driver.
 
 #![no_std]
 #![no_main]
@@ -28,23 +26,18 @@ extern crate alloc;
 
 mod core_task;
 mod display;
+mod radio;
 mod stream;
 mod timers;
-mod wifi;
 
-use core::cell::RefCell;
 use dashboard_firmware::{board, lane::Lane, light::FrontLight, panel::Panel, panel_pins};
 use embassy_executor::Spawner;
 use embassy_net::StackResources;
-use embassy_sync::{
-    blocking_mutex::{Mutex, raw::CriticalSectionRawMutex},
-    signal::Signal as Latest,
-};
+use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal as Latest};
 use esp_backtrace as _;
 use logic::{
     shell::{Signal, StreamOp},
     sleep::Plan,
-    wifi::{LinkHealth, WifiRequest},
 };
 use shared::{PowerSource, ViewModel};
 use static_cell::StaticCell;
@@ -71,19 +64,9 @@ pub static RENDER: Latest<CriticalSectionRawMutex, alloc::boxed::Box<ViewModel>>
 pub static TIMERS: Lane<timers::Request> = Lane::new();
 /// The work of the stream task, with the connection id of the core.
 pub static STREAM: Lane<(u32, StreamOp)> = Lane::new();
-/// The work of the Wi-Fi task.
-pub static WIFI: Lane<WifiRequest> = Lane::new();
-/// Set by the Wi-Fi task after it changed to another access point. The stream
-/// task closes the open stream, because its TCP connection can be dead.
-pub static LINK_CHANGED: Latest<CriticalSectionRawMutex, ()> = Latest::new();
-/// The health of the link (`logic::wifi::LinkHealth`).
-///
-/// The core task records each `Close` of a session that failed. The stream
-/// task records each stream that failed, and the first bytes on each stream.
-/// The Wi-Fi task reads it at each `WifiOn`, and records each address from
-/// DHCP.
-pub static HEALTH: Mutex<CriticalSectionRawMutex, RefCell<LinkHealth>> =
-    Mutex::new(RefCell::new(LinkHealth::new()));
+/// The work of the radio task: the radio jobs, with their tokens, and
+/// `Restart`.
+pub static RADIO: Lane<radio::Request> = Lane::new();
 /// The `FrontLight` jobs for the display task, with their tokens.
 pub static LIGHT: Lane<(u32, u8)> = Lane::new();
 /// The `Sleep` job for the display task, or `None` when the `Sleep`
@@ -149,7 +132,7 @@ async fn main(spawner: Spawner) -> ! {
     );
 
     spawner.spawn(net_task(runner).expect("spawn the network task"));
-    spawner.spawn(wifi::task(peripherals.WIFI, stack).expect("spawn the Wi-Fi task"));
+    spawner.spawn(radio::task(peripherals.WIFI, stack).expect("spawn the radio task"));
     spawner.spawn(stream::task(stack).expect("spawn the stream task"));
     spawner.spawn(timers::task().expect("spawn the timer task"));
     // The display task drives the front light, because it must turn the

@@ -326,8 +326,10 @@ fn a_closed_stream_fails_the_jobs_that_wait_and_then_ends() {
     wire.run();
     wire.log.clear();
 
-    wire.session
-        .handle(Input::Closed("connection reset".into()));
+    wire.session.handle(Input::Closed {
+        reason: "connection reset".into(),
+        by_host: false,
+    });
     wire.run();
     assert_eq!(
         wire.log,
@@ -346,9 +348,25 @@ fn a_closed_stream_fails_the_jobs_that_wait_and_then_ends() {
 }
 
 #[test]
+fn a_reset_from_the_broker_host_ends_by_host() {
+    let mut wire = Wire::connected();
+    wire.session.handle(Input::Closed {
+        reason: "connection reset".into(),
+        by_host: true,
+    });
+    assert_eq!(
+        poll_all(&mut wire.session),
+        [Action::Ended(End::ByHost("connection reset".into()))]
+    );
+}
+
+#[test]
 fn the_session_ignores_all_input_after_the_end() {
     let mut wire = Wire::connected();
-    wire.session.handle(Input::Closed("reset".into()));
+    wire.session.handle(Input::Closed {
+        reason: "reset".into(),
+        by_host: false,
+    });
     wire.run();
     wire.log.clear();
 
@@ -356,7 +374,10 @@ fn the_session_ignores_all_input_after_the_end() {
     wire.session.handle(Input::Timer(timer));
     wire.session.handle(Input::Opened);
     wire.session.handle(Input::Received(vec![0xD0, 0x00]));
-    wire.session.handle(Input::Closed("again".into()));
+    wire.session.handle(Input::Closed {
+        reason: "again".into(),
+        by_host: false,
+    });
     let _ = wire.session.subscribe(&["a".to_string()]);
     wire.session.disconnect();
     assert_eq!(wire.session.publish(online()), Err(Refused::NotConnected));
@@ -948,6 +969,10 @@ fn end_has_a_message_for_each_reason() {
             "the stream closed: connection reset",
         ),
         (
+            End::ByHost("connection refused".into()),
+            "the broker host ended the stream: connection refused",
+        ),
+        (
             End::SessionPresent,
             "the broker kept a session, but the client asked for a clean session",
         ),
@@ -1148,8 +1173,10 @@ fn a_close_after_disconnect_is_a_clean_end() {
     wire.session.publish(command("bye")).unwrap();
     let _ = take_send(&mut wire.session);
     wire.session.disconnect();
-    wire.session
-        .handle(Input::Closed("connection reset".into()));
+    wire.session.handle(Input::Closed {
+        reason: "connection reset".into(),
+        by_host: false,
+    });
     assert_eq!(poll_all(&mut wire.session), [Action::Ended(End::Clean)]);
 }
 

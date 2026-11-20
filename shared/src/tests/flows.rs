@@ -118,13 +118,20 @@ fn count(log: &[String], effect: &str) -> usize {
     log.iter().filter(|entry| *entry == effect).count()
 }
 
+/// Returns the number of `Join` requests in `log`.
+fn joins(log: &[String]) -> usize {
+    log.iter()
+        .filter(|entry| entry.starts_with("RadioJoin"))
+        .count()
+}
+
 #[test]
 fn on_the_stand_the_dashboard_shows_live_state_and_controls_lights() {
     let mut shell = house();
 
     shell.send(start(PowerSource::Stand));
 
-    assert!(shell.wifi_on);
+    assert!(shell.radio.associated.is_some());
     assert_eq!(
         shell.broker.retained("dashboard/hall/status"),
         Some("online")
@@ -251,6 +258,8 @@ fn on_battery_the_dashboard_wakes_syncs_accepts_taps_then_sleeps() {
             // `CLOSE_TIMEOUT`.
             "TimeNotifyAfter 6000ms",
             "WifiOff",
+            // The time limit of the `Off` request.
+            "TimeNotifyAfter 3000ms",
             // No full-refresh timer runs while the device sleeps.
             "TimeClear",
             "Render",
@@ -258,7 +267,7 @@ fn on_battery_the_dashboard_wakes_syncs_accepts_taps_then_sleeps() {
         ]
     );
     assert_eq!(shell.sleep.as_ref().unwrap().wake_on, [WakeSource::Touch]);
-    assert!(!shell.wifi_on);
+    assert!(!shell.radio.on);
     assert!(!shell.broker.is_connected());
     // A disconnect is not a lost connection, so the broker keeps `asleep`.
     assert_eq!(
@@ -287,7 +296,7 @@ fn a_battery_wake_shows_the_changes_from_while_it_slept() {
     shell.broker.set_state("weather.home", "sunny", &[]);
 
     shell.wake(Wake::Timer);
-    assert!(shell.wifi_on);
+    assert!(shell.radio.associated.is_some());
     assert_eq!(shell.broker.connections, 2);
     assert_eq!(shell.view().connection, Connection::Online);
     assert_eq!(
@@ -316,7 +325,7 @@ fn a_move_to_the_stand_while_asleep_connects_and_stays_awake() {
     assert!(shell.model.power.asleep);
 
     shell.send(Event::PowerSourceChanged(PowerSource::Stand));
-    assert!(shell.wifi_on);
+    assert!(shell.radio.associated.is_some());
     assert!(shell.broker.is_connected());
     assert_eq!(
         shell.broker.retained("dashboard/hall/status"),
@@ -341,7 +350,7 @@ fn a_move_off_the_stand_sleeps_after_the_idle_timeout() {
 
     shell.advance(IDLE_TIMEOUT);
     assert!(shell.sleep.is_some());
-    assert!(!shell.wifi_on);
+    assert!(!shell.radio.on);
 }
 
 #[test]
@@ -405,10 +414,11 @@ fn while_the_broker_is_down_the_wait_doubles_up_to_a_limit() {
     shell.broker.down = true;
     shell.send(start(PowerSource::Stand));
 
-    // Only the reconnect timer, the timers of the `Close` requests and the
-    // full-refresh timer run. The shell answered each `Close` request, so
-    // the core ignores the timers of the `Close` requests. A reconnect timer
-    // is due before the full-refresh timer.
+    // Only the reconnect timer, the timers of the `Close` requests, the time
+    // limits of the radio requests and the full-refresh timer run. The
+    // shell answered each `Close` request and each radio request, so the
+    // core ignores their timers. A reconnect timer is due before the
+    // full-refresh timer.
     let mut waits = vec![];
     for _ in 0..9 {
         let before = shell.now();
@@ -420,7 +430,9 @@ fn while_the_broker_is_down_the_wait_doubles_up_to_a_limit() {
                 .count();
             let closes = events
                 .iter()
-                .filter(|event| matches!(event, Event::CloseTimeout { .. }))
+                .filter(|event| {
+                    matches!(event, Event::CloseTimeout { .. } | Event::RadioTimeout(_))
+                })
                 .count();
             assert!(
                 reconnects <= 1 && reconnects + closes == events.len(),
@@ -500,22 +512,22 @@ fn taps_without_a_connection_are_sent_when_the_core_connects() {
 }
 
 #[test]
-fn wifi_that_fails_on_battery_wake_is_tried_again_until_the_device_sleeps() {
+fn a_join_that_fails_on_battery_is_tried_again_until_the_device_sleeps() {
     let mut shell = house();
-    shell.wifi_works = false;
+    shell.radio.blocked = true;
     shell.send(start(PowerSource::Battery));
     assert_eq!(shell.view().connection, Connection::Connecting);
 
-    // The core tries Wi-Fi again after each wait, until the idle timeout.
+    // The core joins again after each wait, until the idle timeout.
     shell.take_log();
     shell.advance(IDLE_TIMEOUT);
-    assert!(count(&shell.take_log(), "WifiOn") > 1);
+    assert!(joins(&shell.take_log()) > 1);
     assert!(shell.sleep.is_some());
     // The core never connected, so it has no time of an update.
     assert_eq!(shell.view().updated, "");
 
     // A reconnect timer from before the sleep is stale, so the device stays
-    // asleep with Wi-Fi off.
+    // asleep with the radio off.
     shell.take_log();
     let events = shell.advance(RECONNECT_MAX);
     assert!(
@@ -525,7 +537,8 @@ fn wifi_that_fails_on_battery_wake_is_tried_again_until_the_device_sleeps() {
         "{events:?}"
     );
     assert!(shell.model.power.asleep);
-    assert!(!shell.take_log().iter().any(|effect| effect == "WifiOn"));
+    assert_eq!(joins(&shell.take_log()), 0);
+    assert!(!shell.radio.on);
 }
 
 #[test]
@@ -551,22 +564,24 @@ fn a_full_refresh_is_kept_when_a_partial_redraw_follows_before_the_shell_draws()
 }
 
 #[test]
-fn on_the_stand_a_wifi_drop_asks_for_wifi_again_before_it_reconnects() {
+fn on_the_stand_a_wifi_drop_joins_again_before_it_reconnects() {
     let mut shell = house();
     shell.send(start(PowerSource::Stand));
 
     // Wi-Fi drops, so the connection drops too.
-    shell.wifi_on = false;
+    shell.radio.drop_link();
     shell.broker.drop_connection();
     shell.run();
     shell.take_log();
 
     shell.advance(RECONNECT_MIN);
     let log = shell.take_log();
-    let wifi = log.iter().position(|effect| effect == "WifiOn");
+    let join = log
+        .iter()
+        .position(|effect| effect.starts_with("RadioJoin"));
     let connect = log.iter().position(|effect| effect == "MqttConnect");
-    assert!(wifi.is_some() && wifi < connect, "{log:?}");
-    assert!(shell.wifi_on);
+    assert!(join.is_some() && join < connect, "{log:?}");
+    assert!(shell.radio.associated.is_some());
     assert!(shell.broker.is_connected());
 }
 
@@ -1007,7 +1022,7 @@ fn a_touch_wake_on_a_light_sends_the_toggle_after_the_reconnect() {
     shell.send(tap_all_lights());
     let log = shell.take_log();
     assert_eq!(log[0], "Wake Touch(Some(AllLights))");
-    assert!(log.contains(&"WifiOn".into()), "{log:?}");
+    assert_eq!(joins(&log), 1, "{log:?}");
     assert!(!shell.model.power.asleep);
     assert_eq!(shell.view().connection, Connection::Online);
     assert_eq!(shell.broker.service_calls.len(), 1);
@@ -1027,7 +1042,7 @@ fn the_stand_while_asleep_wakes_and_the_shell_answers_sleep() {
     shell.send(Event::PowerSourceChanged(PowerSource::Stand));
     let log = shell.take_log();
     assert_eq!(log.last().map(String::as_str), Some("Wake PowerSource"));
-    assert_eq!(count(&log, "WifiOn"), 1, "{log:?}");
+    assert_eq!(joins(&log), 1, "{log:?}");
     assert_eq!(shell.sleep, None);
     assert!(!shell.model.power.asleep);
     assert_eq!(shell.view().connection, Connection::Online);

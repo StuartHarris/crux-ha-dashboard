@@ -2,8 +2,8 @@
 //!
 //! The feature tests drive one step at a time with the `EffectTestExt`
 //! helpers. The flow tests run the core in [`shell::Shell`], which answers the
-//! effects with a fake MQTT broker, a fake Home Assistant with a clock,
-//! Wi-Fi and timers.
+//! effects with a fake MQTT broker, a fake Home Assistant with a clock, a
+//! fake radio and timers.
 
 pub mod broker;
 mod connection;
@@ -15,6 +15,7 @@ mod refresh;
 mod rooms;
 mod session;
 mod subscribe;
+mod wifi;
 
 mod shell;
 mod wire;
@@ -25,14 +26,18 @@ use wire::{ExpectWrite, Wire};
 
 use core::time::Duration;
 
+use crux_core::App;
+
 use crate::{
-    Cmd, Control, EffectTestExt, Model, PowerSource, Settings, Start,
+    Cmd, Control, Dashboard, Effect, EffectTestExt, Model, PowerSource, Settings, Start,
     app::Event,
     entities::STATESTREAM,
+    fake::FakeRadio,
     features::{
         light::LIGHT_TIMEOUT,
         pending::{PENDING_TIMEOUT, SCENE_TIMEOUT, TARGET_TIMEOUT},
         refresh::FULL_REFRESH_INTERVAL,
+        wifi::{ADDRESS_TIMEOUT, JOIN_TIMEOUT, LEAVE_TIMEOUT},
     },
     mqtt::Publish,
 };
@@ -201,4 +206,67 @@ impl ExpectLight for Cmd {
             assert_eq!(Duration::from(notify.duration), LIGHT_TIMEOUT);
         })
     }
+}
+
+/// Expects the start of the time limit of a radio request.
+trait ExpectRadioLimit {
+    /// Expects the next effect to start a timer of `limit`.
+    fn expect_radio_limit(&mut self, limit: Duration) -> &mut Self;
+}
+
+impl ExpectRadioLimit for Cmd {
+    #[track_caller]
+    fn expect_radio_limit(&mut self, limit: Duration) -> &mut Self {
+        self.expect_time_notify_after_with(|notify| {
+            assert_eq!(Duration::from(notify.duration), limit);
+        })
+    }
+}
+
+/// Answers the radio requests of a link with a fake radio, one at a time:
+/// a `Leave` if the core leaves first, the `Join` and the `Address`. Each
+/// request must be the next effect, with the start of its time limit after
+/// it. Returns the command of the lease, which connects.
+#[track_caller]
+fn link_up(cmd: &mut Cmd, model: &mut Model) -> Cmd {
+    let mut radio = FakeRadio::default();
+    let mut event = answer_radio(cmd, &mut radio);
+    loop {
+        let leased = matches!(event, Event::Leased { .. });
+        let mut next = Dashboard.update(event, model);
+        if leased {
+            return next;
+        }
+        event = answer_radio(&mut next, &mut radio);
+    }
+}
+
+/// Answers the radio request that is the next effect of `cmd` with `radio`,
+/// and expects the start of its time limit. Returns the event of the
+/// answer.
+#[track_caller]
+fn answer_radio(cmd: &mut Cmd, radio: &mut FakeRadio) -> Event {
+    let limit = match cmd.expect_effect() {
+        Effect::RadioJoin(mut request) => {
+            let joined = radio.join(&request.operation);
+            request
+                .resolve(joined)
+                .expect("the core waits for the join");
+            JOIN_TIMEOUT
+        }
+        Effect::RadioAddress(mut request) => {
+            let lease = radio.address(&request.operation);
+            request
+                .resolve(lease)
+                .expect("the core waits for the address");
+            ADDRESS_TIMEOUT
+        }
+        Effect::RadioLeave(mut request) => {
+            radio.leave(&request.operation);
+            request.resolve(()).expect("the core waits for the leave");
+            LEAVE_TIMEOUT
+        }
+        effect => panic!("expected a radio request, got {effect:?}"),
+    };
+    cmd.expect_radio_limit(limit).expect_one_event()
 }

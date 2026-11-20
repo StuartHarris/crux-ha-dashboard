@@ -24,6 +24,27 @@ use crate::mqtt::{
     framer::{Frame, Framer},
 };
 
+/// Why the broker did not open a connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoConnection {
+    /// The broker host refused the connection with a TCP reset
+    /// ([`Broker::down`]).
+    Refused,
+    /// The broker host did not answer ([`Broker::unreachable`]).
+    Unreachable,
+}
+
+impl NoConnection {
+    /// Returns the reason for the log.
+    #[must_use]
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::Refused => "connection refused",
+            Self::Unreachable => "no answer from the host",
+        }
+    }
+}
+
 /// The open connection of the client.
 struct Connection {
     framer: Framer,
@@ -42,8 +63,14 @@ struct Connection {
 )]
 #[derive(Default)]
 pub struct Broker {
-    /// If `true`, the broker refuses connections.
+    /// If `true`, the broker is down, and the broker host refuses
+    /// connections with a TCP reset. This occurs when the broker process
+    /// stops.
     pub down: bool,
+    /// If `true`, the broker host does not answer, so no connection opens
+    /// and no reset arrives. This occurs when the link moves no data. This
+    /// flag wins over [`Broker::down`].
+    pub unreachable: bool,
     /// The return code of the CONNACK packet. If it is not 0, the broker
     /// closes the connection after the CONNACK.
     pub code: u8,
@@ -90,10 +117,15 @@ impl Broker {
     ///
     /// # Errors
     ///
-    /// Returns the reason if [`Broker::down`] is `true`.
-    pub fn open(&mut self) -> Result<(), String> {
+    /// Returns [`NoConnection::Unreachable`] if [`Broker::unreachable`] is
+    /// `true`, and else [`NoConnection::Refused`] if [`Broker::down`] is
+    /// `true`.
+    pub fn open(&mut self) -> Result<(), NoConnection> {
+        if self.unreachable {
+            return Err(NoConnection::Unreachable);
+        }
         if self.down {
-            return Err("connection refused".to_string());
+            return Err(NoConnection::Refused);
         }
         self.connection = Some(Connection {
             framer: Framer::new(MAX_PACKET),
@@ -358,7 +390,7 @@ pub fn matches(filter: &str, topic: &str) -> bool {
 mod tests {
     use alloc::vec::Vec;
 
-    use super::{Broker, matches};
+    use super::{Broker, NoConnection, matches};
     use crate::mqtt::{Connect, LastWill, codec};
 
     const STATUS: &str = "dashboard/hall/status";
@@ -436,7 +468,9 @@ mod tests {
             down: true,
             ..Broker::default()
         };
-        assert_eq!(broker.open(), Err("connection refused".into()));
+        assert_eq!(broker.open(), Err(NoConnection::Refused));
+        broker.unreachable = true;
+        assert_eq!(broker.open(), Err(NoConnection::Unreachable));
     }
 
     #[test]

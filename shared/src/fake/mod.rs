@@ -1,23 +1,26 @@
 //! A fake MQTT 3.1.1 broker that reads and writes bytes, with a fake Home
-//! Assistant behind it.
+//! Assistant behind it, and a fake radio.
 //!
 //! - [`broker`] has the fake broker. It reads the packets of one client,
 //!   answers them, keeps retained messages and publishes the last will.
 //! - [`home_assistant`] publishes entity states as the `mqtt_statestream`
 //!   integration does, and does the service calls that the dashboard
 //!   publishes.
+//! - [`radio`] has the fake radio. It answers each radio request at once.
 //!
 //! The tests use this module. Turn on the `fixtures` feature to use it from
 //! another crate.
 
 pub mod broker;
 pub mod home_assistant;
+pub mod radio;
 
 use alloc::vec::Vec;
 use core::time::Duration;
 
-pub use broker::{Broker, matches};
+pub use broker::{Broker, NoConnection, matches};
 pub use home_assistant::{MAX_TEMP, MIN_TEMP, ServiceCall, iso_time};
+pub use radio::FakeRadio;
 
 use crate::{
     features::connection::KEEP_ALIVE_SECS,

@@ -12,15 +12,15 @@ use serde::{Deserialize, Serialize};
 use crate::{
     capabilities::{
         light::FrontLight,
-        network::{WifiOff, WifiOn, WifiQuiet, WifiStatus},
         power::{PowerSource, Sleep, Wake},
+        radio::{Address, Join, Joined, Lease, Leave, Off, Restart, Scan, Scanned, StopScan},
         stream::{Close, Open, StreamItem, Write, Written},
     },
     entities::Entities,
     features::{
         connection, light, pending, power,
         refresh::{self, redraw},
-        rooms,
+        rooms, wifi,
     },
     layout::Page,
     mqtt::{Credentials, Timer},
@@ -134,16 +134,49 @@ pub enum Event {
     /// or while the device sleeps, the event does nothing.
     SleepNow,
 
-    /// The answer to a `WifiOn` request.
+    /// The answer to the `Join` request with this id.
     #[serde(skip)]
     #[facet(skip)]
-    Wifi {
-        /// The id of the request. The core ignores the answer to an older
-        /// request.
-        request: u32,
+    Joined {
+        /// The id of the radio request. The core ignores the answer to an
+        /// older request.
+        radio: u32,
         /// The answer.
-        status: WifiStatus,
+        joined: Joined,
     },
+    /// The answer to the `Address` request with this id.
+    #[serde(skip)]
+    #[facet(skip)]
+    Leased {
+        /// The id of the radio request. The core ignores the answer to an
+        /// older request.
+        radio: u32,
+        /// The answer.
+        lease: Lease,
+    },
+    /// The answer to the `Leave` request with this id.
+    #[serde(skip)]
+    #[facet(skip)]
+    Left(u32),
+    /// The answer to the `Scan` request with this id.
+    #[serde(skip)]
+    #[facet(skip)]
+    Scanned {
+        /// The id of the radio request. The core ignores the answer to an
+        /// older request.
+        radio: u32,
+        /// The answer.
+        scanned: Scanned,
+    },
+    /// The answer to the `StopScan` request with this id.
+    #[serde(skip)]
+    #[facet(skip)]
+    ScanStopped(u32),
+    /// The time limit of the radio request with this id expired. Refer to
+    /// [`wifi`].
+    #[serde(skip)]
+    #[facet(skip)]
+    RadioTimeout(u32),
     /// An item from the byte stream of the MQTT connection with this id.
     #[serde(skip)]
     #[facet(skip)]
@@ -208,7 +241,7 @@ pub enum Event {
     #[serde(skip)]
     #[facet(skip)]
     Offline(u32),
-    /// The radio is off for the sleep with this id.
+    /// The answer to the `Off` request with this id.
     #[serde(skip)]
     #[facet(skip)]
     RadioOff(u32),
@@ -298,12 +331,20 @@ pub enum Effect {
     StreamWrite(Write),
     /// Close the stream.
     StreamClose(Close),
-    /// Turn Wi-Fi on.
-    WifiOn(WifiOn),
-    /// Turn Wi-Fi off.
-    WifiOff(WifiOff),
-    /// Tell the shell that the link is quiet.
-    WifiQuiet(WifiQuiet),
+    /// Join an access point.
+    RadioJoin(Join),
+    /// Wait for an IP address.
+    RadioAddress(Address),
+    /// Leave the access point.
+    RadioLeave(Leave),
+    /// Scan for access points.
+    RadioScan(Scan),
+    /// Stop a scan.
+    RadioStopScan(StopScan),
+    /// Turn the radio off.
+    RadioOff(Off),
+    /// Restart the chip.
+    RadioRestart(Restart),
     /// Put the device to sleep.
     Sleep(Sleep),
     /// Set the brightness of the front light.
@@ -328,8 +369,11 @@ pub struct Model {
     pub route: Route,
     /// The entity states from the state stream.
     pub entities: Entities,
-    /// The state of Wi-Fi and of the MQTT connection.
+    /// The state of the MQTT connection.
     pub connection: connection::State,
+    /// The state of Wi-Fi: the radio, the cache of the access point and the
+    /// health of the link. Refer to [`wifi`].
+    pub wifi: wifi::State,
     /// The power source and the sleep state.
     pub power: power::State,
     /// The state of the front light. Refer to [`light`].
@@ -361,6 +405,7 @@ impl Default for Model {
             route: Route::Home,
             entities: Entities::default(),
             connection: connection::State::default(),
+            wifi: wifi::State::default(),
             power: power::State::default(),
             light: light::State::default(),
             last_sync: None,
@@ -427,12 +472,17 @@ impl App for Dashboard {
             Event::PreviousPage => rooms::turn_page(model, false),
             Event::Navigate(route) => rooms::navigate(route, model),
             Event::SetReadOnly(read_only) => rooms::set_read_only(read_only, model),
-            Event::Wifi { request, status } => connection::wifi(request, status, model),
+            Event::Joined { radio, joined } => wifi::joined(radio, &joined, model),
+            Event::Leased { radio, lease } => wifi::leased(radio, lease, model),
+            Event::Left(radio) => wifi::left(radio, model),
+            Event::Scanned { radio, scanned } => wifi::scanned(radio, &scanned, model),
+            Event::ScanStopped(radio) => wifi::scan_stopped(radio, model),
+            Event::RadioTimeout(radio) => wifi::timeout(radio, model),
             Event::Stream { connection, item } => connection::stream(connection, item, model),
             Event::Written {
                 connection,
                 outcome,
-            } => connection::written(connection, outcome, model),
+            } => connection::written(connection, &outcome, model),
             Event::StreamClosed { connection } => connection::stream_closed(connection, model),
             Event::CloseTimeout { connection } => connection::close_timeout(connection, model),
             Event::SessionTimer { connection, timer } => {
@@ -443,7 +493,7 @@ impl App for Dashboard {
             Event::IdleTimeout(id) => power::idle_timeout(id, model),
             Event::LightOffForSleep(id) => power::light_off(id, model),
             Event::Offline(id) => power::offline(id, model),
-            Event::RadioOff(id) => power::radio_off(id, model),
+            Event::RadioOff(radio) => wifi::radio_off(radio, model),
             Event::Woke { sleep, wake } => power::woke(sleep, wake, model),
             Event::FullRefreshDue(id) => refresh::timer_expired(id, model),
             Event::DrawDue(id) => refresh::draw_due(id, model),

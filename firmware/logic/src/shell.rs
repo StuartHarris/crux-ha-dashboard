@@ -19,10 +19,17 @@
 //!   at once.
 //! - Each timer has a token. The core can use a timer id again after it clears
 //!   the timer, so the shell ignores a signal with an old token.
-//! - Each `WifiOn` request has a token. `WifiOff` answers the requests that
-//!   wait with `Failed`, which the core ignores, because it no longer wants
-//!   the connection. The shell then drops a late answer of the Wi-Fi task.
-//! - `WifiOff` ends at [`Signal::RadioOff`], in the order of the requests.
+//! - Each radio request has a token. The radio task answers with
+//!   [`Signal::Radio`] and the token. The shell drops an answer with a token
+//!   that no request waits for.
+//! - The shell obeys the stop rule of the radio capability
+//!   ([`shared::capabilities::radio`]). A new radio request stops each
+//!   older radio request that waits. The shell answers each stopped request
+//!   with `Stopped` (or `()`) itself, and the job of the new request tells
+//!   the radio task which jobs to stop ([`Job::Radio`]). The shell then
+//!   drops the late answers of those jobs.
+//! - `Restart` is a notification. The shell gives it to a task as
+//!   [`Job::Restart`].
 //! - `Sleep` ends at [`Signal::Woke`]. While it waits, a tap is the wake
 //!   (`Wake::Touch` with the control at the point), and a change of the
 //!   power source also ends it (`Wake::PowerSource`). [`Shell::is_sleeping`] tells
@@ -36,7 +43,6 @@
 
 use alloc::{
     boxed::Box,
-    collections::VecDeque,
     string::{String, ToString},
     vec::Vec,
 };
@@ -51,8 +57,8 @@ use shared::{
     Core, Dashboard, Effect, Event, PowerSource, Settings, Start, ViewModel,
     capabilities::{
         light::FrontLight,
-        network::{WifiOff, WifiOn, WifiQuiet, WifiStatus},
         power::{Sleep, Wake},
+        radio::{Address, Join, Joined, Lease, Leave, Off, Restart, Scan, Scanned, StopScan},
         stream::{Close, Open, StreamItem, Write, Written},
     },
     mqtt::Credentials,
@@ -85,21 +91,19 @@ pub enum Signal {
         /// The token of the timer in the shell.
         token: u32,
     },
-    /// The answer to the `WifiOn` request with this token. The answer is also
-    /// for the older requests that wait.
-    Wifi {
-        /// The token of the newest request that the answer is for.
+    /// The answer to the radio job with this token. The shell drops an
+    /// answer for a job that a newer job stopped.
+    Radio {
+        /// The token of the job.
         token: u32,
         /// The answer.
-        status: WifiStatus,
+        answer: RadioAnswer,
     },
     /// A tap at this point on the panel. The shell sends it to the core as
     /// `Event::Tapped`, also on no control. While a `Sleep` request waits,
     /// the tap answers it with `Wake::Touch` and the control, in place of a
     /// tap.
     Tap(Point),
-    /// The radio is off. The answer to the oldest `WifiOff` job that waits.
-    RadioOff,
     /// The device woke from a real wake. The answer to the `Sleep` job.
     Woke(Wake),
     /// The front light has the level of the `FrontLight` job with this
@@ -117,9 +121,9 @@ pub enum Signal {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StreamOp {
     /// Open a stream. If a stream is open, close it first, and end it with
-    /// `Closed("replaced")`. The stream task answers with the items of the
-    /// new stream as [`Signal::Stream`], and the last item is always
-    /// `Closed`.
+    /// `Closed` and the reason `"replaced"`. The stream task answers with the
+    /// items of the new stream as [`Signal::Stream`], and the last item is
+    /// always `Closed`.
     Open(Open),
     /// Send the bytes. The stream task answers with [`Signal::Written`].
     Write(Write),
@@ -128,6 +132,48 @@ pub enum StreamOp {
     /// end the stream with `Closed`. The shell answers the `Close` request at
     /// the `Closed` item, so the task sends no other answer.
     Close(Close),
+}
+
+/// A radio operation of the core. Each variant holds the operation of the
+/// core, unchanged. Refer to [`shared::capabilities::radio`] for what the
+/// radio task does for each one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RadioOp {
+    /// Associate with an access point. Answer with [`RadioAnswer::Joined`].
+    Join(Join),
+    /// Wait for an IP address. Answer with [`RadioAnswer::Lease`].
+    Address(Address),
+    /// Leave the access point. Answer with [`RadioAnswer::Done`].
+    Leave(Leave),
+    /// Scan all the channels. Answer with [`RadioAnswer::Scanned`].
+    Scan(Scan),
+    /// Stop a scan. Answer with [`RadioAnswer::Done`].
+    StopScan(StopScan),
+    /// Turn the radio off. Answer with [`RadioAnswer::Done`].
+    Off(Off),
+}
+
+/// The answer of the radio task to a radio job.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RadioAnswer {
+    /// The answer to `Join`.
+    Joined(Joined),
+    /// The answer to `Address`.
+    Lease(Lease),
+    /// The answer to `Scan`.
+    Scanned(Scanned),
+    /// The answer to `Leave`, `StopScan` or `Off`.
+    Done,
+}
+
+/// A radio request of the core that waits for its answer.
+enum RadioRequest {
+    Join(Request<Join>),
+    Address(Request<Address>),
+    Leave(Request<Leave>),
+    Scan(Request<Scan>),
+    StopScan(Request<StopScan>),
+    Off(Request<Off>),
 }
 
 /// A timer operation of the core. Each operation holds the id of the timer.
@@ -143,7 +189,7 @@ pub enum TimerOp {
 }
 
 /// Work for a task. A job holds the operations of the core unchanged, and
-/// adds only what the shell owns: the Wi-Fi token, the light token and the
+/// adds only what the shell owns: the radio token, the light token and the
 /// timer token.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Job {
@@ -159,20 +205,21 @@ pub enum Job {
         /// The operation.
         op: StreamOp,
     },
-    /// Turn Wi-Fi on and join the network. Answer with [`Signal::Wifi`] and
-    /// the token.
-    WifiOn {
-        /// The token of the request.
+    /// Do a radio operation. Answer with [`Signal::Radio`] and the token.
+    ///
+    /// Stop the jobs with the tokens in `stop` first, if they run or wait,
+    /// and do not answer them. The shell already answered them.
+    Radio {
+        /// The token of the job.
         token: u32,
+        /// The tokens of the older jobs that this job stops.
+        stop: Vec<u32>,
         /// The operation.
-        op: WifiOn,
+        op: RadioOp,
     },
-    /// The link is quiet. The Wi-Fi task can scan for a better access point
-    /// now. No answer.
-    WifiQuiet(WifiQuiet),
-    /// Turn Wi-Fi off. Stop a join that is in progress, and do not answer it.
-    /// Answer with [`Signal::RadioOff`] when the radio is off.
-    WifiOff(WifiOff),
+    /// Write the reason to the log, wait for the log to go, and restart the
+    /// chip. No answer.
+    Restart(Restart),
     /// Draw the view model that waits, then put the device to sleep. Answer
     /// with [`Signal::Woke`] at the first real wake. After another wake,
     /// sleep again.
@@ -216,11 +263,10 @@ pub struct Shell {
     closes: Vec<(u32, Request<Close>)>,
     timers: Vec<Timer>,
     last_token: u32,
-    /// The `WifiOn` requests that wait for an answer, with their tokens.
-    wifi: Vec<(u32, Request<WifiOn>)>,
-    last_wifi_token: u32,
-    /// The `WifiOff` requests that wait for the radio, from the oldest.
-    wifi_off: VecDeque<Request<WifiOff>>,
+    /// The radio requests that wait for an answer, with their tokens, from
+    /// the oldest.
+    radio: Vec<(u32, RadioRequest)>,
+    last_radio_token: u32,
     /// The `Sleep` request that waits for a wake.
     sleep: Option<Request<Sleep>>,
     /// The `FrontLight` requests that wait for an answer, with their tokens.
@@ -245,9 +291,8 @@ impl Shell {
             closes: Vec::new(),
             timers: Vec::new(),
             last_token: 0,
-            wifi: Vec::new(),
-            last_wifi_token: 0,
-            wifi_off: VecDeque::new(),
+            radio: Vec::new(),
+            last_radio_token: 0,
             sleep: None,
             lights: Vec::new(),
             last_light_token: 0,
@@ -300,8 +345,8 @@ impl Shell {
                 let effects = resolve(&self.core, &mut timer.request, id);
                 self.process(effects)
             }
-            Signal::Wifi { token, status } => {
-                let effects = self.answer_wifi(|request| request <= token, status);
+            Signal::Radio { token, answer } => {
+                let effects = self.answer_radio(token, answer);
                 self.process(effects)
             }
             Signal::Tap(point) => {
@@ -321,13 +366,6 @@ impl Shell {
                 }
                 jobs
             }
-            Signal::RadioOff => match self.wifi_off.pop_front() {
-                Some(mut request) => {
-                    let effects = resolve(&self.core, &mut request, ());
-                    self.process(effects)
-                }
-                None => Vec::new(),
-            },
             Signal::Woke(wake) => self.wake(wake),
             Signal::Light { token } => {
                 let (answered, waiting) = core::mem::take(&mut self.lights)
@@ -352,7 +390,7 @@ impl Shell {
             return Vec::new();
         };
         let reason = match &item {
-            StreamItem::Closed(reason) => Some(reason.clone()),
+            StreamItem::Closed { reason, .. } => Some(reason.clone()),
             _ => None,
         };
         let mut effects = resolve(&self.core, &mut self.streams[index].1, item);
@@ -400,17 +438,67 @@ impl Shell {
         self.timers.len()
     }
 
-    /// Answers the `WifiOn` requests whose tokens match, and returns the new
-    /// effects.
-    fn answer_wifi(&mut self, matches: impl Fn(u32) -> bool, status: WifiStatus) -> Vec<Effect> {
-        let (answered, waiting) = core::mem::take(&mut self.wifi)
-            .into_iter()
-            .partition(|(token, _)| matches(*token));
-        self.wifi = waiting;
-        let mut effects = Vec::new();
-        for (_, mut request) in answered {
-            effects.extend(resolve(&self.core, &mut request, status));
+    /// Answers the radio request with `token`, and returns the new effects.
+    /// If no request waits for the token, or the answer is not for that kind
+    /// of request, the shell drops the answer.
+    fn answer_radio(&mut self, token: u32, answer: RadioAnswer) -> Vec<Effect> {
+        let Some(index) = self.radio.iter().position(|(radio, _)| *radio == token) else {
+            return Vec::new();
+        };
+        let (_, request) = self.radio.remove(index);
+        let core = &self.core;
+        match (request, answer) {
+            (RadioRequest::Join(mut request), RadioAnswer::Joined(joined)) => {
+                resolve(core, &mut request, joined)
+            }
+            (RadioRequest::Address(mut request), RadioAnswer::Lease(lease)) => {
+                resolve(core, &mut request, lease)
+            }
+            (RadioRequest::Scan(mut request), RadioAnswer::Scanned(scanned)) => {
+                resolve(core, &mut request, scanned)
+            }
+            (RadioRequest::Leave(mut request), RadioAnswer::Done) => {
+                resolve(core, &mut request, ())
+            }
+            (RadioRequest::StopScan(mut request), RadioAnswer::Done) => {
+                resolve(core, &mut request, ())
+            }
+            (RadioRequest::Off(mut request), RadioAnswer::Done) => resolve(core, &mut request, ()),
+            (request, _) => {
+                // The answer is for another kind of request. The request
+                // keeps its place, and the core's time limit ends it.
+                self.radio.insert(index, (token, request));
+                Vec::new()
+            }
         }
+    }
+
+    /// Takes a token for the radio request `request` with the operation
+    /// `op`, and adds its job to `jobs`. Returns the new effects of the core.
+    ///
+    /// The core waits for one radio request at a time, so it no longer waits
+    /// for an older request. The new request stops each older request, as
+    /// the stop rule tells. The shell answers each stopped request with
+    /// `Stopped` (or `()`), and the job tells the radio task to stop it.
+    fn radio(&mut self, request: RadioRequest, op: RadioOp, jobs: &mut Vec<Job>) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        let mut stop = Vec::new();
+        for (token, stopped) in core::mem::take(&mut self.radio) {
+            stop.push(token);
+            let core = &self.core;
+            effects.extend(match stopped {
+                RadioRequest::Join(mut request) => resolve(core, &mut request, Joined::Stopped),
+                RadioRequest::Address(mut request) => resolve(core, &mut request, Lease::Stopped),
+                RadioRequest::Scan(mut request) => resolve(core, &mut request, Scanned::Stopped),
+                RadioRequest::Leave(mut request) => resolve(core, &mut request, ()),
+                RadioRequest::StopScan(mut request) => resolve(core, &mut request, ()),
+                RadioRequest::Off(mut request) => resolve(core, &mut request, ()),
+            });
+        }
+        self.last_radio_token = self.last_radio_token.wrapping_add(1);
+        let token = self.last_radio_token;
+        self.radio.push((token, request));
+        jobs.push(Job::Radio { token, stop, op });
         effects
     }
 
@@ -471,21 +559,32 @@ impl Shell {
                 self.closes.push((connection, request));
                 Vec::new()
             }
-            Effect::WifiOn(request) => {
-                self.last_wifi_token = self.last_wifi_token.wrapping_add(1);
-                let token = self.last_wifi_token;
-                let op = request.operation.clone();
-                self.wifi.push((token, request));
-                jobs.push(Job::WifiOn { token, op });
-                Vec::new()
+            Effect::RadioJoin(request) => {
+                let op = RadioOp::Join(request.operation);
+                self.radio(RadioRequest::Join(request), op, jobs)
             }
-            Effect::WifiOff(request) => {
-                jobs.push(Job::WifiOff(request.operation.clone()));
-                self.wifi_off.push_back(request);
-                self.answer_wifi(|_| true, WifiStatus::Failed)
+            Effect::RadioAddress(request) => {
+                let op = RadioOp::Address(request.operation);
+                self.radio(RadioRequest::Address(request), op, jobs)
             }
-            Effect::WifiQuiet(request) => {
-                jobs.push(Job::WifiQuiet(request.operation));
+            Effect::RadioLeave(request) => {
+                let op = RadioOp::Leave(request.operation);
+                self.radio(RadioRequest::Leave(request), op, jobs)
+            }
+            Effect::RadioScan(request) => {
+                let op = RadioOp::Scan(request.operation);
+                self.radio(RadioRequest::Scan(request), op, jobs)
+            }
+            Effect::RadioStopScan(request) => {
+                let op = RadioOp::StopScan(request.operation);
+                self.radio(RadioRequest::StopScan(request), op, jobs)
+            }
+            Effect::RadioOff(request) => {
+                let op = RadioOp::Off(request.operation);
+                self.radio(RadioRequest::Off(request), op, jobs)
+            }
+            Effect::RadioRestart(request) => {
+                jobs.push(Job::Restart(request.operation));
                 Vec::new()
             }
             Effect::Sleep(request) => {

@@ -7,7 +7,7 @@
 //!
 //! - [`Open`] is a stream. The shell answers with [`StreamItem`] values:
 //!   `Opened`, a `Received` for each chunk of bytes, and one `Closed` as the
-//!   last item.
+//!   last item. `Closed` tells if the broker host ended the stream.
 //! - [`Write`] is a request. The shell answers with [`Written`] when it sent
 //!   the bytes, or when it cannot send them.
 //! - [`Close`] is a request. The shell answers when the stream is closed.
@@ -16,7 +16,7 @@
 //!
 //! - The shell finds the address of the host (DNS).
 //! - A new `Open` replaces the stream that is open. The old stream ends with
-//!   `Closed("replaced")`.
+//!   `Closed` with the reason `"replaced"`.
 //! - When a stream ends, the shell answers each `Write` that waits on it
 //!   with `Failed`.
 //! - A `Close` cancels a `Write` that waits. The shell then sends a TCP FIN,
@@ -25,6 +25,8 @@
 //!   `Close`.
 //! - If no stream has the `connection` id of a `Write` or a `Close`, the
 //!   shell answers at once: `Failed` for a `Write`, `()` for a `Close`.
+//! - The shell sets `by_host` in `Closed` only if the broker host ended the
+//!   stream with a TCP reset (RST) or a FIN. Refer to [`StreamItem::Closed`].
 
 use alloc::{string::String, vec::Vec};
 use core::fmt;
@@ -63,9 +65,45 @@ pub enum StreamItem {
     Opened,
     /// Bytes arrived. A chunk can hold any part of the byte stream.
     Received(Vec<u8>),
-    /// The stream closed or did not open, for this reason. This is the last
-    /// item.
-    Closed(String),
+    /// The stream closed or did not open. This is the last item.
+    Closed {
+        /// Why the stream ended, for the log.
+        reason: String,
+        /// `true` if the broker host ended the stream. The host refused the
+        /// connect with a TCP reset (RST), reset the open stream, or closed
+        /// the open stream with a FIN.
+        ///
+        /// Such an end proves that the link moved bytes in both directions,
+        /// because the host got a packet from the device and its answer
+        /// arrived. The shell sets `by_host` only when it knows that the RST
+        /// or the FIN came from the host. A reset that the device makes
+        /// itself (for example, when the network stack loses its address)
+        /// does not count. A timeout, a DNS failure and a write that stalls
+        /// do not count either.
+        by_host: bool,
+    },
+}
+
+impl StreamItem {
+    /// Returns a `Closed` item for `reason` that the broker host did not
+    /// cause.
+    #[must_use]
+    pub fn closed(reason: impl Into<String>) -> Self {
+        Self::Closed {
+            reason: reason.into(),
+            by_host: false,
+        }
+    }
+
+    /// Returns a `Closed` item for `reason` after the broker host ended the
+    /// stream with a TCP reset or a FIN.
+    #[must_use]
+    pub fn by_host(reason: impl Into<String>) -> Self {
+        Self::Closed {
+            reason: reason.into(),
+            by_host: true,
+        }
+    }
 }
 
 impl fmt::Debug for StreamItem {
@@ -76,7 +114,11 @@ impl fmt::Debug for StreamItem {
                 .debug_tuple("Received")
                 .field(&format_args!("{} bytes", bytes.len()))
                 .finish(),
-            Self::Closed(reason) => f.debug_tuple("Closed").field(reason).finish(),
+            Self::Closed { reason, by_host } => f
+                .debug_struct("Closed")
+                .field("reason", reason)
+                .field("by_host", by_host)
+                .finish(),
         }
     }
 }
@@ -110,7 +152,9 @@ impl fmt::Debug for Write {
 pub enum Written {
     /// The shell sent all the bytes.
     Sent,
-    /// The shell did not send all the bytes, for this reason.
+    /// The shell did not send all the bytes, for this reason. The core
+    /// ignores this answer, because the `Closed` item of the stream ends
+    /// the session.
     Failed(String),
 }
 
@@ -123,7 +167,8 @@ pub struct Close {
     /// The id of the connection in the core.
     pub connection: u32,
     /// If `true`, the session ended with a disconnect. If `false`, the
-    /// session failed, and the shell can treat the link as bad.
+    /// session failed. The shell uses `clean` only for its log, because the
+    /// core decides the health of the link.
     pub clean: bool,
     /// Why the session ended, for the log of the shell.
     pub reason: String,
@@ -250,7 +295,7 @@ mod tests {
         let items = [
             StreamItem::Opened,
             StreamItem::Received(vec![0x20, 0x02, 0x00, 0x00]),
-            StreamItem::Closed("connection lost".into()),
+            StreamItem::by_host("connection reset"),
         ];
         for item in items.clone() {
             request

@@ -14,7 +14,6 @@
 //!   the fuel gauge, and decides which changes to send to the core.
 //! - [`config`] reads and checks the build-time configuration.
 //! - [`backoff`] is a wait that doubles after each failure.
-//! - [`wifi`] is the rule of the Wi-Fi task for a request during a join.
 //! - [`sleep`] decides when the chip can go into light sleep, and which
 //!   wake is a real wake.
 //! - [`waveform`] builds the lines and the lookup table of the extra frames
@@ -33,4 +32,3 @@ pub mod stream;
 pub mod timers;
 pub mod touch;
 pub mod waveform;
-pub mod wifi;

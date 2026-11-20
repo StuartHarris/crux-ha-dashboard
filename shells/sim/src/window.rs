@@ -25,7 +25,7 @@ use eframe::egui::{
     TextureOptions, Ui, Vec2, ViewportCommand,
 };
 use embedded_graphics::{prelude::*, primitives::Rectangle};
-use shared::{Event, PowerSource, ViewModel};
+use shared::{Event, PowerSource, ViewModel, fake::FakeRadio};
 
 use crate::{
     inspector::{Direction, Inspector, Log, ROUTINE_EFFECTS},
@@ -294,6 +294,18 @@ impl App {
         if pressed(Key::R) {
             self.shell.restart();
         }
+        if pressed(Key::L) {
+            self.shell.drop_link();
+        }
+        if pressed(Key::B) {
+            self.shell.toggle_blocked();
+        }
+        if pressed(Key::A) {
+            self.shell.move_strongest();
+        }
+        if pressed(Key::K) {
+            self.shell.toggle_stuck();
+        }
         if pressed(Key::D) {
             self.show_outline = !self.show_outline;
         }
@@ -460,6 +472,9 @@ impl App {
         ui.label(format!("Connection: {:?}", view.connection));
 
         ui.separator();
+        self.radio_controls(ui);
+
+        ui.separator();
         ui.heading("MQTT");
         self.read_only_control(ui, view);
 
@@ -491,11 +506,70 @@ impl App {
         ui.label(
             RichText::new(
                 "Keys (when no text box has the focus): S stand/battery, [ and ] \
-                 battery −10% and +10%, W wake, Z sleep now, R restart, D outline, \
+                 battery −10% and +10%, W wake, Z sleep now, R restart, \
+                 L drop the link, B block or unblock the device, A move the strongest \
+                 access point, K make the driver stuck or free, D outline, \
                  Left/Right page, Q quit",
             )
             .small(),
         );
+    }
+
+    /// Shows the state of the fake radio, and the buttons that change it.
+    /// Each button has a key.
+    fn radio_controls(&mut self, ui: &mut Ui) {
+        ui.heading("Radio");
+        ui.label(radio_text(self.shell.radio_state()));
+        let radio = self.shell.radio_state();
+        let block = if radio.blocked {
+            "Unblock (B)"
+        } else {
+            "Block (B)"
+        };
+        let stuck = if radio.stuck {
+            "Free driver (K)"
+        } else {
+            "Stick driver (K)"
+        };
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .button("Drop link (L)")
+                .on_hover_text(
+                    "The device loses the link. The stream ends with \"link lost\", and the \
+                     core joins again.",
+                )
+                .clicked()
+            {
+                self.shell.drop_link();
+            }
+            if ui
+                .button(block)
+                .on_hover_text("The router blocks the device. Each join fails.")
+                .clicked()
+            {
+                self.shell.toggle_blocked();
+            }
+            if ui
+                .button("Move access point (A)")
+                .on_hover_text(
+                    "Another access point gets the strongest signal. The core roams at the \
+                     next quiet scan.",
+                )
+                .clicked()
+            {
+                self.shell.move_strongest();
+            }
+            if ui
+                .button(stuck)
+                .on_hover_text(
+                    "DHCP gives no address. After 3 joins with no address, the core \
+                     restarts the chip.",
+                )
+                .clicked()
+            {
+                self.shell.toggle_stuck();
+            }
+        });
     }
 
     /// Shows the "Sleep now" button. The button ends the idle time of the
@@ -665,6 +739,25 @@ impl App {
             ui.add(Label::new(&entry.payload).truncate());
         });
     }
+}
+
+/// Returns the state of the fake radio as text.
+fn radio_text(radio: &FakeRadio) -> String {
+    let access_point = radio.associated.map_or_else(
+        || "none".to_string(),
+        |access_point| {
+            let bssid = access_point.bssid.map(|byte| format!("{byte:02x}"));
+            format!("{} (channel {})", bssid.join(":"), access_point.channel)
+        },
+    );
+    let yes = |flag| if flag { "yes" } else { "no" };
+    format!(
+        "Radio: on {}, access point {access_point}, address {}, blocked {}, stuck {}",
+        yes(radio.on),
+        yes(radio.has_address),
+        yes(radio.blocked),
+        yes(radio.stuck)
+    )
 }
 
 /// Returns the header of a log: its name, the number of entries, and the

@@ -6,17 +6,21 @@ use core::time::Duration;
 use crux_core::App;
 
 use super::{
-    ExpectFullRefreshTimer, ExpectLight,
+    ExpectFullRefreshTimer, ExpectLight, ExpectRadioLimit,
     broker::publish_of,
-    start,
+    link_up, start,
     wire::{ExpectWrite, Wire},
 };
 use crate::{
     Cmd, Connection, Dashboard, Effect, EffectTestExt, Event, Model, PowerSource, Route, TileState,
-    capabilities::{network::WifiStatus, stream::StreamItem},
+    capabilities::{
+        radio::{Joined, Target},
+        stream::{StreamItem, Written},
+    },
     features::{
         connection::{CLOSE_TIMEOUT, Link, RECONNECT_MAX, RECONNECT_MIN},
         refresh::DRAW_DELAY,
+        wifi::{JOIN_TIMEOUT, Phase},
     },
     mqtt::{
         Qos,
@@ -33,14 +37,11 @@ pub fn drive_to_connecting(power: PowerSource) -> (Model, Wire) {
     let mut model = Model::default();
 
     let mut cmd = app.update(start(power), &mut model);
-    let event = cmd
+    let start = cmd
         .expect_light(0)
         .expect_render()
-        .expect_full_refresh_timer()
-        .resolve_wifi_on(|_| WifiStatus::Connected)
-        .expect_event();
-
-    let cmd = app.update(event, &mut model);
+        .expect_full_refresh_timer();
+    let cmd = link_up(start, &mut model);
     (model, Wire::new(cmd))
 }
 
@@ -126,7 +127,7 @@ fn change_and_draw(
 }
 
 #[test]
-fn start_on_the_stand_draws_and_turns_wifi_on() {
+fn start_on_the_stand_draws_and_joins_the_strongest_access_point() {
     let app = Dashboard;
     let mut model = Model::default();
 
@@ -134,7 +135,12 @@ fn start_on_the_stand_draws_and_turns_wifi_on() {
         .expect_light(0)
         .expect_render()
         .expect_full_refresh_timer()
-        .expect_only_wifi_on();
+        .expect_radio_join_with(|join| {
+            assert_eq!((join.target, join.keep), (Target::Strongest, false));
+        })
+        .expect_only_time_notify_after_with(|notify| {
+            assert_eq!(Duration::from(notify.duration), JOIN_TIMEOUT);
+        });
 
     let view = app.view(&model);
     assert_eq!(view.full_refresh_seq, 1);
@@ -156,7 +162,7 @@ fn filters(packets: &[Packet]) -> Vec<alloc::string::String> {
 }
 
 #[test]
-fn wifi_opens_a_connection_with_a_last_will() {
+fn a_link_opens_a_connection_with_a_last_will() {
     let (mut model, mut wire) = drive_to_connecting(PowerSource::Stand);
     assert_eq!(wire.host(), ("broker.local", 1883));
 
@@ -297,6 +303,48 @@ fn on_the_index_a_message_draws_only_if_a_summary_changes() {
 }
 
 #[test]
+fn a_failed_write_does_not_hide_an_end_by_the_host_in_either_order() {
+    let app = Dashboard;
+    for failed_first in [true, false] {
+        let (mut model, _wire) = drive_to_connected(PowerSource::Stand);
+        model.wifi.health.failed();
+        let connection = model.connection.id;
+        let write = Event::Written {
+            connection,
+            outcome: Written::Failed("write failed".into()),
+        };
+        let end = Event::Stream {
+            connection,
+            item: StreamItem::by_host("the broker closed the stream"),
+        };
+        let events = if failed_first {
+            [write, end]
+        } else {
+            [end, write]
+        };
+        let mut closes = Vec::new();
+        for event in events {
+            let mut cmd = app.update(event, &mut model);
+            closes.extend(cmd.effects().filter_map(|effect| match effect {
+                Effect::StreamClose(request) => Some(request.operation),
+                _ => None,
+            }));
+        }
+        // The `Closed` item ends the session, and the end by the host
+        // proves traffic.
+        assert_eq!(closes.len(), 1, "failed first: {failed_first}");
+        assert!(
+            closes[0]
+                .reason
+                .contains("the broker host ended the stream"),
+            "{closes:?}"
+        );
+        assert_eq!(model.connection.mqtt, Link::Down);
+        assert!(!model.wifi.health.suspect(), "failed first: {failed_first}");
+    }
+}
+
+#[test]
 fn a_lost_connection_shows_the_time_of_the_last_message_and_retries_after_a_backoff() {
     let app = Dashboard;
     let (mut model, mut wire) = drive_to_connected(PowerSource::Stand);
@@ -325,12 +373,10 @@ fn a_lost_connection_shows_the_time_of_the_last_message_and_retries_after_a_back
     app.update(Event::StreamClosed { connection }, &mut model)
         .expect_no_effects();
 
-    // Wi-Fi can be the cause, so the reconnect asks for Wi-Fi first.
-    let event = app
-        .update(reconnect, &mut model)
-        .resolve_wifi_on(|_| WifiStatus::Connected)
-        .expect_event();
-    let _wire = Wire::new(app.update(event, &mut model));
+    // The lost connection makes the link suspect, so the reconnect leaves
+    // and joins again first.
+    let mut cmd = app.update(reconnect, &mut model);
+    let _wire = Wire::new(link_up(&mut cmd, &mut model));
 }
 
 #[test]
@@ -341,7 +387,7 @@ fn the_backoff_doubles_up_to_a_limit_and_resets_on_connect() {
     let mut expected = RECONNECT_MIN;
     for _ in 0..8 {
         let connection = model.connection.id;
-        let refused = StreamItem::Closed("connection refused".into());
+        let refused = StreamItem::by_host("connection refused");
         let event = app
             .update(
                 Event::Stream {
@@ -363,11 +409,8 @@ fn the_backoff_doubles_up_to_a_limit_and_resets_on_connect() {
         app.update(Event::StreamClosed { connection }, &mut model)
             .expect_no_effects();
         expected = (expected * 2).min(RECONNECT_MAX);
-        let event = app
-            .update(event, &mut model)
-            .resolve_wifi_on(|_| WifiStatus::Connected)
-            .expect_event();
-        wire = Wire::new(app.update(event, &mut model));
+        let mut cmd = app.update(event, &mut model);
+        wire = Wire::new(link_up(&mut cmd, &mut model));
     }
     assert_eq!(model.connection.backoff, RECONNECT_MAX);
 
@@ -384,7 +427,7 @@ fn an_item_from_an_old_connection_is_ignored() {
     app.update(
         Event::Stream {
             connection: old,
-            item: StreamItem::Closed("connection lost".into()),
+            item: StreamItem::closed("connection lost"),
         },
         &mut model,
     )
@@ -403,7 +446,7 @@ fn a_stale_reconnect_timer_is_ignored() {
 }
 
 #[test]
-fn wifi_that_fails_is_tried_again_after_a_backoff() {
+fn a_join_that_fails_is_tried_again_after_a_backoff() {
     let app = Dashboard;
     let mut model = Model::default();
 
@@ -412,8 +455,9 @@ fn wifi_that_fails_is_tried_again_after_a_backoff() {
         .expect_light(0)
         .expect_render()
         .expect_full_refresh_timer()
-        .resolve_wifi_on(|_| WifiStatus::Failed)
-        .expect_event();
+        .resolve_radio_join(|_| Joined::Failed("authentication failed".into()))
+        .expect_radio_limit(JOIN_TIMEOUT)
+        .expect_one_event();
     let event = app
         .update(event, &mut model)
         .resolve_time_notify_after(|notify| {
@@ -421,8 +465,10 @@ fn wifi_that_fails_is_tried_again_after_a_backoff() {
             notify.id
         })
         .expect_event();
-    app.update(event, &mut model).expect_only_wifi_on();
-    assert_eq!(model.connection.wifi, Link::Starting);
+    app.update(event, &mut model)
+        .expect_radio_join()
+        .expect_only_time_notify_after();
+    assert_eq!(model.wifi.phase, Phase::Joining(Target::Strongest));
 }
 
 #[test]
@@ -455,7 +501,7 @@ fn the_view_shows_the_state_of_a_tile_from_the_statestream() {
 }
 
 #[test]
-fn an_answer_to_an_older_wifi_request_is_ignored() {
+fn an_answer_to_an_older_join_is_ignored() {
     let app = Dashboard;
     let mut model = Model::default();
 
@@ -464,21 +510,22 @@ fn an_answer_to_an_older_wifi_request_is_ignored() {
         .expect_light(0)
         .expect_render()
         .expect_full_refresh_timer();
-    let mut old = first.expect_effect().expect_wifi_on();
+    let mut old = first.expect_effect().expect_radio_join();
 
     // The shell starts again, for example after a deep sleep, and the core
-    // asks for Wi-Fi again.
+    // joins again.
     let mut second = app.update(start(PowerSource::Battery), &mut model);
     second
         .expect_light(0)
         .expect_render()
         .expect_full_refresh_timer()
-        .expect_wifi_on();
+        .expect_radio_join();
 
-    old.resolve(WifiStatus::Connected).unwrap();
+    let joined = crate::fake::FakeRadio::default().join(&old.operation);
+    old.resolve(joined).unwrap();
     let stale = first.expect_event();
     app.update(stale, &mut model).expect_no_effects();
-    assert_eq!(model.connection.wifi, Link::Starting);
+    assert_eq!(model.wifi.phase, Phase::Joining(Target::Strongest));
 }
 
 #[test]

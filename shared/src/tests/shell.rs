@@ -29,6 +29,14 @@
 //!
 //! The shell answers `FrontLight` at once and keeps the level in
 //! [`Shell::light`].
+//!
+//! The shell answers each radio request at once with the fake radio
+//! ([`Shell::radio`]). It logs `Off` as `WifiOff`, and each other radio
+//! request with its name, for example `RadioJoin Cached keep`. A test that
+//! needs a request that waits sets [`Shell::hold_radio`]. The shell then
+//! keeps each radio request, and obeys the stop rule of the radio
+//! capability: a new request stops each request that waits.
+//! [`Shell::answer_radio`] answers the requests that wait.
 
 use alloc::{format, string::String, vec::Vec};
 use core::time::Duration;
@@ -40,10 +48,11 @@ use super::broker::{Broker, publish_of};
 use crate::{
     Cmd, Dashboard, Effect, Event, Model, ViewModel,
     capabilities::{
-        network::WifiStatus,
         power::{Sleep, Wake},
+        radio::{Address, Join, Joined, Lease, Leave, Off, Scan, Scanned, StopScan, Target},
         stream::Close,
     },
+    fake::FakeRadio,
     mqtt::codec::server::Packet,
 };
 
@@ -58,6 +67,20 @@ struct Timer {
     session: bool,
 }
 
+/// The message if the answer to a radio request fails.
+const ANSWER: &str = "a radio request has one answer";
+
+/// A radio request that waits for its answer. Refer to
+/// [`Shell::hold_radio`].
+enum Held {
+    Join(Request<Join>),
+    Address(Request<Address>),
+    Leave(Request<Leave>),
+    Scan(Request<Scan>),
+    StopScan(Request<StopScan>),
+    Off(Request<Off>),
+}
+
 /// One image on the panel.
 pub struct Frame {
     /// The view that the shell drew.
@@ -70,19 +93,21 @@ pub struct Frame {
 ///
 /// Like an e-paper shell, it draws once at the end of [`Shell::run`], for all
 /// the `Render` requests of the run.
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "each flag is a separate fact of the fake device"
-)]
 pub struct Shell {
     app: Dashboard,
     pub model: Model,
     commands: Vec<Cmd>,
     pub broker: Broker,
-    /// If `false`, the shell answers `WifiOn` with `Failed`.
-    pub wifi_works: bool,
-    /// Wi-Fi is on.
-    pub wifi_on: bool,
+    /// The fake radio, which answers the radio requests.
+    pub radio: FakeRadio,
+    /// If `true`, the shell keeps each radio request until
+    /// [`Shell::answer_radio`]. A new request stops each request that waits,
+    /// as the stop rule of the radio capability tells.
+    pub hold_radio: bool,
+    /// The radio requests that wait, from the oldest.
+    held: Vec<Held>,
+    /// The reason of each `Restart` notification, in order.
+    pub restarts: Vec<String>,
     /// The timers that wait, in the order in which the core started them.
     timers: Vec<Timer>,
     /// The time on the clock of the shell.
@@ -119,8 +144,10 @@ impl Shell {
             model: Model::default(),
             commands: Vec::new(),
             broker,
-            wifi_works: true,
-            wifi_on: false,
+            radio: FakeRadio::default(),
+            hold_radio: false,
+            held: Vec::new(),
+            restarts: Vec::new(),
             timers: Vec::new(),
             now: Duration::ZERO,
             light: 0,
@@ -372,23 +399,40 @@ impl Shell {
                 self.closes.push(request.operation.clone());
                 self.broker.close(request);
             }
-            Effect::WifiOn(mut request) => {
-                self.log.push("WifiOn".into());
-                self.wifi_on = self.wifi_works;
-                let status = if self.wifi_works {
-                    WifiStatus::Connected
-                } else {
-                    WifiStatus::Failed
+            Effect::RadioJoin(request) => {
+                let join = request.operation;
+                let target = match join.target {
+                    Target::Cached(_) => "Cached",
+                    Target::Strongest => "Strongest",
                 };
-                request.resolve(status).expect("the core waits for Wi-Fi");
+                let keep = if join.keep { " keep" } else { "" };
+                self.log.push(format!("RadioJoin {target}{keep}"));
+                self.radio_request(Held::Join(request));
             }
-            Effect::WifiOff(mut request) => {
+            Effect::RadioAddress(request) => {
+                self.log.push("RadioAddress".into());
+                self.radio_request(Held::Address(request));
+            }
+            Effect::RadioLeave(request) => {
+                self.log.push("RadioLeave".into());
+                self.radio_request(Held::Leave(request));
+            }
+            Effect::RadioScan(request) => {
+                self.log.push("RadioScan".into());
+                self.radio_request(Held::Scan(request));
+            }
+            Effect::RadioStopScan(request) => {
+                self.log.push("RadioStopScan".into());
+                self.radio_request(Held::StopScan(request));
+            }
+            Effect::RadioOff(request) => {
                 self.log.push("WifiOff".into());
-                self.wifi_on = false;
-                self.broker.drop_connection();
-                request.resolve(()).expect("the core waits for Wi-Fi off");
+                self.radio_request(Held::Off(request));
             }
-            Effect::WifiQuiet(_) => self.log.push("WifiQuiet".into()),
+            Effect::RadioRestart(request) => {
+                self.log.push("RadioRestart".into());
+                self.restarts.push(request.operation.reason);
+            }
             Effect::Sleep(request) => {
                 self.log.push("Sleep".into());
                 self.sleep = Some(request.operation.clone());
@@ -425,6 +469,73 @@ impl Shell {
                 }
                 self.timers.retain(|timer| timer.request.operation.id != id);
                 request.resolve(id).expect("the core waits for the clear");
+            }
+        }
+    }
+
+    /// Answers a radio request at once, or keeps it if
+    /// [`Shell::hold_radio`] is `true`. A new request first stops each
+    /// request that waits, as the stop rule of the radio capability tells.
+    fn radio_request(&mut self, request: Held) {
+        if !self.hold_radio {
+            self.answer(request);
+            return;
+        }
+        for held in core::mem::take(&mut self.held) {
+            match held {
+                Held::Join(mut join) => join.resolve(Joined::Stopped).expect(ANSWER),
+                Held::Address(mut address) => address.resolve(Lease::Stopped).expect(ANSWER),
+                Held::Scan(mut scan) => scan.resolve(Scanned::Stopped).expect(ANSWER),
+                Held::Leave(mut leave) => leave.resolve(()).expect(ANSWER),
+                Held::StopScan(mut stop_scan) => stop_scan.resolve(()).expect(ANSWER),
+                Held::Off(mut off) => off.resolve(()).expect(ANSWER),
+            }
+        }
+        self.held.push(request);
+    }
+
+    /// Answers the radio requests that wait, in order, with the fake radio,
+    /// and answers the effects until the core waits.
+    pub fn answer_radio(&mut self) {
+        for held in core::mem::take(&mut self.held) {
+            self.answer(held);
+        }
+        self.run();
+    }
+
+    /// Returns the number of radio requests that wait for their answers.
+    pub const fn held_radio(&self) -> usize {
+        self.held.len()
+    }
+
+    /// Answers a radio request with the fake radio. After `Off`, the
+    /// connection to the broker is gone.
+    fn answer(&mut self, request: Held) {
+        match request {
+            Held::Join(mut request) => {
+                let joined = self.radio.join(&request.operation);
+                request.resolve(joined).expect(ANSWER);
+            }
+            Held::Address(mut request) => {
+                let lease = self.radio.address(&request.operation);
+                request.resolve(lease).expect(ANSWER);
+            }
+            Held::Leave(mut request) => {
+                self.radio.leave(&request.operation);
+                request.resolve(()).expect(ANSWER);
+            }
+            Held::Scan(mut request) => {
+                let scanned = self.radio.scan(&request.operation);
+                request.resolve(scanned).expect(ANSWER);
+            }
+            Held::StopScan(mut request) => {
+                self.radio.stop_scan(&request.operation);
+                request.resolve(()).expect(ANSWER);
+            }
+            Held::Off(mut request) => {
+                self.radio.off(&request.operation);
+                self.broker.drop_connection();
+                request.resolve(()).expect(ANSWER);
             }
         }
     }

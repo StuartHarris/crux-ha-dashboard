@@ -131,7 +131,8 @@ each topic after it accepts the filter.
 The `Subscribe` job of the session ends when the broker acknowledged each packet.
 If the broker refused a filter, the outcome is `Refused`. If the stream closes
 first, the outcome is `Failed`. After `Done` or `Refused`, the link is quiet, so the
-core sends `WifiQuiet`. The firmware can then scan for a better access point.
+core starts the roam scan of the Wi-Fi policy (refer to "Change the access
+point" below). The core sends no other signal to the firmware for this.
 
 ### Find a dead link
 
@@ -148,6 +149,19 @@ these timers:
 
 When the session ends with an error, the core closes the stream and connects again
 after a backoff and after the close of the stream.
+
+The reason that a session ends also tells the Wi-Fi policy of the core whether the
+link works:
+
+| End | Meaning for the link |
+| --- | --- |
+| `Timeout` or `Transport` | The link failed. The core marks it suspect. |
+| `ByHost` | The broker host ended the stream with a TCP reset or a FIN. This proves that traffic crosses the link while the link is up. The core keeps the association. |
+| `Clean`, `Refused`, `Malformed` and the other ends | Not a failure of the link. |
+
+A restart of the chip needs 3 joins that get no new address while the link is
+suspect. A block by the router (the joins fail) and an outage of the broker never restart the chip. During an outage of the
+broker, each connect ends `ByHost`, so each reconnect keeps the association.
 
 ### Close the stream
 
@@ -169,9 +183,21 @@ device, but the core connects only after the close.
 If the shell does not answer the `Close` request in 6 seconds (`CLOSE_TIMEOUT`), the
 core acts as if the answer arrived. Thus a shell cannot stop a reconnect or a sleep.
 
-A change of access point (a Wi-Fi roam) closes the stream with no DISCONNECT. The
-broker then publishes the last will. Home Assistant sees a short retained `offline`,
-and then `online` after the dashboard connects again.
+### Change the access point
+
+When the link is quiet, the core can scan all the channels once for a better access
+point. Each channel has a dwell of 50 to 120 ms, so a scan that finds 3 access points
+takes about 1.4 s. If an access point is at least 10 dB stronger than the current
+one, the core starts a roam:
+
+1. The core sends DISCONNECT.
+2. The core closes the stream, and the shell answers the `Close`.
+3. The core joins the stronger access point.
+4. The core opens a new stream and connects again.
+
+The DISCONNECT is clean, so the broker does not publish the last will. Home Assistant
+sees no `offline` during a roam, and the retained `online` stays. The device does not
+publish `asleep`, because it does not sleep.
 
 ### Commands
 
@@ -259,7 +285,7 @@ has no state, so its button shows the pattern for 2 seconds. Refer to
 | --- | --- |
 | `online` | The dashboard publishes it after it connects. |
 | `asleep` | The dashboard publishes it before it sends DISCONNECT to sleep on battery. |
-| `offline` | The broker publishes it as the last will if the connection stops without a DISCONNECT. A change of access point does this. |
+| `offline` | The broker publishes it as the last will if the connection stops without a DISCONNECT, for example when the link fails or the power fails. A roam does not do this. |
 
 ## Test from a shell
 

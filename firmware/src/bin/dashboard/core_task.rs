@@ -3,8 +3,8 @@
 //!
 //! The core runs the MQTT session, so each chunk of bytes from the broker is
 //! an update. The task measures the time of each update. It logs a warning for
-//! a slow update (`logic::stream::SLOW_UPDATE`), and at `WifiQuiet` it logs
-//! the updates since the core opened the stream.
+//! a slow update (`logic::stream::SLOW_UPDATE`). At the `Close` of the
+//! stream that the core opened last, it logs the updates since that `Open`.
 
 use core::time::Duration;
 
@@ -14,16 +14,19 @@ use logic::{
     shell::{self, Job, Shell, StreamOp, TimerOp},
     sleep::Plan,
     stream::UpdateStats,
-    wifi::WifiRequest,
 };
-use shared::{
-    Event, PowerSource,
-    capabilities::network::{WifiOff, WifiOn},
-};
+use shared::{Event, PowerSource};
 
-use crate::{
-    HEALTH, LIGHT, RENDER, SIGNALS, SLEEP, STREAM, TIMERS, WIFI, config::CONFIG, timers::Request,
-};
+use crate::{LIGHT, RADIO, RENDER, SIGNALS, SLEEP, STREAM, TIMERS, config::CONFIG, radio, timers};
+
+/// The update statistics of the stream that the core opened last.
+#[derive(Default)]
+struct Stats {
+    /// The connection id of the stream, until its first `Close`.
+    connection: Option<u32>,
+    /// The updates since the `Open` of the stream.
+    updates: UpdateStats,
+}
 
 /// Starts the core with the power source `source`, then gives it each
 /// signal from the other tasks.
@@ -40,17 +43,17 @@ pub async fn run(source: PowerSource, display: bool) -> ! {
     // TODO: if the firmware uses deep sleep in the future, give the path and
     // the time of the last update that it kept in RTC memory.
     let start = shell::start(&CONFIG, source, None, None);
-    let mut stats = UpdateStats::default();
+    let mut stats = Stats::default();
     let started = Instant::now();
     let jobs = shell.send(Event::Start(start));
-    record(&mut stats, started);
+    record(&mut stats.updates, started);
     dispatch(jobs, display, &mut stats);
     loop {
         let signal = SIGNALS.pop().await;
         let sleeping = shell.is_sleeping();
         let started = Instant::now();
         let jobs = shell.handle(signal);
-        record(&mut stats, started);
+        record(&mut stats.updates, started);
         dispatch(jobs, display, &mut stats);
         // The shell answered the `Sleep` request, so the display task stops
         // the sleep.
@@ -78,43 +81,49 @@ fn record(stats: &mut UpdateStats, started: Instant) {
 /// The display task also sets the front light, and answers with
 /// `Signal::Light`. If `display` is `false`, this function answers at once.
 ///
-/// A `Close` with `clean: false` makes the link suspect in `HEALTH` before
-/// the core can ask for Wi-Fi again. A `Close` with `clean: true` is the
-/// first network step of a sleep, so a scan for a better access point stops.
-/// An `Open` starts new update statistics, and `WifiQuiet` logs them.
-fn dispatch(jobs: alloc::vec::Vec<Job>, display: bool, stats: &mut UpdateStats) {
+/// The radio task does the radio jobs and the `Restart` job, and answers
+/// with `Signal::Radio`.
+///
+/// An `Open` starts new update statistics. The first `Close` of the same
+/// connection logs them. A `Close` of an older connection, or a second
+/// `Close`, logs no statistics.
+fn dispatch(jobs: alloc::vec::Vec<Job>, display: bool, stats: &mut Stats) {
     for job in jobs {
         match job {
             Job::Render(view) => RENDER.signal(view),
             Job::Stream { connection, op } => {
                 match &op {
-                    StreamOp::Open(_) => *stats = UpdateStats::default(),
-                    StreamOp::Close(close) if close.clean => {
-                        log::info!("stream: the core closes {connection}: {}", close.reason);
-                        WIFI.push(WifiRequest::Hold);
+                    StreamOp::Open(_) => {
+                        *stats = Stats {
+                            connection: Some(connection),
+                            updates: UpdateStats::default(),
+                        };
                     }
                     StreamOp::Close(close) => {
-                        log::warn!(
-                            "stream: the session on {connection} failed: {}",
-                            close.reason
-                        );
-                        HEALTH.lock(|health| health.borrow_mut().session_failed());
+                        if close.clean {
+                            log::info!("stream: the core closes {connection}: {}", close.reason);
+                        } else {
+                            log::warn!(
+                                "stream: the session on {connection} failed: {}",
+                                close.reason
+                            );
+                        }
+                        if stats.connection == Some(connection) {
+                            stats.connection = None;
+                            let UpdateStats { count, total, max } = stats.updates.take();
+                            log::info!(
+                                "core: {count} updates since the stream opened, {} ms in total, the longest {} ms",
+                                total.as_millis(),
+                                max.as_millis()
+                            );
+                        }
                     }
                     StreamOp::Write(_) => {}
                 }
                 STREAM.push((connection, op));
             }
-            Job::WifiOn { token, op: WifiOn } => WIFI.push(WifiRequest::On { token }),
-            Job::WifiOff(WifiOff) => WIFI.push(WifiRequest::Off),
-            Job::WifiQuiet(_) => {
-                let UpdateStats { count, total, max } = stats.take();
-                log::info!(
-                    "core: {count} updates since the stream opened, {} ms in total, the longest {} ms",
-                    total.as_millis(),
-                    max.as_millis()
-                );
-                WIFI.push(WifiRequest::Roam);
-            }
+            Job::Radio { token, stop, op } => RADIO.push(radio::Request::Job { token, stop, op }),
+            Job::Restart(restart) => RADIO.push(radio::Request::Restart(restart)),
             Job::FrontLight { token, level } if display => LIGHT.push((token, level)),
             Job::FrontLight { token, .. } => SIGNALS.push(shell::Signal::Light { token }),
             Job::Sleep(sleep) => {
@@ -124,7 +133,7 @@ fn dispatch(jobs: alloc::vec::Vec<Job>, display: bool, stats: &mut UpdateStats) 
             Job::Timer {
                 token,
                 op: TimerOp::NotifyAfter(NotifyAfter { id, duration }),
-            } => TIMERS.push(Request::Start {
+            } => TIMERS.push(timers::Request::Start {
                 id,
                 token,
                 after: Duration::from(duration),
@@ -132,7 +141,7 @@ fn dispatch(jobs: alloc::vec::Vec<Job>, display: bool, stats: &mut UpdateStats) 
             Job::Timer {
                 token,
                 op: TimerOp::ClearTimer(_),
-            } => TIMERS.push(Request::Cancel { token }),
+            } => TIMERS.push(timers::Request::Cancel { token }),
         }
     }
 }

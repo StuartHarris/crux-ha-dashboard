@@ -6,18 +6,20 @@ use core::time::Duration;
 use crux_core::App;
 
 use super::{
-    ExpectFullRefreshTimer, ExpectLight,
+    ExpectFullRefreshTimer, ExpectLight, ExpectRadioLimit,
     connection::{drive_to_connected, drive_to_connecting},
     start, tap_tile,
-    wire::{ExpectWrite, Wire},
+    wire::ExpectWrite,
 };
 use crate::{
     Connection, Control, Dashboard, Effect, EffectTestExt, Event, Model, PowerSource,
-    capabilities::{
-        network::WifiStatus,
-        power::{Wake, WakeSource},
+    capabilities::power::{Wake, WakeSource},
+    features::{
+        connection::Link,
+        light::BATTERY_LEVEL,
+        power::IDLE_TIMEOUT,
+        wifi::{JOIN_TIMEOUT, OFF_TIMEOUT, Phase},
     },
-    features::{connection::Link, light::BATTERY_LEVEL, power::IDLE_TIMEOUT},
 };
 
 #[test]
@@ -29,7 +31,8 @@ fn start_on_battery_also_starts_the_idle_timer() {
         .expect_light(0)
         .expect_render()
         .expect_full_refresh_timer()
-        .expect_wifi_on()
+        .expect_radio_join()
+        .expect_radio_limit(JOIN_TIMEOUT)
         .expect_only_time_notify_after_with(|notify| {
             assert_eq!(Duration::from(notify.duration), IDLE_TIMEOUT);
         });
@@ -52,10 +55,11 @@ fn the_idle_timeout_sleeps_in_steps_and_a_touch_wakes() {
     assert!(model.power.asleep);
     assert_eq!(app.view(&model).connection, Connection::Offline);
 
-    // Step 2: turn Wi-Fi off, and wait for the answer.
+    // Step 2: turn the radio off, and wait for the answer.
     let radio_off = app
         .update(offline, &mut model)
-        .resolve_wifi_off(|_| ())
+        .resolve_radio_off(|_| ())
+        .expect_radio_limit(OFF_TIMEOUT)
         .expect_one_event();
 
     // Step 3: draw the last image, and sleep until a touch.
@@ -80,14 +84,15 @@ fn the_idle_timeout_sleeps_in_steps_and_a_touch_wakes() {
     // The start asked for the first full refresh, and the sleep for the second.
     assert_eq!(view.full_refresh_seq, 2);
     assert_eq!(view.updated, "Last changed 09:41");
-    assert_eq!(model.connection.wifi, Link::Down);
+    assert_eq!(model.wifi.phase, Phase::Off);
 
-    // The touch wakes the device: draw, connect and start the idle timer.
-    // The touch also turns the light on.
+    // The touch wakes the device: draw, join and start the idle timer. The
+    // touch also turns the light on.
     app.update(woke, &mut model)
         .expect_render()
         .expect_full_refresh_timer()
-        .expect_wifi_on()
+        .expect_radio_join_with(|join| assert!(!join.keep))
+        .expect_radio_limit(JOIN_TIMEOUT)
         .expect_time_notify_after_with(|notify| {
             assert_eq!(Duration::from(notify.duration), IDLE_TIMEOUT);
         })
@@ -104,18 +109,18 @@ fn a_tap_during_the_steps_wakes_and_the_late_answers_are_ignored() {
     // The write of the DISCONNECT packet waits.
     let mut sleep = app.update(Event::IdleTimeout(model.power.idle), &mut model);
 
-    // The user taps before the disconnect ends.
+    // The user taps before the disconnect ends. The session of the sleep
+    // still closes, so the core does not connect yet.
     app.update(Event::Tapped(None), &mut model)
         .expect_render()
         .expect_full_refresh_timer()
-        .expect_wifi_on()
         .expect_time_notify_after()
         .expect_touch_light(BATTERY_LEVEL)
         .expect_no_effects();
     assert!(!model.power.asleep);
 
     // The DISCONNECT leaves and the stream closes. The core does not
-    // continue the sleep. It asks for Wi-Fi again, to connect at once.
+    // continue the sleep. The link is still up, so it connects at once.
     sleep
         .expect_disconnect(&mut wire, &mut model)
         .expect_no_effects();
@@ -125,7 +130,7 @@ fn a_tap_during_the_steps_wakes_and_the_late_answers_are_ignored() {
     assert!(
         wire.effects
             .iter()
-            .any(|effect| matches!(effect, Effect::WifiOn(_))),
+            .any(|effect| matches!(effect, Effect::StreamOpen(_))),
         "{:?}",
         wire.effects
     );
@@ -203,52 +208,41 @@ fn on_the_stand_while_asleep_wakes_and_connects() {
     let mut sleep = app.update(Event::IdleTimeout(model.power.idle), &mut model);
     assert!(model.power.asleep);
 
-    let event = app
-        .update(Event::PowerSourceChanged(PowerSource::Stand), &mut model)
+    // The session of the sleep still closes, so the core does not connect
+    // yet.
+    app.update(Event::PowerSourceChanged(PowerSource::Stand), &mut model)
         .expect_render()
         .expect_full_refresh_timer()
-        .resolve_wifi_on(|_| WifiStatus::Connected)
-        .expect_event();
+        .expect_no_effects();
     // The idle timeout only started the steps of the sleep, so the core
     // drew no last image. The wake asked for the second full refresh.
     assert_eq!(model.full_refresh_seq, 2);
     assert!(!model.power.asleep);
 
-    // The session of the sleep still closes, so the core does not connect
-    // yet.
-    app.update(event, &mut model).expect_no_effects();
-
-    // The DISCONNECT leaves and the session ends. The core asks for Wi-Fi
-    // again, and then connects.
+    // The DISCONNECT leaves and the session ends. The link is still up, so
+    // the core connects at once.
     sleep
         .expect_disconnect(&mut wire, &mut model)
         .expect_no_effects();
-    let index = wire
-        .effects
-        .iter()
-        .position(|effect| matches!(effect, Effect::WifiOn(_)))
-        .expect("a WifiOn request");
-    let mut wifi = wire.effects.remove(index).unwrap().expect_wifi_on();
-    wifi.resolve(WifiStatus::Connected).unwrap();
-    wire.run(&mut model);
-    let event = wire
-        .events
-        .iter()
-        .position(|event| matches!(event, Event::Wifi { .. }))
-        .and_then(|index| wire.events.remove(index))
-        .expect("a Wifi event");
-    let _wire = Wire::new(app.update(event, &mut model));
+    assert!(
+        wire.effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::StreamOpen(_))),
+        "{:?}",
+        wire.effects
+    );
 }
 
 #[test]
-fn a_timer_wake_turns_wifi_on_and_starts_the_idle_timer() {
+fn a_timer_wake_joins_and_starts_the_idle_timer() {
     let app = Dashboard;
     let mut model = asleep_on_battery();
 
     app.update(woke(&model, Wake::Timer), &mut model)
         .expect_render()
         .expect_full_refresh_timer()
-        .expect_wifi_on()
+        .expect_radio_join()
+        .expect_radio_limit(JOIN_TIMEOUT)
         .expect_only_time_notify_after();
     assert_eq!(model.full_refresh_seq, 1);
 }
@@ -269,7 +263,10 @@ fn a_power_source_wake_on_battery_is_ignored() {
     app.update(woke(&model, Wake::PowerSource), &mut model)
         .expect_render()
         .expect_full_refresh_timer()
-        .expect_only_wifi_on();
+        .expect_radio_join()
+        .expect_only_time_notify_after_with(|notify| {
+            assert_eq!(Duration::from(notify.duration), JOIN_TIMEOUT);
+        });
     assert!(!model.power.asleep);
 }
 
@@ -305,7 +302,8 @@ fn a_tap_on_no_control_while_asleep_only_wakes() {
     app.update(woke(&model, Wake::Touch(None)), &mut model)
         .expect_render()
         .expect_full_refresh_timer()
-        .expect_wifi_on()
+        .expect_radio_join()
+        .expect_radio_limit(JOIN_TIMEOUT)
         .expect_time_notify_after_with(|notify| {
             assert_eq!(Duration::from(notify.duration), IDLE_TIMEOUT);
         })
@@ -415,13 +413,13 @@ fn a_battery_level_while_asleep_does_not_wake_the_device() {
     let mut model = asleep_on_battery();
     let idle = model.power.idle;
 
-    // The core keeps the level, but it does not draw, turn Wi-Fi on or
-    // start a timer.
+    // The core keeps the level, but it does not draw, join or start a
+    // timer.
     app.update(Event::BatteryChanged(Some(41)), &mut model)
         .expect_no_effects();
     assert!(model.power.asleep);
     assert_eq!(model.power.idle, idle);
-    assert_eq!(model.connection.wifi, Link::Down);
+    assert_eq!(model.wifi.phase, Phase::Off);
     assert_eq!(app.view(&model).battery, Some(40));
 
     // The wake draws the level.

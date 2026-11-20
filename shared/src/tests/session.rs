@@ -19,6 +19,10 @@ use crate::{
         pending::{PENDING_TIMEOUT, QUEUED_TIMEOUT, SCENE_TIMEOUT, TARGET_TIMEOUT},
         power::IDLE_TIMEOUT,
         refresh::{DRAW_DELAY, FULL_REFRESH_INTERVAL},
+        wifi::{
+            ADDRESS_TIMEOUT, JOIN_TIMEOUT, LEAVE_TIMEOUT, OFF_TIMEOUT, SCAN_TIMEOUT,
+            STOP_SCAN_TIMEOUT,
+        },
     },
     mqtt::{MAX_IN_FLIGHT, MAX_PACKET, SEND_TIMEOUT, codec::server::Packet},
 };
@@ -46,8 +50,9 @@ fn connected(power: PowerSource) -> Shell {
     shell
 }
 
-#[test]
-fn the_timers_of_the_session_have_durations_that_no_feature_timer_has() {
+/// Returns the durations of the timers of the features, with each step of
+/// the reconnect backoff.
+fn feature_timers() -> Vec<Duration> {
     let mut features = vec![
         CLOSE_TIMEOUT,
         LIGHT_TIMEOUT,
@@ -58,6 +63,12 @@ fn the_timers_of_the_session_have_durations_that_no_feature_timer_has() {
         IDLE_TIMEOUT,
         DRAW_DELAY,
         FULL_REFRESH_INTERVAL,
+        JOIN_TIMEOUT,
+        ADDRESS_TIMEOUT,
+        LEAVE_TIMEOUT,
+        SCAN_TIMEOUT,
+        STOP_SCAN_TIMEOUT,
+        OFF_TIMEOUT,
     ];
     let mut backoff = RECONNECT_MIN;
     while backoff < RECONNECT_MAX {
@@ -65,6 +76,12 @@ fn the_timers_of_the_session_have_durations_that_no_feature_timer_has() {
         backoff *= 2;
     }
     features.push(RECONNECT_MAX);
+    features
+}
+
+#[test]
+fn the_timers_of_the_session_have_durations_that_no_feature_timer_has() {
+    let features = feature_timers();
     for duration in session_timers() {
         assert!(!features.contains(&duration), "{duration:?}");
     }
@@ -444,7 +461,7 @@ fn an_answer_or_a_timer_of_an_older_connection_is_ignored() {
         },
         Event::Stream {
             connection: old,
-            item: StreamItem::Closed("late".into()),
+            item: StreamItem::closed("late"),
         },
     ];
     for event in stale {

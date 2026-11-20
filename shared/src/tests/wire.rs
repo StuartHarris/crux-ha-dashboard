@@ -153,9 +153,7 @@ impl Wire {
     #[track_caller]
     pub fn drop_connection(&mut self, model: &mut Model, reason: &str) -> Cmd {
         self.broker.drop_connection();
-        self.open
-            .resolve(StreamItem::Closed(reason.into()))
-            .unwrap();
+        self.open.resolve(StreamItem::closed(reason)).unwrap();
         let event = self.commands[0].expect_one_event();
         Dashboard.update(event, model)
     }

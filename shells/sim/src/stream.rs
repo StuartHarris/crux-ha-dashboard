@@ -17,6 +17,10 @@
 //! The stream ends when the peer closes it, when a read or a write fails, or
 //! when the shell closes it. The last item is always `Closed`. The shell
 //! answers the `Write` requests that wait when it gets the `Closed` item.
+//!
+//! `Closed` has `by_host` set when the peer closed the stream (a read of no
+//! bytes), and for an error that only a reset or a close by the peer gives.
+//! Refer to [`is_reset`] and [`is_write_reset`].
 
 use std::{future::Future, io, pin::Pin, time::Duration};
 
@@ -37,6 +41,8 @@ pub const CLOSED: &str = "closed";
 pub const REPLACED: &str = "replaced";
 /// The reason in the `Closed` item after the peer closed the stream.
 pub const PEER_CLOSED: &str = "the broker closed the stream";
+/// The reason in the `Closed` item after the link dropped.
+pub const LINK_LOST: &str = "link lost";
 /// The longest time that a close waits for the bytes to go and for the peer
 /// to close its side.
 pub const FLUSH_LIMIT: Duration = Duration::from_secs(2);
@@ -79,6 +85,38 @@ pub fn tcp_opener() -> Opener {
             Ok(Box::new(stream) as Box<dyn Io>)
         })
     })
+}
+
+/// Returns `true` if `error` shows that the peer answered with a TCP reset:
+/// it refused the connect, or it reset the stream.
+///
+/// The system gives these kinds only for a reset from the peer. A timeout,
+/// a host with no route and a DNS failure have other kinds.
+fn is_reset(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionRefused | io::ErrorKind::ConnectionReset
+    )
+}
+
+/// Returns `true` if the write error `error` shows that the peer reset or
+/// closed the stream. A write also gives `BrokenPipe` after a reset or a
+/// close by the peer, and `ConnectionAborted` after an abort.
+fn is_write_reset(error: &io::Error) -> bool {
+    is_reset(error)
+        || matches!(
+            error.kind(),
+            io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionAborted
+        )
+}
+
+/// Returns the `Closed` item for `error`. `by_host` tells if the peer
+/// caused the error.
+fn failed(error: &io::Error, by_host: bool) -> StreamItem {
+    StreamItem::Closed {
+        reason: error.to_string(),
+        by_host,
+    }
 }
 
 /// The task of one stream, as the shell sees it.
@@ -169,13 +207,13 @@ async fn run(connecting: Connecting, mut channels: Channels, flush_limit: Durati
     let io = tokio::select! {
         biased;
         _ = &mut channels.stop => {
-            channels.item(StreamItem::Closed(CLOSED.into()));
+            channels.item(StreamItem::closed(CLOSED));
             return;
         }
         result = connecting => match result {
             Ok(io) => io,
             Err(error) => {
-                channels.item(StreamItem::Closed(error.to_string()));
+                channels.item(failed(&error, is_reset(&error)));
                 return;
             }
         },
@@ -192,45 +230,49 @@ async fn run(connecting: Connecting, mut channels: Channels, flush_limit: Durati
     let failure = tokio::select! {
         biased;
         _ = stop => None,
-        reason = read_loop(&mut reader, *token, notifier) => Some(reason),
-        reason = write_loop(&mut writer, writes, *token, notifier) => Some(reason),
+        item = read_loop(&mut reader, *token, notifier) => Some(item),
+        item = write_loop(&mut writer, writes, *token, notifier) => Some(item),
     };
-    let reason = if let Some(reason) = failure {
-        reason
+    let item = if let Some(item) = failure {
+        item
     } else {
         close(reader, writer, flush_limit).await;
-        CLOSED.into()
+        StreamItem::closed(CLOSED)
     };
-    channels.item(StreamItem::Closed(reason));
+    channels.item(item);
 }
 
-/// Gives each chunk of bytes from the peer to the shell. Returns the reason
-/// when the stream ends.
-async fn read_loop(reader: &mut ReadHalf<Box<dyn Io>>, token: u64, notifier: &Notifier) -> String {
+/// Gives each chunk of bytes from the peer to the shell. Returns the
+/// `Closed` item when the stream ends.
+async fn read_loop(
+    reader: &mut ReadHalf<Box<dyn Io>>,
+    token: u64,
+    notifier: &Notifier,
+) -> StreamItem {
     let mut buffer = vec![0; READ_BUFFER];
     loop {
         match reader.read(&mut buffer).await {
-            Ok(0) => return PEER_CLOSED.into(),
+            Ok(0) => return StreamItem::by_host(PEER_CLOSED),
             Ok(length) => notifier.send(Signal::Stream {
                 token,
                 item: StreamItem::Received(buffer[..length].to_vec()),
             }),
-            Err(error) => return error.to_string(),
+            Err(error) => return failed(&error, is_reset(&error)),
         }
     }
 }
 
 /// Writes the bytes of each `Write` request in order, and answers each one
-/// with `Sent`. Returns the reason if a write fails.
+/// with `Sent`. Returns the `Closed` item if a write fails.
 async fn write_loop(
     writer: &mut WriteHalf<Box<dyn Io>>,
     queue: &mut mpsc::UnboundedReceiver<Vec<u8>>,
     token: u64,
     notifier: &Notifier,
-) -> String {
+) -> StreamItem {
     while let Some(bytes) = queue.recv().await {
         if let Err(error) = writer.write_all(&bytes).await {
-            return error.to_string();
+            return failed(&error, is_write_reset(&error));
         }
         notifier.send(Signal::Written {
             token,
@@ -350,7 +392,7 @@ mod tests {
         drop(peer);
         assert_eq!(
             next(&signals),
-            format!("1 {:?}", StreamItem::Closed(PEER_CLOSED.into()))
+            format!("1 {:?}", StreamItem::by_host(PEER_CLOSED))
         );
     }
 
@@ -369,7 +411,7 @@ mod tests {
         // the shell to answer it.
         assert_eq!(
             next(&signals),
-            format!("1 {:?}", StreamItem::Closed(CLOSED.into()))
+            format!("1 {:?}", StreamItem::closed(CLOSED))
         );
     }
 
@@ -392,7 +434,7 @@ mod tests {
         drop(peer);
         assert_eq!(
             next(&signals),
-            format!("1 {:?}", StreamItem::Closed(CLOSED.into()))
+            format!("1 {:?}", StreamItem::closed(CLOSED))
         );
         runtime.block_on(async { tokio::time::sleep(Duration::from_millis(20)).await });
         assert!(task.is_finished());
@@ -407,12 +449,12 @@ mod tests {
         task.close();
         assert_eq!(
             next(&signals),
-            format!("1 {:?}", StreamItem::Closed(CLOSED.into()))
+            format!("1 {:?}", StreamItem::closed(CLOSED))
         );
     }
 
     #[test]
-    fn a_stream_that_does_not_open_ends_with_the_error() {
+    fn a_refused_connect_ends_with_a_reset() {
         let runtime = runtime();
         let refused: Connecting = Box::pin(async {
             Err(std::io::Error::new(
@@ -423,7 +465,43 @@ mod tests {
         let (_task, signals) = spawn(&runtime, refused, WAIT);
         assert_eq!(
             next(&signals),
-            format!("1 {:?}", StreamItem::Closed("connection refused".into()))
+            format!("1 {:?}", StreamItem::by_host("connection refused"))
         );
+    }
+
+    #[test]
+    fn a_connect_that_times_out_ends_with_no_reset() {
+        let runtime = runtime();
+        let timeout: Connecting = Box::pin(async {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "no TCP connection in 10 s",
+            ))
+        });
+        let (_task, signals) = spawn(&runtime, timeout, WAIT);
+        assert_eq!(
+            next(&signals),
+            format!("1 {:?}", StreamItem::closed("no TCP connection in 10 s"))
+        );
+    }
+
+    #[test]
+    fn a_refused_tcp_connect_ends_with_a_reset() {
+        let runtime = runtime();
+        // Bind a port, and then close it, so that nothing listens on it.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|listener| listener.local_addr())
+            .unwrap()
+            .port();
+        let connecting = super::tcp_opener()("127.0.0.1", port);
+        let (_task, signals) = spawn(&runtime, connecting, WAIT);
+        let Ok(Signal::Stream {
+            item: StreamItem::Closed { by_host, reason },
+            ..
+        }) = signals.recv_timeout(WAIT)
+        else {
+            panic!("a Closed item");
+        };
+        assert!(by_host, "{reason}");
     }
 }
