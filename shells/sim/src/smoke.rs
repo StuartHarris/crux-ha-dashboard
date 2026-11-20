@@ -1,6 +1,10 @@
 //! Connects to the broker, waits for the retained entity states, draws the
 //! page to a PNG file and stops.
 //!
+//! The broker sends the retained states after the SUBACK packet. The core
+//! sends `WifiQuiet` at the SUBACK packet, so the smoke test stops when no
+//! bytes arrive for [`QUIET`] after `WifiQuiet`.
+//!
 //! The core does a dry run in this mode, so it publishes no service call.
 
 use std::{
@@ -9,18 +13,19 @@ use std::{
     time::{Duration, Instant},
 };
 
-use shared::{Connection, Event, Settings, capabilities::mqtt::MqttEvent};
+use shared::{Connection, Event, Settings, capabilities::stream::StreamItem};
 
 use crate::{
     inspector::Direction,
-    mqtt,
     panel::Panel,
     settings::Options,
     shell::{Notifier, Shell, Signal},
+    stream,
 };
 
-/// The time with no message after which the shell has the retained states.
-const QUIET: Duration = Duration::from_secs(2);
+/// The time with no bytes from the broker, after `WifiQuiet`, after which
+/// the shell has the retained states.
+const QUIET: Duration = Duration::from_millis(300);
 /// The longest time to wait.
 const LIMIT: Duration = Duration::from_secs(20);
 
@@ -35,8 +40,7 @@ pub fn run(options: Options, out: &Path) -> Result<(), String> {
     let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
     let (sender, signals) = mpsc::channel();
     let notifier = Notifier::new(sender, Arc::new(|| {}));
-    let open = mqtt::opener(runtime.handle().clone());
-    let mut shell = Shell::new(runtime.handle().clone(), notifier, open);
+    let mut shell = Shell::new(runtime.handle().clone(), notifier, stream::tcp_opener());
     let settings = Settings {
         read_only: true,
         ..options.settings
@@ -45,24 +49,29 @@ pub fn run(options: Options, out: &Path) -> Result<(), String> {
     shell.send(Event::BatteryChanged(Some(options.level)));
 
     let started = Instant::now();
-    let mut last_message: Option<Instant> = None;
-    let mut messages = 0_usize;
+    // The time of the last bytes from the broker, or of `WifiQuiet` if no
+    // bytes arrived after it.
+    let mut last_bytes = Instant::now();
+    let mut quiet = false;
     let complete = loop {
-        if let Ok(signal) = signals.recv_timeout(Duration::from_millis(100)) {
+        if let Ok(signal) = signals.recv_timeout(Duration::from_millis(50)) {
             if matches!(
                 signal,
-                Signal::Mqtt {
-                    event: MqttEvent::Message(_),
+                Signal::Stream {
+                    item: StreamItem::Received(_),
                     ..
                 }
             ) {
-                messages += 1;
-                last_message = Some(Instant::now());
+                last_bytes = Instant::now();
             }
             shell.handle(signal);
         }
+        if !quiet && shell.quiet_count() > 0 {
+            quiet = true;
+            last_bytes = last_bytes.max(Instant::now());
+        }
         let online = shell.view().connection == Connection::Online;
-        if online && last_message.is_some_and(|time| time.elapsed() >= QUIET) {
+        if online && quiet && last_bytes.elapsed() >= QUIET {
             break true;
         }
         if started.elapsed() >= LIMIT {
@@ -78,6 +87,7 @@ pub fn run(options: Options, out: &Path) -> Result<(), String> {
         .filter(|entry| entry.direction == Direction::Out && entry.topic.ends_with("/cmd"))
         .count();
 
+    let messages = shell.inspector().messages;
     let view = shell.view();
     let mut panel = Panel::new();
     panel.draw(&view);
@@ -108,7 +118,7 @@ pub fn run(options: Options, out: &Path) -> Result<(), String> {
             room.any_on
         );
     }
-    // Stop with no disconnect packet. The broker publishes the last will.
+    // Stop with no DISCONNECT packet. The broker publishes the last will.
     drop(shell);
     runtime.shutdown_background();
     if calls > 0 {

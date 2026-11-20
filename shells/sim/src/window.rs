@@ -28,12 +28,12 @@ use embedded_graphics::{prelude::*, primitives::Rectangle};
 use shared::{Event, PowerSource, ViewModel};
 
 use crate::{
-    inspector::{Delivery, Direction, Inspector, Log, ROUTINE_EFFECTS},
-    mqtt,
+    inspector::{Direction, Inspector, Log, ROUTINE_EFFECTS},
     panel::{Scale, Viewport, share},
     screen::Screen,
     settings::Options,
     shell::{Notifier, Shell, Signal},
+    stream,
 };
 
 /// The window title.
@@ -94,15 +94,14 @@ pub fn run(options: Options) -> Result<(), String> {
             let context = creation.egui_ctx.clone();
             let (sender, signals) = mpsc::channel();
             let notifier = Notifier::new(sender, Arc::new(move || context.request_repaint()));
-            let open = mqtt::opener(handle.clone());
-            let mut shell = Shell::new(handle, notifier, open);
+            let mut shell = Shell::new(handle, notifier, stream::tcp_opener());
             shell.start(settings, power, path);
             shell.send(Event::BatteryChanged(Some(level)));
             Ok(Box::new(App::new(shell, signals, power, level)))
         }),
     );
     // eframe dropped the app and its shell. The tasks stopped with no
-    // disconnect packet, so the broker publishes the last will, as for a
+    // DISCONNECT packet, so the broker publishes the last will, as for a
     // device that loses power.
     runtime.shutdown_background();
     result.map_err(|error| error.to_string())
@@ -658,15 +657,6 @@ impl App {
             ui.monospace(format!("{:?}", entry.packet));
             if entry.retained {
                 ui.monospace("retained");
-            }
-            match &entry.delivery {
-                Delivery::Received | Delivery::Sent => {}
-                Delivery::NoConnection => {
-                    ui.colored_label(Color32::YELLOW, "no connection");
-                }
-                Delivery::Failed(error) => {
-                    ui.colored_label(Color32::RED, format!("failed: {error}"));
-                }
             }
             let topic = ui.monospace(&entry.topic);
             if !entry.topics.is_empty() {

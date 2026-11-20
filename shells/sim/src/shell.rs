@@ -1,22 +1,33 @@
 //! The shell: it runs the core on the main thread and performs its effects.
 //!
 //! The core has locks that it only tries to take, so one thread owns it. The
-//! MQTT client and the timers run as tasks on a tokio runtime. A task sends a
-//! [`Signal`] through a channel when it has an answer. The main thread reads
-//! the channel and calls [`Shell::handle`], which gives the answer to the
-//! core.
+//! byte streams and the timers run as tasks on a tokio runtime. A task sends
+//! a [`Signal`] through a channel when it has an answer. The main thread
+//! reads the channel and calls [`Shell::handle`], which gives the answer to
+//! the core.
 //!
-//! A new connection does not stop the old one at once. The shell sends a
-//! disconnect packet on the old connection, so the broker does not publish
-//! the last will, and the old stream ends with `Disconnected`. The core
-//! ignores the items of an older connection.
+//! The core runs the MQTT session, and the shell gives it only bytes. The
+//! shell obeys the rules of the stream capability
+//! ([`shared::capabilities::stream`]):
 //!
-//! A `Subscribe` request ends when the SUBACK packet of its connection
-//! arrives. If the stream of the connection ends first, the shell answers
-//! `Failed`.
+//! - Each stream has a token of the shell and the connection id of the
+//!   core. A restart makes a new core, which uses the same connection ids
+//!   again, so the signals of a task carry the token. The shell ignores the
+//!   signals of a stream that ended.
+//! - A new `Open` replaces the stream that is open. The shell stops the old
+//!   task, and the old stream ends with `Closed("replaced")`.
+//! - A `Write` ends at [`Signal::Written`] for its stream, in the order of
+//!   the requests. At the end of the stream, the shell answers each `Write`
+//!   of the stream that waits with `Failed`. If no stream has the connection
+//!   id of the request, the shell answers `Failed` at once.
+//! - A `Close` ends at the end of the stream, after the `Closed` item. If no
+//!   stream has the connection id of the request, the shell answers at once.
+//! - The core does not clear the timers of the session. Such a timer runs
+//!   until it expires, and the core then ignores it.
 //!
-//! The shell writes each effect and each MQTT packet to an [`Inspector`],
-//! which the window shows.
+//! The shell writes each effect to an [`Inspector`], which the window shows.
+//! The inspector also finds the MQTT packets in a copy of the bytes of each
+//! stream.
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -31,37 +42,39 @@ use crux_time::{TimerId, operation::NotifyAfter};
 use shared::{
     Core, Dashboard, Effect, Event, PowerSource, Settings, Start, ViewModel,
     capabilities::{
-        mqtt::{Connect, Disconnect, MqttEvent, Publish, Subscribe, SubscribeOutcome},
         network::WifiStatus,
         power::{Sleep, Wake},
+        stream::{Close, Open, StreamItem, Write, Written},
     },
 };
 use tokio::{runtime::Handle, task::JoinHandle};
 
 use crate::{
-    inspector::{Delivery, Direction, Inspector, Packet, truncate},
-    mqtt::{Item, Link, Opener},
+    inspector::{Inspector, Wire},
+    stream::{FLUSH_LIMIT, Opener, REPLACED, Task},
 };
+
+/// The reason in the answer to a `Write` request for a stream that is not
+/// open.
+const NOT_OPEN: &str = "the stream is not open";
 
 /// An answer from a task on the runtime.
 #[derive(Debug)]
 pub enum Signal {
-    /// An item from the stream of the MQTT connection with this id.
-    Mqtt {
-        /// The id of the connection in the shell.
-        connection: u64,
+    /// An item from the stream with this token. `Closed` is the last item.
+    Stream {
+        /// The token of the stream in the shell.
+        token: u64,
         /// The item.
-        event: MqttEvent,
-        /// `true` for a message that the broker retained.
-        retained: bool,
+        item: StreamItem,
     },
-    /// The answer to the oldest `Subscribe` request of the MQTT connection
-    /// with this id.
-    Subscribed {
-        /// The id of the connection in the shell.
-        connection: u64,
+    /// The answer to the oldest `Write` request of the stream with this
+    /// token.
+    Written {
+        /// The token of the stream in the shell.
+        token: u64,
         /// The answer.
-        outcome: SubscribeOutcome,
+        outcome: Written,
     },
     /// The timer with this id expired.
     Timer {
@@ -95,11 +108,16 @@ impl Notifier {
     }
 }
 
-/// An MQTT connection and the request of its stream.
+/// A stream that did not end, and the request of the core for it.
 struct Live {
-    id: u64,
-    request: Request<Connect>,
-    link: Box<dyn Link>,
+    /// The token of the stream in the shell.
+    token: u64,
+    /// The connection id of the core.
+    connection: u32,
+    request: Request<Open>,
+    task: Task,
+    /// The packets in the bytes of the stream, for the MQTT log.
+    wire: Wire,
 }
 
 /// A timer that runs.
@@ -115,24 +133,26 @@ pub struct Shell {
     runtime: Handle,
     notifier: Notifier,
     open: Opener,
-    /// The connections whose streams did not end, from the oldest.
-    connections: Vec<Live>,
-    /// The id of the connection to which subscribe, publish and disconnect
-    /// apply.
-    current: Option<u64>,
-    last_connection: u64,
+    /// The streams that did not end, from the oldest. A new `Open` replaces
+    /// the stream that is open, so there is at most one.
+    streams: Vec<Live>,
+    last_stream: u64,
+    /// The `Write` requests that wait for their answers, from the oldest,
+    /// with the tokens of their streams.
+    writes: Vec<(u64, Request<Write>)>,
+    /// The `Close` requests that wait for the end of their streams, with the
+    /// tokens of the streams.
+    closes: Vec<(u64, Request<Close>)>,
+    /// The longest time that a close waits for the peer.
+    flush_limit: Duration,
     timers: HashMap<TimerId, Timer>,
     last_token: u64,
     render: bool,
     inspector: Inspector,
     /// The settings that [`Shell::start`] gave, for [`Shell::restart`].
     settings: Option<Settings>,
-    /// The `Disconnect` requests that wait for the end of the stream of
-    /// their connection.
-    disconnects: Vec<(u64, Request<Disconnect>)>,
-    /// The `Subscribe` requests that wait for their SUBACK packets, from the
-    /// oldest, with the ids of their connections.
-    subscribes: Vec<(u64, Request<Subscribe>)>,
+    /// The number of `WifiQuiet` effects.
+    quiet: u32,
     /// The `Sleep` request that waits for a wake.
     sleep: Option<Request<Sleep>>,
     /// The level of the front light, in percent. The window shows the
@@ -141,12 +161,12 @@ pub struct Shell {
 }
 
 impl Drop for Shell {
-    /// Stops all the tasks of the shell. A connection stops with no
-    /// disconnect packet, so the broker publishes the last will, as for a
-    /// device that loses power.
+    /// Stops all the tasks of the shell. A stream stops with no DISCONNECT
+    /// packet, so the broker publishes the last will, as for a device that
+    /// loses power.
     fn drop(&mut self) {
-        for live in &self.connections {
-            live.link.abort();
+        for live in &self.streams {
+            live.task.abort();
         }
         for timer in self.timers.values() {
             timer.task.abort();
@@ -156,23 +176,24 @@ impl Drop for Shell {
 
 impl Shell {
     /// Makes a shell. Tasks run on `runtime` and send their answers with
-    /// `notifier`. `open` opens an MQTT connection.
+    /// `notifier`. `open` opens a byte stream.
     pub fn new(runtime: Handle, notifier: Notifier, open: Opener) -> Self {
         Self {
             core: Core::new(),
             runtime,
             notifier,
             open,
-            connections: Vec::new(),
-            current: None,
-            last_connection: 0,
+            streams: Vec::new(),
+            last_stream: 0,
+            writes: Vec::new(),
+            closes: Vec::new(),
+            flush_limit: FLUSH_LIMIT,
             timers: HashMap::new(),
             last_token: 0,
             render: false,
             inspector: Inspector::default(),
             settings: None,
-            disconnects: Vec::new(),
-            subscribes: Vec::new(),
+            quiet: 0,
             sleep: None,
             light: 0,
         }
@@ -213,9 +234,9 @@ impl Shell {
     /// restart uses `read_only` from the settings or from the view, so a
     /// restart never switches to live service calls.
     ///
-    /// The inspector and the counters of connections and timers stay. A late
-    /// signal from a task of the old core finds no connection or timer, so
-    /// the shell ignores it.
+    /// The inspector and the counters of streams and timers stay. A late
+    /// signal from a task of the old core finds no stream or timer, so the
+    /// shell ignores it.
     pub fn restart(&mut self) -> bool {
         let view = self.view();
         let Some(mut settings) = self.settings.clone().filter(|_| view.asleep) else {
@@ -228,15 +249,14 @@ impl Shell {
             String::new(),
             "deep sleep: new core, the page and the last update kept",
         );
-        for live in self.connections.drain(..) {
-            live.link.abort();
+        for live in self.streams.drain(..) {
+            live.task.abort();
         }
         for (_, timer) in self.timers.drain() {
             timer.task.abort();
         }
-        self.current = None;
-        self.disconnects.clear();
-        self.subscribes.clear();
+        self.writes.clear();
+        self.closes.clear();
         self.sleep = None;
         self.core = Core::new();
         self.send(Event::Start(Start {
@@ -338,9 +358,16 @@ impl Shell {
         self.timers.len()
     }
 
-    /// Returns the id of the current MQTT connection, if there is one.
-    pub const fn current_connection(&self) -> Option<u64> {
-        self.current
+    /// Returns the connection id of the core for the stream that is open, if
+    /// there is one.
+    pub fn current_connection(&self) -> Option<u32> {
+        self.streams.last().map(|live| live.connection)
+    }
+
+    /// Returns the number of `WifiQuiet` effects. The core sends `WifiQuiet`
+    /// when the broker accepted the subscribe, after the retained states.
+    pub const fn quiet_count(&self) -> u32 {
+        self.quiet
     }
 
     /// Returns the logs of the shell.
@@ -372,70 +399,15 @@ impl Shell {
     /// Gives an answer from a task to the core.
     pub fn handle(&mut self, signal: Signal) {
         match signal {
-            Signal::Mqtt {
-                connection,
-                event,
-                retained,
-            } => {
-                let Some(index) = self
-                    .connections
-                    .iter()
-                    .position(|live| live.id == connection)
-                else {
+            Signal::Stream { token, item } => self.stream(token, item),
+            Signal::Written { token, outcome } => {
+                let Some(index) = self.writes.iter().position(|(id, _)| *id == token) else {
                     return;
                 };
-                let last = self.record_stream(connection, &event, retained);
-                let live = &mut self.connections[index];
-                let mut effects = resolve(&self.core, &mut live.request, event);
-                if last {
-                    self.connections.remove(index);
-                    if self.current == Some(connection) {
-                        self.current = None;
-                    }
-                    // The connection is closed, so its `Disconnect` requests
-                    // end.
-                    let (done, waiting) = std::mem::take(&mut self.disconnects)
-                        .into_iter()
-                        .partition(|(id, _)| *id == connection);
-                    self.disconnects = waiting;
-                    for (_, mut request) in done {
-                        self.inspector.effect(
-                            "MqttDisconnect",
-                            format!("connection {connection}"),
-                            "resolved: closed",
-                        );
-                        effects.extend(resolve(&self.core, &mut request, ()));
-                    }
-                    // Its `Subscribe` requests got no SUBACK packet.
-                    let (failed, waiting) = std::mem::take(&mut self.subscribes)
-                        .into_iter()
-                        .partition(|(id, _)| *id == connection);
-                    self.subscribes = waiting;
-                    for (_, mut request) in failed {
-                        self.inspector.effect(
-                            "MqttSubscribe",
-                            format!("connection {connection}"),
-                            "resolved: Failed (closed before the SUBACK)",
-                        );
-                        let outcome = SubscribeOutcome::Failed;
-                        effects.extend(resolve(&self.core, &mut request, outcome));
-                    }
-                }
-                self.process(effects);
-            }
-            Signal::Subscribed {
-                connection,
-                outcome,
-            } => {
-                let Some(index) = self.subscribes.iter().position(|(id, _)| *id == connection)
-                else {
-                    return;
-                };
-                let (_, mut request) = self.subscribes.remove(index);
-                eprintln!("mqtt: subscribe {outcome:?}");
+                let (_, mut request) = self.writes.remove(index);
                 self.inspector.effect(
-                    "MqttSubscribe",
-                    format!("connection {connection}"),
+                    "StreamWrite",
+                    format!("connection {}", request.operation.connection),
                     format!("resolved: {outcome:?}"),
                 );
                 let effects = resolve(&self.core, &mut request, outcome);
@@ -460,55 +432,71 @@ impl Shell {
         }
     }
 
-    /// Writes an item of the stream of a connection to the logs. Returns
-    /// `true` if the item is the last one.
-    fn record_stream(&mut self, connection: u64, event: &MqttEvent, retained: bool) -> bool {
-        let stream = format!("connection {connection}");
-        match event {
-            MqttEvent::Connected => {
-                eprintln!("mqtt: connected");
+    /// Gives an item of the stream with the token `token` to the core. After
+    /// the `Closed` item, answers the `Write` and `Close` requests of the
+    /// stream. If the stream ended, does nothing.
+    fn stream(&mut self, token: u64, item: StreamItem) {
+        let Some(index) = self.streams.iter().position(|live| live.token == token) else {
+            return;
+        };
+        let connection = self.streams[index].connection;
+        let request = format!("connection {connection}");
+        let mut reason = None;
+        match &item {
+            StreamItem::Opened => {
+                eprintln!("stream: opened (connection {connection})");
+                self.inspector.effect("StreamOpen", request, "item: Opened");
+            }
+            StreamItem::Received(bytes) => {
                 self.inspector
-                    .effect("MqttConnect", stream, "resolved: Connected");
-                self.inspector.packet(
-                    Direction::In,
-                    Packet::ConnAck,
-                    "",
-                    String::new(),
-                    false,
-                    Delivery::Received,
-                );
-                false
+                    .received(&mut self.streams[index].wire, bytes);
             }
-            MqttEvent::Message(message) => {
-                self.inspector.packet(
-                    Direction::In,
-                    Packet::Publish,
-                    message.topic.clone(),
-                    truncate(&message.payload),
-                    retained,
-                    Delivery::Received,
-                );
-                false
-            }
-            MqttEvent::Disconnected { reason } => {
-                let reason = reason.as_deref().unwrap_or("disconnect");
-                eprintln!("mqtt: disconnected ({reason})");
-                self.inspector.effect(
-                    "MqttConnect",
-                    stream,
-                    format!("resolved: Disconnected ({reason})"),
-                );
-                self.inspector.packet(
-                    Direction::In,
-                    Packet::Disconnect,
-                    "",
-                    reason.to_string(),
-                    false,
-                    Delivery::Received,
-                );
-                true
+            StreamItem::Closed(text) => {
+                eprintln!("stream: closed (connection {connection}): {text}");
+                self.inspector
+                    .effect("StreamOpen", request, format!("item: Closed ({text})"));
+                reason = Some(text.clone());
             }
         }
+        let mut effects = resolve(&self.core, &mut self.streams[index].request, item);
+        if let Some(reason) = reason {
+            self.streams.remove(index);
+            effects.extend(self.end(token, connection, &reason));
+        }
+        self.process(effects);
+    }
+
+    /// Answers the requests of the stream with the token `token`, which
+    /// ended for `reason`: `Failed` for each `Write`, and `()` for each
+    /// `Close`. Returns the new effects.
+    fn end(&mut self, token: u64, connection: u32, reason: &str) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        let (failed, waiting) = std::mem::take(&mut self.writes)
+            .into_iter()
+            .partition(|(id, _)| *id == token);
+        self.writes = waiting;
+        for (_, mut request) in failed {
+            self.inspector.effect(
+                "StreamWrite",
+                format!("connection {connection}"),
+                format!("resolved: Failed ({reason})"),
+            );
+            let outcome = Written::Failed(reason.to_string());
+            effects.extend(resolve(&self.core, &mut request, outcome));
+        }
+        let (done, waiting) = std::mem::take(&mut self.closes)
+            .into_iter()
+            .partition(|(id, _)| *id == token);
+        self.closes = waiting;
+        for (_, mut request) in done {
+            self.inspector.effect(
+                "StreamClose",
+                format!("connection {connection}"),
+                "resolved: closed",
+            );
+            effects.extend(resolve(&self.core, &mut request, ()));
+        }
+        effects
     }
 
     fn process(&mut self, effects: Vec<Effect>) {
@@ -527,22 +515,9 @@ impl Shell {
                     .effect("Render", String::new(), "the window draws the view");
                 Vec::new()
             }
-            Effect::MqttConnect(request) => self.connect(request),
-            Effect::MqttSubscribe(request) => self.subscribe(request),
-            Effect::MqttPublish(request) => {
-                self.publish(&request.operation);
-                Vec::new()
-            }
-            Effect::MqttDisconnect(mut request) => {
-                if let Some(current) = self.current {
-                    self.disconnect_current();
-                    self.disconnects.push((current, request));
-                    return Vec::new();
-                }
-                self.inspector
-                    .effect("MqttDisconnect", String::new(), "resolved: no connection");
-                resolve(&self.core, &mut request, ())
-            }
+            Effect::StreamOpen(request) => self.open(request),
+            Effect::StreamWrite(request) => self.write(request),
+            Effect::StreamClose(request) => self.close(request),
             Effect::WifiOn(mut request) => {
                 self.inspector
                     .effect("WifiOn", String::new(), "resolved: Connected");
@@ -620,6 +595,7 @@ impl Shell {
     /// Logs `WifiQuiet`. The simulator has no access points, so it does
     /// nothing else.
     fn quiet(&mut self) -> Vec<Effect> {
+        self.quiet += 1;
         self.inspector.effect(
             "WifiQuiet",
             String::new(),
@@ -628,147 +604,109 @@ impl Shell {
         Vec::new()
     }
 
-    /// Returns the connection to which subscribe, publish and disconnect
-    /// apply.
-    fn current(&self) -> Option<&Live> {
-        let current = self.current?;
-        self.connections.iter().find(|live| live.id == current)
-    }
-
-    /// Subscribes to the topics of `request` on the current connection. The
-    /// request waits for the SUBACK packet. If the request cannot go to the
-    /// client, the shell answers `Failed` at once.
-    fn subscribe(&mut self, mut request: Request<Subscribe>) -> Vec<Effect> {
-        let topics = &request.operation.topics;
-        let current = self.current;
-        let delivery = self.current().map_or(Delivery::NoConnection, |live| {
-            eprintln!("mqtt: subscribe to {} topics", topics.len());
-            delivery("subscribe", live.link.subscribe(topics))
-        });
-        self.inspector.effect(
-            "MqttSubscribe",
-            format!("{} topics", topics.len()),
-            outcome(&delivery),
-        );
-        self.inspector.subscribe(topics, delivery.clone());
-        match (current, delivery) {
-            (Some(connection), Delivery::Sent) => {
-                self.subscribes.push((connection, request));
-                Vec::new()
-            }
-            _ => resolve(&self.core, &mut request, SubscribeOutcome::Failed),
-        }
-    }
-
-    /// Publishes a message on the current connection.
-    fn publish(&mut self, publish: &Publish) {
-        let payload = String::from_utf8_lossy(&publish.payload);
-        let delivery = self.current().map_or(Delivery::NoConnection, |live| {
-            eprintln!("mqtt: publish {} {payload}", publish.topic);
-            delivery("publish", live.link.publish(publish))
-        });
-        self.inspector
-            .effect("MqttPublish", publish.topic.clone(), outcome(&delivery));
-        self.inspector.packet(
-            Direction::Out,
-            Packet::Publish,
-            publish.topic.clone(),
-            truncate(&publish.payload),
-            publish.retain,
-            delivery,
-        );
-    }
-
-    /// Sends a disconnect packet on the current connection. Its stream ends
-    /// later with `Disconnected`.
-    fn disconnect_current(&mut self) {
-        let delivery = self.current().map_or(Delivery::NoConnection, |live| {
-            eprintln!("mqtt: disconnect");
-            delivery("disconnect", live.link.disconnect())
-        });
-        if let Some(current) = self.current {
+    /// Opens a stream for `request`. If a stream is open, the new stream
+    /// replaces it, and the old stream ends with `Closed("replaced")`.
+    fn open(&mut self, request: Request<Open>) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        for mut live in std::mem::take(&mut self.streams) {
+            live.task.abort();
+            let connection = live.connection;
+            eprintln!("stream: closed (connection {connection}): {REPLACED}");
             self.inspector.effect(
-                "MqttDisconnect",
-                format!("connection {current}"),
-                outcome(&delivery),
+                "StreamOpen",
+                format!("connection {connection}"),
+                format!("item: Closed ({REPLACED})"),
             );
-            self.inspector.packet(
-                Direction::Out,
-                Packet::Disconnect,
-                "",
-                String::new(),
-                false,
-                delivery,
-            );
+            let item = StreamItem::Closed(REPLACED.into());
+            effects.extend(resolve(&self.core, &mut live.request, item));
+            effects.extend(self.end(live.token, connection, REPLACED));
         }
-        self.current = None;
+        let Open {
+            connection,
+            host,
+            port,
+        } = &request.operation;
+        let (connection, target) = (*connection, format!("{host}:{port}"));
+        eprintln!("stream: open {target} (connection {connection})");
+        self.inspector.effect(
+            "StreamOpen",
+            format!("connection {connection}: {target}"),
+            "started",
+        );
+        self.last_stream += 1;
+        let token = self.last_stream;
+        let connecting = (self.open)(host, *port);
+        let task = Task::spawn(
+            &self.runtime,
+            connecting,
+            token,
+            self.notifier.clone(),
+            self.flush_limit,
+        );
+        self.streams.push(Live {
+            token,
+            connection,
+            request,
+            task,
+            wire: Wire::new(target),
+        });
+        effects
     }
 
-    /// Opens a connection and makes it the current connection. If a
-    /// connection is current, the shell disconnects it first.
-    fn connect(&mut self, request: Request<Connect>) -> Vec<Effect> {
-        self.disconnect_current();
-        self.last_connection += 1;
-        let id = self.last_connection;
-        let connect = &request.operation;
-        // Do not log the credentials of the request.
-        let target = format!("{}:{} as {}", connect.host, connect.port, connect.client_id);
-        eprintln!("mqtt: connect to {target}");
-        self.inspector.effect(
-            "MqttConnect",
-            target.clone(),
-            format!("opened connection {id}"),
-        );
-        self.inspector.packet(
-            Direction::Out,
-            Packet::Connect,
-            "",
-            target,
-            false,
-            Delivery::Sent,
-        );
-        let notifier = self.notifier.clone();
-        let link = (self.open)(
-            connect,
-            Box::new(move |item| {
-                notifier.send(match item {
-                    Item::Stream(event, retained) => Signal::Mqtt {
-                        connection: id,
-                        event,
-                        retained,
-                    },
-                    Item::Subscribed(outcome) => Signal::Subscribed {
-                        connection: id,
-                        outcome,
-                    },
-                });
-            }),
-        );
-        self.connections.push(Live { id, request, link });
-        self.current = Some(id);
+    /// Gives the bytes of `request` to the task of its stream. If no stream
+    /// has the connection id of the request, answers `Failed` at once.
+    fn write(&mut self, mut request: Request<Write>) -> Vec<Effect> {
+        let connection = request.operation.connection;
+        let length = request.operation.bytes.len();
+        let entry = format!("connection {connection}: {length} bytes");
+        let Some(live) = self
+            .streams
+            .iter_mut()
+            .find(|live| live.connection == connection)
+        else {
+            self.inspector.effect(
+                "StreamWrite",
+                entry,
+                format!("resolved: Failed ({NOT_OPEN})"),
+            );
+            return resolve(&self.core, &mut request, Written::Failed(NOT_OPEN.into()));
+        };
+        // The task takes the bytes. The request needs only its answer.
+        let bytes = std::mem::take(&mut request.operation.bytes);
+        self.inspector.sent(&mut live.wire, &bytes);
+        live.task.write(bytes);
+        self.writes.push((live.token, request));
+        self.inspector
+            .effect("StreamWrite", entry, "given to the stream");
         Vec::new()
     }
-}
 
-/// Converts the result of a request to the client to a delivery. Logs an
-/// error.
-fn delivery(request: &str, result: Result<(), String>) -> Delivery {
-    match result {
-        Ok(()) => Delivery::Sent,
-        Err(error) => {
-            eprintln!("mqtt: the {request} failed: {error}");
-            Delivery::Failed(error)
-        }
-    }
-}
-
-/// Returns the text of the effect log for a delivery.
-fn outcome(delivery: &Delivery) -> String {
-    match delivery {
-        Delivery::Received => "received".into(),
-        Delivery::Sent => "sent".into(),
-        Delivery::NoConnection => "not sent: no connection".into(),
-        Delivery::Failed(error) => format!("failed: {error}"),
+    /// Closes the stream of `request`, and logs why the core closes it. The
+    /// request ends at the end of the stream. If no stream has the
+    /// connection id of the request, answers at once.
+    fn close(&mut self, mut request: Request<Close>) -> Vec<Effect> {
+        let Close {
+            connection,
+            clean,
+            reason,
+        } = &request.operation;
+        let kind = if *clean { "clean" } else { "failed" };
+        eprintln!("stream: close (connection {connection}, {kind}): {reason}");
+        let entry = format!("connection {connection}, {kind}: {reason}");
+        let connection = *connection;
+        let Some(live) = self
+            .streams
+            .iter_mut()
+            .find(|live| live.connection == connection)
+        else {
+            self.inspector
+                .effect("StreamClose", entry, "resolved: no stream");
+            return resolve(&self.core, &mut request, ());
+        };
+        live.task.close();
+        self.closes.push((live.token, request));
+        self.inspector.effect("StreamClose", entry, "started");
+        Vec::new()
     }
 }
 
@@ -788,104 +726,231 @@ fn resolve<Op: Operation>(
 #[cfg(test)]
 mod tests {
     use std::{
-        sync::{Arc, Mutex, mpsc},
-        time::Duration,
+        future::pending,
+        sync::{Arc, Mutex, MutexGuard, mpsc},
+        time::{Duration, Instant},
     };
 
+    use crux_core::Command;
     use embedded_graphics::prelude::Point;
     use shared::{
-        Control, Event, PowerSource, Settings,
-        capabilities::mqtt::{Connect, Credentials, Message, MqttEvent, Publish, SubscribeOutcome},
+        Control, Effect, Event, PowerSource, Settings,
+        capabilities::stream::{Stream, StreamItem, Written},
+        fake::Broker,
         features::{
+            connection::{KEEP_ALIVE_SECS, RECONNECT_MIN},
             power::IDLE_TIMEOUT,
             refresh::{DRAW_DELAY, FULL_REFRESH_INTERVAL},
         },
+        mqtt::{Credentials, OPEN_TIMEOUT, codec::server::Packet as Received, ping_interval},
     };
-    use tokio::runtime::Runtime;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt, DuplexStream},
+        runtime::Runtime,
+        sync::Notify,
+    };
 
-    use super::{Notifier, Shell, Signal};
+    use super::{NOT_OPEN, Notifier, Shell, Signal};
     use crate::{
-        inspector::{Delivery, Direction, Packet},
-        mqtt::{Link, Opener, Sink},
+        inspector::{Direction, Packet},
+        stream::{Io, Opener, PEER_CLOSED, REPLACED},
     };
 
-    type Log = Arc<Mutex<Vec<String>>>;
+    /// The longest time that a test waits for a condition.
+    const WAIT: Duration = Duration::from_secs(2);
+    /// The time with no signal after which the shell has nothing more to do.
+    const SETTLE: Duration = Duration::from_millis(100);
+    /// The durations of the timers of the features. The timers of the MQTT
+    /// session have other durations.
+    const FEATURE_TIMERS: [Duration; 3] = [DRAW_DELAY, IDLE_TIMEOUT, FULL_REFRESH_INTERVAL];
 
-    /// A connection that only records what the shell asks of it.
-    struct FakeLink {
-        number: usize,
-        log: Log,
+    /// What the fake opener gives.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Mode {
+        /// A stream to the fake broker.
+        Broker,
+        /// A stream whose peer never reads, so a large write waits.
+        Deaf,
+        /// A stream that never opens.
+        Stall,
     }
 
-    impl FakeLink {
-        fn record(&self, text: &str) {
-            self.log
-                .lock()
-                .unwrap()
-                .push(format!("{text} {}", self.number));
+    /// The fake network: the broker, and a log of what the shell asks of it.
+    struct Net {
+        broker: Broker,
+        mode: Mode,
+        /// The number of streams that the opener made.
+        opened: usize,
+        /// The number of the stream that the broker serves.
+        current: usize,
+        /// Wakes the driver of the current stream.
+        nudge: Arc<Notify>,
+        /// If `true`, the driver of the current stream closes the stream at
+        /// the next nudge.
+        hang_up: bool,
+        /// The streams that the opener opened and the packets that the
+        /// broker received, as text, for example `publish <topic> 1`. The
+        /// number is the number of the stream. The core subscribes with
+        /// several SUBSCRIBE packets in a row, which are one line.
+        log: Vec<String>,
+        /// The numbers of the streams that the shell closed, in order.
+        closed: Vec<usize>,
+    }
+
+    type Shared = Arc<Mutex<Net>>;
+
+    impl Net {
+        /// Gives bytes from the stream `number` to the broker, and returns
+        /// the answer. The broker ignores the bytes of an older stream.
+        fn receive(&mut self, number: usize, bytes: Vec<u8>) -> Vec<u8> {
+            if number != self.current {
+                return Vec::new();
+            }
+            let before = self.broker.packets.len();
+            let answer = self.broker.receive(bytes);
+            for packet in &self.broker.packets[before..] {
+                let text = match packet {
+                    Received::Connect { .. } => "connect".to_string(),
+                    Received::Publish { topic, .. } => format!("publish {topic}"),
+                    Received::Subscribe { .. } => "subscribe".to_string(),
+                    Received::PingReq => "ping".to_string(),
+                    Received::Disconnect => "disconnect".to_string(),
+                    Received::PubAck(_) => continue,
+                };
+                let line = format!("{text} {number}");
+                if text == "subscribe" && self.log.last() == Some(&line) {
+                    continue;
+                }
+                self.log.push(line);
+            }
+            answer
+        }
+
+        /// Records that the shell closed the stream `number`. If it is the
+        /// current stream and the broker did not get a DISCONNECT packet, the
+        /// broker publishes the last will.
+        fn close(&mut self, number: usize) {
+            self.closed.push(number);
+            if number == self.current {
+                self.broker.drop_connection();
+            }
         }
     }
 
-    impl Link for FakeLink {
-        fn subscribe(&self, _: &[String]) -> Result<(), String> {
-            self.record("subscribe");
-            Ok(())
-        }
-
-        fn publish(&self, publish: &Publish) -> Result<(), String> {
-            self.record(&format!("publish {}", publish.topic));
-            Ok(())
-        }
-
-        fn disconnect(&self) -> Result<(), String> {
-            self.record("disconnect");
-            Ok(())
-        }
-
-        fn abort(&self) {
-            self.record("abort");
+    /// Serves the stream `number` with the broker until the stream closes.
+    async fn drive(server: DuplexStream, net: Shared, number: usize, nudge: Arc<Notify>) {
+        let (mut reader, mut writer) = tokio::io::split(server);
+        let mut buffer = vec![0; 4096];
+        loop {
+            let answer = tokio::select! {
+                read = reader.read(&mut buffer) => match read {
+                    Ok(length) if length > 0 => {
+                        net.lock().unwrap().receive(number, buffer[..length].to_vec())
+                    }
+                    _ => {
+                        net.lock().unwrap().close(number);
+                        return;
+                    }
+                },
+                () = nudge.notified() => {
+                    let mut net = net.lock().unwrap();
+                    if net.hang_up {
+                        net.hang_up = false;
+                        net.broker.drop_connection();
+                        return;
+                    }
+                    net.broker.take()
+                }
+            };
+            if !answer.is_empty() && writer.write_all(&answer).await.is_err() {
+                return;
+            }
         }
     }
 
-    fn fake_opener(log: &Log) -> Opener {
-        let log = log.clone();
-        let mut count = 0;
-        Box::new(move |_: &Connect, _: Sink| {
-            count += 1;
-            log.lock().unwrap().push(format!("open {count}"));
-            Box::new(FakeLink {
-                number: count,
-                log: log.clone(),
-            }) as Box<dyn Link>
+    /// Returns an opener that opens a stream of the mode of `net`.
+    fn fake_opener(runtime: &Runtime, net: &Shared) -> Opener {
+        let net = net.clone();
+        let runtime = runtime.handle().clone();
+        Box::new(move |_, _| {
+            let mut guard = net.lock().unwrap();
+            guard.opened += 1;
+            let number = guard.opened;
+            guard.log.push(format!("open {number}"));
+            let client = match guard.mode {
+                Mode::Stall => return Box::pin(pending()),
+                Mode::Deaf => {
+                    let (client, server) = tokio::io::duplex(8);
+                    runtime.spawn(async move {
+                        let _server = server;
+                        pending::<()>().await;
+                    });
+                    client
+                }
+                Mode::Broker => {
+                    if let Err(reason) = guard.broker.open() {
+                        return Box::pin(async move { Err(std::io::Error::other(reason)) });
+                    }
+                    guard.current = number;
+                    let nudge = Arc::new(Notify::new());
+                    guard.nudge = nudge.clone();
+                    let (client, server) = tokio::io::duplex(64 * 1024);
+                    runtime.spawn(drive(server, net.clone(), number, nudge));
+                    client
+                }
+            };
+            drop(guard);
+            Box::pin(async move { Ok(Box::new(client) as Box<dyn Io>) })
         })
     }
 
     struct Fixture {
         runtime: Runtime,
         shell: Option<Shell>,
-        log: Log,
+        signals: mpsc::Receiver<Signal>,
+        net: Shared,
     }
 
     impl Fixture {
         fn new() -> Self {
+            Self::with_mode(Mode::Broker)
+        }
+
+        fn with_mode(mode: Mode) -> Self {
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(1)
-                .enable_time()
+                .enable_all()
                 .build()
                 .unwrap();
-            let (sender, _signals) = mpsc::channel();
+            let (sender, signals) = mpsc::channel();
             let notifier = Notifier::new(sender, Arc::new(|| {}));
-            let log = Log::default();
-            let shell = Shell::new(runtime.handle().clone(), notifier, fake_opener(&log));
+            let net = Arc::new(Mutex::new(Net {
+                broker: Broker::default(),
+                mode,
+                opened: 0,
+                current: 0,
+                nudge: Arc::new(Notify::new()),
+                hang_up: false,
+                log: Vec::new(),
+                closed: Vec::new(),
+            }));
+            let open = fake_opener(&runtime, &net);
+            let mut shell = Shell::new(runtime.handle().clone(), notifier, open);
+            shell.flush_limit = Duration::from_millis(50);
             Self {
                 runtime,
                 shell: Some(shell),
-                log,
+                signals,
+                net,
             }
         }
 
         fn shell(&mut self) -> &mut Shell {
             self.shell.as_mut().unwrap()
+        }
+
+        fn net(&self) -> MutexGuard<'_, Net> {
+            self.net.lock().unwrap()
         }
 
         fn start(&mut self, power: PowerSource) {
@@ -909,29 +974,91 @@ mod tests {
                 .start(settings, power, Some("/room/living_room".into()));
         }
 
-        fn mqtt(&mut self, connection: u64, event: MqttEvent) {
-            self.shell().handle(Signal::Mqtt {
-                connection,
-                event,
-                retained: false,
+        /// Gives the signals of the stream tasks to the shell until `done`
+        /// is `true`. The timers of the shell do not fire by themselves: a
+        /// test sends their signals. Panics after [`WAIT`].
+        fn until(&mut self, what: &str, done: impl Fn(&mut Self) -> bool) {
+            let deadline = Instant::now() + WAIT;
+            while !done(self) {
+                assert!(Instant::now() < deadline, "no {what} after {WAIT:?}");
+                self.next(Duration::from_millis(5));
+            }
+        }
+
+        /// Gives the signals of the stream tasks to the shell until no
+        /// signal arrives for [`SETTLE`].
+        fn settle(&mut self) {
+            while self.next(SETTLE) {}
+        }
+
+        /// Gives the next signal of a stream task to the shell. Drops a
+        /// timer signal. Returns `false` if no signal arrived in `wait`.
+        fn next(&mut self, wait: Duration) -> bool {
+            match self.signals.recv_timeout(wait) {
+                Ok(Signal::Timer { .. }) => true,
+                Ok(signal) => {
+                    self.shell().handle(signal);
+                    true
+                }
+                Err(_) => false,
+            }
+        }
+
+        /// Waits until the core gets the SUBACK packet of the next
+        /// connection, after the broker sent the retained messages.
+        fn connect(&mut self) {
+            let quiet = self.shell().quiet_count();
+            self.until("SUBACK", |fixture| fixture.shell().quiet_count() > quiet);
+        }
+
+        /// Waits until the core reaches the `Sleep` effect.
+        fn sleep(&mut self) {
+            self.until("Sleep", |fixture| fixture.shell().sleep.is_some());
+        }
+
+        /// Waits until the log has at least `count` lines, then takes it.
+        fn wait_log(&mut self, count: usize) -> Vec<String> {
+            self.until("log", |fixture| fixture.net().log.len() >= count);
+            self.take_log()
+        }
+
+        fn take_log(&self) -> Vec<String> {
+            std::mem::take(&mut self.net().log)
+        }
+
+        /// Publishes a retained message from Home Assistant, and waits until
+        /// the shell received it.
+        fn publish(&mut self, topic: &str, payload: &str) {
+            let messages = self.shell().inspector().messages;
+            {
+                let mut net = self.net();
+                net.broker.publish(topic, payload.as_bytes(), true);
+                net.nudge.notify_one();
+            }
+            self.until("message", |fixture| {
+                fixture.shell().inspector().messages > messages
             });
         }
 
         /// Starts the core as [`Fixture::start`] does, and returns the id
-        /// and the token of each timer that the start started, in the order
-        /// in which the shell started them.
+        /// and the token of each feature timer that the start started, in
+        /// the order in which the shell started them.
         fn start_timers(&mut self, power: PowerSource) -> Vec<(crux_time::TimerId, u64)> {
-            let before = running(self.shell());
-            self.start(power);
-            running(self.shell())
-                .into_iter()
-                .filter(|timer| !before.contains(timer))
-                .collect()
+            self.new_timers(|shell| {
+                let settings = Settings {
+                    device_id: "test".into(),
+                    host: "localhost".into(),
+                    port: 1883,
+                    credentials: None,
+                    read_only: false,
+                };
+                shell.start(settings, power, Some("/room/living_room".into()));
+            })
         }
 
         /// Runs `action` on the shell, and returns the id and the token of
-        /// each timer that the action started, in the order in which the
-        /// shell started them.
+        /// each feature timer that the action started, in the order in
+        /// which the shell started them.
         fn new_timers(
             &mut self,
             action: impl FnOnce(&mut Shell),
@@ -944,28 +1071,76 @@ mod tests {
                 .collect()
         }
 
-        fn take_log(&self) -> Vec<String> {
-            std::mem::take(&mut *self.log.lock().unwrap())
+        /// Returns the outcomes in the effect log of `effect`, from the
+        /// newest.
+        fn outcomes(&mut self, effect: &str) -> Vec<String> {
+            self.shell()
+                .inspector()
+                .effects
+                .iter()
+                .filter(|entry| entry.effect == effect)
+                .map(|entry| format!("{}: {}", entry.request, entry.outcome))
+                .collect()
+        }
+
+        /// Returns the names in the effect log, from the newest.
+        fn effects(&mut self) -> Vec<&'static str> {
+            self.shell()
+                .inspector()
+                .effects
+                .iter()
+                .map(|entry| entry.effect)
+                .collect()
         }
     }
 
-    /// Returns the id and the token of each timer that runs.
-    /// The shell keeps the timers in a map, so this function sorts them by
-    /// their tokens, which increase in the order of the starts.
+    /// Returns the id and the token of each feature timer that runs. The
+    /// shell keeps the timers in a map, so this function sorts them by their
+    /// tokens, which increase in the order of the starts.
     fn running(shell: &Shell) -> Vec<(crux_time::TimerId, u64)> {
         let mut timers: Vec<_> = shell
             .timers
             .iter()
+            .filter(|(_, timer)| {
+                FEATURE_TIMERS.contains(&Duration::from(timer.request.operation.duration))
+            })
             .map(|(id, timer)| (*id, timer.token))
             .collect();
         timers.sort_by_key(|(_, token)| *token);
         timers
     }
 
+    /// Returns the durations of the feature timers that run.
+    fn durations(shell: &Shell) -> Vec<Duration> {
+        let mut durations: Vec<_> = shell
+            .timers
+            .values()
+            .map(|timer| Duration::from(timer.request.operation.duration))
+            .filter(|duration| FEATURE_TIMERS.contains(duration))
+            .collect();
+        durations.sort();
+        durations
+    }
+
+    /// Returns `true` if a timer with `duration` runs.
+    fn runs(shell: &Shell, duration: Duration) -> bool {
+        shell
+            .timers
+            .values()
+            .any(|timer| Duration::from(timer.request.operation.duration) == duration)
+    }
+
+    /// Gives the effects of `command` to the shell, as if the core asked for
+    /// them.
+    fn perform(fixture: &mut Fixture, command: &mut Command<Effect, Event>) {
+        let effects: Vec<Effect> = command.effects().collect();
+        fixture.shell().process(effects);
+    }
+
     #[test]
     fn a_timer_signal_with_an_old_token_is_ignored() {
         let mut fixture = Fixture::new();
-        // The first timer that the start started.
+        // The first feature timer that the start started.
         let (id, token) = fixture.start_timers(PowerSource::Battery)[0];
 
         // A signal from an aborted task that had the same id.
@@ -980,111 +1155,275 @@ mod tests {
     }
 
     #[test]
-    fn a_new_connection_disconnects_the_old_one_and_stays_current() {
+    fn the_core_sends_the_status_and_the_subscribe_after_the_connack() {
         let mut fixture = Fixture::new();
-        fixture.start(PowerSource::Battery);
-        fixture.mqtt(1, MqttEvent::Connected);
+        fixture.start(PowerSource::Stand);
+        fixture.connect();
         assert_eq!(
             fixture.take_log(),
-            ["open 1", "publish dashboard/test/status 1", "subscribe 1"]
+            [
+                "open 1",
+                "connect 1",
+                "publish dashboard/test/status 1",
+                "subscribe 1"
+            ]
         );
-
-        // The idle time ends: the core publishes `asleep`, disconnects and
-        // sleeps.
-        assert!(fixture.shell().sleep_now());
-        assert!(fixture.shell().view().asleep);
-        assert_eq!(
-            fixture.take_log(),
-            ["publish dashboard/test/status 1", "disconnect 1"]
-        );
-
-        // A tap before the old stream ends wakes the core, which opens a
-        // second connection. The old connection is not aborted, so its
-        // disconnect completes.
-        fixture.shell().tap(Point::new(1, 1));
-        assert_eq!(fixture.take_log(), ["open 2"]);
-
-        // The old stream ends. The core ignores it, and the new connection
-        // stays current.
-        fixture.mqtt(1, MqttEvent::Disconnected { reason: None });
-        fixture.mqtt(2, MqttEvent::Connected);
-        assert_eq!(
-            fixture.take_log(),
-            ["publish dashboard/test/status 2", "subscribe 2"]
-        );
+        assert!(fixture.shell().current_connection().is_some());
         assert_eq!(
             fixture.shell().view().connection,
             shared::Connection::Online
         );
     }
 
-    /// Returns the number of `WifiQuiet` entries in the effect log.
-    fn quiet_count(fixture: &mut Fixture) -> usize {
-        fixture
+    #[test]
+    fn a_wake_during_the_close_replaces_the_stream_that_closes() {
+        let mut fixture = Fixture::new();
+        fixture.start(PowerSource::Battery);
+        fixture.connect();
+        fixture.take_log();
+        let old = fixture.shell().current_connection().unwrap();
+
+        // The idle time ends: the core publishes `asleep` and disconnects.
+        assert!(fixture.shell().sleep_now());
+        assert!(fixture.shell().view().asleep);
+
+        // A tap before the DISCONNECT packet is sent wakes the core. When the
+        // packet is sent, the core closes the stream and connects again at
+        // once. The new stream replaces the stream that closes.
+        fixture.shell().tap(Point::new(1, 1));
+        fixture.connect();
+        let replaced = format!("connection {old}: item: Closed ({REPLACED})");
+        assert!(fixture.outcomes("StreamOpen").contains(&replaced));
+        assert_eq!(
+            fixture.take_log(),
+            [
+                "publish dashboard/test/status 1",
+                "disconnect 1",
+                "open 2",
+                "connect 2",
+                "publish dashboard/test/status 2",
+                "subscribe 2"
+            ]
+        );
+        fixture.until("the close of stream 1", |fixture| {
+            fixture.net().closed == [1]
+        });
+        assert_eq!(
+            fixture.shell().view().connection,
+            shared::Connection::Online
+        );
+    }
+
+    #[test]
+    fn the_link_is_quiet_after_the_suback() {
+        let mut fixture = Fixture::new();
+        fixture.net().broker.hold_suback = true;
+        fixture.start(PowerSource::Stand);
+        fixture.wait_log(4);
+        fixture.settle();
+        assert_eq!(fixture.shell().quiet_count(), 0);
+
+        let mut fixture = Fixture::new();
+        fixture.start(PowerSource::Stand);
+        fixture.connect();
+        assert_eq!(fixture.shell().quiet_count(), 1);
+    }
+
+    #[test]
+    fn a_stream_that_ends_before_the_suback_leaves_the_link_not_quiet() {
+        let mut fixture = Fixture::new();
+        fixture.net().broker.hold_suback = true;
+        fixture.start(PowerSource::Stand);
+        fixture.wait_log(4);
+        {
+            let mut net = fixture.net();
+            net.hang_up = true;
+            net.nudge.notify_one();
+        }
+        fixture.until("the end of the stream", |fixture| {
+            fixture.shell().current_connection().is_none()
+        });
+        fixture.settle();
+        assert_eq!(fixture.shell().quiet_count(), 0);
+    }
+
+    #[test]
+    fn a_peer_that_closes_the_stream_makes_the_core_connect_again() {
+        let mut fixture = Fixture::new();
+        fixture.start(PowerSource::Stand);
+        fixture.connect();
+        {
+            let mut net = fixture.net();
+            net.hang_up = true;
+            net.nudge.notify_one();
+        }
+        fixture.until("the end of the stream", |fixture| {
+            fixture.shell().current_connection().is_none()
+        });
+
+        assert_ne!(
+            fixture.shell().view().connection,
+            shared::Connection::Online
+        );
+        assert!(
+            fixture.outcomes("StreamOpen")[0].ends_with(&format!("item: Closed ({PEER_CLOSED})"))
+        );
+        // The stream ended, so the `Close` of the core has no stream.
+        assert!(fixture.outcomes("StreamClose")[0].ends_with("resolved: no stream"));
+        // The broker lost the client, so it published the last will.
+        assert_eq!(
+            fixture.net().broker.retained("dashboard/test/status"),
+            Some("offline")
+        );
+        // The core waits, then connects again.
+        assert!(runs(fixture.shell(), RECONNECT_MIN));
+    }
+
+    #[test]
+    fn a_stream_that_does_not_open_in_time_is_closed() {
+        let mut fixture = Fixture::with_mode(Mode::Stall);
+        fixture.start(PowerSource::Stand);
+        assert_eq!(fixture.take_log(), ["open 1"]);
+        let connection = fixture.shell().current_connection().unwrap();
+        // The core owns the timeout of the open. Its timer expires.
+        let (&id, timer) = fixture
             .shell()
-            .inspector()
-            .effects
+            .timers
             .iter()
-            .filter(|entry| entry.effect == "WifiQuiet")
-            .count()
+            .find(|(_, timer)| Duration::from(timer.request.operation.duration) == OPEN_TIMEOUT)
+            .expect("the open timer");
+        let token = timer.token;
+        fixture.shell().handle(Signal::Timer { id, token });
+
+        // The core closes the stream. The task stops the open, the stream
+        // ends, and then the shell answers the `Close`.
+        fixture.until("the end of the stream", |fixture| {
+            fixture.shell().current_connection().is_none()
+        });
+        assert_eq!(
+            fixture.outcomes("StreamClose"),
+            [
+                format!("connection {connection}: resolved: closed"),
+                format!(
+                    "connection {connection}, failed: the stream did not open in time: started"
+                ),
+            ]
+        );
+        assert!(runs(fixture.shell(), RECONNECT_MIN));
     }
 
     #[test]
-    fn a_suback_answers_the_subscribe_and_the_link_is_quiet() {
+    fn a_newer_open_replaces_the_open_stream() {
         let mut fixture = Fixture::new();
         fixture.start(PowerSource::Stand);
-        fixture.mqtt(1, MqttEvent::Connected);
-        assert_eq!(quiet_count(&mut fixture), 0);
+        fixture.connect();
+        fixture.take_log();
+        let old = fixture.shell().current_connection().unwrap();
 
-        fixture.shell().handle(Signal::Subscribed {
-            connection: 1,
-            outcome: SubscribeOutcome::Done,
+        let mut open = Stream::open(9, "localhost".into(), 1883).then_send(|item| Event::Stream {
+            connection: 9,
+            item,
         });
-        assert_eq!(quiet_count(&mut fixture), 1);
+        perform(&mut fixture, &mut open);
+        // The old stream ends at once, and the core ends its session.
+        let closed = format!("connection {old}: item: Closed ({REPLACED})");
+        assert!(fixture.outcomes("StreamOpen").contains(&closed));
+        assert_ne!(
+            fixture.shell().view().connection,
+            shared::Connection::Online
+        );
+
+        fixture.until("the new stream", |fixture| {
+            fixture.outcomes("StreamOpen")[0] == "connection 9: item: Opened"
+        });
+        assert_eq!(fixture.take_log(), ["open 2"]);
+        let events: Vec<Event> = open.events().collect();
+        assert!(matches!(
+            events.as_slice(),
+            [Event::Stream {
+                connection: 9,
+                item: StreamItem::Opened
+            }]
+        ));
+        assert_eq!(fixture.shell().current_connection(), Some(9));
     }
 
     #[test]
-    fn a_stream_that_ends_before_the_suback_fails_the_subscribe() {
-        let mut fixture = Fixture::new();
+    fn a_close_cancels_a_write_that_waits() {
+        let mut fixture = Fixture::with_mode(Mode::Deaf);
         fixture.start(PowerSource::Stand);
-        fixture.mqtt(1, MqttEvent::Connected);
-        fixture.mqtt(1, MqttEvent::Disconnected { reason: None });
-
-        // The shell answered `Failed` at the end of the stream, so a late
-        // SUBACK has no request, and the link is not quiet.
-        fixture.shell().handle(Signal::Subscribed {
-            connection: 1,
-            outcome: SubscribeOutcome::Done,
+        // The peer does not read, so the CONNECT packet waits.
+        fixture.until("the CONNECT packet", |fixture| {
+            !fixture.outcomes("StreamWrite").is_empty()
         });
-        assert_eq!(quiet_count(&mut fixture), 0);
+        fixture.settle();
+        let connection = fixture.shell().current_connection().unwrap();
+
+        let mut close = Stream::close(connection, false, "a test".into())
+            .then_send(move |()| Event::StreamClosed { connection });
+        perform(&mut fixture, &mut close);
+        fixture.until("the end of the stream", |fixture| {
+            fixture.shell().current_connection().is_none()
+        });
+
+        assert_eq!(
+            fixture.outcomes("StreamWrite")[0],
+            format!("connection {connection}: resolved: Failed (closed)")
+        );
+        let events: Vec<Event> = close.events().collect();
+        assert!(matches!(
+            events.as_slice(),
+            [Event::StreamClosed { connection: closed }] if *closed == connection
+        ));
+    }
+
+    #[test]
+    fn a_request_for_a_stream_that_is_not_open_is_answered_at_once() {
+        let mut fixture = Fixture::new();
+        let mut write = Stream::write(4, vec![0xC0, 0x00]).then_send(|outcome| Event::Written {
+            connection: 4,
+            outcome,
+        });
+        perform(&mut fixture, &mut write);
+        let events: Vec<Event> = write.events().collect();
+        assert!(matches!(
+            events.as_slice(),
+            [Event::Written { connection: 4, outcome: Written::Failed(reason) }] if reason == NOT_OPEN
+        ));
+
+        let mut close = Stream::close(4, true, "a test".into())
+            .then_send(|()| Event::StreamClosed { connection: 4 });
+        perform(&mut fixture, &mut close);
+        assert_eq!(close.events().count(), 1);
     }
 
     #[test]
     fn a_tap_on_a_tile_publishes_the_service_call_of_the_core() {
         let mut fixture = Fixture::new();
         fixture.start(PowerSource::Stand);
-        fixture.mqtt(1, MqttEvent::Connected);
+        fixture.connect();
         fixture.take_log();
         let tile = ui::layout::tile(0).unwrap().center();
         fixture.shell().tap(tile);
-        assert_eq!(fixture.take_log(), ["publish dashboard/test/cmd 1"]);
+        assert_eq!(fixture.wait_log(1), ["publish dashboard/test/cmd 1"]);
     }
 
     #[test]
     fn a_dry_run_in_the_settings_reaches_the_core() {
         let mut fixture = Fixture::new();
         fixture.start_with(PowerSource::Stand, None, true);
-        fixture.mqtt(1, MqttEvent::Connected);
+        fixture.connect();
         fixture.take_log();
         assert!(fixture.shell().view().read_only);
 
         let tile = ui::layout::tile(0).unwrap().center();
         fixture.shell().tap(tile);
+        fixture.settle();
         assert_eq!(fixture.take_log(), Vec::<String>::new());
 
         fixture.shell().send(Event::SetReadOnly(false));
         fixture.shell().tap(tile);
-        assert_eq!(fixture.take_log(), ["publish dashboard/test/cmd 1"]);
+        assert_eq!(fixture.wait_log(1), ["publish dashboard/test/cmd 1"]);
     }
 
     #[test]
@@ -1099,67 +1438,73 @@ mod tests {
     }
 
     #[test]
-    fn drop_stops_the_connections_and_the_timers() {
+    fn drop_stops_the_streams_and_the_timers() {
         let mut fixture = Fixture::new();
         fixture.start(PowerSource::Battery);
-        fixture.mqtt(1, MqttEvent::Connected);
-        fixture.take_log();
+        fixture.connect();
+        // The idle timer and the full-refresh timer.
+        assert_eq!(running(fixture.shell()).len(), 2);
         let tasks: Vec<_> = fixture
             .shell()
             .timers
             .values()
             .map(|timer| timer.task.abort_handle())
             .collect();
-        // The idle timer and the full-refresh timer.
-        assert_eq!(tasks.len(), 2);
 
         drop(fixture.shell.take());
-        assert_eq!(fixture.take_log(), ["abort 1"]);
-        fixture
-            .runtime
-            .block_on(async { tokio::time::sleep(Duration::from_millis(20)).await });
-        assert!(tasks.iter().all(tokio::task::AbortHandle::is_finished));
+        // The stream stops with no DISCONNECT packet, so the broker
+        // publishes the last will, as for a device that loses power.
+        let deadline = Instant::now() + WAIT;
+        while fixture.net().closed.is_empty()
+            || !tasks.iter().all(tokio::task::AbortHandle::is_finished)
+        {
+            assert!(Instant::now() < deadline, "a task did not stop");
+            fixture
+                .runtime
+                .block_on(async { tokio::time::sleep(Duration::from_millis(5)).await });
+        }
+        assert_eq!(
+            fixture.net().broker.retained("dashboard/test/status"),
+            Some("offline")
+        );
     }
 
     #[test]
     fn the_mqtt_log_has_the_messages_in_and_out() {
         let mut fixture = Fixture::new();
+        let topic = "homeassistant/statestream/light/living_room_lights/state";
+        fixture.net().broker.retain(topic, b"on");
         fixture.start(PowerSource::Stand);
-        fixture.mqtt(1, MqttEvent::Connected);
-        let topic = "homeassistant/statestream/light/kitchen/state";
-        fixture.shell().handle(Signal::Mqtt {
-            connection: 1,
-            event: MqttEvent::Message(Message {
-                topic: topic.into(),
-                payload: b"on".to_vec(),
-            }),
-            retained: true,
-        });
+        fixture.connect();
+        fixture.settle();
 
         let log = &fixture.shell().inspector().mqtt;
-        let newest = log.iter().next().unwrap();
-        assert_eq!(
-            (newest.direction, newest.packet, newest.topic.as_str()),
-            (Direction::In, Packet::Publish, topic)
-        );
+        let newest = log
+            .iter()
+            .find(|entry| entry.direction == Direction::In && entry.packet == Packet::Publish)
+            .unwrap();
+        assert_eq!(newest.topic, topic);
         assert_eq!(newest.payload, "on");
         assert!(newest.retained);
-        assert_eq!(newest.delivery, Delivery::Received);
 
         let packets: Vec<_> = log.iter().map(|entry| entry.packet).collect();
         assert_eq!(packets.last(), Some(&Packet::Connect));
         assert!(packets.contains(&Packet::ConnAck));
-        // One subscribe request is one entry, with all its topics.
+        // One subscribe packet is one entry, with all its topics. The
+        // broker answers each one.
         let subscribes: Vec<_> = log
             .iter()
             .filter(|entry| entry.packet == Packet::Subscribe)
             .collect();
-        assert_eq!(subscribes.len(), 1);
-        assert_eq!(
-            subscribes[0].topic,
-            format!("{} topics", subscribes[0].topics.len())
-        );
-        assert!(subscribes[0].topics.len() > 1);
+        for subscribe in &subscribes {
+            assert_eq!(
+                subscribe.topic,
+                format!("{} topics", subscribe.topics.len())
+            );
+            assert!(subscribe.topics.len() > 1);
+        }
+        let subacks = packets.iter().filter(|packet| **packet == Packet::SubAck);
+        assert_eq!(subacks.count(), subscribes.len());
         // A message is not an effect, so the effect log does not have it.
         assert!(
             fixture
@@ -1169,6 +1514,41 @@ mod tests {
                 .iter()
                 .all(|entry| !entry.request.contains(topic))
         );
+    }
+
+    #[test]
+    fn the_mqtt_log_has_the_pings() {
+        let mut fixture = Fixture::new();
+        fixture.start(PowerSource::Stand);
+        fixture.connect();
+        fixture.take_log();
+        // The ping timer of the session expires.
+        let interval = ping_interval(KEEP_ALIVE_SECS);
+        let (&id, timer) = fixture
+            .shell()
+            .timers
+            .iter()
+            .find(|(_, timer)| Some(Duration::from(timer.request.operation.duration)) == interval)
+            .expect("the ping timer");
+        let token = timer.token;
+        fixture.shell().handle(Signal::Timer { id, token });
+        assert_eq!(fixture.wait_log(1), ["ping 1"]);
+        fixture.until("PINGRESP", |fixture| {
+            let mqtt = &fixture.shell().inspector().mqtt;
+            mqtt.iter()
+                .filter(|entry| entry.packet == Packet::Ping)
+                .count()
+                == 2
+        });
+        let pings: Vec<_> = fixture
+            .shell()
+            .inspector()
+            .mqtt
+            .iter()
+            .filter(|entry| entry.packet == Packet::Ping)
+            .map(|entry| entry.direction)
+            .collect();
+        assert_eq!(pings, [Direction::In, Direction::Out]);
     }
 
     #[test]
@@ -1182,7 +1562,7 @@ mod tests {
             }),
             false,
         );
-        fixture.mqtt(1, MqttEvent::Connected);
+        fixture.connect();
         let inspector = fixture.shell().inspector();
         let effects = inspector
             .effects
@@ -1201,31 +1581,25 @@ mod tests {
     fn the_effect_log_has_the_effects_and_their_answers() {
         let mut fixture = Fixture::new();
         let timers = fixture.start_timers(PowerSource::Battery);
-        fixture.mqtt(1, MqttEvent::Connected);
+        fixture.connect();
         // The timers of the start expire, in order. On battery, one of them
         // is the idle timer, so the core sleeps.
         for (id, token) in timers {
             fixture.shell().handle(Signal::Timer { id, token });
         }
         assert!(fixture.shell().view().asleep);
-        // The stream ends, so the `Disconnect` request ends, and the core
+        // The stream closes, so the `Close` request ends, and the core
         // continues to sleep.
-        fixture.mqtt(1, MqttEvent::Disconnected { reason: None });
-        let effects: Vec<_> = fixture
-            .shell()
-            .inspector()
-            .effects
-            .iter()
-            .map(|entry| entry.effect)
-            .collect();
+        fixture.sleep();
+        let effects = fixture.effects();
         for name in [
             "Render",
             "WifiOn",
-            "MqttConnect",
-            "MqttSubscribe",
-            "MqttPublish",
+            "StreamOpen",
+            "StreamWrite",
+            "StreamClose",
             "TimeNotifyAfter",
-            "MqttDisconnect",
+            "WifiQuiet",
             "Sleep",
         ] {
             assert!(effects.contains(&name), "{name} is not in {effects:?}");
@@ -1245,39 +1619,31 @@ mod tests {
 
         let mut fixture = Fixture::new();
         fixture.start(PowerSource::Battery);
-        fixture.mqtt(1, MqttEvent::Connected);
+        fixture.connect();
         assert_eq!(fixture.shell().light(), 0);
 
         // The shell answers `FrontLight` at once.
         fixture.shell().tap(Point::new(1, 1));
         assert_eq!(fixture.shell().light(), BATTERY_LEVEL);
 
-        // The sleep turns the light off before it disconnects.
+        // The sleep turns the light off before it closes the stream.
         assert!(fixture.shell().sleep_now());
         assert_eq!(fixture.shell().light(), 0);
-        let effects: Vec<_> = fixture
-            .shell()
-            .inspector()
-            .effects
-            .iter()
-            .map(|entry| entry.effect)
-            .collect();
+        fixture.sleep();
+        let effects = fixture.effects();
         // The log has the newest entry first.
         let light = effects.iter().position(|effect| *effect == "FrontLight");
-        let disconnect = effects
-            .iter()
-            .position(|effect| *effect == "MqttDisconnect");
-        assert!(disconnect.is_some() && disconnect < light, "{effects:?}");
+        let close = effects.iter().position(|effect| *effect == "StreamClose");
+        assert!(close.is_some() && close < light, "{effects:?}");
     }
 
     #[test]
     fn a_tap_while_sleep_waits_answers_sleep_with_the_control() {
         let mut fixture = Fixture::new();
         fixture.start(PowerSource::Battery);
-        fixture.mqtt(1, MqttEvent::Connected);
+        fixture.connect();
         assert!(fixture.shell().sleep_now());
-        fixture.mqtt(1, MqttEvent::Disconnected { reason: None });
-        assert!(fixture.shell().sleep.is_some());
+        fixture.sleep();
         fixture.take_log();
 
         // A tap on a tile wakes the device and acts on the tile. The
@@ -1287,7 +1653,7 @@ mod tests {
         assert!(fixture.shell().sleep.is_none());
         assert!(!fixture.shell().view().asleep);
         assert_eq!(fixture.take_log(), ["open 2"]);
-        fixture.mqtt(2, MqttEvent::Connected);
+        fixture.connect();
         let log = fixture.take_log();
         assert!(
             log.contains(&"publish dashboard/test/cmd 2".into()),
@@ -1296,6 +1662,7 @@ mod tests {
 
         // With no `Sleep` request, the Wake button does nothing.
         fixture.shell().wake();
+        fixture.settle();
         assert_eq!(fixture.take_log(), Vec::<String>::new());
     }
 
@@ -1303,10 +1670,9 @@ mod tests {
     fn the_stand_while_sleep_waits_answers_sleep() {
         let mut fixture = Fixture::new();
         fixture.start(PowerSource::Battery);
-        fixture.mqtt(1, MqttEvent::Connected);
+        fixture.connect();
         assert!(fixture.shell().sleep_now());
-        fixture.mqtt(1, MqttEvent::Disconnected { reason: None });
-        assert!(fixture.shell().sleep.is_some());
+        fixture.sleep();
 
         fixture.shell().set_power_source(PowerSource::Stand);
         assert!(fixture.shell().sleep.is_none());
@@ -1320,41 +1686,32 @@ mod tests {
         assert!(answered);
     }
 
-    /// Returns the durations of the timers that run.
-    fn durations(shell: &Shell) -> Vec<Duration> {
-        shell
-            .timers
-            .values()
-            .map(|timer| Duration::from(timer.request.operation.duration))
-            .collect()
-    }
-
     #[test]
     fn sleep_now_ends_the_idle_time_and_the_core_sleeps() {
         let mut fixture = Fixture::new();
         fixture.start(PowerSource::Battery);
-        fixture.mqtt(1, MqttEvent::Connected);
+        fixture.connect();
         fixture.take_log();
         assert!(fixture.shell().can_sleep_now());
 
         assert!(fixture.shell().sleep_now());
-        // The core goes through its normal path to sleep.
+        // The core goes through its normal path to sleep. It waits for the
+        // end of the stream before the next step.
         assert!(fixture.shell().view().asleep);
+        assert!(fixture.shell().sleep.is_none());
+        fixture.sleep();
         assert_eq!(
             fixture.take_log(),
             ["publish dashboard/test/status 1", "disconnect 1"]
         );
-        // The core waits for the end of the connection before the next step.
-        assert!(fixture.shell().sleep.is_none());
-        fixture.mqtt(1, MqttEvent::Disconnected { reason: None });
-        assert!(fixture.shell().sleep.is_some());
-        let effects: Vec<_> = fixture
-            .shell()
-            .inspector()
-            .effects
-            .iter()
-            .map(|entry| entry.effect)
-            .collect();
+        // The broker got the DISCONNECT packet before the stream closed, so
+        // it kept `asleep` and did not publish the last will.
+        assert_eq!(fixture.net().closed, [1]);
+        assert_eq!(
+            fixture.net().broker.retained("dashboard/test/status"),
+            Some("asleep")
+        );
+        let effects = fixture.effects();
         for name in ["WifiOff", "Render", "Sleep"] {
             assert!(effects.contains(&name), "{name} is not in {effects:?}");
         }
@@ -1365,12 +1722,13 @@ mod tests {
     fn sleep_now_does_nothing_on_the_stand() {
         let mut fixture = Fixture::new();
         fixture.start(PowerSource::Stand);
-        fixture.mqtt(1, MqttEvent::Connected);
+        fixture.connect();
         fixture.take_log();
 
         assert!(!fixture.shell().can_sleep_now());
         assert!(!fixture.shell().sleep_now());
         assert!(!fixture.shell().view().asleep);
+        fixture.settle();
         assert_eq!(fixture.take_log(), Vec::<String>::new());
     }
 
@@ -1378,29 +1736,25 @@ mod tests {
     fn sleep_now_sends_an_intent_and_does_not_fire_a_timer() {
         let mut fixture = Fixture::new();
         fixture.start(PowerSource::Battery);
-        fixture.mqtt(1, MqttEvent::Connected);
+        fixture.connect();
         // A state message for a tile on the page (the living room) starts the
         // draw timer.
-        fixture.mqtt(
-            1,
-            MqttEvent::Message(Message {
-                topic: "homeassistant/statestream/light/living_room_lights/state".into(),
-                payload: b"on".to_vec(),
-            }),
+        fixture.publish(
+            "homeassistant/statestream/light/living_room_lights/state",
+            "on",
         );
-        let mut running = durations(fixture.shell());
-        running.sort();
-        assert_eq!(running, [DRAW_DELAY, IDLE_TIMEOUT, FULL_REFRESH_INTERVAL]);
+        assert_eq!(
+            durations(fixture.shell()),
+            [DRAW_DELAY, IDLE_TIMEOUT, FULL_REFRESH_INTERVAL]
+        );
 
         assert!(fixture.shell().sleep_now());
         assert!(fixture.shell().view().asleep);
-        fixture.mqtt(1, MqttEvent::Disconnected { reason: None });
+        fixture.sleep();
         // The core clears the full-refresh timer before it sleeps. The draw
         // timer and the idle timer still run. They are now stale, and they
         // do nothing when they fire.
-        let mut running = durations(fixture.shell());
-        running.sort();
-        assert_eq!(running, [DRAW_DELAY, IDLE_TIMEOUT]);
+        assert_eq!(durations(fixture.shell()), [DRAW_DELAY, IDLE_TIMEOUT]);
     }
 
     #[test]
@@ -1424,19 +1778,13 @@ mod tests {
     /// A change of a tile on the dining room page: the state, then the time
     /// of the update from Home Assistant. On the dining room page,
     /// `last_sync` is then this time.
-    fn state_message(fixture: &mut Fixture, connection: u64) {
+    fn state_message(fixture: &mut Fixture) {
         let base = "homeassistant/statestream/light/dining_room_lights";
         for (key, payload) in [
             ("state", "on"),
             ("last_updated", "2026-11-08T14:03:21+00:00"),
         ] {
-            fixture.mqtt(
-                connection,
-                MqttEvent::Message(Message {
-                    topic: format!("{base}/{key}"),
-                    payload: payload.as_bytes().to_vec(),
-                }),
-            );
+            fixture.publish(&format!("{base}/{key}"), payload);
         }
     }
 
@@ -1444,30 +1792,32 @@ mod tests {
     fn restart_keeps_the_page_and_the_last_update_and_connects_again() {
         let mut fixture = Fixture::new();
         fixture.start(PowerSource::Battery);
-        fixture.mqtt(1, MqttEvent::Connected);
+        fixture.connect();
+        let first = fixture.shell().current_connection();
         fixture.shell().send(Event::NextPage);
         fixture.shell().send(Event::BatteryChanged(Some(64)));
-        state_message(&mut fixture, 1);
+        state_message(&mut fixture);
         let before = fixture.shell().view();
         assert!(before.last_sync.is_some());
         assert_eq!(before.path, "/room/dining_room");
         assert!(fixture.shell().sleep_now());
+        fixture.sleep();
         assert!(fixture.shell().can_restart());
         fixture.take_log();
 
         assert!(fixture.shell().restart());
 
-        // The shell aborts the old connection, and the new core opens a new
-        // one.
-        assert_eq!(fixture.take_log(), ["abort 1", "open 2"]);
+        // The new core opens a new stream.
+        assert_eq!(fixture.take_log(), ["open 2"]);
         let after = fixture.shell().view();
         assert_eq!(after.path, before.path);
         assert_eq!(after.last_sync, before.last_sync);
         // The new core gets the charge again, as the view rounds it.
         assert_eq!(after.battery, Some(65));
         assert!(!after.asleep);
-        assert_eq!(fixture.shell().current_connection(), Some(2));
-        fixture.mqtt(2, MqttEvent::Connected);
+        // The new core counts its connections from the start again.
+        assert_eq!(fixture.shell().current_connection(), first);
+        fixture.connect();
         assert_eq!(
             fixture.shell().view().connection,
             shared::Connection::Online
@@ -1478,14 +1828,16 @@ mod tests {
     fn restart_while_awake_does_nothing() {
         let mut fixture = Fixture::new();
         fixture.start(PowerSource::Battery);
-        fixture.mqtt(1, MqttEvent::Connected);
+        fixture.connect();
+        let first = fixture.shell().current_connection();
         fixture.take_log();
         let before = fixture.shell().view();
 
         assert!(!fixture.shell().can_restart());
         assert!(!fixture.shell().restart());
         assert_eq!(fixture.shell().view(), before);
-        assert_eq!(fixture.shell().current_connection(), Some(1));
+        assert_eq!(fixture.shell().current_connection(), first);
+        fixture.settle();
         assert_eq!(fixture.take_log(), Vec::<String>::new());
     }
 
@@ -1493,7 +1845,7 @@ mod tests {
     fn restart_keeps_a_dry_run_that_the_user_switched_on() {
         let mut fixture = Fixture::new();
         fixture.start_with(PowerSource::Battery, None, false);
-        fixture.mqtt(1, MqttEvent::Connected);
+        fixture.connect();
         fixture.shell().send(Event::SetReadOnly(true));
         assert!(fixture.shell().view().read_only);
         assert!(fixture.shell().sleep_now());
@@ -1506,7 +1858,7 @@ mod tests {
     fn restart_keeps_the_dry_run_of_the_settings() {
         let mut fixture = Fixture::new();
         fixture.start_with(PowerSource::Battery, None, true);
-        fixture.mqtt(1, MqttEvent::Connected);
+        fixture.connect();
         fixture.shell().send(Event::SetReadOnly(false));
         assert!(fixture.shell().sleep_now());
 
@@ -1517,18 +1869,28 @@ mod tests {
     #[test]
     fn restart_ignores_the_signals_of_the_old_core() {
         let mut fixture = Fixture::new();
-        // The first timer that the start started.
+        // The first feature timer that the start started.
         let (old_id, old_token) = fixture.start_timers(PowerSource::Battery)[0];
-        fixture.mqtt(1, MqttEvent::Connected);
+        fixture.connect();
+        let first = fixture.shell().current_connection();
         assert!(fixture.shell().sleep_now());
         let timers = fixture.new_timers(|shell| assert!(shell.restart()));
-        fixture.take_log();
         assert_ne!(timers.len(), 0);
         assert!(timers.iter().all(|(_, token)| *token > old_token));
 
-        // A late signal of the old connection does not reach the core.
-        fixture.mqtt(1, MqttEvent::Disconnected { reason: None });
-        assert_eq!(fixture.shell().current_connection(), Some(2));
+        // The old stream and the new stream have the same connection id. A
+        // late signal of the old stream does not reach the new core.
+        let old = 1;
+        fixture.shell().handle(Signal::Written {
+            token: old,
+            outcome: Written::Failed("late".into()),
+        });
+        fixture.shell().handle(Signal::Stream {
+            token: old,
+            item: StreamItem::Closed("late".into()),
+        });
+        assert_eq!(fixture.shell().current_connection(), first);
+        assert_eq!(fixture.shell().streams[0].token, 2);
         // A late signal of a timer of the old core does not fire a new one.
         fixture.shell().handle(Signal::Timer {
             id: old_id,
@@ -1537,5 +1899,10 @@ mod tests {
         let now = running(fixture.shell());
         assert!(timers.iter().all(|timer| now.contains(timer)));
         assert!(!fixture.shell().view().asleep);
+        fixture.connect();
+        assert_eq!(
+            fixture.shell().view().connection,
+            shared::Connection::Online
+        );
     }
 }

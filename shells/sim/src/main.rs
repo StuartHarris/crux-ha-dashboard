@@ -12,13 +12,13 @@
 //! Run `sim --help` for the options.
 
 mod inspector;
-mod mqtt;
 mod panel;
 mod png;
 mod screen;
 mod settings;
 mod shell;
 mod smoke;
+mod stream;
 mod window;
 
 use std::{fs, io, path::Path, process::ExitCode};
