@@ -17,7 +17,7 @@ use futures::StreamExt;
 use crate::{
     Cmd, Event, Model,
     capabilities::{
-        mqtt::{Connect, LastWill, Mqtt, MqttEvent, Publish, Qos, SubscribeOutcome},
+        mqtt::{Mqtt, MqttEvent},
         network::{Network, WifiStatus},
     },
     entities,
@@ -25,6 +25,7 @@ use crate::{
         pending,
         refresh::{redraw, redraw_soon},
     },
+    mqtt::{Connect, LastWill, Publish, Qos, SubscribeOutcome},
     summary,
 };
 

@@ -23,12 +23,12 @@ use alloc::{
 };
 use core::{fmt, mem, time::Duration};
 
+use super::types::{Connect, Message, Publish, Qos, SubscribeOutcome};
 use super::{
     codec::{self, Flags, Inbound, TooLong},
     framer::{Frame, Framer},
     ping_interval, silence_limit,
 };
-use crate::capabilities::mqtt::{Connect, Message, Publish, Qos, SubscribeOutcome};
 
 /// The limits of a session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

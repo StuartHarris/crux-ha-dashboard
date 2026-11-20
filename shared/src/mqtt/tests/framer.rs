@@ -4,9 +4,9 @@
 use alloc::{string::String, vec::Vec};
 
 use crate::{
-    capabilities::mqtt::Qos,
     entities::topics,
     mqtt::{
+        Qos,
         codec::{self, Flags, Malformed, server},
         framer::{Frame, Framer},
     },

@@ -13,8 +13,8 @@ use super::{
 };
 use crate::{
     Control, Dashboard, EffectTestExt, Event, Model, PowerSource, Route, TileState,
-    capabilities::mqtt::Qos,
     features::{connection::Link, light::STAND_LEVEL, pending::QUEUED_TIMEOUT},
+    mqtt::Qos,
     view::LightState,
 };
 

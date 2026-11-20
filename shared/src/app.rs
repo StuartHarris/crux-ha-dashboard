@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     capabilities::{
         light::FrontLight,
-        mqtt::{Connect, Credentials, Disconnect, MqttEvent, Publish, Subscribe, SubscribeOutcome},
+        mqtt::{Disconnect, MqttEvent, Subscribe},
         network::{WifiOff, WifiOn, WifiQuiet, WifiStatus},
         power::{PowerSource, Sleep, Wake},
     },
@@ -23,6 +23,7 @@ use crate::{
         rooms,
     },
     layout::Page,
+    mqtt::{Connect, Credentials, Publish, SubscribeOutcome},
     pages::PAGES,
     route::Route,
     view::{self, ViewModel},

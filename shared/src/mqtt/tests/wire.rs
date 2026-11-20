@@ -14,9 +14,8 @@ use alloc::{
 use core::time::Duration;
 
 use crate::{
-    capabilities::mqtt::Qos,
     mqtt::{
-        Action, Input, Limits, Session, Timer, TimerKind,
+        Action, Input, Limits, Qos, Session, Timer, TimerKind,
         codec::{
             self, Flags,
             server::{self, Packet},

@@ -10,6 +10,8 @@
 //!   the broker.
 //! - [`framer`] finds the packets in the byte stream.
 //! - [`session`] is the state machine of one connection.
+//! - [`types`] has the data of a connection: the options, the messages and
+//!   the result of a subscribe.
 //!
 //! The client uses a subset of MQTT 3.1.1: a clean session, subscriptions at
 //! `QoS` 0, publishes at `QoS` 0 or 1, and a last will at `QoS` 1.
@@ -19,11 +21,13 @@ use core::time::Duration;
 pub mod codec;
 pub mod framer;
 pub mod session;
+pub mod types;
 
 #[cfg(test)]
 mod tests;
 
 pub use session::{Action, End, Input, Limits, Refused, Session, SubscribeId, Timer, TimerKind};
+pub use types::{Connect, Credentials, LastWill, Message, Publish, Qos, SubscribeOutcome};
 
 /// The longest packet body that the session reads (256 KiB).
 pub const MAX_PACKET: usize = 256 * 1024;

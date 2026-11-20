@@ -8,9 +8,10 @@
 mod codec;
 mod framer;
 mod session;
+mod types;
 mod wire;
 
-use crate::capabilities::mqtt::{Connect, Credentials, LastWill};
+use super::{Connect, Credentials, LastWill};
 
 /// The password in [`connect`]. No `Debug` output can show it.
 const PASSWORD: &str = "secret-password";

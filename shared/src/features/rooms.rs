@@ -5,7 +5,6 @@ use serde::Serialize;
 
 use crate::{
     Cmd, Control, Model,
-    capabilities::mqtt::{Publish, Qos},
     features::{
         connection::{self, Call},
         light,
@@ -14,6 +13,7 @@ use crate::{
         refresh::redraw,
     },
     layout::{BRIGHTNESS_STEP_PCT, Page, Tile, TileKind},
+    mqtt::{Publish, Qos},
     route::Route,
     temperature,
     view::light_percent,

@@ -12,83 +12,42 @@
 //! apply to the open connection.
 
 use alloc::{string::String, vec::Vec};
-use core::fmt;
 
 use crux_core::{
-    Command, Request,
+    Command, OperationKind, Request,
+    capability::Operation,
     command::{RequestBuilder, StreamBuilder},
     macros::Operation,
+    operation,
 };
 use facet::Facet;
 use futures::Stream;
 use serde::{Deserialize, Serialize};
 
 use super::notify;
-
-/// The user name and password for the broker.
-///
-/// The `Debug` output does not show the password, so a log of a `Connect`
-/// request or of the settings is safe.
-#[derive(Facet, Serialize, Deserialize, Clone, PartialEq, Eq)]
-pub struct Credentials {
-    /// The user name.
-    pub username: String,
-    /// The password.
-    pub password: String,
-}
-
-impl fmt::Debug for Credentials {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Credentials")
-            .field("username", &self.username)
-            .field("password", &"***")
-            .finish()
-    }
-}
-
-/// The quality of service for a publish.
-#[derive(Facet, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(C)]
-pub enum Qos {
-    /// The broker gets the message at most once (`QoS` 0).
-    AtMostOnce,
-    /// The broker gets the message at least once (`QoS` 1).
-    AtLeastOnce,
-}
-
-/// The message that the broker publishes if the connection stops without a
-/// disconnect from the client.
-#[derive(Facet, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct LastWill {
-    /// The topic of the message.
-    pub topic: String,
-    /// The payload of the message.
-    pub payload: Vec<u8>,
-    /// If `true`, the broker keeps the message for new subscribers.
-    pub retain: bool,
-}
+pub use crate::mqtt::{Connect, Credentials, LastWill, Message, Publish, Qos, SubscribeOutcome};
 
 /// Opens a connection to the broker.
 ///
 /// The shell answers with a stream of [`MqttEvent`] values. The last item is
 /// always `Disconnected`, also when the connection fails before it opens. The
 /// shell does not reconnect by itself. The core decides when to try again.
-#[derive(Operation, Facet, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[operation(stream, output = MqttEvent)]
-pub struct Connect {
-    /// The host name or IP address of the broker.
-    pub host: String,
-    /// The TCP port of the broker.
-    pub port: u16,
-    /// The MQTT client id.
-    pub client_id: String,
-    /// The credentials, if the broker needs them.
-    pub credentials: Option<Credentials>,
-    /// The keep-alive interval in seconds.
-    pub keep_alive_secs: u16,
-    /// The last-will message.
-    pub last_will: LastWill,
+impl Operation for Connect {
+    type Output = MqttEvent;
+
+    const KIND: Option<OperationKind> = Some(OperationKind::Stream);
 }
+
+impl operation::Stream for Connect {}
+
+/// Publishes a message on the open connection.
+impl Operation for Publish {
+    type Output = ();
+
+    const KIND: Option<OperationKind> = Some(OperationKind::Notify);
+}
+
+impl operation::Notify for Publish {}
 
 /// Subscribes the open connection to topic filters.
 ///
@@ -105,31 +64,6 @@ pub struct Subscribe {
     pub topics: Vec<String>,
 }
 
-/// The answer to a [`Subscribe`] request.
-#[derive(Facet, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(C)]
-pub enum SubscribeOutcome {
-    /// The broker acknowledged each topic filter with success.
-    Done,
-    /// The broker refused a topic filter, or the connection closed before
-    /// all the acknowledgements arrived.
-    Failed,
-}
-
-/// Publishes a message on the open connection.
-#[derive(Operation, Facet, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[operation(notify)]
-pub struct Publish {
-    /// The topic of the message.
-    pub topic: String,
-    /// The payload of the message.
-    pub payload: Vec<u8>,
-    /// The quality of service.
-    pub qos: Qos,
-    /// If `true`, the broker keeps the message for new subscribers.
-    pub retain: bool,
-}
-
 /// Closes the open connection with a disconnect packet, so the broker does
 /// not publish the last will.
 ///
@@ -144,15 +78,6 @@ pub struct Publish {
 #[derive(Operation, Facet, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[operation(request, output = ())]
 pub struct Disconnect;
-
-/// A message from the broker on a subscribed topic.
-#[derive(Facet, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct Message {
-    /// The topic of the message.
-    pub topic: String,
-    /// The payload of the message.
-    pub payload: Vec<u8>,
-}
 
 /// An item in the stream of a connection.
 #[derive(Facet, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -216,36 +141,5 @@ impl Mqtt {
         Event: Send + 'static,
     {
         Command::request_from_shell(Disconnect)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use alloc::format;
-
-    use super::{Connect, Credentials, LastWill};
-
-    #[test]
-    fn debug_does_not_show_the_password() {
-        let credentials = Credentials {
-            username: "dashboard".into(),
-            password: "secret-password".into(),
-        };
-        let connect = Connect {
-            host: "broker".into(),
-            port: 1883,
-            client_id: "dashboard-hall".into(),
-            credentials: Some(credentials.clone()),
-            keep_alive_secs: 60,
-            last_will: LastWill {
-                topic: "dashboard/hall/status".into(),
-                payload: b"offline".to_vec(),
-                retain: true,
-            },
-        };
-        for text in [format!("{credentials:?}"), format!("{connect:?}")] {
-            assert!(!text.contains("secret-password"), "{text}");
-            assert!(text.contains("dashboard"), "{text}");
-        }
     }
 }

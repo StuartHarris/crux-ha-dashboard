@@ -8,14 +8,12 @@ use crux_core::{App, Request};
 use super::{ExpectFullRefreshTimer, ExpectLight, start};
 use crate::{
     Cmd, Connection, Dashboard, Effect, EffectTestExt, Event, Model, PowerSource, Route, TileState,
-    capabilities::{
-        mqtt::{Connect, Message, MqttEvent, Qos},
-        network::WifiStatus,
-    },
+    capabilities::{mqtt::MqttEvent, network::WifiStatus},
     features::{
         connection::{Link, RECONNECT_MAX, RECONNECT_MIN},
         refresh::DRAW_DELAY,
     },
+    mqtt::{Connect, Message, Qos},
     view::LightState::{On, Unavailable},
 };
 

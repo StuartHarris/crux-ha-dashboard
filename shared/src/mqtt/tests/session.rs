@@ -13,10 +13,10 @@ use super::{
     wire::{Chunks, Wire, client_packets, remaining_lengths},
 };
 use crate::{
-    capabilities::mqtt::{Message, Publish, Qos, SubscribeOutcome},
     entities::topics,
     mqtt::{
-        Action, End, Input, Limits, Refused, Session, TimerKind,
+        Action, End, Input, Limits, Message, Publish, Qos, Refused, Session, SubscribeOutcome,
+        TimerKind,
         codec::{self, Flags, server::Packet},
     },
     pages::PAGES,

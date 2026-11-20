@@ -7,7 +7,7 @@
 
 use alloc::vec::Vec;
 
-use crate::capabilities::mqtt::{Connect, Qos};
+use super::types::{Connect, Qos};
 
 /// The protocol level of MQTT 3.1.1.
 pub const PROTOCOL_LEVEL: u8 = 4;

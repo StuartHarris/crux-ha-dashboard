@@ -22,10 +22,8 @@ use crux_time::operation::NotifyAfter;
 
 use crate::{
     Core, Dashboard, Effect, Event, PowerSource, Settings, Start, TileKind, ViewModel,
-    capabilities::{
-        mqtt::{Connect, Message, MqttEvent, SubscribeOutcome},
-        network::WifiStatus,
-    },
+    capabilities::{mqtt::MqttEvent, network::WifiStatus},
+    mqtt::{Connect, Message, SubscribeOutcome},
     pages::PAGES,
 };
 

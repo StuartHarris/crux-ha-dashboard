@@ -15,7 +15,7 @@ use super::{
 };
 use crate::{
     Cmd, Dashboard, EffectTestExt, Event, Model, PowerSource, Route, TileState,
-    capabilities::mqtt::{Connect, MqttEvent},
+    capabilities::mqtt::MqttEvent,
     features::{
         connection::{OUTBOX_LIMIT, RECONNECT_MIN},
         light::STAND_LEVEL,
@@ -23,6 +23,7 @@ use crate::{
         power::IDLE_TIMEOUT,
         refresh::DRAW_DELAY,
     },
+    mqtt::Connect,
 };
 
 /// The rocket lamp: tile 1 on the page of the living room.

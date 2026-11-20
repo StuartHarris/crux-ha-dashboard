@@ -12,8 +12,9 @@ use crux_core::App;
 use super::{connection::drive_to_connected, flows::house, start};
 use crate::{
     Dashboard, EffectTestExt, Event, PowerSource,
-    capabilities::{mqtt::SubscribeOutcome, power::Wake},
+    capabilities::power::Wake,
     features::{connection::RECONNECT_MIN, power::IDLE_TIMEOUT},
+    mqtt::SubscribeOutcome,
 };
 
 /// Returns the number of times that `effect` is in `log`.

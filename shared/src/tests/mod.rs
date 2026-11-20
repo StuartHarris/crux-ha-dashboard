@@ -24,13 +24,13 @@ use core::time::Duration;
 use crate::{
     Cmd, Control, EffectTestExt, PowerSource, Settings, Start,
     app::Event,
-    capabilities::mqtt::Publish,
     entities::STATESTREAM,
     features::{
         light::LIGHT_TIMEOUT,
         pending::{PENDING_TIMEOUT, SCENE_TIMEOUT, TARGET_TIMEOUT},
         refresh::FULL_REFRESH_INTERVAL,
     },
+    mqtt::Publish,
 };
 
 /// The time in the tests: 2026-07-01T08:41:00Z, which is 09:41 in BST.

@@ -22,10 +22,9 @@ use crux_core::Request;
 use serde::Deserialize;
 
 use crate::{
-    capabilities::mqtt::{
-        Connect, LastWill, Message, MqttEvent, Publish, Subscribe, SubscribeOutcome,
-    },
+    capabilities::mqtt::{MqttEvent, Subscribe},
     entities::STATESTREAM,
+    mqtt::{Connect, LastWill, Message, Publish, SubscribeOutcome},
 };
 
 /// The open connection of the dashboard.
