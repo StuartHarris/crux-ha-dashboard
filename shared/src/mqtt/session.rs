@@ -150,9 +150,9 @@ pub enum Input {
     Closed {
         /// Why the stream closed.
         reason: String,
-        /// `true` if the broker host answered with a TCP reset. Refer to
-        /// [`End::Reset`].
-        reset: bool,
+        /// `true` if the broker host ended the stream. Refer to
+        /// [`End::ByHost`].
+        by_host: bool,
     },
     /// A timer from [`Action::StartTimer`] expired.
     Timer(Timer),
@@ -263,10 +263,10 @@ pub enum End {
     Timeout(TimerKind),
     /// The stream closed, for this reason.
     Transport(String),
-    /// The broker host answered with a TCP reset, for this reason: it refused
-    /// the connect, or it reset the stream. The host got bytes from the
-    /// client, and its answer arrived.
-    Reset(String),
+    /// The broker host ended the stream, for this reason. It refused the
+    /// connect with a TCP reset, or it reset or closed the open stream. The
+    /// host got bytes from the client, and its answer arrived.
+    ByHost(String),
     /// The broker kept a session, but the client asked for a clean session.
     SessionPresent,
     /// A field of the CONNECT packet is too long.
@@ -299,7 +299,7 @@ impl fmt::Display for End {
                 TimerKind::Ack => "the broker did not acknowledge a packet in time",
             }),
             Self::Transport(reason) => write!(f, "the stream closed: {reason}"),
-            Self::Reset(reason) => write!(f, "the broker host reset the stream: {reason}"),
+            Self::ByHost(reason) => write!(f, "the broker host ended the stream: {reason}"),
             Self::SessionPresent => {
                 f.write_str("the broker kept a session, but the client asked for a clean session")
             }
@@ -492,8 +492,8 @@ impl Session {
             Input::Closed { .. } if self.state == State::Closing => self.end(End::Clean, false),
             Input::Closed {
                 reason,
-                reset: true,
-            } => self.end(End::Reset(reason), false),
+                by_host: true,
+            } => self.end(End::ByHost(reason), false),
             Input::Closed { reason, .. } => self.end(End::Transport(reason), false),
             Input::Timer(timer) => self.expired(timer),
         }

@@ -412,9 +412,9 @@ fn connect(model: &mut Model) -> Cmd {
 /// an item for an older connection.
 ///
 /// Bytes from the broker prove that the link moves data in both
-/// directions. Refer to [`wifi::traffic`]. A TCP reset from the broker host
-/// proves it too. The session then ends with [`End::Reset`], and
-/// [`wifi::session_ended`] records the proof.
+/// directions. Refer to [`wifi::traffic`]. An end of the stream by the
+/// broker host proves it too. The session then ends with [`End::ByHost`],
+/// and [`wifi::session_ended`] records the proof.
 pub fn stream(id: u32, item: StreamItem, model: &mut Model) -> Cmd {
     let input = match item {
         StreamItem::Opened => Input::Opened,
@@ -424,26 +424,24 @@ pub fn stream(id: u32, item: StreamItem, model: &mut Model) -> Cmd {
             }
             Input::Received(bytes)
         }
-        StreamItem::Closed { reason, reset } => Input::Closed { reason, reset },
+        StreamItem::Closed { reason, by_host } => Input::Closed { reason, by_host },
     };
     handle(id, input, model)
 }
 
-/// Handles the answer to a `Write` request on the connection `id`. A write
-/// that failed ends the session, as a closed stream does.
+/// Handles the answer to a `Write` request on the connection `id`.
 ///
-/// A write that failed is never a reset. The shell gives the `Closed` item
-/// of the stream before it answers the writes that wait, so the `Closed`
-/// item tells the core about a reset.
-pub fn written(id: u32, outcome: Written, model: &mut Model) -> Cmd {
-    let input = match outcome {
-        Written::Sent => Input::Sent,
-        Written::Failed(reason) => Input::Closed {
-            reason,
-            reset: false,
-        },
-    };
-    handle(id, input, model)
+/// The core ignores `Failed`. A write fails only when the stream ended or
+/// has no stream, and the `Closed` item of the stream ends the session. The
+/// `Closed` item also tells if the broker host ended the stream, and
+/// `Failed` does not. Thus the session ends in the same way if `Failed`
+/// arrives before or after `Closed`. If no `Closed` item arrives, the send
+/// timer of the session ends it.
+pub fn written(id: u32, outcome: &Written, model: &mut Model) -> Cmd {
+    match outcome {
+        Written::Sent => handle(id, Input::Sent, model),
+        Written::Failed(_) => Cmd::done(),
+    }
 }
 
 /// Handles the expiry of a timer of the session on the connection `id`.

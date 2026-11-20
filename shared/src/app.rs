@@ -482,7 +482,7 @@ impl App for Dashboard {
             Event::Written {
                 connection,
                 outcome,
-            } => connection::written(connection, outcome, model),
+            } => connection::written(connection, &outcome, model),
             Event::StreamClosed { connection } => connection::stream_closed(connection, model),
             Event::CloseTimeout { connection } => connection::close_timeout(connection, model),
             Event::SessionTimer { connection, timer } => {

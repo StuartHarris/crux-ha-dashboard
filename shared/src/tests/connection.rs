@@ -15,7 +15,7 @@ use crate::{
     Cmd, Connection, Dashboard, Effect, EffectTestExt, Event, Model, PowerSource, Route, TileState,
     capabilities::{
         radio::{Joined, Target},
-        stream::StreamItem,
+        stream::{StreamItem, Written},
     },
     features::{
         connection::{CLOSE_TIMEOUT, Link, RECONNECT_MAX, RECONNECT_MIN},
@@ -303,6 +303,48 @@ fn on_the_index_a_message_draws_only_if_a_summary_changes() {
 }
 
 #[test]
+fn a_failed_write_does_not_hide_an_end_by_the_host_in_either_order() {
+    let app = Dashboard;
+    for failed_first in [true, false] {
+        let (mut model, _wire) = drive_to_connected(PowerSource::Stand);
+        model.wifi.health.failed();
+        let connection = model.connection.id;
+        let write = Event::Written {
+            connection,
+            outcome: Written::Failed("write failed".into()),
+        };
+        let end = Event::Stream {
+            connection,
+            item: StreamItem::by_host("the broker closed the stream"),
+        };
+        let events = if failed_first {
+            [write, end]
+        } else {
+            [end, write]
+        };
+        let mut closes = Vec::new();
+        for event in events {
+            let mut cmd = app.update(event, &mut model);
+            closes.extend(cmd.effects().filter_map(|effect| match effect {
+                Effect::StreamClose(request) => Some(request.operation),
+                _ => None,
+            }));
+        }
+        // The `Closed` item ends the session, and the end by the host
+        // proves traffic.
+        assert_eq!(closes.len(), 1, "failed first: {failed_first}");
+        assert!(
+            closes[0]
+                .reason
+                .contains("the broker host ended the stream"),
+            "{closes:?}"
+        );
+        assert_eq!(model.connection.mqtt, Link::Down);
+        assert!(!model.wifi.health.suspect(), "failed first: {failed_first}");
+    }
+}
+
+#[test]
 fn a_lost_connection_shows_the_time_of_the_last_message_and_retries_after_a_backoff() {
     let app = Dashboard;
     let (mut model, mut wire) = drive_to_connected(PowerSource::Stand);
@@ -345,7 +387,7 @@ fn the_backoff_doubles_up_to_a_limit_and_resets_on_connect() {
     let mut expected = RECONNECT_MIN;
     for _ in 0..8 {
         let connection = model.connection.id;
-        let refused = StreamItem::reset("connection refused");
+        let refused = StreamItem::by_host("connection refused");
         let event = app
             .update(
                 Event::Stream {

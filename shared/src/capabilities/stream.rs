@@ -7,7 +7,7 @@
 //!
 //! - [`Open`] is a stream. The shell answers with [`StreamItem`] values:
 //!   `Opened`, a `Received` for each chunk of bytes, and one `Closed` as the
-//!   last item. `Closed` tells if the broker host reset the stream.
+//!   last item. `Closed` tells if the broker host ended the stream.
 //! - [`Write`] is a request. The shell answers with [`Written`] when it sent
 //!   the bytes, or when it cannot send them.
 //! - [`Close`] is a request. The shell answers when the stream is closed.
@@ -25,8 +25,8 @@
 //!   `Close`.
 //! - If no stream has the `connection` id of a `Write` or a `Close`, the
 //!   shell answers at once: `Failed` for a `Write`, `()` for a `Close`.
-//! - The shell sets `reset` in `Closed` only if the broker host answered
-//!   with a TCP reset (RST). Refer to [`StreamItem::Closed`].
+//! - The shell sets `by_host` in `Closed` only if the broker host ended the
+//!   stream with a TCP reset (RST) or a FIN. Refer to [`StreamItem::Closed`].
 
 use alloc::{string::String, vec::Vec};
 use core::fmt;
@@ -69,37 +69,39 @@ pub enum StreamItem {
     Closed {
         /// Why the stream ended, for the log.
         reason: String,
-        /// `true` if the broker host answered with a TCP reset (RST): it
-        /// refused the connect, or it reset the open stream.
+        /// `true` if the broker host ended the stream. The host refused the
+        /// connect with a TCP reset (RST), reset the open stream, or closed
+        /// the open stream with a FIN.
         ///
-        /// A reset proves that the link moved bytes in both directions,
+        /// Such an end proves that the link moved bytes in both directions,
         /// because the host got a packet from the device and its answer
-        /// arrived. The shell sets `reset` only when it knows that the reset
-        /// came from the host. A reset that the device makes itself (for
-        /// example, when the network stack loses its address) is not a
-        /// reset from the host. A timeout, a DNS failure, a write that
-        /// stalls and a FIN from the host are not resets either.
-        reset: bool,
+        /// arrived. The shell sets `by_host` only when it knows that the RST
+        /// or the FIN came from the host. A reset that the device makes
+        /// itself (for example, when the network stack loses its address)
+        /// does not count. A timeout, a DNS failure and a write that stalls
+        /// do not count either.
+        by_host: bool,
     },
 }
 
 impl StreamItem {
-    /// Returns a `Closed` item for `reason` with no reset.
+    /// Returns a `Closed` item for `reason` that the broker host did not
+    /// cause.
     #[must_use]
     pub fn closed(reason: impl Into<String>) -> Self {
         Self::Closed {
             reason: reason.into(),
-            reset: false,
+            by_host: false,
         }
     }
 
-    /// Returns a `Closed` item for `reason` after the broker host answered
-    /// with a TCP reset.
+    /// Returns a `Closed` item for `reason` after the broker host ended the
+    /// stream with a TCP reset or a FIN.
     #[must_use]
-    pub fn reset(reason: impl Into<String>) -> Self {
+    pub fn by_host(reason: impl Into<String>) -> Self {
         Self::Closed {
             reason: reason.into(),
-            reset: true,
+            by_host: true,
         }
     }
 }
@@ -112,10 +114,10 @@ impl fmt::Debug for StreamItem {
                 .debug_tuple("Received")
                 .field(&format_args!("{} bytes", bytes.len()))
                 .finish(),
-            Self::Closed { reason, reset } => f
+            Self::Closed { reason, by_host } => f
                 .debug_struct("Closed")
                 .field("reason", reason)
-                .field("reset", reset)
+                .field("by_host", by_host)
                 .finish(),
         }
     }
@@ -150,7 +152,9 @@ impl fmt::Debug for Write {
 pub enum Written {
     /// The shell sent all the bytes.
     Sent,
-    /// The shell did not send all the bytes, for this reason.
+    /// The shell did not send all the bytes, for this reason. The core
+    /// ignores this answer, because the `Closed` item of the stream ends
+    /// the session.
     Failed(String),
 }
 
@@ -291,7 +295,7 @@ mod tests {
         let items = [
             StreamItem::Opened,
             StreamItem::Received(vec![0x20, 0x02, 0x00, 0x00]),
-            StreamItem::reset("connection reset"),
+            StreamItem::by_host("connection reset"),
         ];
         for item in items.clone() {
             request

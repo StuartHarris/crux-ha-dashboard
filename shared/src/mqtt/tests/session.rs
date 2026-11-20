@@ -328,7 +328,7 @@ fn a_closed_stream_fails_the_jobs_that_wait_and_then_ends() {
 
     wire.session.handle(Input::Closed {
         reason: "connection reset".into(),
-        reset: false,
+        by_host: false,
     });
     wire.run();
     assert_eq!(
@@ -348,15 +348,15 @@ fn a_closed_stream_fails_the_jobs_that_wait_and_then_ends() {
 }
 
 #[test]
-fn a_reset_from_the_broker_host_ends_with_reset() {
+fn a_reset_from_the_broker_host_ends_by_host() {
     let mut wire = Wire::connected();
     wire.session.handle(Input::Closed {
         reason: "connection reset".into(),
-        reset: true,
+        by_host: true,
     });
     assert_eq!(
         poll_all(&mut wire.session),
-        [Action::Ended(End::Reset("connection reset".into()))]
+        [Action::Ended(End::ByHost("connection reset".into()))]
     );
 }
 
@@ -365,7 +365,7 @@ fn the_session_ignores_all_input_after_the_end() {
     let mut wire = Wire::connected();
     wire.session.handle(Input::Closed {
         reason: "reset".into(),
-        reset: false,
+        by_host: false,
     });
     wire.run();
     wire.log.clear();
@@ -376,7 +376,7 @@ fn the_session_ignores_all_input_after_the_end() {
     wire.session.handle(Input::Received(vec![0xD0, 0x00]));
     wire.session.handle(Input::Closed {
         reason: "again".into(),
-        reset: false,
+        by_host: false,
     });
     let _ = wire.session.subscribe(&["a".to_string()]);
     wire.session.disconnect();
@@ -969,8 +969,8 @@ fn end_has_a_message_for_each_reason() {
             "the stream closed: connection reset",
         ),
         (
-            End::Reset("connection refused".into()),
-            "the broker host reset the stream: connection refused",
+            End::ByHost("connection refused".into()),
+            "the broker host ended the stream: connection refused",
         ),
         (
             End::SessionPresent,
@@ -1175,7 +1175,7 @@ fn a_close_after_disconnect_is_a_clean_end() {
     wire.session.disconnect();
     wire.session.handle(Input::Closed {
         reason: "connection reset".into(),
-        reset: false,
+        by_host: false,
     });
     assert_eq!(poll_all(&mut wire.session), [Action::Ended(End::Clean)]);
 }

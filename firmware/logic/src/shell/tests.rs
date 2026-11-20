@@ -14,7 +14,7 @@ use shared::{
     },
     fake::{Broker, FakeRadio, radio::HALL, session_timers},
     features::{
-        connection::CLOSE_TIMEOUT,
+        connection::{CLOSE_TIMEOUT, RECONNECT_MIN},
         light::{BATTERY_LEVEL, LIGHT_TIMEOUT, STAND_LEVEL},
         power::IDLE_TIMEOUT,
         refresh::DRAW_DELAY,
@@ -476,40 +476,52 @@ fn the_end_of_the_stream_fails_the_write_that_waits() {
 }
 
 #[test]
-fn a_failed_write_ends_the_session_and_closes_the_stream() {
+fn a_failed_write_waits_for_the_closed_item_to_end_the_session() {
     let (mut device, _) = started(PowerSource::Stand, true);
     device.link();
     device.connect(FIRST);
+    // The core ignores `Failed`. The `Closed` item ends the session.
     let jobs = device.handle(Signal::Written {
         connection: FIRST,
-        outcome: Written::Failed("reset by peer".into()),
+        outcome: Written::Failed("write failed".into()),
     });
-    assert!(
-        names(&jobs).contains(&format!("close {FIRST}")),
-        "{:?}",
-        names(&jobs)
-    );
-    let Some((_, StreamOp::Close(close))) = stream_job(&jobs) else {
-        panic!("not a close");
-    };
-    assert!(!close.clean);
-    assert!(close.reason.contains("reset by peer"), "{}", close.reason);
+    assert_eq!(stream_job(&jobs), None, "{:?}", names(&jobs));
+    assert!(started_timers(&jobs).is_empty(), "{:?}", names(&jobs));
+    device.broker.drop_connection();
+    // The stream ended, so the shell answers the `Close` request of the
+    // core at once. The core waits for the backoff.
+    let jobs = device.closed(FIRST, "connection lost");
+    let backoff = started_timers(&jobs)
+        .iter()
+        .any(|(_, _, duration)| *duration == RECONNECT_MIN);
+    assert!(backoff, "{:?}", names(&jobs));
 }
 
 #[test]
 fn a_new_stream_opens_only_after_the_end_of_the_old_stream() {
     let (mut device, _) = started(PowerSource::Stand, true);
     device.link();
-    device.connect(FIRST);
-    // The write fails. The core closes the stream. The backoff ends before
-    // the old stream ends, so the core does not get the link or open a new
-    // stream yet.
-    let jobs = device.handle(Signal::Written {
-        connection: FIRST,
-        outcome: Written::Failed("timeout".into()),
-    });
-    let [(id, token, _)] = started_timers(&jobs)[..] else {
-        panic!("not one timer: {:?}", names(&jobs));
+    // The broker does not answer the CONNECT packet, so the session timers
+    // expire. The core closes the stream. The backoff ends before the old
+    // stream ends, so the core does not get the link or open a new stream
+    // yet.
+    let opened = device.opened(FIRST);
+    let jobs: Vec<Job> = opened
+        .iter()
+        .filter_map(|job| match job {
+            Job::Timer {
+                token,
+                op: TimerOp::NotifyAfter(notify),
+            } if Duration::from(notify.duration) == CONNACK_TIMEOUT => Some((notify.id, *token)),
+            _ => None,
+        })
+        .flat_map(|(id, token)| device.handle(Signal::Timer { id, token }))
+        .collect();
+    let Some((id, token, _)) = started_timers(&jobs)
+        .into_iter()
+        .find(|(_, _, duration)| *duration == RECONNECT_MIN)
+    else {
+        panic!("no backoff timer: {:?}", names(&jobs));
     };
     assert_eq!(device.handle(Signal::Timer { id, token }), Vec::new());
 

@@ -91,16 +91,16 @@ impl Streams {
     /// Ends the stream of `connection` for `reason`. Returns its `Closed`
     /// signal, or `None` if the stream already ended.
     ///
-    /// `reset` is `true` only if the broker host answered with a TCP reset.
-    /// Refer to [`StreamItem::Closed`].
-    pub fn end(&mut self, connection: u32, reason: String, reset: bool) -> Option<Signal> {
+    /// `by_host` is `true` only if the broker host ended the stream with a
+    /// TCP reset or a FIN. Refer to [`StreamItem::Closed`].
+    pub fn end(&mut self, connection: u32, reason: String, by_host: bool) -> Option<Signal> {
         if !self.accepts(connection) {
             return None;
         }
         self.open = None;
         Some(Signal::Stream {
             connection,
-            item: StreamItem::Closed { reason, reset },
+            item: StreamItem::Closed { reason, by_host },
         })
     }
 
@@ -110,7 +110,8 @@ impl Streams {
     }
 }
 
-/// Returns the `Closed` signal of `connection` for `reason`, with no reset.
+/// Returns the `Closed` signal of `connection` for `reason`, which the
+/// broker host did not cause.
 fn closed(connection: u32, reason: &str) -> Signal {
     Signal::Stream {
         connection,
@@ -204,8 +205,8 @@ mod tests {
     use super::{CLOSED, REPLACED, SLOW_UPDATE, Streams, UpdateStats, supersede};
     use crate::shell::{Signal, StreamOp};
 
-    /// Returns the connection id and the reason of a `Closed` signal with
-    /// no reset, or `None` for another signal.
+    /// Returns the connection id and the reason of a `Closed` signal that
+    /// the broker host did not cause, or `None` for another signal.
     fn closed(signal: Option<&Signal>) -> Option<(u32, &str)> {
         match signal {
             Some(Signal::Stream {
@@ -213,7 +214,7 @@ mod tests {
                 item:
                     StreamItem::Closed {
                         reason,
-                        reset: false,
+                        by_host: false,
                     },
             }) => Some((*connection, reason.as_str())),
             _ => None,
@@ -235,7 +236,7 @@ mod tests {
     }
 
     #[test]
-    fn a_reset_from_the_host_is_in_the_closed_item() {
+    fn an_end_by_the_host_is_in_the_closed_item() {
         let mut streams = Streams::default();
         streams.begin(1);
         let signal = streams.end(1, "TCP connect failed: ConnectionReset".into(), true);
@@ -243,7 +244,7 @@ mod tests {
             signal,
             Some(Signal::Stream {
                 connection: 1,
-                item: StreamItem::reset("TCP connect failed: ConnectionReset"),
+                item: StreamItem::by_host("TCP connect failed: ConnectionReset"),
             })
         );
     }

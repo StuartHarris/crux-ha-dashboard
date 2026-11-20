@@ -182,24 +182,34 @@ pub enum Recovery {
 /// a session that the broker kept and a field that is too long are problems
 /// of the broker or of the configuration. A clean end is not a failure.
 ///
-/// A TCP reset from the broker host ([`End::Reset`]) is not a failure of the
-/// link either, because the host answered. Refer to [`proves_traffic`].
+/// `linked` is `true` if the device has a link with an address when the
+/// session ends. An end by the broker host ([`End::ByHost`]) is a failure of
+/// the link only if `linked` is `false`. Refer to [`proves_traffic`].
 #[must_use]
-pub const fn fails_the_link(end: &End) -> bool {
-    matches!(end, End::Timeout(_) | End::Transport(_))
+pub const fn fails_the_link(end: &End, linked: bool) -> bool {
+    match end {
+        End::Timeout(_) | End::Transport(_) => true,
+        End::ByHost(_) => !linked,
+        _ => false,
+    }
 }
 
 /// Returns `true` if a session that ended with `end` proves that the link
 /// moves data in both directions.
 ///
-/// Only a TCP reset from the broker host ([`End::Reset`]) is a proof. The
-/// host got a packet from the device, and its answer arrived. This occurs
-/// when the broker is down on a host that is up, and the host refuses each
-/// connect. The cause is not the link, so the core does not leave and join
-/// again for it.
+/// Only an end by the broker host ([`End::ByHost`]) is a proof: a TCP reset
+/// or a FIN from the host. The host got a packet from the device, and its
+/// answer arrived. This occurs when the broker stops on a host that is up.
+/// The host closes the session, and then it refuses each connect. The cause
+/// is not the link, so the core does not leave and join again for it.
+///
+/// The end is a proof only if `linked` is `true`: the device has a link with
+/// an address when the session ends. This is a second check after the check
+/// of the shell. Without a link, the shell made a mistake, and the core
+/// uses the rules for a failure of the link.
 #[must_use]
-pub const fn proves_traffic(end: &End) -> bool {
-    matches!(end, End::Reset(_))
+pub const fn proves_traffic(end: &End, linked: bool) -> bool {
+    linked && matches!(end, End::ByHost(_))
 }
 
 /// The health of the link.
@@ -216,8 +226,8 @@ pub const fn proves_traffic(end: &End) -> bool {
 ///   the chip.
 /// - The first bytes from the broker on a stream prove that the link moves
 ///   data in both directions. They clear the suspicion and the count
-///   ([`Health::traffic`]). A TCP reset from the broker host is the same
-///   proof ([`Health::ended`], [`proves_traffic`]). A new address from DHCP
+///   ([`Health::traffic`]). An end of the stream by the broker host is the
+///   same proof ([`Health::ended`], [`proves_traffic`]). A new address from DHCP
 ///   also proves traffic, so it clears the count ([`Health::leased`]).
 /// - If the network stack kept its old address through the join, the address
 ///   proves nothing. It counts as a join with no address
@@ -242,20 +252,20 @@ impl Health {
         self.suspect = true;
     }
 
-    /// Records an MQTT session that ended with `end`. A failure of the link
-    /// makes it suspect. A TCP reset from the broker host proves traffic.
-    /// Another end changes nothing. Refer to [`fails_the_link`] and
-    /// [`proves_traffic`].
-    pub const fn ended(&mut self, end: &End) {
-        if proves_traffic(end) {
+    /// Records an MQTT session that ended with `end`. `linked` is `true` if
+    /// the device has a link with an address. A failure of the link makes
+    /// it suspect. An end by the broker host proves traffic. Another end
+    /// changes nothing. Refer to [`fails_the_link`] and [`proves_traffic`].
+    pub const fn ended(&mut self, end: &End, linked: bool) {
+        if proves_traffic(end, linked) {
             self.traffic();
-        } else if fails_the_link(end) {
+        } else if fails_the_link(end, linked) {
             self.failed();
         }
     }
 
     /// Records a proof of traffic: the first bytes from the broker on a
-    /// stream, or a TCP reset from the broker host.
+    /// stream, or an end of the stream by the broker host.
     pub const fn traffic(&mut self) {
         self.suspect = false;
         self.no_lease = 0;
@@ -562,10 +572,10 @@ mod tests {
             End::Transport(String::from("no TCP connection in 10 s")),
         ];
         for end in &failures {
-            assert!(fails_the_link(end), "{end:?}");
-            assert!(!proves_traffic(end), "{end:?}");
+            assert!(fails_the_link(end, true), "{end:?}");
+            assert!(!proves_traffic(end, true), "{end:?}");
             let mut health = Health::default();
-            health.ended(end);
+            health.ended(end, true);
             assert!(health.suspect(), "{end:?}");
         }
     }
@@ -580,31 +590,52 @@ mod tests {
             End::TooLong,
         ];
         for end in &others {
-            assert!(!fails_the_link(end), "{end:?}");
-            assert!(!proves_traffic(end), "{end:?}");
+            assert!(!fails_the_link(end, true), "{end:?}");
+            assert!(!proves_traffic(end, true), "{end:?}");
             let mut health = Health::default();
-            health.ended(end);
+            health.ended(end, true);
             assert!(!health.suspect(), "{end:?}");
             assert!(health.keep(), "{end:?}");
             // The end proves nothing, so a suspect link stays suspect.
             health.failed();
-            health.ended(end);
+            health.ended(end, true);
             assert!(health.suspect(), "{end:?}");
         }
     }
 
     #[test]
-    fn a_reset_from_the_host_clears_the_suspicion_and_the_count() {
-        let end = End::Reset(String::from("TCP connect failed: ConnectionReset"));
-        assert!(!fails_the_link(&end));
-        assert!(proves_traffic(&end));
+    fn an_end_by_the_host_clears_the_suspicion_and_the_count() {
+        for reason in [
+            "TCP connect failed: ConnectionReset",
+            "the broker closed the stream",
+        ] {
+            let end = End::ByHost(String::from(reason));
+            assert!(!fails_the_link(&end, true));
+            assert!(proves_traffic(&end, true));
+            let mut health = Health::default();
+            health.failed();
+            assert_eq!(health.no_lease(), Recovery::Continue);
+            health.ended(&end, true);
+            assert!(!health.suspect());
+            assert!(health.keep());
+            assert_eq!(health.joins_with_no_lease(), 0);
+        }
+    }
+
+    #[test]
+    fn an_end_by_the_host_with_no_link_fails_the_link() {
+        let end = End::ByHost(String::from("TCP connect failed: ConnectionReset"));
+        assert!(fails_the_link(&end, false));
+        assert!(!proves_traffic(&end, false));
         let mut health = Health::default();
         health.failed();
         assert_eq!(health.no_lease(), Recovery::Continue);
-        health.ended(&end);
-        assert!(!health.suspect());
-        assert!(health.keep());
-        assert_eq!(health.joins_with_no_lease(), 0);
+        health.ended(&end, false);
+        assert!(health.suspect());
+        assert_eq!(health.joins_with_no_lease(), 1);
+        let mut health = Health::default();
+        health.ended(&end, false);
+        assert!(health.suspect());
     }
 
     #[test]

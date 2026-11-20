@@ -32,13 +32,15 @@
 //! the broker, a write that stalls and a stream that does not open are
 //! warnings.
 //!
-//! The task sets `reset` in the `Closed` item only for a TCP reset from the
-//! broker host. embassy-net gives the error `ConnectionReset` for a reset
-//! from the host, and also when smoltcp closes the socket because the
-//! network stack lost its address (the link dropped). For that reason the
-//! task counts the error as a reset only while the link is up and the stack
-//! has an address. Refer to [`host_reset`]. The socket has no smoltcp
-//! timeout and no keep-alive, so no timer of the socket gives the error.
+//! The task sets `by_host` in the `Closed` item only when the broker host
+//! ended the stream: with a FIN (a read of no bytes) or with a TCP reset.
+//! embassy-net gives the error `ConnectionReset` for a reset from the host,
+//! and also when smoltcp closes the socket because the network stack lost
+//! its address (the link dropped). For that reason the task counts the
+//! error as a reset only while the link is up and the stack has an address.
+//! Refer to [`host_reset`]. The socket has no smoltcp timeout and no
+//! keep-alive, so no timer of the socket gives the error. Only a FIN from
+//! the host gives a read of no bytes.
 //!
 //! The receive and send buffers of the socket are 8 KiB each. The task takes
 //! them from the heap once and keeps them, so the allocator puts them in
@@ -98,9 +100,9 @@ struct End {
     /// `true` if the link or the broker did not work. The task then writes
     /// the end to the log as a warning.
     failed: bool,
-    /// `true` if the broker host answered with a TCP reset. Refer to
-    /// [`host_reset`].
-    reset: bool,
+    /// `true` if the broker host ended the stream with a FIN or a TCP
+    /// reset. Refer to [`host_reset`].
+    by_host: bool,
     /// `true` if the task sends a FIN and waits for the bytes that wait
     /// before it aborts the socket.
     graceful: bool,
@@ -112,7 +114,7 @@ impl End {
         Self {
             reason: reason.into(),
             failed: true,
-            reset: false,
+            by_host: false,
             graceful: false,
         }
     }
@@ -122,7 +124,7 @@ impl End {
     /// [`host_reset`]. The task aborts the socket at once.
     fn reset(stack: Stack<'static>, reason: impl Into<String>) -> Self {
         Self {
-            reset: host_reset(stack),
+            by_host: host_reset(stack),
             ..Self::error(reason)
         }
     }
@@ -132,7 +134,7 @@ impl End {
         Self {
             reason: reason.into(),
             failed: false,
-            reset: false,
+            by_host: false,
             graceful: true,
         }
     }
@@ -143,11 +145,13 @@ impl End {
 /// address.
 ///
 /// smoltcp also closes a socket when the stack loses the address of the
-/// socket, and embassy-net then gives the same error. When the link drops,
-/// embassy-net removes the address before smoltcp closes the socket. Thus
-/// such a close always finds no link or no address here. A new address
-/// needs a DHCP exchange, which takes much longer than the task needs to
-/// see the error.
+/// socket, and embassy-net then gives the same error. This check relies on
+/// the order of events in embassy-net 0.9.1 and smoltcp 0.13.1. In the poll
+/// in which embassy-net sees the link drop, it clears the address. smoltcp
+/// resets the socket only in the next poll. Thus such a close always finds
+/// no link or no address here. A new address needs a DHCP exchange, which
+/// takes much longer than the task needs to see the error. Examine this
+/// order again after an update of either crate.
 fn host_reset(stack: Stack<'static>) -> bool {
     stack.is_link_up() && stack.config_v4().is_some()
 }
@@ -213,17 +217,13 @@ pub async fn task(stack: Stack<'static>) {
         }
         log::info!("stream: open {connection} to {}:{}", open.host, open.port);
         let end = session(stack, rx, tx, &streams, connection, &open, &mut pending).await;
-        let reset = if end.reset {
-            " (reset by the host)"
-        } else {
-            ""
-        };
+        let by_host = if end.by_host { " (by the host)" } else { "" };
         if end.failed {
-            log::warn!("stream: {connection} failed: {}{reset}", end.reason);
+            log::warn!("stream: {connection} failed: {}{by_host}", end.reason);
         } else {
-            log::info!("stream: {connection} closed: {}", end.reason);
+            log::info!("stream: {connection} closed: {}{by_host}", end.reason);
         }
-        if let Some(signal) = streams.end(connection, end.reason, end.reset) {
+        if let Some(signal) = streams.end(connection, end.reason, end.by_host) {
             SIGNALS.push(signal);
         }
     }
@@ -375,6 +375,7 @@ async fn exchange(
             Either3::Second(Ok(0)) => {
                 let mut end = End::closed("the broker closed the stream");
                 end.graceful = false;
+                end.by_host = true;
                 return end;
             }
             Either3::Second(Ok(count)) => {

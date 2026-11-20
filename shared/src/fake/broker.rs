@@ -68,7 +68,8 @@ pub struct Broker {
     /// stops.
     pub down: bool,
     /// If `true`, the broker host does not answer, so no connection opens
-    /// and no reset arrives. This occurs when the link moves no data.
+    /// and no reset arrives. This occurs when the link moves no data. This
+    /// flag wins over [`Broker::down`].
     pub unreachable: bool,
     /// The return code of the CONNACK packet. If it is not 0, the broker
     /// closes the connection after the CONNACK.

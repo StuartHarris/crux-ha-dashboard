@@ -382,6 +382,47 @@ fn a_refused_connect_clears_a_suspect_link_and_its_count() {
 }
 
 #[test]
+fn a_broker_that_stops_closes_the_session_and_the_core_keeps_the_association() {
+    let mut shell = online();
+    // The broker host closes the session with a FIN, and then refuses each
+    // connect with a TCP reset. Both prove that the link works.
+    shell.broker.stop();
+    shell.run();
+    assert!(!shell.model.wifi.health.suspect());
+
+    shell.advance(RECONNECT_MIN + RECONNECT_MIN * 2);
+    let log = shell.take_log();
+    assert_eq!(
+        radio(&log),
+        [
+            "RadioJoin Cached keep",
+            "RadioAddress",
+            "RadioJoin Cached keep",
+            "RadioAddress",
+        ]
+    );
+    assert_eq!(shell.restarts, Vec::<String>::new());
+
+    shell.broker.down = false;
+    shell.advance(RECONNECT_MAX);
+    assert_eq!(shell.view().connection, Connection::Online);
+}
+
+#[test]
+fn an_end_by_the_host_while_the_device_has_no_link_does_not_clear_the_suspicion() {
+    let mut shell = online();
+    fail_the_session(&mut shell);
+    // The core leaves before it joins again. While the `Leave` waits, the
+    // device has no link, so an end by the host proves nothing.
+    shell.hold_radio = true;
+    shell.advance(RECONNECT_MIN);
+    assert!(matches!(shell.model.wifi.phase, Phase::Leaving(_)));
+    let end = crate::mqtt::End::ByHost("TCP connect failed: ConnectionReset".into());
+    crate::features::wifi::session_ended(&end, &mut shell.model);
+    assert!(shell.model.wifi.health.suspect());
+}
+
+#[test]
 fn a_connect_with_no_answer_keeps_the_link_suspect() {
     let mut shell = online();
     shell.broker.unreachable = true;

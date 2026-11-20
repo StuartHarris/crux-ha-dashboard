@@ -206,22 +206,36 @@ fn rejoin(current: AccessPoint, model: &mut Model) -> Cmd {
     }
 }
 
-/// Records the end of an MQTT session with `end`. A failure of the link
-/// makes it suspect. A TCP reset from the broker host proves traffic. Refer
-/// to [`Health::ended`].
+/// Records the end of an MQTT session with `end`.
+///
+/// A failure of the link makes it suspect. An end by the broker host proves
+/// traffic, but only while the device has a link with an address. Refer to
+/// [`Health::ended`] and [`linked`].
 ///
 /// After an end that is not clean, the link can be the cause, so the next
 /// [`link`] joins again. A clean end comes from the core, so the link stays
 /// ready.
 pub fn session_ended(end: &End, model: &mut Model) {
-    model.wifi.health.ended(end);
+    let linked = linked(model.wifi.phase);
+    model.wifi.health.ended(end, linked);
     if *end != End::Clean {
         model.wifi.ready = false;
     }
 }
 
-/// Records bytes from the broker, which prove that the link moves data. A
-/// TCP reset from the broker host is the same proof. Refer to
+/// Returns `true` if the device has a link with an address in `phase`.
+///
+/// A scan keeps the link to the access point, so `Scanning` and
+/// `StoppingScan` have a link too.
+const fn linked(phase: Phase) -> bool {
+    matches!(
+        phase,
+        Phase::Up(_) | Phase::Scanning(_) | Phase::StoppingScan { .. }
+    )
+}
+
+/// Records bytes from the broker, which prove that the link moves data. An
+/// end of the stream by the broker host is the same proof. Refer to
 /// [`session_ended`].
 pub const fn traffic(model: &mut Model) {
     model.wifi.health.traffic();

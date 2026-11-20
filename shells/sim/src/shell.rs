@@ -330,8 +330,9 @@ impl Shell {
     }
 
     /// Drops the link, as when the access point goes off. The device is not
-    /// associated, and the address goes. The open stream ends with `Closed`,
-    /// the reason `"link lost"` and no reset, as for a socket that is dead.
+    /// associated, and the address goes. The open stream ends with `Closed`
+    /// and the reason `"link lost"`, as for a socket that is dead. The host
+    /// did not end it.
     pub fn drop_link(&mut self) {
         eprintln!("radio: the link drops");
         self.radio.drop_link();
@@ -582,9 +583,9 @@ impl Shell {
             }
             StreamItem::Closed {
                 reason: text,
-                reset,
+                by_host,
             } => {
-                let reset = if *reset { ", reset" } else { "" };
+                let reset = if *by_host { ", by the host" } else { "" };
                 eprintln!("stream: closed (connection {connection}): {text}{reset}");
                 self.inspector.effect(
                     "StreamOpen",
@@ -1073,15 +1074,23 @@ mod tests {
                     client
                 }
                 Mode::Broker => {
-                    if let Err(failure) = guard.broker.open() {
-                        // The stream task of the shell finds a reset from the
-                        // kind of the error.
-                        let kind = match failure {
-                            NoConnection::Refused => std::io::ErrorKind::ConnectionRefused,
-                            NoConnection::Unreachable => std::io::ErrorKind::TimedOut,
-                        };
-                        let error = std::io::Error::new(kind, failure.reason());
-                        return Box::pin(async move { Err(error) });
+                    match guard.broker.open() {
+                        Ok(()) => {}
+                        // The stream task of the shell finds the end by the
+                        // host from the kind of the error.
+                        Err(NoConnection::Refused) => {
+                            let error = std::io::Error::new(
+                                std::io::ErrorKind::ConnectionRefused,
+                                NoConnection::Refused.reason(),
+                            );
+                            return Box::pin(async move { Err(error) });
+                        }
+                        // The host does not answer, so the connect waits.
+                        // The tests use simulated time, and the tokio timer
+                        // of the opener does not. The open timer of the core
+                        // has the same 10 s as the connect limit of the
+                        // firmware, so it ends the stream at that time.
+                        Err(NoConnection::Unreachable) => return Box::pin(pending()),
                     }
                     guard.current = number;
                     let nudge = Arc::new(Notify::new());
@@ -1538,7 +1547,8 @@ mod tests {
             shared::Connection::Online
         );
         assert!(
-            fixture.outcomes("StreamOpen")[0].ends_with(&format!("item: Closed ({PEER_CLOSED})"))
+            fixture.outcomes("StreamOpen")[0]
+                .ends_with(&format!("item: Closed ({PEER_CLOSED}, by the host)"))
         );
         // The stream ended, so the `Close` of the core has no stream.
         assert!(fixture.outcomes("StreamClose")[0].ends_with("resolved: no stream"));
@@ -2213,6 +2223,65 @@ mod tests {
         assert!(count(&mut fixture, "RadioLeave") > leaves);
         assert_eq!(fixture.shell().suback_count(), 2);
         assert_eq!(count(&mut fixture, "RadioRestart"), 0);
+    }
+
+    #[test]
+    fn a_dropped_link_is_not_an_end_by_the_host() {
+        let mut fixture = Fixture::new();
+        fixture.start(PowerSource::Stand);
+        fixture.connect();
+        let leaves = count(&mut fixture, "RadioLeave");
+
+        // The broker host refuses each connect from now. The drop of the
+        // link ends the stream first, and the host did not end it.
+        fixture.net().broker.down = true;
+        fixture.shell().drop_link();
+        let outcomes = fixture.outcomes("StreamOpen");
+        assert!(
+            outcomes[0].ends_with("item: Closed (link lost)"),
+            "{outcomes:?}"
+        );
+
+        // The link is suspect, so the reconnect leaves and joins again.
+        // Then the host refuses the connect, which proves the new link.
+        fixture.advance(RECONNECT_MIN);
+        fixture.settle();
+        assert_eq!(count(&mut fixture, "RadioLeave"), leaves + 1);
+        let outcomes = fixture.outcomes("StreamOpen");
+        assert!(
+            outcomes[0].ends_with("item: Closed (connection refused, by the host)"),
+            "{outcomes:?}"
+        );
+
+        // The next reconnect keeps the association.
+        fixture.advance(RECONNECT_MIN * 2);
+        fixture.settle();
+        assert_eq!(count(&mut fixture, "RadioLeave"), leaves + 1);
+        assert_eq!(count(&mut fixture, "RadioRestart"), 0);
+    }
+
+    #[test]
+    fn a_broker_host_that_does_not_answer_fails_the_link() {
+        let mut fixture = Fixture::new();
+        fixture.net().broker.unreachable = true;
+        fixture.start(PowerSource::Stand);
+        fixture.settle();
+        let leaves = count(&mut fixture, "RadioLeave");
+
+        // The open timer of the core ends the stream. The host did not end
+        // it, so the link is suspect, and the reconnect leaves first.
+        fixture.advance(OPEN_TIMEOUT);
+        fixture.settle();
+        let closes = fixture.outcomes("StreamClose");
+        assert!(
+            closes
+                .iter()
+                .any(|close| close.contains("the stream did not open in time")),
+            "{closes:?}"
+        );
+        fixture.advance(RECONNECT_MIN);
+        fixture.settle();
+        assert_eq!(count(&mut fixture, "RadioLeave"), leaves + 1);
     }
 
     #[test]
