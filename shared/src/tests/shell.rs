@@ -11,6 +11,17 @@
 //! A stale timer (one that the core no longer uses) stays until its
 //! deadline, as on a real device. When it fires, the core ignores its event.
 //!
+//! The timers of the MQTT session are separate. They are not in the log,
+//! and [`Shell::advance`] and [`Shell::advance_to_next`] do not fire them.
+//! A test of the session fires them with [`Shell::advance_session`]. The
+//! shell finds a timer of the session by its duration. Refer to
+//! [`session_timers`].
+//!
+//! The shell logs the stream with the names of the MQTT operations: an
+//! `Open` is `MqttConnect`, and each packet in a `Write` is
+//! `MqttPublish <topic> <payload>`, `MqttSubscribe` (once for each write)
+//! or `MqttDisconnect`. A `Close` is `StreamClose`.
+//!
 //! The draw timer is short, and the steps of a test are far apart in time.
 //! Thus, by default, [`Shell::run`] moves the clock to the next deadline
 //! while the core waits for a draw. A test of the draw timer sets
@@ -25,20 +36,43 @@ use core::time::Duration;
 use crux_core::{App, Request};
 use crux_time::operation::NotifyAfter;
 
-use super::broker::Broker;
+use super::broker::{Broker, publish_of};
 use crate::{
     Cmd, Dashboard, Effect, Event, Model, ViewModel,
     capabilities::{
         network::WifiStatus,
         power::{Sleep, Wake},
+        stream::Close,
+    },
+    features::connection::KEEP_ALIVE_SECS,
+    mqtt::{
+        ACK_TIMEOUT, CONNACK_TIMEOUT, OPEN_TIMEOUT, PING_RESPONSE_TIMEOUT, SEND_TIMEOUT,
+        codec::server::Packet, ping_interval, silence_limit,
     },
 };
+
+/// Returns the durations of the timers of the MQTT session. No timer of a
+/// feature has one of these durations. A test checks this.
+pub fn session_timers() -> Vec<Duration> {
+    let mut durations = alloc::vec![
+        OPEN_TIMEOUT,
+        CONNACK_TIMEOUT,
+        PING_RESPONSE_TIMEOUT,
+        SEND_TIMEOUT,
+        ACK_TIMEOUT,
+    ];
+    durations.extend(ping_interval(KEEP_ALIVE_SECS));
+    durations.extend(silence_limit(KEEP_ALIVE_SECS));
+    durations
+}
 
 /// A timer that waits.
 struct Timer {
     /// The time on the clock of the shell at which the timer fires.
     due: Duration,
     request: Request<NotifyAfter>,
+    /// The timer is a timer of the MQTT session.
+    session: bool,
 }
 
 /// One image on the panel.
@@ -87,6 +121,10 @@ pub struct Shell {
     sleep_request: Option<Request<Sleep>>,
     /// A short name for each effect, in order.
     pub log: Vec<String>,
+    /// The `Close` requests, in order.
+    pub closes: Vec<Close>,
+    /// The packets of each `Write` request, in order.
+    pub writes: Vec<Vec<Packet>>,
 }
 
 impl Shell {
@@ -110,6 +148,8 @@ impl Shell {
             sleep: None,
             sleep_request: None,
             log: Vec::new(),
+            closes: Vec::new(),
+            writes: Vec::new(),
         }
     }
 
@@ -172,7 +212,7 @@ impl Shell {
             return;
         }
         while self.model.refresh.draw_pending {
-            let Some(index) = self.next_due(limit) else {
+            let Some(index) = self.next_due(limit, false) else {
                 break;
             };
             self.fire(index, limit, fired);
@@ -190,6 +230,11 @@ impl Shell {
                 events.extend(command.events());
             }
             if effects.is_empty() && events.is_empty() {
+                // The answer of the broker to a write arrives after the
+                // answer to the write.
+                if self.broker.deliver_answers() {
+                    continue;
+                }
                 break;
             }
             for effect in effects {
@@ -224,21 +269,37 @@ impl Shell {
     /// until the core waits. Returns the events that the fired timers sent,
     /// in order, also the events of the draw timers.
     pub fn advance(&mut self, duration: Duration) -> Vec<Event> {
+        self.advance_with(duration, false)
+    }
+
+    /// Moves the clock forward by `duration` as [`Shell::advance`] does, but
+    /// fires the timers of the MQTT session too.
+    pub fn advance_session(&mut self, duration: Duration) -> Vec<Event> {
+        self.advance_with(duration, true)
+    }
+
+    fn advance_with(&mut self, duration: Duration, session: bool) -> Vec<Event> {
         self.settle();
         let target = self.now + duration;
         let mut fired = Vec::new();
-        while let Some(index) = self.next_due(target) {
+        while let Some(index) = self.next_due(target, session) {
             self.fire(index, target, &mut fired);
         }
         self.set_now(target);
         fired
     }
 
-    /// Moves the clock to the next deadline, and fires the timers that are
-    /// due then. Returns the events that they sent. If no timer waits,
-    /// returns no events.
+    /// Moves the clock to the next deadline of a timer that is not a timer
+    /// of the session, and fires the timers that are due then. Returns the
+    /// events that they sent. If no timer waits, returns no events.
     pub fn advance_to_next(&mut self) -> Vec<Event> {
-        match self.timers.iter().map(|timer| timer.due).min() {
+        let next = self
+            .timers
+            .iter()
+            .filter(|timer| !timer.session)
+            .map(|timer| timer.due)
+            .min();
+        match next {
             Some(due) => self.advance(due.saturating_sub(self.now)),
             None => Vec::new(),
         }
@@ -246,12 +307,13 @@ impl Shell {
 
     /// Returns the place of the timer with the earliest deadline at or
     /// before `target`. Of two timers with the same deadline, the timer that
-    /// the core started first comes first.
-    fn next_due(&self, target: Duration) -> Option<usize> {
+    /// the core started first comes first. A timer of the session counts
+    /// only if `session` is `true`.
+    fn next_due(&self, target: Duration, session: bool) -> Option<usize> {
         self.timers
             .iter()
             .enumerate()
-            .filter(|(_, timer)| timer.due <= target)
+            .filter(|(_, timer)| timer.due <= target && (session || !timer.session))
             .min_by_key(|(index, timer)| (timer.due, *index))
             .map(|(index, _)| index)
     }
@@ -261,7 +323,8 @@ impl Shell {
     /// or before `limit`. Adds the events of the fired timers to `fired`.
     fn fire(&mut self, index: usize, limit: Duration, fired: &mut Vec<Event>) {
         let mut timer = self.timers.remove(index);
-        self.set_now(timer.due);
+        // A timer of the session that [`Shell::advance`] skipped fires now.
+        self.set_now(timer.due.max(self.now));
         let id = timer.request.operation.id;
         timer
             .request
@@ -312,28 +375,19 @@ impl Shell {
                 self.log.push("Render".into());
                 self.render_requested = true;
             }
-            Effect::MqttConnect(request) => {
+            Effect::StreamOpen(request) => {
                 self.log.push("MqttConnect".into());
-                self.broker.connect(request);
+                self.broker.open(request);
             }
-            Effect::MqttSubscribe(request) => {
-                self.log.push("MqttSubscribe".into());
-                self.broker.subscribe(request);
+            Effect::StreamWrite(request) => {
+                let packets = self.broker.write(request);
+                self.log_packets(&packets);
+                self.writes.push(packets);
             }
-            Effect::MqttPublish(request) => {
-                let publish = request.operation;
-                let payload = String::from_utf8_lossy(&publish.payload);
-                self.log
-                    .push(format!("MqttPublish {} {payload}", publish.topic));
-                self.broker.publish_from_dashboard(publish);
-            }
-            Effect::MqttDisconnect(mut request) => {
-                self.log.push("MqttDisconnect".into());
-                // The stream ends first, then the request.
-                self.broker.disconnect();
-                request
-                    .resolve(())
-                    .expect("the core waits for the disconnect");
+            Effect::StreamClose(request) => {
+                self.log.push("StreamClose".into());
+                self.closes.push(request.operation.clone());
+                self.broker.close(request);
             }
             Effect::WifiOn(mut request) => {
                 self.log.push("WifiOn".into());
@@ -365,16 +419,53 @@ impl Shell {
             }
             Effect::TimeNotifyAfter(request) => {
                 let duration = Duration::from(request.operation.duration);
-                self.log
-                    .push(format!("TimeNotifyAfter {}ms", duration.as_millis()));
+                let session = session_timers().contains(&duration);
+                if !session {
+                    self.log
+                        .push(format!("TimeNotifyAfter {}ms", duration.as_millis()));
+                }
                 let due = self.now + duration;
-                self.timers.push(Timer { due, request });
+                self.timers.push(Timer {
+                    due,
+                    request,
+                    session,
+                });
             }
             Effect::TimeClear(mut request) => {
-                self.log.push("TimeClear".into());
                 let id = request.operation.id;
+                let session = self
+                    .timers
+                    .iter()
+                    .any(|timer| timer.session && timer.request.operation.id == id);
+                if !session {
+                    self.log.push("TimeClear".into());
+                }
                 self.timers.retain(|timer| timer.request.operation.id != id);
                 request.resolve(id).expect("the core waits for the clear");
+            }
+        }
+    }
+
+    /// Logs the packets of a `Write` with the names of the MQTT operations.
+    fn log_packets(&mut self, packets: &[Packet]) {
+        let mut subscribed = false;
+        for packet in packets {
+            match packet {
+                Packet::Publish { .. } => {
+                    let publish = publish_of(packet).expect("a publish");
+                    let payload = String::from_utf8_lossy(&publish.payload);
+                    self.log
+                        .push(format!("MqttPublish {} {payload}", publish.topic));
+                }
+                Packet::Subscribe { .. } if !subscribed => {
+                    subscribed = true;
+                    self.log.push("MqttSubscribe".into());
+                }
+                Packet::Disconnect => self.log.push("MqttDisconnect".into()),
+                Packet::Connect { .. }
+                | Packet::Subscribe { .. }
+                | Packet::PubAck(_)
+                | Packet::PingReq => {}
             }
         }
     }

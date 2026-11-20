@@ -1,4 +1,4 @@
-//! Tests of the subscribe request and of `WifiQuiet`: the core subscribes
+//! Tests of the subscribe and of `WifiQuiet`: the core subscribes
 //! after each connect, and the link is quiet when the broker acknowledged
 //! all the topic filters.
 //!
@@ -9,12 +9,18 @@ use alloc::string::String;
 
 use crux_core::App;
 
-use super::{connection::drive_to_connected, flows::house, start};
+use super::{
+    connection::{drive_to_connected, drive_to_connecting},
+    flows::house,
+    start,
+    wire::ExpectWrite,
+};
 use crate::{
-    Dashboard, EffectTestExt, Event, PowerSource,
-    capabilities::power::Wake,
+    Dashboard, Effect, EffectTestExt, Event, PowerSource,
+    capabilities::{power::Wake, stream::StreamItem},
+    entities::topics,
     features::{connection::RECONNECT_MIN, power::IDLE_TIMEOUT},
-    mqtt::SubscribeOutcome,
+    pages::PAGES,
 };
 
 /// Returns the number of times that `effect` is in `log`.
@@ -27,24 +33,36 @@ fn place(log: &[String], effect: &str) -> Option<usize> {
     log.iter().position(|entry| entry == effect)
 }
 
+/// Connects with `refuse` as the filter that the broker refuses, and
+/// returns the number of `WifiQuiet` effects after the SUBACK packets.
+fn quiet_after_connect(refuse: Option<String>) -> usize {
+    let (mut model, mut wire) = drive_to_connecting(PowerSource::Stand);
+    wire.broker.refuse = refuse;
+    wire.connect(&mut model)
+        .expect_write_with(&mut wire, &mut model, |_| {})
+        .expect_only_render();
+    wire.effects
+        .iter()
+        .filter(|effect| matches!(effect, Effect::WifiQuiet(_)))
+        .count()
+}
+
 #[test]
 fn only_done_for_the_current_connection_makes_the_link_quiet() {
-    let app = Dashboard;
-    let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Stand);
+    assert_eq!(quiet_after_connect(None), 1);
+    // The broker refused a filter, so the subscribe failed.
+    let topic = topics(PAGES).swap_remove(0);
+    assert_eq!(quiet_after_connect(Some(topic)), 0);
 
+    // A SUBACK on the stream of an older connection does not reach the
+    // session.
+    let (mut model, _wire) = drive_to_connected(PowerSource::Stand);
     let older = model.connection.id.wrapping_sub(1);
-    let answer = |connection, outcome| Event::Subscribed {
-        connection,
-        outcome,
+    let event = Event::Stream {
+        connection: older,
+        item: StreamItem::Received(alloc::vec![0x90, 0x03, 0x00, 0x01, 0x00]),
     };
-    app.update(answer(older, SubscribeOutcome::Done), &mut model)
-        .expect_no_effects();
-
-    let connection = model.connection.id;
-    app.update(answer(connection, SubscribeOutcome::Failed), &mut model)
-        .expect_no_effects();
-    app.update(answer(connection, SubscribeOutcome::Done), &mut model)
-        .expect_only_wifi_quiet();
+    Dashboard.update(event, &mut model).expect_no_effects();
 }
 
 #[test]

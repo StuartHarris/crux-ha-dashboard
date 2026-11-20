@@ -244,6 +244,9 @@ fn on_battery_the_dashboard_wakes_syncs_accepts_taps_then_sleeps() {
             // Each step of the sleep waits for the answer of the shell.
             "MqttPublish dashboard/hall/status asleep",
             "MqttDisconnect",
+            // The answer to the close of the stream comes after the shell
+            // sent the DISCONNECT packet.
+            "StreamClose",
             "WifiOff",
             // No full-refresh timer runs while the device sleeps.
             "TimeClear",

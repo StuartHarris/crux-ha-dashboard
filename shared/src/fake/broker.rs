@@ -67,6 +67,9 @@ pub struct Broker {
     pub published: Vec<Publish>,
     /// The service calls that Home Assistant got, in order.
     pub service_calls: Vec<super::ServiceCall>,
+    /// If `true`, Home Assistant keeps each service call in
+    /// [`Broker::service_calls`], but does not do it.
+    pub ignore_calls: bool,
     /// The number of connections that the broker accepted.
     pub connections: usize,
     /// The topics of the messages that the broker sent to the client.
@@ -100,6 +103,13 @@ impl Broker {
         });
         self.outgoing.clear();
         Ok(())
+    }
+
+    /// Returns `true` if a connection is open, also before its CONNECT
+    /// packet.
+    #[must_use]
+    pub const fn is_open(&self) -> bool {
+        self.connection.is_some()
     }
 
     /// Returns `true` if the broker accepted the CONNECT packet of the open
@@ -209,6 +219,14 @@ impl Broker {
             codec::publish(&mut self.outgoing, topic, payload, flags, None)
                 .expect("a short publish");
             self.delivered.push(topic.to_string());
+        }
+    }
+
+    /// Sends the PUBACK packets that the broker held back. They wait for the
+    /// client.
+    pub fn release_pubacks(&mut self) {
+        for id in core::mem::take(&mut self.held_pubacks) {
+            server::puback(&mut self.outgoing, id);
         }
     }
 

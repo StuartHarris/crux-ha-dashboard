@@ -29,8 +29,7 @@ impl fmt::Debug for Credentials {
 }
 
 /// The quality of service for a publish.
-#[derive(Facet, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Qos {
     /// The broker gets the message at most once (`QoS` 0).
     AtMostOnce,
@@ -40,7 +39,7 @@ pub enum Qos {
 
 /// The message that the broker publishes if the connection stops without a
 /// disconnect from the client.
-#[derive(Facet, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LastWill {
     /// The topic of the message.
     pub topic: String,
@@ -51,7 +50,7 @@ pub struct LastWill {
 }
 
 /// The options of a connection to the broker.
-#[derive(Facet, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Connect {
     /// The host name or IP address of the broker.
     pub host: String,
@@ -68,8 +67,7 @@ pub struct Connect {
 }
 
 /// The result of a subscribe.
-#[derive(Facet, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SubscribeOutcome {
     /// The broker acknowledged each topic filter with success.
     Done,
@@ -79,7 +77,7 @@ pub enum SubscribeOutcome {
 }
 
 /// A message that the client publishes.
-#[derive(Facet, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Publish {
     /// The topic of the message.
     pub topic: String,
@@ -92,7 +90,7 @@ pub struct Publish {
 }
 
 /// A message from the broker on a subscribed topic.
-#[derive(Facet, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Message {
     /// The topic of the message.
     pub topic: String,

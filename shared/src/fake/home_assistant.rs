@@ -63,7 +63,8 @@ impl Broker {
 
     /// If `publish` is a service call on a command topic, moves the clock
     /// one second forward, does the call and keeps it in
-    /// [`Broker::service_calls`].
+    /// [`Broker::service_calls`]. If [`Broker::ignore_calls`] is `true`,
+    /// Home Assistant only keeps the call.
     pub(super) fn service_call(&mut self, publish: &Publish) {
         if !publish.topic.ends_with("/cmd") {
             return;
@@ -74,7 +75,9 @@ impl Broker {
         // A service call comes after the state that the dashboard shows, so
         // its change has a later `last_updated` time.
         self.time += 1;
-        self.home_assistant(&call);
+        if !self.ignore_calls {
+            self.home_assistant(&call);
+        }
         self.service_calls.push(call);
     }
 

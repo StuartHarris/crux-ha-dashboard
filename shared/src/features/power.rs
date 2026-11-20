@@ -21,7 +21,6 @@ use crux_time::clock::Time;
 use crate::{
     Cmd, Event, Model,
     capabilities::{
-        mqtt::Mqtt,
         network::Network,
         power::{Power, PowerSource, Wake, WakeSource},
     },
@@ -72,7 +71,8 @@ pub fn woke(id: u32, wake: Wake, model: &mut Model) -> Cmd {
     }
 }
 
-/// The MQTT connection of the sleep `id` closed: turn Wi-Fi off.
+/// The stream of the MQTT connection of the sleep `id` closed: turn Wi-Fi
+/// off.
 pub fn offline(id: u32, model: &mut Model) -> Cmd {
     if id != model.power.sleep || !model.power.asleep {
         return Cmd::done();
@@ -227,12 +227,13 @@ pub fn light_off(id: u32, model: &mut Model) -> Cmd {
     disconnect(id, model)
 }
 
-/// Publishes `asleep` and disconnects. The answer to `Disconnect` starts the
-/// next step ([`offline`]).
+/// Publishes `asleep` and disconnects. The answer to the `Close` of the
+/// stream starts the next step ([`offline`]). Refer to
+/// [`connection::go_offline`].
 ///
 /// The core drops the service calls that wait in the outbox, and the view
 /// shows how many. The last image shows the time of the last state message.
 fn disconnect(id: u32, model: &mut Model) -> Cmd {
     model.unsent += model.connection.outbox.len();
-    connection::go_offline(model).then(Mqtt::disconnect().then_send(move |()| Event::Offline(id)))
+    connection::go_offline(id, model)
 }

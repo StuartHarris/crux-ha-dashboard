@@ -13,16 +13,20 @@ mod pending;
 mod power;
 mod refresh;
 mod rooms;
+mod session;
 mod subscribe;
 
 mod shell;
+mod wire;
 
 use alloc::string::String;
+
+use wire::{ExpectWrite, Wire};
 
 use core::time::Duration;
 
 use crate::{
-    Cmd, Control, EffectTestExt, PowerSource, Settings, Start,
+    Cmd, Control, EffectTestExt, Model, PowerSource, Settings, Start,
     app::Event,
     entities::STATESTREAM,
     features::{
@@ -126,12 +130,18 @@ impl ExpectFullRefreshTimer for Cmd {
 /// Expects the effects of a service call that the core issues at once.
 trait ExpectServiceCall {
     /// Expects the publish of the service call, the timer of its mark and
-    /// the render of the mark, and no other effect.
-    fn expect_only_service_call_with(&mut self, check: impl FnOnce(&Publish));
+    /// the render of the mark, and no other effect. The publish goes
+    /// through `wire`.
+    fn expect_only_service_call_with(
+        &mut self,
+        wire: &mut Wire,
+        model: &mut Model,
+        check: impl FnOnce(&Publish),
+    );
 
     /// Expects the effects of a service call, with any payload.
-    fn expect_only_service_call(&mut self) {
-        self.expect_only_service_call_with(|_| {});
+    fn expect_only_service_call(&mut self, wire: &mut Wire, model: &mut Model) {
+        self.expect_only_service_call_with(wire, model, |_| {});
     }
 
     /// Expects the effect that starts the timer of a mark: [`PENDING_TIMEOUT`],
@@ -141,8 +151,13 @@ trait ExpectServiceCall {
 
 impl ExpectServiceCall for Cmd {
     #[track_caller]
-    fn expect_only_service_call_with(&mut self, check: impl FnOnce(&Publish)) {
-        self.expect_mqtt_publish_with(check)
+    fn expect_only_service_call_with(
+        &mut self,
+        wire: &mut Wire,
+        model: &mut Model,
+        check: impl FnOnce(&Publish),
+    ) {
+        self.expect_publish_with(wire, model, check)
             .expect_pending_timer()
             .expect_only_render();
     }

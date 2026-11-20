@@ -2,7 +2,7 @@
 //!
 //! [`FixedShell`] drives the real core with no clock and no network. It
 //! answers each effect at once: Wi-Fi and the connection always work, and
-//! the broker sends [`states`]. Home Assistant updated each entity at
+//! the fake broker sends [`states`]. Home Assistant updated each entity at
 //! [`NOW`]. Timers expire
 //! only when you call [`FixedShell::fire_timers`]. Each run gives the same
 //! views, so the golden-image tests of the `ui` crate and the PNG mode of
@@ -22,8 +22,11 @@ use crux_time::operation::NotifyAfter;
 
 use crate::{
     Core, Dashboard, Effect, Event, PowerSource, Settings, Start, TileKind, ViewModel,
-    capabilities::{mqtt::MqttEvent, network::WifiStatus},
-    mqtt::{Connect, Message, SubscribeOutcome},
+    capabilities::{
+        network::WifiStatus,
+        stream::{Open, StreamItem, Written},
+    },
+    fake,
     pages::PAGES,
 };
 
@@ -35,12 +38,16 @@ pub const NOW: u64 = 1_782_898_860;
 pub const NOW_TEXT: &str = "2026-07-01T09:41:00+00:00";
 
 /// A shell that answers the effects of the core at once, with fixed answers.
+///
+/// The MQTT session of the core talks to a fake broker ([`fake::Broker`]),
+/// which keeps the messages of [`states`] as retained messages. Home
+/// Assistant keeps the service calls, but does not do them, so a tap does
+/// not change a state.
 pub struct FixedShell {
     core: Core<Dashboard>,
-    connection: Option<Request<Connect>>,
+    broker: fake::Broker,
+    stream: Option<Request<Open>>,
     timers: Vec<Request<NotifyAfter>>,
-    /// The entity ids for which the broker sends no message.
-    without: Vec<String>,
 }
 
 impl FixedShell {
@@ -56,11 +63,18 @@ impl FixedShell {
     /// no state, so its tile shows `-` and its toggle shows a cross.
     #[must_use]
     pub fn start_without(power: PowerSource, path: &str, without: &[&str]) -> Self {
+        let mut broker = fake::Broker::default();
+        broker.ignore_calls = true;
+        for (topic, payload) in states() {
+            if !without.iter().any(|entity| is_topic_of(&topic, entity)) {
+                broker.retain(&topic, payload.as_bytes());
+            }
+        }
         let mut shell = Self {
             core: Core::new(),
-            connection: None,
+            broker,
+            stream: None,
             timers: Vec::new(),
-            without: without.iter().map(ToString::to_string).collect(),
         };
         let effects = shell.core.process_event(Event::Start(Start {
             settings: Settings {
@@ -93,35 +107,30 @@ impl FixedShell {
         while let Some(effect) = queue.pop_front() {
             let more = match effect {
                 Effect::WifiOn(mut request) => self.resolve(&mut request, WifiStatus::Connected),
-                Effect::MqttConnect(mut request) => {
-                    let more = self.resolve(&mut request, MqttEvent::Connected);
-                    self.connection = Some(request);
-                    more
-                }
-                Effect::MqttSubscribe(mut subscribe) => {
-                    let mut more = Vec::new();
-                    if let Some(mut request) = self.connection.take() {
-                        for (topic, payload) in states() {
-                            if self
-                                .without
-                                .iter()
-                                .any(|entity| is_topic_of(&topic, entity))
-                            {
-                                continue;
-                            }
-                            let message = MqttEvent::Message(Message {
-                                topic,
-                                payload: payload.into_bytes(),
-                            });
-                            more.extend(self.resolve(&mut request, message));
-                        }
-                        self.connection = Some(request);
-                    }
-                    more.extend(self.resolve(&mut subscribe, SubscribeOutcome::Done));
-                    more
-                }
-                Effect::MqttDisconnect(mut request) => {
+                Effect::StreamOpen(mut request) => {
                     let mut more = self.end_stream();
+                    self.broker.open().expect("the fake broker is up");
+                    more.extend(self.resolve(&mut request, StreamItem::Opened));
+                    self.stream = Some(request);
+                    more
+                }
+                Effect::StreamWrite(mut request) => {
+                    let bytes = std::mem::take(&mut request.operation.bytes);
+                    let answer = self.broker.receive(bytes);
+                    let mut more = self.resolve(&mut request, Written::Sent);
+                    more.extend(self.deliver(answer));
+                    more
+                }
+                Effect::StreamClose(mut request) => {
+                    let open = self
+                        .stream
+                        .as_ref()
+                        .map(|stream| stream.operation.connection);
+                    let mut more = if open == Some(request.operation.connection) {
+                        self.end_stream()
+                    } else {
+                        Vec::new()
+                    };
                     more.extend(self.resolve(&mut request, ()));
                     more
                 }
@@ -136,13 +145,24 @@ impl FixedShell {
                     self.timers.retain(|timer| timer.operation.id != id);
                     self.resolve(&mut request, id)
                 }
-                Effect::Render(_)
-                | Effect::MqttPublish(_)
-                | Effect::Sleep(_)
-                | Effect::WifiQuiet(_) => Vec::new(),
+                Effect::Render(_) | Effect::Sleep(_) | Effect::WifiQuiet(_) => Vec::new(),
             };
             queue.extend(more);
         }
+    }
+
+    /// Gives `bytes` from the broker to the core on the open stream, and
+    /// returns the new effects.
+    fn deliver(&mut self, bytes: Vec<u8>) -> Vec<Effect> {
+        if bytes.is_empty() {
+            return Vec::new();
+        }
+        let Some(mut request) = self.stream.take() else {
+            return Vec::new();
+        };
+        let effects = self.resolve(&mut request, StreamItem::Received(bytes));
+        self.stream = Some(request);
+        effects
     }
 
     /// Sends `event` to the core, and answers the effects until the core
@@ -163,9 +183,6 @@ impl FixedShell {
         let Some((domain, object)) = entity_id.split_once('.') else {
             return;
         };
-        let Some(mut request) = self.connection.take() else {
-            return;
-        };
         let base = format!("homeassistant/statestream/{domain}/{object}");
         let messages = [
             (format!("{base}/state"), state),
@@ -177,15 +194,11 @@ impl FixedShell {
                 .iter()
                 .map(|(name, value)| (format!("{base}/{name}"), *value)),
         );
-        let mut effects = Vec::new();
         for (topic, payload) in messages {
-            let message = MqttEvent::Message(Message {
-                topic,
-                payload: payload.as_bytes().to_vec(),
-            });
-            effects.extend(self.resolve(&mut request, message));
+            self.broker.publish(&topic, payload.as_bytes(), false);
         }
-        self.connection = Some(request);
+        let bytes = self.broker.take();
+        let effects = self.deliver(bytes);
         self.run(effects);
     }
 
@@ -196,17 +209,18 @@ impl FixedShell {
         self.run(effects);
     }
 
-    /// Ends the stream of the MQTT connection, and returns the new effects.
+    /// Ends the open stream, and returns the new effects. If the broker did
+    /// not get a DISCONNECT packet, it publishes the last will.
     fn end_stream(&mut self) -> Vec<Effect> {
-        let Some(mut request) = self.connection.take() else {
+        self.broker.drop_connection();
+        let Some(mut request) = self.stream.take() else {
             return Vec::new();
         };
-        let reason = Some("test".into());
-        self.resolve(&mut request, MqttEvent::Disconnected { reason })
+        self.resolve(&mut request, StreamItem::Closed("test".into()))
     }
 
-    /// Fires all the timers that wait, and answers the effects until the
-    /// core waits.
+    /// Fires all the timers that wait, also the timers of the MQTT session,
+    /// and answers the effects until the core waits.
     pub fn fire_timers(&mut self) {
         for mut timer in std::mem::take(&mut self.timers) {
             let id = timer.operation.id;

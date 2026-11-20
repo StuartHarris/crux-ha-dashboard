@@ -3,7 +3,7 @@
 
 use crux_core::App;
 
-use super::{ExpectLight, connection::drive_to_connected, shell::Shell, start};
+use super::{ExpectLight, connection::drive_to_connected, shell::Shell, start, wire::ExpectWrite};
 use crate::{
     Dashboard, EffectTestExt, Event, Model, PowerSource,
     capabilities::power::Wake,
@@ -32,7 +32,7 @@ fn a_tap_turns_the_light_on_at_the_level_of_the_power_source() {
         (PowerSource::Stand, STAND_LEVEL),
         (PowerSource::Battery, BATTERY_LEVEL),
     ] {
-        let (mut model, _cmd, _request) = drive_to_connected(source);
+        let (mut model, _wire) = drive_to_connected(source);
 
         app.update(Event::Tapped(None), &mut model)
             .expect_touch_light(level)
@@ -44,7 +44,7 @@ fn a_tap_turns_the_light_on_at_the_level_of_the_power_source() {
 #[test]
 fn the_light_goes_off_at_the_light_timeout() {
     let app = Dashboard;
-    let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Stand);
+    let (mut model, _wire) = drive_to_connected(PowerSource::Stand);
     let _ = app.update(Event::Tapped(None), &mut model);
 
     app.update(Event::LightTimeout(model.light.timer), &mut model)
@@ -56,7 +56,7 @@ fn the_light_goes_off_at_the_light_timeout() {
 #[test]
 fn a_second_tap_starts_the_timer_again_and_the_old_timer_is_ignored() {
     let app = Dashboard;
-    let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Stand);
+    let (mut model, _wire) = drive_to_connected(PowerSource::Stand);
     let _ = app.update(Event::Tapped(None), &mut model);
     let old = model.light.timer;
 
@@ -73,7 +73,7 @@ fn a_second_tap_starts_the_timer_again_and_the_old_timer_is_ignored() {
 #[test]
 fn a_change_of_the_power_source_while_the_light_is_on_sets_the_new_level() {
     let app = Dashboard;
-    let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Stand);
+    let (mut model, _wire) = drive_to_connected(PowerSource::Stand);
     let _ = app.update(Event::Tapped(None), &mut model);
 
     app.update(Event::PowerSourceChanged(PowerSource::Battery), &mut model)
@@ -91,7 +91,7 @@ fn a_change_of_the_power_source_while_the_light_is_on_sets_the_new_level() {
 #[test]
 fn a_change_of_the_power_source_while_the_light_is_off_does_not_set_it() {
     let app = Dashboard;
-    let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Stand);
+    let (mut model, _wire) = drive_to_connected(PowerSource::Stand);
 
     app.update(Event::PowerSourceChanged(PowerSource::Battery), &mut model)
         .expect_render()
@@ -102,7 +102,7 @@ fn a_change_of_the_power_source_while_the_light_is_off_does_not_set_it() {
 #[test]
 fn the_sleep_turns_the_light_off_before_it_disconnects() {
     let app = Dashboard;
-    let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Battery);
+    let (mut model, mut wire) = drive_to_connected(PowerSource::Battery);
     let _ = app.update(Event::Tapped(None), &mut model);
 
     // The core waits for the answer to `FrontLight` before it disconnects.
@@ -115,10 +115,9 @@ fn the_sleep_turns_the_light_off_before_it_disconnects() {
     light.resolve(()).unwrap();
     let light_off = sleep.expect_one_event();
     let mut disconnect = app.update(light_off, &mut model);
-    let _request = disconnect
-        .expect_mqtt_publish()
-        .expect_one_effect()
-        .expect_mqtt_disconnect();
+    disconnect
+        .expect_disconnect(&mut wire, &mut model)
+        .expect_no_effects();
 
     // The light timer of the tap expires during the sleep. It does nothing.
     app.update(Event::LightTimeout(model.light.timer), &mut model)
@@ -128,7 +127,7 @@ fn the_sleep_turns_the_light_off_before_it_disconnects() {
 #[test]
 fn a_tap_while_the_light_goes_off_for_the_sleep_wakes_and_the_late_answer_is_ignored() {
     let app = Dashboard;
-    let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Battery);
+    let (mut model, _wire) = drive_to_connected(PowerSource::Battery);
     let _ = app.update(Event::Tapped(None), &mut model);
     let mut sleep = app.update(Event::IdleTimeout(model.power.idle), &mut model);
     let mut light = sleep.expect_one_effect().expect_front_light();
@@ -150,7 +149,7 @@ fn a_tap_while_the_light_goes_off_for_the_sleep_wakes_and_the_late_answer_is_ign
 #[test]
 fn a_tap_on_no_control_lights_the_light_but_the_sleep_comes_on_time_and_turns_it_off() {
     let app = Dashboard;
-    let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Battery);
+    let (mut model, mut wire) = drive_to_connected(PowerSource::Battery);
     let idle = model.power.idle;
 
     // A touch by accident turns the light on, but it does not start the idle
@@ -169,24 +168,20 @@ fn a_tap_on_no_control_lights_the_light_but_the_sleep_comes_on_time_and_turns_it
 
     light.resolve(()).unwrap();
     let light_off = sleep.expect_one_event();
-    let _request = app
-        .update(light_off, &mut model)
-        .expect_mqtt_publish()
-        .expect_one_effect()
-        .expect_mqtt_disconnect();
+    app.update(light_off, &mut model)
+        .expect_disconnect(&mut wire, &mut model)
+        .expect_no_effects();
     assert_eq!(model.light.level, 0);
 }
 
 #[test]
 fn a_sleep_with_the_light_off_disconnects_at_once() {
     let app = Dashboard;
-    let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Battery);
+    let (mut model, mut wire) = drive_to_connected(PowerSource::Battery);
 
-    let _request = app
-        .update(Event::IdleTimeout(model.power.idle), &mut model)
-        .expect_mqtt_publish()
-        .expect_one_effect()
-        .expect_mqtt_disconnect();
+    app.update(Event::IdleTimeout(model.power.idle), &mut model)
+        .expect_disconnect(&mut wire, &mut model)
+        .expect_no_effects();
 }
 
 #[test]
