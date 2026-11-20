@@ -1,5 +1,6 @@
 //! Tests of the power feature: the idle timer, sleep and the power source.
 
+use crate::features::{power, wifi};
 use alloc::vec::Vec;
 use core::time::Duration;
 
@@ -45,12 +46,18 @@ fn the_idle_timeout_sleeps_in_steps_and_a_touch_wakes() {
 
     // Step 1: publish `asleep`, then disconnect. The core waits for the
     // answer to the close of the stream.
-    app.update(Event::IdleTimeout(model.power.idle), &mut model)
-        .expect_disconnect(&mut wire, &mut model)
-        .expect_session_clear(&wire)
-        .expect_no_effects();
+    app.update(
+        Event::Power(power::Event::IdleTimeout(model.power.idle)),
+        &mut model,
+    )
+    .expect_disconnect(&mut wire, &mut model)
+    .expect_session_clear(&wire)
+    .expect_no_effects();
     let offline = wire.take_event();
-    assert!(matches!(offline, Event::Offline(_)), "{offline:?}");
+    assert!(
+        matches!(offline, Event::Power(power::Event::Offline(_))),
+        "{offline:?}"
+    );
     assert!(model.power.asleep);
     assert_eq!(app.view(&model).connection, Connection::Offline);
 
@@ -106,7 +113,10 @@ fn a_tap_during_the_steps_wakes_and_the_late_answers_are_ignored() {
     let app = Dashboard;
     let (mut model, mut wire) = drive_to_connected(PowerSource::Battery);
     // The write of the DISCONNECT packet waits.
-    let mut sleep = app.update(Event::IdleTimeout(model.power.idle), &mut model);
+    let mut sleep = app.update(
+        Event::Power(power::Event::IdleTimeout(model.power.idle)),
+        &mut model,
+    );
 
     // The user taps before the disconnect ends. The session of the sleep
     // still closes, so the core does not connect yet.
@@ -141,7 +151,10 @@ fn the_answer_of_an_older_sleep_is_ignored() {
     let app = Dashboard;
     let (mut model, _wire) = drive_to_connected(PowerSource::Battery);
     let old = model.power.sleep.wrapping_add(1);
-    let _ = app.update(Event::IdleTimeout(model.power.idle), &mut model);
+    let _ = app.update(
+        Event::Power(power::Event::IdleTimeout(model.power.idle)),
+        &mut model,
+    );
     assert_eq!(model.power.sleep, old);
 
     // The device moves to the stand and wakes. The shell then answers the
@@ -149,12 +162,12 @@ fn the_answer_of_an_older_sleep_is_ignored() {
     let _ = app.update(Event::PowerSourceChanged(PowerSource::Stand), &mut model);
     assert!(!model.power.asleep);
     for event in [
-        Event::Offline(old),
-        Event::RadioOff(old),
-        Event::Woke {
+        Event::Power(power::Event::Offline(old)),
+        Event::Wifi(wifi::Event::RadioOff(old)),
+        Event::Power(power::Event::Woke {
             sleep: old,
             wake: Wake::PowerSource,
-        },
+        }),
     ] {
         app.update(event, &mut model).expect_no_effects();
     }
@@ -174,7 +187,7 @@ fn a_tap_restarts_the_idle_timer_and_the_old_timer_is_ignored() {
             assert_eq!(Duration::from(notify.duration), IDLE_TIMEOUT);
         });
 
-    app.update(Event::IdleTimeout(old), &mut model)
+    app.update(Event::Power(power::Event::IdleTimeout(old)), &mut model)
         .expect_no_effects();
 }
 
@@ -186,8 +199,11 @@ fn on_the_stand_there_is_no_idle_timer() {
     app.update(Event::NextPage, &mut model)
         .expect_render()
         .expect_full_refresh_timer();
-    app.update(Event::IdleTimeout(model.power.idle), &mut model)
-        .expect_no_effects();
+    app.update(
+        Event::Power(power::Event::IdleTimeout(model.power.idle)),
+        &mut model,
+    )
+    .expect_no_effects();
 }
 
 #[test]
@@ -205,7 +221,10 @@ fn off_the_stand_starts_the_idle_timer() {
 fn on_the_stand_while_asleep_wakes_and_connects() {
     let app = Dashboard;
     let (mut model, mut wire) = drive_to_connected(PowerSource::Battery);
-    let mut sleep = app.update(Event::IdleTimeout(model.power.idle), &mut model);
+    let mut sleep = app.update(
+        Event::Power(power::Event::IdleTimeout(model.power.idle)),
+        &mut model,
+    );
     assert!(model.power.asleep);
 
     // The session of the sleep still closes, so the core does not connect
@@ -273,10 +292,10 @@ fn a_power_source_wake_on_battery_is_ignored() {
 
 /// The answer to the `Sleep` request of the newest sleep.
 const fn woke(model: &Model, wake: Wake) -> Event {
-    Event::Woke {
+    Event::Power(power::Event::Woke {
         sleep: model.power.sleep,
         wake,
-    }
+    })
 }
 
 /// Returns a model of a device on battery that sleeps, with settings.
@@ -367,7 +386,7 @@ fn a_tap_on_no_control_while_awake_does_not_restart_the_idle_timer() {
         .expect_no_effects();
     assert_eq!(model.power.idle, idle);
 
-    let _ = app.update(Event::IdleTimeout(idle), &mut model);
+    let _ = app.update(Event::Power(power::Event::IdleTimeout(idle)), &mut model);
     assert!(model.power.asleep);
 }
 
@@ -527,7 +546,7 @@ fn sleep_now_with_calls_in_the_outbox_first_waits_one_more_idle_period() {
         });
     assert!(!model.power.asleep);
     // The idle timer that ran before is now stale.
-    app.update(Event::IdleTimeout(old), &mut model)
+    app.update(Event::Power(power::Event::IdleTimeout(old)), &mut model)
         .expect_no_effects();
     assert!(!model.power.asleep);
 
@@ -551,7 +570,7 @@ fn an_idle_timer_that_expires_after_sleep_now_is_ignored() {
     // The core cleared the idle timer of the start. If its expiry still
     // arrives, the core ignores it.
     assert_ne!(model.power.idle, idle);
-    app.update(Event::IdleTimeout(idle), &mut model)
+    app.update(Event::Power(power::Event::IdleTimeout(idle)), &mut model)
         .expect_no_effects();
     assert_eq!(model.power.sleep, sleep);
 }
@@ -572,7 +591,7 @@ fn sleep_now_before_start_does_nothing() {
 fn idle_timeouts(events: &[Event]) -> usize {
     events
         .iter()
-        .filter(|event| matches!(event, Event::IdleTimeout(_)))
+        .filter(|event| matches!(event, Event::Power(power::Event::IdleTimeout(_))))
         .count()
 }
 

@@ -13,6 +13,7 @@
 //! They skip the timers of the session, take the `Write`, answer it, and
 //! leave the other effects of the command for the next helpers.
 
+use crate::features::connection;
 use alloc::{collections::VecDeque, format, string::String, vec::Vec};
 use core::time::Duration;
 
@@ -213,10 +214,12 @@ impl Wire {
     /// Keeps another event for the test.
     fn dispatch(&mut self, event: Event, model: &mut Model) {
         match event {
-            Event::Stream { .. }
-            | Event::Written { .. }
-            | Event::StreamClosed { .. }
-            | Event::SessionTimer { .. } => {
+            Event::Connection(
+                connection::Event::Stream { .. }
+                | connection::Event::Written { .. }
+                | connection::Event::StreamClosed { .. }
+                | connection::Event::SessionTimer { .. },
+            ) => {
                 let command = Dashboard.update(event, model);
                 self.commands.push(command);
             }
@@ -314,7 +317,7 @@ pub trait ExpectWrite {
 
     /// Expects the `Write` of a sleep: the retained `asleep` status and then
     /// a DISCONNECT packet. After the write, the core closes the stream, and
-    /// the wire keeps [`Event::Offline`] for the test.
+    /// the wire keeps [`power::Event::Offline`] for the test.
     #[track_caller]
     fn expect_disconnect(&mut self, wire: &mut Wire, model: &mut Model) -> &mut Self {
         self.expect_write_with(wire, model, |packets| {

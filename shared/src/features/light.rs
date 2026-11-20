@@ -17,10 +17,32 @@
 use core::time::Duration;
 
 use crate::{
-    Cmd, Event, Model,
+    Cmd, Model,
     capabilities::{light::Light, power::PowerSource},
     features::timer::Slot,
 };
+
+/// The internal events of the front light. The core makes them from its
+/// timer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Event {
+    /// The light timer with this id expired. Refer to
+    /// [`crate::features::light`].
+    Timeout(u32),
+}
+
+impl From<Event> for crate::Event {
+    fn from(event: Event) -> Self {
+        Self::Light(event)
+    }
+}
+
+/// Handles an internal event of the front light.
+pub fn update(event: Event, model: &mut Model) -> Cmd {
+    match event {
+        Event::Timeout(id) => timeout(id, model),
+    }
+}
 
 /// The level of the front light on the stand, in percent.
 pub const STAND_LEVEL: u8 = 60;
@@ -76,7 +98,7 @@ pub fn touched(model: &mut Model) -> Cmd {
     let timer = model
         .light
         .running
-        .start(id, LIGHT_TIMEOUT, Event::LightTimeout(id));
+        .start(id, LIGHT_TIMEOUT, Event::Timeout(id).into());
     set(level_for(model.power.source), model).and(timer)
 }
 
@@ -132,6 +154,7 @@ mod tests {
     //! Tests of the light feature: the front light after a touch, its timer,
     //! the power source and the sleep.
 
+    use crate::features::{light, power};
     use crux_core::App;
 
     use crate::tests::{ExpectLight, drive_to_connected, shell::Shell, start, wire::ExpectWrite};
@@ -178,9 +201,12 @@ mod tests {
         let (mut model, _wire) = drive_to_connected(PowerSource::Stand);
         let _ = app.update(Event::Tapped(None), &mut model);
 
-        app.update(Event::LightTimeout(model.light.timer), &mut model)
-            .expect_light(0)
-            .expect_no_effects();
+        app.update(
+            Event::Light(light::Event::Timeout(model.light.timer)),
+            &mut model,
+        )
+        .expect_light(0)
+        .expect_no_effects();
         assert_eq!(model.light.level, 0);
     }
 
@@ -196,7 +222,7 @@ mod tests {
             .expect_light_timer()
             .expect_no_effects();
 
-        app.update(Event::LightTimeout(old), &mut model)
+        app.update(Event::Light(light::Event::Timeout(old)), &mut model)
             .expect_no_effects();
         assert_eq!(model.light.level, STAND_LEVEL);
     }
@@ -237,7 +263,10 @@ mod tests {
         let _ = app.update(Event::Tapped(None), &mut model);
 
         // The core waits for the answer to `FrontLight` before it disconnects.
-        let mut sleep = app.update(Event::IdleTimeout(model.power.idle), &mut model);
+        let mut sleep = app.update(
+            Event::Power(power::Event::IdleTimeout(model.power.idle)),
+            &mut model,
+        );
         let mut light = sleep.expect_one_effect().expect_front_light();
         assert_eq!(light.operation.level, 0);
         assert!(model.power.asleep);
@@ -252,8 +281,11 @@ mod tests {
             .expect_no_effects();
 
         // The light timer of the tap expires during the sleep. It does nothing.
-        app.update(Event::LightTimeout(model.light.timer), &mut model)
-            .expect_no_effects();
+        app.update(
+            Event::Light(light::Event::Timeout(model.light.timer)),
+            &mut model,
+        )
+        .expect_no_effects();
     }
 
     #[test]
@@ -261,7 +293,10 @@ mod tests {
         let app = Dashboard;
         let (mut model, _wire) = drive_to_connected(PowerSource::Battery);
         let _ = app.update(Event::Tapped(None), &mut model);
-        let mut sleep = app.update(Event::IdleTimeout(model.power.idle), &mut model);
+        let mut sleep = app.update(
+            Event::Power(power::Event::IdleTimeout(model.power.idle)),
+            &mut model,
+        );
         let mut light = sleep.expect_one_effect().expect_front_light();
 
         // The user taps before the light is off. The tap wakes the device and
@@ -293,7 +328,7 @@ mod tests {
 
         // The first idle timer expires while the light is on. The first step of
         // the sleep turns the light off, and only then the core disconnects.
-        let mut sleep = app.update(Event::IdleTimeout(idle), &mut model);
+        let mut sleep = app.update(Event::Power(power::Event::IdleTimeout(idle)), &mut model);
         let mut light = sleep.expect_one_effect().expect_front_light();
         assert_eq!(light.operation.level, 0);
         assert!(model.power.asleep);
@@ -312,10 +347,13 @@ mod tests {
         let app = Dashboard;
         let (mut model, mut wire) = drive_to_connected(PowerSource::Battery);
 
-        app.update(Event::IdleTimeout(model.power.idle), &mut model)
-            .expect_disconnect(&mut wire, &mut model)
-            .expect_session_clear(&wire)
-            .expect_no_effects();
+        app.update(
+            Event::Power(power::Event::IdleTimeout(model.power.idle)),
+            &mut model,
+        )
+        .expect_disconnect(&mut wire, &mut model)
+        .expect_session_clear(&wire)
+        .expect_no_effects();
     }
 
     #[test]
@@ -333,7 +371,7 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|event| matches!(event, Event::LightTimeout(_))),
+                .any(|event| matches!(event, Event::Light(light::Event::Timeout(_)))),
             "{events:?}"
         );
         assert_eq!(shell.light, 0);
@@ -389,7 +427,7 @@ mod tests {
         assert!(
             !events
                 .iter()
-                .any(|event| matches!(event, Event::LightTimeout(_))),
+                .any(|event| matches!(event, Event::Light(light::Event::Timeout(_)))),
             "{events:?}"
         );
         assert_eq!(shell.light, 0);
@@ -419,7 +457,7 @@ mod tests {
         let events = shell.advance(LIGHT_TIMEOUT);
         let timeouts = events
             .iter()
-            .filter(|event| matches!(event, Event::LightTimeout(_)))
+            .filter(|event| matches!(event, Event::Light(light::Event::Timeout(_))))
             .count();
         assert_eq!(timeouts, 1, "{events:?}");
         assert_eq!(shell.light, 0);

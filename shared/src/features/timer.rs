@@ -111,6 +111,7 @@ impl Slot {
 
 #[cfg(test)]
 mod tests {
+    use crate::features::light;
     use core::time::Duration;
 
     use crux_core::Command;
@@ -122,7 +123,7 @@ mod tests {
 
     #[test]
     fn a_timer_that_completes_sends_its_event() {
-        let (mut command, _handle) = notify_after(AFTER, Event::LightTimeout(7));
+        let (mut command, _handle) = notify_after(AFTER, Event::Light(light::Event::Timeout(7)));
 
         let event = command
             .resolve_time_notify_after(|notify| {
@@ -131,13 +132,16 @@ mod tests {
             })
             .expect_one_event();
 
-        assert!(matches!(event, Event::LightTimeout(7)), "{event:?}");
+        assert!(
+            matches!(event, Event::Light(light::Event::Timeout(7))),
+            "{event:?}"
+        );
         assert!(command.is_done());
     }
 
     #[test]
     fn a_cleared_timer_asks_the_shell_to_clear_it_and_sends_no_event() {
-        let (mut command, handle) = notify_after(AFTER, Event::LightTimeout(7));
+        let (mut command, handle) = notify_after(AFTER, Event::Light(light::Event::Timeout(7)));
         let notify = command.expect_one_effect().expect_time_notify_after();
         let id = notify.operation.id;
 
@@ -154,7 +158,7 @@ mod tests {
 
     #[test]
     fn a_timer_cleared_before_it_starts_sends_nothing() {
-        let (mut command, handle) = notify_after(AFTER, Event::LightTimeout(7));
+        let (mut command, handle) = notify_after(AFTER, Event::Light(light::Event::Timeout(7)));
 
         handle.clear();
 
@@ -165,14 +169,15 @@ mod tests {
     #[test]
     fn a_new_timer_in_a_slot_clears_the_old_timer() {
         let mut slot = Slot::default();
-        let mut old: Command<Effect, Event> = slot.start(1, AFTER, Event::LightTimeout(1));
+        let mut old: Command<Effect, Event> =
+            slot.start(1, AFTER, Event::Light(light::Event::Timeout(1)));
         let id = old
             .expect_one_effect()
             .expect_time_notify_after()
             .operation
             .id;
 
-        let mut new = slot.start(2, AFTER, Event::LightTimeout(2));
+        let mut new = slot.start(2, AFTER, Event::Light(light::Event::Timeout(2)));
 
         old.resolve_time_clear(|clear| {
             assert_eq!(clear.id, id);
@@ -185,13 +190,16 @@ mod tests {
         let event = new
             .resolve_time_notify_after(|notify| notify.id)
             .expect_one_event();
-        assert!(matches!(event, Event::LightTimeout(2)), "{event:?}");
+        assert!(
+            matches!(event, Event::Light(light::Event::Timeout(2))),
+            "{event:?}"
+        );
     }
 
     #[test]
     fn a_slot_takes_only_the_expiry_of_its_timer() {
         let mut slot = Slot::default();
-        let _command = slot.start(1, AFTER, Event::LightTimeout(1));
+        let _command = slot.start(1, AFTER, Event::Light(light::Event::Timeout(1)));
 
         assert!(!slot.expired(2));
         assert!(slot.is_running());

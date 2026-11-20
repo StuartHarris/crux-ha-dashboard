@@ -929,6 +929,7 @@ fn resolve<Op: Operation>(
 
 #[cfg(test)]
 mod tests {
+    use shared::features::connection;
     use std::{
         collections::HashMap,
         future::pending,
@@ -1621,9 +1622,11 @@ mod tests {
         fixture.take_log();
         let old = fixture.shell().current_connection().unwrap();
 
-        let mut open = Stream::open(9, "localhost".into(), 1883).then_send(|item| Event::Stream {
-            connection: 9,
-            item,
+        let mut open = Stream::open(9, "localhost".into(), 1883).then_send(|item| {
+            Event::Connection(connection::Event::Stream {
+                connection: 9,
+                item,
+            })
         });
         perform(&mut fixture, &mut open);
         // The old stream ends at once, and the core ends its session.
@@ -1641,10 +1644,10 @@ mod tests {
         let events: Vec<Event> = open.events().collect();
         assert!(matches!(
             events.as_slice(),
-            [Event::Stream {
+            [Event::Connection(connection::Event::Stream {
                 connection: 9,
                 item: StreamItem::Opened
-            }]
+            })]
         ));
         assert_eq!(fixture.shell().current_connection(), Some(9));
     }
@@ -1661,7 +1664,7 @@ mod tests {
         let connection = fixture.shell().current_connection().unwrap();
 
         let mut close = Stream::close(connection, false, "a test".into())
-            .then_send(move |()| Event::StreamClosed { connection });
+            .then_send(move |()| Event::Connection(connection::Event::StreamClosed { connection }));
         perform(&mut fixture, &mut close);
         fixture.until("the end of the stream", |fixture| {
             fixture.shell().current_connection().is_none()
@@ -1674,26 +1677,28 @@ mod tests {
         let events: Vec<Event> = close.events().collect();
         assert!(matches!(
             events.as_slice(),
-            [Event::StreamClosed { connection: closed }] if *closed == connection
+            [Event::Connection(connection::Event::StreamClosed { connection: closed })] if *closed == connection
         ));
     }
 
     #[test]
     fn a_request_for_a_stream_that_is_not_open_is_answered_at_once() {
         let mut fixture = Fixture::new();
-        let mut write = Stream::write(4, vec![0xC0, 0x00]).then_send(|outcome| Event::Written {
-            connection: 4,
-            outcome,
+        let mut write = Stream::write(4, vec![0xC0, 0x00]).then_send(|outcome| {
+            Event::Connection(connection::Event::Written {
+                connection: 4,
+                outcome,
+            })
         });
         perform(&mut fixture, &mut write);
         let events: Vec<Event> = write.events().collect();
         assert!(matches!(
             events.as_slice(),
-            [Event::Written { connection: 4, outcome: Written::Failed(reason) }] if reason == NOT_OPEN
+            [Event::Connection(connection::Event::Written { connection: 4, outcome: Written::Failed(reason) })] if reason == NOT_OPEN
         ));
 
         let mut close = Stream::close(4, true, "a test".into())
-            .then_send(|()| Event::StreamClosed { connection: 4 });
+            .then_send(|()| Event::Connection(connection::Event::StreamClosed { connection: 4 }));
         perform(&mut fixture, &mut close);
         assert_eq!(close.events().count(), 1);
     }

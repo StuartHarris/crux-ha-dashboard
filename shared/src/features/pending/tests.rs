@@ -1,6 +1,7 @@
 //! Tests of the pending feature: the mark that a tap gives a tile or a
 //! scene until Home Assistant confirms the service call.
 
+use crate::features::{pending, power};
 use core::time::Duration;
 
 use crux_core::App;
@@ -135,14 +136,17 @@ fn the_timeout_shows_the_last_state_and_an_old_timer_is_ignored() {
         .expect_no_effects();
     assert_ne!(model.pending.timer, first);
 
-    app.update(Event::PendingTimeout(first), &mut model)
+    app.update(Event::Pending(pending::Event::Timeout(first)), &mut model)
         .expect_no_effects();
     assert_eq!(tile_state(&model, 1), TileState::Pending);
 
     // Home Assistant did not confirm the call, so the tile shows the last
     // state that the core has.
-    app.update(Event::PendingTimeout(model.pending.timer), &mut model)
-        .expect_only_render();
+    app.update(
+        Event::Pending(pending::Event::Timeout(model.pending.timer)),
+        &mut model,
+    )
+    .expect_only_render();
     assert_eq!(tile_state(&model, 1), TileState::On);
 }
 
@@ -181,8 +185,11 @@ fn a_scene_mark_ends_after_the_scene_timeout() {
     assert!(scenes[2].pending);
     assert!(!scenes[0].pending);
 
-    app.update(Event::PendingTimeout(model.pending.timer), &mut model)
-        .expect_only_render();
+    app.update(
+        Event::Pending(pending::Event::Timeout(model.pending.timer)),
+        &mut model,
+    )
+    .expect_only_render();
     assert!(!app.view(&model).scenes()[2].pending);
 }
 
@@ -249,8 +256,14 @@ fn a_call_that_the_sleep_drops_loses_its_mark() {
     let _ = app.update(tap_tile(1), &mut model);
     assert_eq!(tile_state(&model, 1), TileState::Pending);
     // The first idle timeout waits one more period for the connection.
-    let _ = app.update(Event::IdleTimeout(model.power.idle), &mut model);
-    let mut sleep = app.update(Event::IdleTimeout(model.power.idle), &mut model);
+    let _ = app.update(
+        Event::Power(power::Event::IdleTimeout(model.power.idle)),
+        &mut model,
+    );
+    let mut sleep = app.update(
+        Event::Power(power::Event::IdleTimeout(model.power.idle)),
+        &mut model,
+    );
     assert!(model.power.asleep);
     // The tap turned the light on, so the first step of the sleep turns it
     // off. The core drops the call in the next step.
@@ -271,12 +284,15 @@ fn a_timeout_while_asleep_removes_the_mark_but_does_not_draw() {
 
     let _ = app.update(tap_tile(1), &mut model);
     let id = model.pending.timer;
-    let _ = app.update(Event::IdleTimeout(model.power.idle), &mut model);
+    let _ = app.update(
+        Event::Power(power::Event::IdleTimeout(model.power.idle)),
+        &mut model,
+    );
     assert!(model.power.asleep);
     // The call went out before the sleep, so the mark stays.
     assert_eq!(tile_state(&model, 1), TileState::Pending);
 
-    app.update(Event::PendingTimeout(id), &mut model)
+    app.update(Event::Pending(pending::Event::Timeout(id)), &mut model)
         .expect_no_effects();
     assert!(model.pending.marks.is_empty());
 }
@@ -320,7 +336,7 @@ fn a_tap_that_wakes_the_device_shows_the_mark_through_the_reconnect() {
     assert!(
         !events
             .iter()
-            .any(|event| matches!(event, Event::PendingTimeout(_))),
+            .any(|event| matches!(event, Event::Pending(pending::Event::Timeout(_)))),
         "{events:?}"
     );
 }
@@ -340,7 +356,7 @@ fn the_flow_of_a_tap_draws_the_new_state() {
     assert!(
         !events
             .iter()
-            .any(|event| matches!(event, Event::PendingTimeout(_))),
+            .any(|event| matches!(event, Event::Pending(pending::Event::Timeout(_)))),
         "{events:?}"
     );
 }
@@ -401,8 +417,11 @@ fn a_toggle_with_no_state_at_the_tap_ends_only_at_the_timeout() {
     let _ = lamp_updated(&mut model, &mut wire, BEFORE);
     assert_eq!(tile_state(&model, 1), TileState::Pending);
 
-    app.update(Event::PendingTimeout(model.pending.timer), &mut model)
-        .expect_only_render();
+    app.update(
+        Event::Pending(pending::Event::Timeout(model.pending.timer)),
+        &mut model,
+    )
+    .expect_only_render();
     assert_eq!(tile_state(&model, 1), TileState::On);
 }
 
@@ -418,8 +437,11 @@ fn a_step_with_no_time_at_the_tap_ends_only_at_the_timeout() {
     let _ = lamp_updated(&mut model, &mut wire, BEFORE + 1);
     assert_eq!(tile_state(&model, 1), TileState::Pending);
 
-    app.update(Event::PendingTimeout(model.pending.timer), &mut model)
-        .expect_only_render();
+    app.update(
+        Event::Pending(pending::Event::Timeout(model.pending.timer)),
+        &mut model,
+    )
+    .expect_only_render();
     assert_eq!(tile_state(&model, 1), TileState::On);
 }
 
@@ -440,13 +462,13 @@ fn a_timeout_keeps_the_mark_while_a_newer_call_waits_in_the_outbox() {
     assert_eq!(model.connection.outbox.len(), 1);
 
     // The timeout of the first call does not remove the mark.
-    app.update(Event::PendingTimeout(sent), &mut model)
+    app.update(Event::Pending(pending::Event::Timeout(sent)), &mut model)
         .expect_no_effects();
     assert_eq!(tile_state(&model, 1), TileState::Pending);
 
     // The timeout of the outbox removes the mark, but the call stays in the
     // outbox.
-    app.update(Event::PendingTimeout(queued), &mut model)
+    app.update(Event::Pending(pending::Event::Timeout(queued)), &mut model)
         .expect_only_render();
     assert_eq!(tile_state(&model, 1), TileState::On);
     assert_eq!(model.connection.outbox.len(), 1);
@@ -467,8 +489,11 @@ fn a_mark_whose_call_cannot_go_out_ends_after_the_queued_timeout() {
         .expect_only_render();
     assert_eq!(tile_state(&model, 1), TileState::Pending);
 
-    app.update(Event::PendingTimeout(model.pending.timer), &mut model)
-        .expect_only_render();
+    app.update(
+        Event::Pending(pending::Event::Timeout(model.pending.timer)),
+        &mut model,
+    )
+    .expect_only_render();
     assert_eq!(tile_state(&model, 1), TileState::On);
 
     // The connection opens later, and the call still goes out, with no mark.
@@ -634,8 +659,11 @@ fn after_the_timeout_a_thermostat_step_starts_from_the_target_of_home_assistant(
     // Home Assistant does not answer, for example because the target is at
     // its limit.
     wire.settle(app.update(tap_plus(4), &mut model), &mut model);
-    app.update(Event::PendingTimeout(model.pending.timer), &mut model)
-        .expect_only_render();
+    app.update(
+        Event::Pending(pending::Event::Timeout(model.pending.timer)),
+        &mut model,
+    )
+    .expect_only_render();
     assert!(model.pending.marks.is_empty());
     assert_eq!(tile_state(&model, 4), TileState::Value);
 
@@ -664,7 +692,7 @@ fn a_second_call_clears_the_timeout_of_the_first_and_only_the_new_timeout_fires(
     let events = shell.advance(PENDING_TIMEOUT);
     let timeouts = events
         .iter()
-        .filter(|event| matches!(event, Event::PendingTimeout(_)))
+        .filter(|event| matches!(event, Event::Pending(pending::Event::Timeout(_))))
         .count();
     assert_eq!(timeouts, 1, "{events:?}");
     assert_eq!(shell.view().tiles()[1].state, TileState::On);

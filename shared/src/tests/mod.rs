@@ -13,6 +13,7 @@ mod subscribe;
 pub mod shell;
 pub mod wire;
 
+use crate::features::wifi;
 use alloc::string::String;
 
 use wire::{ExpectWrite, Wire};
@@ -228,7 +229,7 @@ pub fn link_up(cmd: &mut Cmd, model: &mut Model) -> Cmd {
     let mut radio = FakeRadio::default();
     let mut event = answer_radio(cmd, &mut radio);
     loop {
-        let leased = matches!(event, Event::Leased { .. });
+        let leased = matches!(event, Event::Wifi(wifi::Event::Leased { .. }));
         let mut next = Dashboard.update(event, model);
         if leased {
             return next;

@@ -38,7 +38,7 @@ use alloc::{format, string::String};
 use core::time::Duration;
 
 use crate::{
-    Cmd, Event, Model,
+    Cmd, Model,
     capabilities::{
         log::{self, Area},
         radio::{AccessPoint, Joined, Lease, Radio, Scanned, Target, signal},
@@ -51,6 +51,64 @@ use rules::{
     AfterFailure, ApCache, Health, RESTART_AFTER, ROAM_MARGIN_DB, Recovery, better_access_point,
     current_signal,
 };
+
+/// The internal events of the Wi-Fi feature. The core makes them from the
+/// answers to its radio requests and from its time limits.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Event {
+    /// The answer to the `Join` request with this id.
+    Joined {
+        /// The id of the radio request. The core ignores the answer to an
+        /// older request.
+        radio: u32,
+        /// The answer.
+        joined: Joined,
+    },
+    /// The answer to the `Address` request with this id.
+    Leased {
+        /// The id of the radio request. The core ignores the answer to an
+        /// older request.
+        radio: u32,
+        /// The answer.
+        lease: Lease,
+    },
+    /// The answer to the `Leave` request with this id.
+    Left(u32),
+    /// The answer to the `Scan` request with this id.
+    Scanned {
+        /// The id of the radio request. The core ignores the answer to an
+        /// older request.
+        radio: u32,
+        /// The answer.
+        scanned: Scanned,
+    },
+    /// The answer to the `StopScan` request with this id.
+    ScanStopped(u32),
+    /// The time limit of the radio request with this id expired. Refer to
+    /// [`crate::features::wifi`].
+    RadioTimeout(u32),
+    /// The answer to the `Off` request with this id.
+    RadioOff(u32),
+}
+
+impl From<Event> for crate::Event {
+    fn from(event: Event) -> Self {
+        Self::Wifi(event)
+    }
+}
+
+/// Handles an internal event of the Wi-Fi feature.
+pub fn update(event: Event, model: &mut Model) -> Cmd {
+    match event {
+        Event::Joined { radio, joined } => self::joined(radio, &joined, model),
+        Event::Leased { radio, lease } => leased(radio, lease, model),
+        Event::Left(radio) => left(radio, model),
+        Event::Scanned { radio, scanned } => self::scanned(radio, &scanned, model),
+        Event::ScanStopped(radio) => scan_stopped(radio, model),
+        Event::RadioTimeout(radio) => timeout(radio, model),
+        Event::RadioOff(radio) => radio_off(radio, model),
+    }
+}
 
 /// The time limit of the core for a `Join` request. The shell gives up
 /// after 20 seconds at most, with the leave before the join and the
@@ -304,7 +362,7 @@ pub fn quiet(model: &mut Model) -> Cmd {
     model.wifi.phase = Phase::Scanning(current);
     let radio = next_id(model);
     Radio::scan(radio)
-        .then_send(move |scanned| Event::Scanned { radio, scanned })
+        .then_send(move |scanned| Event::Scanned { radio, scanned }.into())
         .and(limit(radio, SCAN_TIMEOUT, model))
 }
 
@@ -319,7 +377,7 @@ pub fn stop_scan(sleep: u32, model: &mut Model) -> Option<Cmd> {
         sleep,
     };
     let radio = next_id(model);
-    let stop = Radio::stop_scan(radio).then_send(move |()| Event::ScanStopped(radio));
+    let stop = Radio::stop_scan(radio).then_send(move |()| Event::ScanStopped(radio).into());
     Some(stop.and(limit(radio, STOP_SCAN_TIMEOUT, model)))
 }
 
@@ -341,7 +399,7 @@ pub fn off(sleep: u32, model: &mut Model) -> Cmd {
     state.ready = false;
     let radio = next_id(model);
     Radio::off(radio)
-        .then_send(move |()| Event::RadioOff(radio))
+        .then_send(move |()| Event::RadioOff(radio).into())
         .and(limit(radio, OFF_TIMEOUT, model))
 }
 
@@ -561,7 +619,7 @@ fn after_join(joined: &Joined, model: &mut Model) -> Cmd {
     };
     let radio = next_id(model);
     Radio::address(radio)
-        .then_send(move |lease| Event::Leased { radio, lease })
+        .then_send(move |lease| Event::Leased { radio, lease }.into())
         .and(limit(radio, ADDRESS_TIMEOUT, model))
 }
 
@@ -696,7 +754,7 @@ fn join(target: Target, keep: bool, model: &mut Model) -> Cmd {
     model.wifi.phase = Phase::Joining(target);
     let radio = next_id(model);
     Radio::join(radio, target, keep)
-        .then_send(move |joined| Event::Joined { radio, joined })
+        .then_send(move |joined| Event::Joined { radio, joined }.into())
         .and(limit(radio, JOIN_TIMEOUT, model))
 }
 
@@ -705,7 +763,7 @@ fn leave(then: Then, model: &mut Model) -> Cmd {
     model.wifi.phase = Phase::Leaving(then);
     let radio = next_id(model);
     Radio::leave(radio)
-        .then_send(move |()| Event::Left(radio))
+        .then_send(move |()| Event::Left(radio).into())
         .and(limit(radio, LEAVE_TIMEOUT, model))
 }
 
@@ -741,7 +799,7 @@ fn limit(radio: u32, after: Duration, model: &mut Model) -> Cmd {
     model
         .wifi
         .limit
-        .start(radio, after, Event::RadioTimeout(radio))
+        .start(radio, after, Event::RadioTimeout(radio).into())
 }
 
 #[cfg(test)]

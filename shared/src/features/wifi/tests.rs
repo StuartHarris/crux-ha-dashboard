@@ -5,6 +5,7 @@
 //! each request in the log. A test that needs a request that waits sets
 //! [`Shell::hold_radio`].
 
+use crate::features::wifi;
 use alloc::{format, string::String, vec::Vec};
 use core::time::Duration;
 
@@ -809,7 +810,7 @@ fn a_join_with_no_answer_in_its_time_limit_fails_and_the_late_answer_is_ignored(
     assert!(
         events
             .iter()
-            .any(|event| matches!(event, Event::RadioTimeout(_))),
+            .any(|event| matches!(event, Event::Wifi(wifi::Event::RadioTimeout(_)))),
         "{events:?}"
     );
     // The join to the strongest access point failed, so the core waits for
@@ -960,7 +961,7 @@ fn a_time_limit_after_the_answer_does_nothing() {
     assert!(
         !events
             .iter()
-            .any(|event| matches!(event, Event::RadioTimeout(_))),
+            .any(|event| matches!(event, Event::Wifi(wifi::Event::RadioTimeout(_)))),
         "{events:?}"
     );
     assert_eq!(radio(&shell.take_log()), Vec::<&str>::new());
@@ -1057,7 +1058,10 @@ fn an_association_after_the_sleep_started_is_up_but_not_ready() {
         had_address: false,
     };
     Dashboard
-        .update(Event::Joined { radio: 9, joined }, &mut model)
+        .update(
+            Event::Wifi(wifi::Event::Joined { radio: 9, joined }),
+            &mut model,
+        )
         .expect_no_effects();
     assert_eq!(model.wifi.phase, Phase::Up(HALL));
     assert!(!model.wifi.ready);
@@ -1066,10 +1070,10 @@ fn an_association_after_the_sleep_started_is_up_but_not_ready() {
 
     // A wake before `Off` joins again from `Up`. The cache has no access
     // point, so the core leaves first.
-    let woke = Event::Woke {
+    let woke = Event::Power(power::Event::Woke {
         sleep: 1,
         wake: Wake::Timer,
-    };
+    });
     Dashboard
         .update(woke, &mut model)
         .expect_render()
@@ -1087,7 +1091,7 @@ fn a_time_limit_after_the_sleep_started_changes_nothing_in_the_cache() {
     });
     model.wifi.cache.joined(Target::Cached(HALL), HALL);
     Dashboard
-        .update(Event::RadioTimeout(9), &mut model)
+        .update(Event::Wifi(wifi::Event::RadioTimeout(9)), &mut model)
         .expect_only_log_with(|log| {
             assert_eq!(
                 log.to_string(),
@@ -1103,7 +1107,7 @@ fn a_restart_wins_over_a_sleep() {
     let mut model = sleeping_with(Phase::Restarting);
     // The stream closed for the sleep. The core does not turn the radio off.
     Dashboard
-        .update(Event::Offline(1), &mut model)
+        .update(Event::Power(power::Event::Offline(1)), &mut model)
         .expect_no_effects();
     assert_eq!(model.wifi.phase, Phase::Restarting);
 }
@@ -1170,7 +1174,10 @@ fn a_better_access_point_found_during_a_sleep_is_for_the_next_wake() {
         rssi: None,
     };
     Dashboard
-        .update(Event::Scanned { radio: 9, scanned }, &mut model)
+        .update(
+            Event::Wifi(wifi::Event::Scanned { radio: 9, scanned }),
+            &mut model,
+        )
         .expect_only_log_with(|log| {
             assert_eq!(
                 log.to_string(),
@@ -1199,10 +1206,10 @@ fn the_count_of_joins_with_no_new_address_comes_before_the_restart() {
     assert_eq!(health.no_lease(), Recovery::Continue);
     assert_eq!(health.no_lease(), Recovery::Continue);
 
-    let leased = Event::Leased {
+    let leased = Event::Wifi(wifi::Event::Leased {
         radio: 9,
         lease: Lease::NoLease,
-    };
+    });
     Dashboard
         .update(leased, &mut model)
         .expect_log_with(|log| {
@@ -1231,10 +1238,10 @@ fn a_stale_address_on_a_link_that_is_not_suspect_writes_no_line() {
     };
     model.wifi.radio = 9;
 
-    let leased = Event::Leased {
+    let leased = Event::Wifi(wifi::Event::Leased {
         radio: 9,
         lease: Lease::Leased,
-    };
+    });
     let mut cmd = Dashboard.update(leased, &mut model);
     let lines: Vec<Effect> = cmd
         .effects()
@@ -1262,7 +1269,10 @@ fn a_scan_with_no_signal_for_the_current_access_point_stays() {
         rssi: None,
     };
     Dashboard
-        .update(Event::Scanned { radio: 9, scanned }, &mut model)
+        .update(
+            Event::Wifi(wifi::Event::Scanned { radio: 9, scanned }),
+            &mut model,
+        )
         .expect_only_log_with(|log| {
             assert_eq!(log.level, Level::Info);
             assert_eq!(
@@ -1279,7 +1289,10 @@ fn a_strongest_join_that_fails_after_the_sleep_started_writes_no_line() {
     let mut model = sleeping_with(Phase::Joining(Target::Strongest));
     let joined = Joined::Failed("no access point found".into());
     Dashboard
-        .update(Event::Joined { radio: 9, joined }, &mut model)
+        .update(
+            Event::Wifi(wifi::Event::Joined { radio: 9, joined }),
+            &mut model,
+        )
         .expect_no_effects();
     assert_eq!(model.wifi.phase, Phase::Idle);
 }
@@ -1302,9 +1315,9 @@ fn an_answer_clears_the_time_limit_of_its_request() {
 
     let events = shell.advance(JOIN_TIMEOUT);
     assert!(
-        !events
-            .iter()
-            .any(|event| matches!(event, Event::RadioTimeout(radio) if *radio == join)),
+        !events.iter().any(
+            |event| matches!(event, Event::Wifi(wifi::Event::RadioTimeout(radio)) if *radio == join)
+        ),
         "{events:?}"
     );
 }

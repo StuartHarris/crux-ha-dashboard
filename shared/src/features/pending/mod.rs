@@ -87,7 +87,7 @@ use alloc::{string::String, vec::Vec};
 use core::time::Duration;
 
 use crate::{
-    Cmd, Event, Model,
+    Cmd, Model,
     entities::EntityState,
     features::{
         refresh::{redraw, redraw_soon},
@@ -96,6 +96,28 @@ use crate::{
     temperature::{self, Centi},
 };
 use chrono::{DateTime, Utc};
+
+/// The internal events of the pending marks. The core makes them from its
+/// timers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Event {
+    /// The timer of a mark with this id expired. Refer to
+    /// [`pending`](crate::features::pending).
+    Timeout(u32),
+}
+
+impl From<Event> for crate::Event {
+    fn from(event: Event) -> Self {
+        Self::Pending(event)
+    }
+}
+
+/// Handles an internal event of the pending marks.
+pub fn update(event: Event, model: &mut Model) -> Cmd {
+    match event {
+        Event::Timeout(id) => timeout(id, model),
+    }
+}
 
 /// The time after which the core removes the mark of a service call that
 /// Home Assistant did not confirm.
@@ -221,7 +243,7 @@ impl State {
     fn start(&mut self, wait: Duration) -> (Cmd, Running) {
         self.timer = self.timer.wrapping_add(1);
         let id = self.timer;
-        Running::start(id, wait, Event::PendingTimeout(id))
+        Running::start(id, wait, Event::Timeout(id).into())
     }
 }
 

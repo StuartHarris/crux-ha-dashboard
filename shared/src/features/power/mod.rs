@@ -2,7 +2,7 @@
 //!
 //! - On the stand, the device stays awake and connected.
 //! - On battery, the device connects when it wakes. After [`IDLE_TIMEOUT`]
-//!   without a touch, or at [`Event::SleepNow`], it sleeps in steps. Each
+//!   without a touch, or at [`crate::Event::SleepNow`], it sleeps in steps. Each
 //!   step waits for the answer of the shell: stop a scan for a better
 //!   access point if one runs, publish `asleep` and disconnect, then turn
 //!   the radio off, then draw the last image with the time of the last
@@ -11,7 +11,7 @@
 //!   off first. Usually the light timer turned it off already. Refer to
 //!   [`LIGHT_TIMEOUT`](crate::features::light::LIGHT_TIMEOUT).
 //! - The core clears the idle timer on a move to the stand, at a sleep and
-//!   at [`Event::SleepNow`]. Each idle timer has an id. If the expiry of an
+//!   at [`crate::Event::SleepNow`]. Each idle timer has an id. If the expiry of an
 //!   older timer still arrives, the core ignores it.
 //! - Each sleep has an id. A tap or a move to the stand wakes the device
 //!   during the steps, and the core then ignores the answers of the steps and
@@ -21,11 +21,48 @@ use alloc::vec;
 use core::time::Duration;
 
 use crate::{
-    Cmd, Event, Model,
+    Cmd, Model,
     capabilities::power::{Power, PowerSource, Wake, WakeSource},
     features::{connection, light, refresh::redraw, rooms, timer::Slot, wifi},
     view::rounded_level,
 };
+
+/// The internal events of the power feature. The core makes them from its
+/// timers and from the answers to its requests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Event {
+    /// The idle timer with this id expired.
+    IdleTimeout(u32),
+    /// The front light is off for the sleep with this id. Refer to
+    /// [`light_off`].
+    LightOffForSleep(u32),
+    /// The stream of the MQTT connection closed for the sleep with this id.
+    Offline(u32),
+    /// The `Sleep` request of the sleep with this id ended.
+    Woke {
+        /// The id of the sleep. The core ignores the answer of an older
+        /// sleep.
+        sleep: u32,
+        /// What ended the sleep.
+        wake: Wake,
+    },
+}
+
+impl From<Event> for crate::Event {
+    fn from(event: Event) -> Self {
+        Self::Power(event)
+    }
+}
+
+/// Handles an internal event of the power feature.
+pub fn update(event: Event, model: &mut Model) -> Cmd {
+    match event {
+        Event::IdleTimeout(id) => idle_timeout(id, model),
+        Event::LightOffForSleep(id) => light_off(id, model),
+        Event::Offline(id) => offline(id, model),
+        Event::Woke { sleep, wake } => woke(sleep, wake, model),
+    }
+}
 
 /// On battery, the time without a touch after which the device sleeps.
 ///
@@ -89,7 +126,7 @@ pub fn radio_off(id: u32, model: &mut Model) -> Cmd {
     }
     redraw(model, true).and(
         Power::sleep(vec![WakeSource::Touch])
-            .then_send(move |wake| Event::Woke { sleep: id, wake }),
+            .then_send(move |wake| Event::Woke { sleep: id, wake }.into()),
     )
 }
 
@@ -167,7 +204,7 @@ pub fn restart_idle_timer(model: &mut Model) -> Cmd {
     let id = state.idle;
     state
         .idle_timer
-        .start(id, IDLE_TIMEOUT, Event::IdleTimeout(id))
+        .start(id, IDLE_TIMEOUT, Event::IdleTimeout(id).into())
 }
 
 /// The idle timer with the id `id` expired. If it is the newest idle timer,
@@ -218,7 +255,7 @@ fn sleep(model: &mut Model) -> Cmd {
     model.power.sleep = model.power.sleep.wrapping_add(1);
     let id = model.power.sleep;
     if light::is_on(model) {
-        return light::off(model).then(Cmd::event(Event::LightOffForSleep(id)));
+        return light::off(model).then(Cmd::event(Event::LightOffForSleep(id).into()));
     }
     disconnect(id, model)
 }
