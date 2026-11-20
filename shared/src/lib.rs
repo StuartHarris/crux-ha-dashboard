@@ -6,8 +6,8 @@
 //! - [`features`] has the logic for rooms, the connection, power, the front
 //!   light, the refresh of the panel and the marks of taps that wait for
 //!   Home Assistant.
-//! - [`capabilities`] has the custom effects: MQTT, network, power and the
-//!   front light.
+//! - [`capabilities`] has the custom effects: MQTT, a byte stream, network,
+//!   power and the front light.
 //! - [`mqtt`] is an MQTT 3.1.1 client with no I/O: a codec, a framer and the
 //!   state machine of a connection.
 //! - [`view`] makes the view model, which has all the text that the `ui`
