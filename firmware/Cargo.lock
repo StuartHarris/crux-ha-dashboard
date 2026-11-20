@@ -2092,7 +2092,6 @@ dependencies = [
  "chrono",
  "crux_core",
  "crux_time",
- "facet",
  "futures",
  "serde",
  "serde_json",

@@ -10,11 +10,8 @@ use alloc::{
     string::{String, ToString},
 };
 
-use facet::Facet;
-use serde::{Deserialize, Serialize};
-
 /// The id of a room. It is the Home Assistant area id, for example `kitchen`.
-#[derive(Facet, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RoomId(pub String);
 
 impl RoomId {
@@ -26,8 +23,7 @@ impl RoomId {
 }
 
 /// A page of the dashboard.
-#[derive(Facet, Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
-#[repr(C)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum Route {
     /// The home page, which shows the whole house.
     #[default]
