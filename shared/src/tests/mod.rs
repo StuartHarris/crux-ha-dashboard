@@ -6,19 +6,12 @@
 //! fake radio and timers.
 
 pub mod broker;
-mod connection;
-mod flows;
-mod light;
-mod pending;
-mod power;
-mod refresh;
-mod rooms;
+pub mod flows;
 mod session;
 mod subscribe;
-mod wifi;
 
-mod shell;
-mod wire;
+pub mod shell;
+pub mod wire;
 
 use alloc::string::String;
 
@@ -34,6 +27,7 @@ use crate::{
     entities::STATESTREAM,
     fake::FakeRadio,
     features::{
+        connection::Link,
         light::LIGHT_TIMEOUT,
         pending::{PENDING_TIMEOUT, SCENE_TIMEOUT, TARGET_TIMEOUT},
         refresh::FULL_REFRESH_INTERVAL,
@@ -43,9 +37,9 @@ use crate::{
 };
 
 /// The time in the tests: 2026-07-01T08:41:00Z, which is 09:41 in BST.
-const NOW: u64 = 1_782_895_260;
+pub const NOW: u64 = 1_782_895_260;
 
-fn settings() -> Settings {
+pub fn settings() -> Settings {
     Settings {
         device_id: "hall".into(),
         host: "broker.local".into(),
@@ -55,11 +49,11 @@ fn settings() -> Settings {
     }
 }
 
-fn start(power: PowerSource) -> Event {
+pub fn start(power: PowerSource) -> Event {
     start_at(power, None)
 }
 
-fn start_at(power: PowerSource, path: Option<&str>) -> Event {
+pub fn start_at(power: PowerSource, path: Option<&str>) -> Event {
     Event::Start(Start {
         settings: settings(),
         power,
@@ -69,13 +63,13 @@ fn start_at(power: PowerSource, path: Option<&str>) -> Event {
 }
 
 /// A tap on the tile with `index`.
-const fn tap_tile(index: usize) -> Event {
+pub const fn tap_tile(index: usize) -> Event {
     Event::Tapped(Some(Control::Tile(index)))
 }
 
 /// Gives the entity `entity_id` the state `state` in `model`, as a message
 /// on the state stream does.
-fn set_state(model: &mut crate::Model, entity_id: &str, state: &str) {
+pub fn set_state(model: &mut crate::Model, entity_id: &str, state: &str) {
     let (domain, object_id) = entity_id.split_once('.').expect("an entity id");
     let topic = alloc::format!("{STATESTREAM}/{domain}/{object_id}/state");
     let pages = model.pages;
@@ -84,7 +78,7 @@ fn set_state(model: &mut crate::Model, entity_id: &str, state: &str) {
 
 /// Gives the entity `entity_id` the attribute `name` with the JSON value
 /// `value` in `model`, as a message on the state stream does.
-fn set_attribute(model: &mut crate::Model, entity_id: &str, name: &str, value: &str) {
+pub fn set_attribute(model: &mut crate::Model, entity_id: &str, name: &str, value: &str) {
     let (domain, object_id) = entity_id.split_once('.').expect("an entity id");
     let topic = alloc::format!("{STATESTREAM}/{domain}/{object_id}/{name}");
     let pages = model.pages;
@@ -92,32 +86,32 @@ fn set_attribute(model: &mut crate::Model, entity_id: &str, name: &str, value: &
 }
 
 /// A tap on the + button of the tile with `index`.
-const fn tap_plus(index: usize) -> Event {
+pub const fn tap_plus(index: usize) -> Event {
     Event::Tapped(Some(Control::Plus(index)))
 }
 
 /// A tap on the − button of the tile with `index`.
-const fn tap_minus(index: usize) -> Event {
+pub const fn tap_minus(index: usize) -> Event {
     Event::Tapped(Some(Control::Minus(index)))
 }
 
 /// A tap on the scene button with `index`.
-const fn tap_scene(index: usize) -> Event {
+pub const fn tap_scene(index: usize) -> Event {
     Event::Tapped(Some(Control::Scene(index)))
 }
 
 /// A tap on the All lights toggle of the index page.
-const fn tap_all_lights() -> Event {
+pub const fn tap_all_lights() -> Event {
     Event::Tapped(Some(Control::AllLights))
 }
 
 /// A tap on the button of the room with `index` on the index page.
-const fn tap_room(index: usize) -> Event {
+pub const fn tap_room(index: usize) -> Event {
     Event::Tapped(Some(Control::Room(index)))
 }
 
 /// Expects the effect that starts the full-refresh timer.
-trait ExpectFullRefreshTimer {
+pub trait ExpectFullRefreshTimer {
     /// Expects the next effect to start the timer of
     /// [`FULL_REFRESH_INTERVAL`].
     fn expect_full_refresh_timer(&mut self) -> &mut Self;
@@ -133,7 +127,7 @@ impl ExpectFullRefreshTimer for Cmd {
 }
 
 /// Expects the effects of a service call that the core issues at once.
-trait ExpectServiceCall {
+pub trait ExpectServiceCall {
     /// Expects the publish of the service call, the timer of its mark, the
     /// render of the mark and the clear of the send timer of the session,
     /// and no other effect. The publish goes through `wire`.
@@ -182,7 +176,7 @@ impl ExpectServiceCall for Cmd {
 }
 
 /// Expects the effects of the front light.
-trait ExpectLight {
+pub trait ExpectLight {
     /// Expects the next effect to set the front light to `level`.
     fn expect_light(&mut self, level: u8) -> &mut Self;
 
@@ -211,7 +205,7 @@ impl ExpectLight for Cmd {
 }
 
 /// Expects the start of the time limit of a radio request.
-trait ExpectRadioLimit {
+pub trait ExpectRadioLimit {
     /// Expects the next effect to start a timer of `limit`.
     fn expect_radio_limit(&mut self, limit: Duration) -> &mut Self;
 }
@@ -230,7 +224,7 @@ impl ExpectRadioLimit for Cmd {
 /// request must be the next effect, with the start of its time limit after
 /// it. Returns the command of the lease, which connects.
 #[track_caller]
-fn link_up(cmd: &mut Cmd, model: &mut Model) -> Cmd {
+pub fn link_up(cmd: &mut Cmd, model: &mut Model) -> Cmd {
     let mut radio = FakeRadio::default();
     let mut event = answer_radio(cmd, &mut radio);
     loop {
@@ -251,7 +245,7 @@ fn link_up(cmd: &mut Cmd, model: &mut Model) -> Cmd {
 /// the line of a leave for a suspect link. A test that checks a line uses
 /// `expect_log_with` before it calls this function.
 #[track_caller]
-fn answer_radio(cmd: &mut Cmd, radio: &mut FakeRadio) -> Event {
+pub fn answer_radio(cmd: &mut Cmd, radio: &mut FakeRadio) -> Event {
     let mut effect = cmd.expect_effect();
     while matches!(effect, Effect::Log(_)) {
         effect = cmd.expect_effect();
@@ -279,4 +273,46 @@ fn answer_radio(cmd: &mut Cmd, radio: &mut FakeRadio) -> Event {
         effect => panic!("expected a radio request, got {effect:?}"),
     };
     cmd.expect_radio_limit(limit).expect_one_event()
+}
+
+/// Drives the core from the start to the `Open` request of the stream.
+/// Returns the wire of the stream, which the test must keep while the
+/// connection is open.
+pub fn drive_to_connecting(power: PowerSource) -> (Model, Wire) {
+    let app = Dashboard;
+    let mut model = Model::default();
+
+    let mut cmd = app.update(start(power), &mut model);
+    let start = cmd
+        .expect_light(0)
+        .expect_render()
+        .expect_full_refresh_timer();
+    let cmd = link_up(start, &mut model);
+    (model, Wire::new(cmd))
+}
+
+/// Drives the core to an open connection, and ignores the effects of the
+/// CONNACK and the subscribe. The wire then has no effects, events or
+/// packets.
+pub fn drive_to_connected(power: PowerSource) -> (Model, Wire) {
+    let (mut model, mut wire) = drive_to_connecting(power);
+    let connected = wire.connect(&mut model);
+    wire.settle(connected, &mut model);
+    wire.effects.clear();
+    wire.events.clear();
+    wire.packets.clear();
+    assert_eq!(model.connection.mqtt, Link::Up);
+    (model, wire)
+}
+
+/// Returns the state-stream topic of `key` for the entity `entity_id`.
+pub fn topic(entity_id: &str, key: &str) -> alloc::string::String {
+    let (domain, object_id) = entity_id.split_once('.').unwrap();
+    format!("homeassistant/statestream/{domain}/{object_id}/{key}")
+}
+
+/// Sends a message from Home Assistant through the broker, and returns the
+/// command of the update.
+pub fn send(model: &mut Model, wire: &mut Wire, topic: &str, payload: &str) -> Cmd {
+    wire.send(model, topic, payload)
 }

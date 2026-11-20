@@ -872,3 +872,6 @@ fn schedule_reconnect(model: &mut Model) -> Cmd {
     let reason = log::info(Area::Mqtt, format!("connect again in {} s", wait.as_secs()));
     reason.and(timer)
 }
+
+#[cfg(test)]
+mod tests;

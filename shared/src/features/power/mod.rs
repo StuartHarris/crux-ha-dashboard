@@ -264,3 +264,6 @@ fn disconnect(id: u32, model: &mut Model) -> Cmd {
     model.unsent += model.connection.outbox.len();
     connection::go_offline(id, model)
 }
+
+#[cfg(test)]
+mod tests;

@@ -5,12 +5,11 @@ use core::time::Duration;
 
 use crux_core::App;
 
-use super::{
+use crate::tests::{
     ExpectFullRefreshTimer, ExpectLight, ExpectServiceCall,
     broker::publish_of,
-    connection::{drive_to_connected, drive_to_connecting},
-    set_attribute, set_state, start_at, tap_all_lights, tap_minus, tap_plus, tap_room, tap_scene,
-    tap_tile,
+    drive_to_connected, drive_to_connecting, set_attribute, set_state, start_at, tap_all_lights,
+    tap_minus, tap_plus, tap_room, tap_scene, tap_tile,
     wire::{ExpectWrite, Wire},
 };
 use crate::{

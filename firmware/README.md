@@ -75,7 +75,7 @@ The core connects again after a drop, with a backoff.
 
 ### The radio and the Wi-Fi policy
 
-The core decides each Wi-Fi step (`shared/src/features/wifi.rs` and
+The core decides each Wi-Fi step (`shared/src/features/wifi/mod.rs` and
 `shared/src/features/wifi/rules.rs`). The radio task has no policy. It does one
 job at a time that the core asks for through the `radio` capability
 (`shared/src/capabilities/radio.rs`).

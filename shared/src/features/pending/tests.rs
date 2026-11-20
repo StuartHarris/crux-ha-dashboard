@@ -5,13 +5,12 @@ use core::time::Duration;
 
 use crux_core::App;
 
-use super::{
+use crate::tests::{
     ExpectLight, ExpectServiceCall,
     broker::{iso_time, publish_of},
-    connection::{drive_to_connected, drive_to_connecting, send, topic},
-    set_state,
+    drive_to_connected, drive_to_connecting, send, set_state,
     shell::Shell,
-    start_at, tap_minus, tap_plus, tap_scene, tap_tile,
+    start_at, tap_minus, tap_plus, tap_scene, tap_tile, topic,
     wire::{ExpectWrite, Wire},
 };
 use crate::{
@@ -30,7 +29,7 @@ use crate::{
 const LAMP: &str = "light.living_room_rocket_lamp";
 
 /// The time of the last update of the lamp before the tap: 08:41:00 UTC.
-const BEFORE: u64 = super::NOW;
+const BEFORE: u64 = crate::tests::NOW;
 
 /// Returns the state of tile `index` in the view.
 fn tile_state(model: &Model, index: usize) -> TileState {
@@ -284,7 +283,7 @@ fn a_timeout_while_asleep_removes_the_mark_but_does_not_draw() {
 
 #[test]
 fn a_tap_that_wakes_the_device_shows_the_mark_through_the_reconnect() {
-    let mut shell = super::flows::house();
+    let mut shell = crate::tests::flows::house();
     shell.send(start_at(PowerSource::Battery, Some("/room/living_room")));
     shell.advance(IDLE_TIMEOUT);
     assert!(shell.view().asleep);
@@ -329,7 +328,7 @@ fn a_tap_that_wakes_the_device_shows_the_mark_through_the_reconnect() {
 /// The fake device shows each tap in the frame that it draws.
 #[test]
 fn the_flow_of_a_tap_draws_the_new_state() {
-    let mut shell: Shell = super::flows::house();
+    let mut shell: Shell = crate::tests::flows::house();
     shell.send(start_at(PowerSource::Stand, Some("/room/living_room")));
     shell.send(tap_tile(1));
     // The fake Home Assistant answers at once, so the frame shows the new
@@ -651,7 +650,7 @@ fn after_the_timeout_a_thermostat_step_starts_from_the_target_of_home_assistant(
 
 #[test]
 fn a_second_call_clears_the_timeout_of_the_first_and_only_the_new_timeout_fires() {
-    let mut shell = super::flows::house();
+    let mut shell = crate::tests::flows::house();
     // Home Assistant does not answer, so no state confirms a call.
     shell.broker.ignore_calls = true;
     shell.send(start_at(PowerSource::Stand, Some("/room/living_room")));

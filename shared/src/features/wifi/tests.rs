@@ -10,7 +10,7 @@ use core::time::Duration;
 
 use crux_core::App;
 
-use super::{flows::house, settings, shell::Shell, start};
+use crate::tests::{flows::house, settings, shell::Shell, start};
 use crate::{
     Connection, Dashboard, Effect, EffectTestExt, Event, Model, PowerSource,
     capabilities::{

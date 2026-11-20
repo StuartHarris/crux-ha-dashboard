@@ -5,11 +5,12 @@ use core::time::Duration;
 
 use crux_core::App;
 
-use super::{
+use crate::tests::{
     ExpectFullRefreshTimer, ExpectLight, ExpectRadioLimit,
     broker::publish_of,
+    drive_to_connected, drive_to_connecting,
     flows::house,
-    link_up, start, tap_all_lights,
+    link_up, send, start, tap_all_lights, topic,
     wire::{ExpectWrite, Wire},
 };
 use crate::{
@@ -30,51 +31,9 @@ use crate::{
     view::LightState::{On, Unavailable},
 };
 
-/// Drives the core from the start to the `Open` request of the stream.
-/// Returns the wire of the stream, which the test must keep while the
-/// connection is open.
-pub fn drive_to_connecting(power: PowerSource) -> (Model, Wire) {
-    let app = Dashboard;
-    let mut model = Model::default();
-
-    let mut cmd = app.update(start(power), &mut model);
-    let start = cmd
-        .expect_light(0)
-        .expect_render()
-        .expect_full_refresh_timer();
-    let cmd = link_up(start, &mut model);
-    (model, Wire::new(cmd))
-}
-
-/// Drives the core to an open connection, and ignores the effects of the
-/// CONNACK and the subscribe. The wire then has no effects, events or
-/// packets.
-pub fn drive_to_connected(power: PowerSource) -> (Model, Wire) {
-    let (mut model, mut wire) = drive_to_connecting(power);
-    let connected = wire.connect(&mut model);
-    wire.settle(connected, &mut model);
-    wire.effects.clear();
-    wire.events.clear();
-    wire.packets.clear();
-    assert_eq!(model.connection.mqtt, Link::Up);
-    (model, wire)
-}
-
 /// The time `seconds` after the Unix epoch.
 fn at(seconds: u64) -> chrono::DateTime<chrono::Utc> {
     chrono::DateTime::from_timestamp(seconds.cast_signed(), 0).unwrap()
-}
-
-/// Returns the state-stream topic of `key` for the entity `entity_id`.
-pub fn topic(entity_id: &str, key: &str) -> alloc::string::String {
-    let (domain, object_id) = entity_id.split_once('.').unwrap();
-    format!("homeassistant/statestream/{domain}/{object_id}/{key}")
-}
-
-/// Sends a message from Home Assistant through the broker, and returns the
-/// command of the update.
-pub fn send(model: &mut Model, wire: &mut Wire, topic: &str, payload: &str) -> Cmd {
-    wire.send(model, topic, payload)
 }
 
 /// Expects the command to start only the draw timer. Fires the timer and
@@ -99,7 +58,7 @@ fn change(
     time: u64,
 ) -> (Cmd, Cmd) {
     let first = send(model, wire, &topic(entity_id, "state"), state);
-    let updated = super::broker::iso_time(time);
+    let updated = crate::tests::broker::iso_time(time);
     let second = send(model, wire, &topic(entity_id, "last_updated"), &updated);
     (first, second)
 }
@@ -273,13 +232,18 @@ fn a_message_for_another_page_changes_the_state_but_does_not_draw() {
 
     // The state and the time changed, but the page does not show them. The
     // core starts no timer and does not draw.
-    let (mut first, mut second) =
-        change(&mut model, &mut wire, "light.loft_loft_1", "on", super::NOW);
+    let (mut first, mut second) = change(
+        &mut model,
+        &mut wire,
+        "light.loft_loft_1",
+        "on",
+        crate::tests::NOW,
+    );
     first.expect_no_effects();
     second.expect_no_effects();
     let loft = model.entities.get("light.loft_loft_1").unwrap();
     assert_eq!(loft.state.as_deref(), Some("on"));
-    assert_eq!(loft.last_updated, Some(at(super::NOW)));
+    assert_eq!(loft.last_updated, Some(at(crate::tests::NOW)));
 }
 
 #[test]
@@ -290,16 +254,29 @@ fn on_the_index_a_message_draws_only_if_a_summary_changes() {
     assert_eq!(lights(&model), [Unavailable; 3]);
 
     // The summary of the Loft shows the new state. The draw timer draws once.
-    change_and_draw(&mut model, &mut wire, "light.loft_loft_1", "on", super::NOW)
-        .unwrap()
-        .expect_only_render();
+    change_and_draw(
+        &mut model,
+        &mut wire,
+        "light.loft_loft_1",
+        "on",
+        crate::tests::NOW,
+    )
+    .unwrap()
+    .expect_only_render();
     assert_eq!(lights(&model), [On, Unavailable, Unavailable]);
     assert_eq!(app.view(&model).full_refresh_seq, 1);
 
     // No summary shows the group of the Loft, because the Loft has the
     // members of the group. The core does not draw.
     assert!(
-        change_and_draw(&mut model, &mut wire, "light.loft_lights", "on", super::NOW,).is_none()
+        change_and_draw(
+            &mut model,
+            &mut wire,
+            "light.loft_lights",
+            "on",
+            crate::tests::NOW,
+        )
+        .is_none()
     );
     assert_eq!(lights(&model), [On, Unavailable, Unavailable]);
 }
@@ -350,7 +327,7 @@ fn a_failed_write_does_not_hide_an_end_by_the_host_in_either_order() {
 fn a_lost_connection_shows_the_time_of_the_last_message_and_retries_after_a_backoff() {
     let app = Dashboard;
     let (mut model, mut wire) = drive_to_connected(PowerSource::Stand);
-    let _ = change_and_draw(&mut model, &mut wire, VISIBLE, "on", super::NOW);
+    let _ = change_and_draw(&mut model, &mut wire, VISIBLE, "on", crate::tests::NOW);
     let connection = model.connection.id;
 
     // The time is the time of the last update from Home Assistant, not the
@@ -631,7 +608,7 @@ fn a_shown_change_gives_one_draw_with_the_time_from_home_assistant() {
     // The timer gives exactly one render. 08:41 UTC is 09:41 in BST.
     app.update(due, &mut model).expect_only_render();
     assert_eq!(app.view(&model).updated, "Last changed 09:41");
-    assert_eq!(app.view(&model).last_sync, Some(super::NOW));
+    assert_eq!(app.view(&model).last_sync, Some(crate::tests::NOW));
 }
 
 #[test]
@@ -648,12 +625,13 @@ fn in_winter_the_footer_time_is_utc() {
 fn a_hidden_change_gives_no_effects_and_shows_its_time_on_its_page() {
     let app = Dashboard;
     let (mut model, mut wire) = drive_to_connected(PowerSource::Stand);
-    let _ = change_and_draw(&mut model, &mut wire, VISIBLE, "on", super::NOW);
+    let _ = change_and_draw(&mut model, &mut wire, VISIBLE, "on", crate::tests::NOW);
 
     // On the index page, the humidity of the living room changes two minutes
     // later. The index page does not show it, so the core starts no timer
     // and does not draw.
-    let (mut first, mut second) = change(&mut model, &mut wire, HIDDEN, "40", super::NOW + 120);
+    let (mut first, mut second) =
+        change(&mut model, &mut wire, HIDDEN, "40", crate::tests::NOW + 120);
     first.expect_no_effects();
     second.expect_no_effects();
     assert_eq!(app.view(&model).updated, "Last changed 09:41");
@@ -661,18 +639,18 @@ fn a_hidden_change_gives_no_effects_and_shows_its_time_on_its_page() {
     // The living room page shows the time of that change.
     navigate(&mut model, Route::room("living_room"));
     assert_eq!(app.view(&model).updated, "Last changed 09:43");
-    assert_eq!(app.view(&model).last_sync, Some(super::NOW + 120));
+    assert_eq!(app.view(&model).last_sync, Some(crate::tests::NOW + 120));
 }
 
 #[test]
 fn a_page_keeps_its_own_older_time_after_a_page_turn() {
     let app = Dashboard;
     let (mut model, mut wire) = drive_to_connected(PowerSource::Stand);
-    let _ = change_and_draw(&mut model, &mut wire, VISIBLE, "on", super::NOW);
+    let _ = change_and_draw(&mut model, &mut wire, VISIBLE, "on", crate::tests::NOW);
     navigate(&mut model, Route::room("living_room"));
 
     // On the living room page, the humidity changes two minutes later.
-    change_and_draw(&mut model, &mut wire, HIDDEN, "40", super::NOW + 120)
+    change_and_draw(&mut model, &mut wire, HIDDEN, "40", crate::tests::NOW + 120)
         .unwrap()
         .expect_only_render();
     assert_eq!(app.view(&model).updated, "Last changed 09:43");
@@ -686,7 +664,7 @@ fn a_page_keeps_its_own_older_time_after_a_page_turn() {
 fn the_index_time_follows_last_updated_of_an_entity_that_a_summary_shows() {
     let app = Dashboard;
     let (mut model, mut wire) = drive_to_connected(PowerSource::Stand);
-    let _ = change_and_draw(&mut model, &mut wire, VISIBLE, "on", super::NOW);
+    let _ = change_and_draw(&mut model, &mut wire, VISIBLE, "on", crate::tests::NOW);
 
     // The summary of the Loft shows its first light.
     change_and_draw(
@@ -694,7 +672,7 @@ fn the_index_time_follows_last_updated_of_an_entity_that_a_summary_shows() {
         &mut wire,
         "light.loft_loft_1",
         "on",
-        super::NOW + 120,
+        crate::tests::NOW + 120,
     )
     .unwrap()
     .expect_only_render();
@@ -706,7 +684,7 @@ fn the_index_time_follows_last_updated_of_an_entity_that_a_summary_shows() {
         &mut model,
         &mut wire,
         &topic(WEATHER, "last_updated"),
-        &super::broker::iso_time(super::NOW + 180),
+        &crate::tests::broker::iso_time(crate::tests::NOW + 180),
     );
     let due = expect_draw_timer(&mut first);
     app.update(due, &mut model).expect_only_render();
@@ -720,7 +698,7 @@ fn a_burst_of_messages_gives_one_draw_timer_and_one_render() {
 
     // The seed automation sends each entity again when the dashboard
     // connects. The first change that the page shows starts the draw timer.
-    let updated = super::broker::iso_time(super::NOW);
+    let updated = crate::tests::broker::iso_time(crate::tests::NOW);
     let mut first = send(&mut model, &mut wire, &topic(VISIBLE, "state"), "on");
     for (entity_id, key, payload) in [
         (VISIBLE, "last_updated", updated.as_str()),
@@ -744,7 +722,7 @@ fn a_burst_of_messages_gives_one_draw_timer_and_one_render() {
     );
 
     // The next change starts a new timer.
-    let (mut first, _) = change(&mut model, &mut wire, VISIBLE, "off", super::NOW);
+    let (mut first, _) = change(&mut model, &mut wire, VISIBLE, "off", crate::tests::NOW);
     let _due = expect_draw_timer(&mut first);
 }
 
@@ -752,7 +730,7 @@ fn a_burst_of_messages_gives_one_draw_timer_and_one_render() {
 fn a_last_updated_in_the_same_minute_as_the_page_time_draws_nothing() {
     let app = Dashboard;
     let (mut model, mut wire) = drive_to_connected(PowerSource::Stand);
-    let _ = change_and_draw(&mut model, &mut wire, VISIBLE, "on", super::NOW);
+    let _ = change_and_draw(&mut model, &mut wire, VISIBLE, "on", crate::tests::NOW);
 
     // The same entity in the same minute is not a change, so the core
     // starts no timer.
@@ -760,7 +738,7 @@ fn a_last_updated_in_the_same_minute_as_the_page_time_draws_nothing() {
         &mut model,
         &mut wire,
         &topic(VISIBLE, "last_updated"),
-        &super::broker::iso_time(super::NOW + 40),
+        &crate::tests::broker::iso_time(crate::tests::NOW + 40),
     )
     .expect_no_effects();
 
@@ -771,7 +749,7 @@ fn a_last_updated_in_the_same_minute_as_the_page_time_draws_nothing() {
         &mut model,
         &mut wire,
         &topic(WEATHER, "last_updated"),
-        &super::broker::iso_time(super::NOW + 30),
+        &crate::tests::broker::iso_time(crate::tests::NOW + 30),
     );
     let due = expect_draw_timer(&mut first);
     app.update(due, &mut model).expect_no_effects();
@@ -782,7 +760,7 @@ fn a_last_updated_in_the_same_minute_as_the_page_time_draws_nothing() {
 fn a_last_updated_that_is_not_valid_is_ignored() {
     let app = Dashboard;
     let (mut model, mut wire) = drive_to_connected(PowerSource::Stand);
-    let _ = change_and_draw(&mut model, &mut wire, VISIBLE, "on", super::NOW);
+    let _ = change_and_draw(&mut model, &mut wire, VISIBLE, "on", crate::tests::NOW);
 
     for payload in [
         "",
@@ -800,7 +778,7 @@ fn a_last_updated_that_is_not_valid_is_ignored() {
     }
     assert_eq!(
         model.entities.get(VISIBLE).unwrap().last_updated,
-        Some(at(super::NOW))
+        Some(at(crate::tests::NOW))
     );
     assert_eq!(app.view(&model).updated, "Last changed 09:41");
 }
@@ -822,28 +800,34 @@ fn after_start_the_footer_shows_the_kept_time_until_a_change_on_the_page() {
         unreachable!()
     };
     let start = Event::Start(crate::Start {
-        last_sync: Some(super::NOW),
+        last_sync: Some(crate::tests::NOW),
         ..start
     });
     let _effects: Vec<_> = app.update(start, &mut model).effects().collect();
     // No entity has a `last_updated` time, so the footer shows the kept time.
     assert_eq!(model.entities.last_updated().count(), 0);
     assert_eq!(app.view(&model).updated, "Last changed 09:41");
-    assert_eq!(app.view(&model).last_sync, Some(super::NOW));
+    assert_eq!(app.view(&model).last_sync, Some(crate::tests::NOW));
 }
 
 #[test]
 fn a_time_from_home_assistant_replaces_the_kept_time() {
     let app = Dashboard;
     let (mut model, mut wire) = drive_to_connected(PowerSource::Stand);
-    model.last_sync = Some(at(super::NOW));
+    model.last_sync = Some(at(crate::tests::NOW));
     assert_eq!(app.view(&model).updated, "Last changed 09:41");
 
     // A change on the page has an earlier time than the kept time. The
     // footer shows the time from Home Assistant.
-    change_and_draw(&mut model, &mut wire, VISIBLE, "on", super::NOW - 600)
-        .unwrap()
-        .expect_only_render();
+    change_and_draw(
+        &mut model,
+        &mut wire,
+        VISIBLE,
+        "on",
+        crate::tests::NOW - 600,
+    )
+    .unwrap()
+    .expect_only_render();
     assert_eq!(app.view(&model).updated, "Last changed 09:31");
 }
 

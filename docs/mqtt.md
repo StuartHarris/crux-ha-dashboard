@@ -275,7 +275,7 @@ thermostat), the tile shows the last state again. A call that changes nothing sh
 pattern for this time. A thermostat gets more time, because a Nest thermostat reports
 its new target through the Google cloud, and that can take more than 10 seconds. A scene
 has no state, so its button shows the pattern for 2 seconds. Refer to
-`shared/src/features/pending.rs`.
+`shared/src/features/pending/mod.rs`.
 
 ### Status
 

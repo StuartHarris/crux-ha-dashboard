@@ -402,3 +402,6 @@ pub fn timeout(id: u32, model: &mut Model) -> Cmd {
     }
     redraw(model, false)
 }
+
+#[cfg(test)]
+mod tests;
