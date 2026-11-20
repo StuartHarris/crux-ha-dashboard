@@ -17,9 +17,10 @@ shared.workspace = true
 ui.workspace = true
 
 [dev-dependencies]
-# Tests run on the host, so they can use the `std` feature of `shared`. The
-# library build must not use it.
-shared = { workspace = true, features = ["std"] }
+# Tests run on the host, so they can use the `fixtures` feature of `shared`,
+# which turns on `std` and gives the fake broker. The library build must not
+# use it.
+shared = { workspace = true, features = ["fixtures"] }
 
 [lints]
 workspace = true

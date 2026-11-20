@@ -7,20 +7,22 @@
 //!
 //! The shell keeps the bookkeeping that the simulator shell also has:
 //!
-//! - Each MQTT connection has an id. A new connection disconnects the current
-//!   one first. The core ignores the items of an older connection, and the
-//!   shell ignores the items of a connection whose stream ended.
+//! - Each stream has the connection id of the core. The stream task closes
+//!   the open stream when a new `Open` replaces it. The shell ignores the
+//!   items of a stream that ended.
+//! - A `Write` ends at [`Signal::Written`] for its connection, in the order
+//!   of the requests. At the end of the stream, the shell answers each
+//!   `Write` of the stream that waits with `Failed`. If the stream ended
+//!   before the request, the shell answers `Failed` at once.
+//! - A `Close` ends at the end of the stream of its connection, after the
+//!   `Closed` item. If the stream ended before the request, the shell answers
+//!   at once.
 //! - Each timer has a token. The core can use a timer id again after it clears
 //!   the timer, so the shell ignores a signal with an old token.
 //! - Each `WifiOn` request has a token. `WifiOff` answers the requests that
 //!   wait with `Failed`, which the core ignores, because it no longer wants
 //!   the connection. The shell then drops a late answer of the Wi-Fi task.
-//! - `Disconnect` ends when the stream of its connection ends, or at once if
-//!   no connection is current. `WifiOff` ends at [`Signal::RadioOff`], in the
-//!   order of the requests.
-//! - `Subscribe` ends at [`Signal::Subscribed`] for its connection. If the
-//!   stream of the connection ends first, the shell answers `Failed`. If no
-//!   connection is current, the shell answers `Failed` at once.
+//! - `WifiOff` ends at [`Signal::RadioOff`], in the order of the requests.
 //! - `Sleep` ends at [`Signal::Woke`]. While it waits, a tap is the wake
 //!   (`Wake::Touch` with the control at the point), and a change of the
 //!   power source also ends it (`Wake::PowerSource`). [`Shell::is_sleeping`] tells
@@ -32,7 +34,12 @@
 //!   at the end of the batch. It is at the place of the last `Render` effect,
 //!   so it stays before a `Sleep` that follows it.
 
-use alloc::{boxed::Box, collections::VecDeque, string::String, vec::Vec};
+use alloc::{
+    boxed::Box,
+    collections::VecDeque,
+    string::{String, ToString},
+    vec::Vec,
+};
 
 use crux_core::{Request, capability::Operation};
 use crux_time::{
@@ -44,10 +51,11 @@ use shared::{
     Core, Dashboard, Effect, Event, PowerSource, Settings, Start, ViewModel,
     capabilities::{
         light::FrontLight,
-        mqtt::{Connect, Credentials, Disconnect, MqttEvent, Publish, Subscribe, SubscribeOutcome},
         network::{WifiOff, WifiOn, WifiQuiet, WifiStatus},
         power::{Sleep, Wake},
+        stream::{Close, Open, StreamItem, Write, Written},
     },
+    mqtt::Credentials,
 };
 
 use crate::config::Config;
@@ -55,12 +63,20 @@ use crate::config::Config;
 /// An answer or a fact from a task, for the shell.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Signal {
-    /// An item from the stream of the MQTT connection with this id.
-    Mqtt {
-        /// The id of the connection in the shell.
+    /// An item from the stream of the connection with this id. `Closed` is
+    /// the last item.
+    Stream {
+        /// The connection id of the core.
         connection: u32,
         /// The item.
-        event: MqttEvent,
+        item: StreamItem,
+    },
+    /// The answer to the oldest `Write` job of the connection with this id.
+    Written {
+        /// The connection id of the core.
+        connection: u32,
+        /// The answer.
+        outcome: Written,
     },
     /// The timer with this id and token expired.
     Timer {
@@ -82,14 +98,6 @@ pub enum Signal {
     /// the tap answers it with `Wake::Touch` and the control, in place of a
     /// tap.
     Tap(Point),
-    /// The answer to the oldest `Subscribe` job of the MQTT connection with
-    /// this id.
-    Subscribed {
-        /// The id of the connection in the shell.
-        connection: u32,
-        /// The answer.
-        outcome: SubscribeOutcome,
-    },
     /// The radio is off. The answer to the oldest `WifiOff` job that waits.
     RadioOff,
     /// The device woke from a real wake. The answer to the `Sleep` job.
@@ -104,22 +112,22 @@ pub enum Signal {
     Event(Event),
 }
 
-/// An MQTT operation of the core, for the connection with an id in the
+/// A stream operation of the core, for the connection with the id in the
 /// [`Job`]. Each variant holds the operation of the core, unchanged.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum MqttOp {
-    /// Open the connection. The MQTT task answers with the items of its
-    /// stream, and the last item is always `Disconnected`.
-    Connect(Connect),
-    /// Subscribe to the topic filters. The MQTT task answers with
-    /// [`Signal::Subscribed`] when the broker acknowledged all of them.
-    Subscribe(Subscribe),
-    /// Publish a message.
-    Publish(Publish),
-    /// Send a disconnect packet and close the connection. The core asks for
-    /// it, or the shell makes it to close a connection that a new one
-    /// replaces. In the second case no core operation is behind it.
-    Disconnect(Disconnect),
+pub enum StreamOp {
+    /// Open a stream. If a stream is open, close it first, and end it with
+    /// `Closed("replaced")`. The stream task answers with the items of the
+    /// new stream as [`Signal::Stream`], and the last item is always
+    /// `Closed`.
+    Open(Open),
+    /// Send the bytes. The stream task answers with [`Signal::Written`].
+    Write(Write),
+    /// Close the stream. Stop a `Write` that waits, send a TCP FIN, send the
+    /// bytes that wait for no more than 2 seconds, and abort the socket. Then
+    /// end the stream with `Closed`. The shell answers the `Close` request at
+    /// the `Closed` item, so the task sends no other answer.
+    Close(Close),
 }
 
 /// A timer operation of the core. Each operation holds the id of the timer.
@@ -135,20 +143,21 @@ pub enum TimerOp {
 }
 
 /// Work for a task. A job holds the operations of the core unchanged, and
-/// adds only what the shell owns: the connection id, the Wi-Fi token and
-/// the timer token.
+/// adds only what the shell owns: the Wi-Fi token, the light token and the
+/// timer token.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Job {
     /// Draw the view model on the panel. The shell decides this job, so no
     /// core operation is behind it. The view model is in a box, because it
     /// is much larger than the other jobs.
     Render(Box<ViewModel>),
-    /// Do an operation on an MQTT connection.
-    Mqtt {
-        /// The id of the connection.
+    /// Do an operation on the stream of a connection.
+    Stream {
+        /// The connection id of the core. It is the same as the id in the
+        /// operation.
         connection: u32,
         /// The operation.
-        op: MqttOp,
+        op: StreamOp,
     },
     /// Turn Wi-Fi on and join the network. Answer with [`Signal::Wifi`] and
     /// the token.
@@ -196,23 +205,20 @@ struct Timer {
 /// The shell logic. One task owns it.
 pub struct Shell {
     core: Core<Dashboard>,
-    /// The connections whose streams did not end, from the oldest.
-    connections: Vec<(u32, Request<Connect>)>,
-    /// The id of the connection to which subscribe, publish and disconnect
-    /// apply.
-    current: Option<u32>,
-    last_connection: u32,
+    /// The `Open` requests whose streams did not end, from the oldest, with
+    /// their connection ids.
+    streams: Vec<(u32, Request<Open>)>,
+    /// The `Write` requests that wait for their answers, from the oldest,
+    /// with their connection ids.
+    writes: Vec<(u32, Request<Write>)>,
+    /// The `Close` requests that wait for the end of the stream of their
+    /// connection.
+    closes: Vec<(u32, Request<Close>)>,
     timers: Vec<Timer>,
     last_token: u32,
     /// The `WifiOn` requests that wait for an answer, with their tokens.
     wifi: Vec<(u32, Request<WifiOn>)>,
     last_wifi_token: u32,
-    /// The `Disconnect` requests that wait for the end of the stream of their
-    /// connection.
-    disconnects: Vec<(u32, Request<Disconnect>)>,
-    /// The `Subscribe` requests that wait for their answers, from the
-    /// oldest, with the ids of their connections.
-    subscribes: Vec<(u32, Request<Subscribe>)>,
     /// The `WifiOff` requests that wait for the radio, from the oldest.
     wifi_off: VecDeque<Request<WifiOff>>,
     /// The `Sleep` request that waits for a wake.
@@ -234,15 +240,13 @@ impl Shell {
     pub fn new() -> Self {
         Self {
             core: Core::new(),
-            connections: Vec::new(),
-            current: None,
-            last_connection: 0,
+            streams: Vec::new(),
+            writes: Vec::new(),
+            closes: Vec::new(),
             timers: Vec::new(),
             last_token: 0,
             wifi: Vec::new(),
             last_wifi_token: 0,
-            disconnects: Vec::new(),
-            subscribes: Vec::new(),
             wifi_off: VecDeque::new(),
             sleep: None,
             lights: Vec::new(),
@@ -272,52 +276,15 @@ impl Shell {
     /// tasks.
     pub fn handle(&mut self, signal: Signal) -> Vec<Job> {
         match signal {
-            Signal::Mqtt { connection, event } => {
-                let Some(index) = self
-                    .connections
-                    .iter()
-                    .position(|(id, _)| *id == connection)
-                else {
-                    return Vec::new();
-                };
-                let last = matches!(event, MqttEvent::Disconnected { .. });
-                let mut effects = resolve(&self.core, &mut self.connections[index].1, event);
-                if last {
-                    self.connections.remove(index);
-                    if self.current == Some(connection) {
-                        self.current = None;
-                    }
-                    // The connection is closed, so its `Disconnect` requests
-                    // end.
-                    let (done, waiting) = core::mem::take(&mut self.disconnects)
-                        .into_iter()
-                        .partition(|(id, _)| *id == connection);
-                    self.disconnects = waiting;
-                    for (_, mut request) in done {
-                        effects.extend(resolve(&self.core, &mut request, ()));
-                    }
-                    // Its `Subscribe` requests did not get all the
-                    // acknowledgements.
-                    let (failed, waiting) = core::mem::take(&mut self.subscribes)
-                        .into_iter()
-                        .partition(|(id, _)| *id == connection);
-                    self.subscribes = waiting;
-                    for (_, mut request) in failed {
-                        let outcome = SubscribeOutcome::Failed;
-                        effects.extend(resolve(&self.core, &mut request, outcome));
-                    }
-                }
-                self.process(effects)
-            }
-            Signal::Subscribed {
+            Signal::Stream { connection, item } => self.stream(connection, item),
+            Signal::Written {
                 connection,
                 outcome,
             } => {
-                let Some(index) = self.subscribes.iter().position(|(id, _)| *id == connection)
-                else {
+                let Some(index) = self.writes.iter().position(|(id, _)| *id == connection) else {
                     return Vec::new();
                 };
-                let (_, mut request) = self.subscribes.remove(index);
+                let (_, mut request) = self.writes.remove(index);
                 let effects = resolve(&self.core, &mut request, outcome);
                 self.process(effects)
             }
@@ -376,6 +343,45 @@ impl Shell {
         }
     }
 
+    /// Gives an item of the stream of `connection` to the core. After the
+    /// `Closed` item, answers the `Write` requests of the stream with
+    /// `Failed` and its `Close` requests. If the stream ended, returns no
+    /// jobs.
+    fn stream(&mut self, connection: u32, item: StreamItem) -> Vec<Job> {
+        let Some(index) = self.streams.iter().position(|(id, _)| *id == connection) else {
+            return Vec::new();
+        };
+        let reason = match &item {
+            StreamItem::Closed(reason) => Some(reason.clone()),
+            _ => None,
+        };
+        let mut effects = resolve(&self.core, &mut self.streams[index].1, item);
+        if let Some(reason) = reason {
+            self.streams.remove(index);
+            let (failed, waiting) = core::mem::take(&mut self.writes)
+                .into_iter()
+                .partition(|(id, _)| *id == connection);
+            self.writes = waiting;
+            for (_, mut request) in failed {
+                let outcome = Written::Failed(reason.clone());
+                effects.extend(resolve(&self.core, &mut request, outcome));
+            }
+            let (done, waiting) = core::mem::take(&mut self.closes)
+                .into_iter()
+                .partition(|(id, _)| *id == connection);
+            self.closes = waiting;
+            for (_, mut request) in done {
+                effects.extend(resolve(&self.core, &mut request, ()));
+            }
+        }
+        self.process(effects)
+    }
+
+    /// Returns `true` if the stream of `connection` did not end.
+    fn is_open(&self, connection: u32) -> bool {
+        self.streams.iter().any(|(id, _)| *id == connection)
+    }
+
     /// Answers the `Sleep` request that waits with `wake`. If no request
     /// waits, returns no jobs.
     fn wake(&mut self, wake: Wake) -> Vec<Job> {
@@ -432,40 +438,39 @@ impl Shell {
         match effect {
             // `process` handles `Render`, because it needs the whole batch.
             Effect::Render(_) => Vec::new(),
-            Effect::MqttConnect(request) => {
-                if let Some(current) = self.current.take() {
-                    jobs.push(mqtt(current, MqttOp::Disconnect(Disconnect)));
-                }
-                self.last_connection = self.last_connection.wrapping_add(1);
-                let id = self.last_connection;
-                jobs.push(mqtt(id, MqttOp::Connect(request.operation.clone())));
-                self.connections.push((id, request));
-                self.current = Some(id);
+            Effect::StreamOpen(request) => {
+                let op = request.operation.clone();
+                let connection = op.connection;
+                jobs.push(stream(connection, StreamOp::Open(op)));
+                self.streams.push((connection, request));
                 Vec::new()
             }
-            Effect::MqttSubscribe(mut request) => match self.current {
-                Some(current) => {
-                    let subscribe = request.operation.clone();
-                    jobs.push(mqtt(current, MqttOp::Subscribe(subscribe)));
-                    self.subscribes.push((current, request));
-                    Vec::new()
+            Effect::StreamWrite(mut request) => {
+                let connection = request.operation.connection;
+                if !self.is_open(connection) {
+                    let outcome = Written::Failed(NOT_OPEN.to_string());
+                    return resolve(&self.core, &mut request, outcome);
                 }
-                None => resolve(&self.core, &mut request, SubscribeOutcome::Failed),
-            },
-            Effect::MqttPublish(request) => {
-                if let Some(current) = self.current {
-                    jobs.push(mqtt(current, MqttOp::Publish(request.operation)));
-                }
+                // The job takes the bytes, so the shell does not copy them.
+                // The request needs only its answer.
+                let op = Write {
+                    connection,
+                    bytes: core::mem::take(&mut request.operation.bytes),
+                };
+                jobs.push(stream(connection, StreamOp::Write(op)));
+                self.writes.push((connection, request));
                 Vec::new()
             }
-            Effect::MqttDisconnect(mut request) => match self.current.take() {
-                Some(current) => {
-                    jobs.push(mqtt(current, MqttOp::Disconnect(request.operation.clone())));
-                    self.disconnects.push((current, request));
-                    Vec::new()
+            Effect::StreamClose(mut request) => {
+                let connection = request.operation.connection;
+                if !self.is_open(connection) {
+                    return resolve(&self.core, &mut request, ());
                 }
-                None => resolve(&self.core, &mut request, ()),
-            },
+                let op = request.operation.clone();
+                jobs.push(stream(connection, StreamOp::Close(op)));
+                self.closes.push((connection, request));
+                Vec::new()
+            }
             Effect::WifiOn(request) => {
                 self.last_wifi_token = self.last_wifi_token.wrapping_add(1);
                 let token = self.last_wifi_token;
@@ -524,8 +529,11 @@ impl Shell {
     }
 }
 
-const fn mqtt(connection: u32, op: MqttOp) -> Job {
-    Job::Mqtt { connection, op }
+/// The reason in the answer to a `Write` for a stream that ended.
+const NOT_OPEN: &str = "the stream is not open";
+
+const fn stream(connection: u32, op: StreamOp) -> Job {
+    Job::Stream { connection, op }
 }
 
 const fn clear_timer(token: u32, id: TimerId) -> Job {

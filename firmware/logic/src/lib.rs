@@ -5,8 +5,9 @@
 //! hardware code, so its tests run on the host with `just test-firmware`.
 //!
 //! - [`shell`] owns the core, routes each effect to a task, and keeps the
-//!   MQTT connections and the timers.
-//! - [`mqtt`] is the bookkeeping of the MQTT task.
+//!   streams and the timers.
+//! - [`stream`] is the bookkeeping of the stream task, and the time of each
+//!   update of the core.
 //! - [`timers`] keeps the timers of the timer task.
 //! - [`touch`] converts touch samples to taps on the panel.
 //! - [`power`] reads the power source and the charge from the charger and
@@ -25,10 +26,10 @@ extern crate alloc;
 
 pub mod backoff;
 pub mod config;
-pub mod mqtt;
 pub mod power;
 pub mod shell;
 pub mod sleep;
+pub mod stream;
 pub mod timers;
 pub mod touch;
 pub mod waveform;
