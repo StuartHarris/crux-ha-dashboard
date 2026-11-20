@@ -28,6 +28,14 @@
 //! to an access point that is clearly better. A `Hold` (the first network
 //! step of a sleep) or any other request stops that scan. The log tells which
 //! path each join took, its time, the scan result and each change.
+//!
+//! After an MQTT session failed, `HEALTH` says that the link is suspect. If
+//! the driver is still connected, the next `WifiOn` leaves the access point
+//! and joins again, so the task does not keep a link that is stuck. If the
+//! joins then get no new address from DHCP, the task restarts the chip
+//! (`logic::wifi::LinkHealth`). The driver can count frames that it never
+//! sends, and when that count is full, the network stack stops. Only a
+//! restart clears the count.
 
 use alloc::vec::Vec;
 use core::pin::pin;
@@ -37,17 +45,18 @@ use embassy_futures::select::{Either, select};
 use embassy_net::Stack;
 use embassy_time::{Duration, Instant, Timer, with_timeout};
 use esp_hal::peripherals::WIFI as WifiPeripheral;
+use esp_hal::system::software_reset;
 use esp_radio::wifi::WifiController;
 use logic::{
     shell::Signal,
     wifi::{
-        AccessPoint, AfterFailure, ApCache, DuringSwitch, JoinPath, Seen, WifiRequest,
-        better_access_point, during_switch,
+        AccessPoint, AfterFailure, ApCache, DuringSwitch, JoinPath, JoinStart, NoAddress,
+        RESTART_AFTER, Seen, WifiRequest, better_access_point, during_switch,
     },
 };
 use shared::capabilities::network::WifiStatus;
 
-use crate::{LINK_CHANGED, SIGNALS, WIFI, config::CONFIG};
+use crate::{HEALTH, LINK_CHANGED, SIGNALS, WIFI, config::CONFIG};
 
 /// The longest time to join the network with a scan of all the channels.
 const JOIN_TIMEOUT: Duration = Duration::from_secs(20);
@@ -65,6 +74,8 @@ const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 /// The time from the disconnect to the drop of the controller, for the
 /// frames in the driver.
 const TX_DRAIN: Duration = Duration::from_millis(100);
+/// The time for the log line to go out before a restart of the chip.
+const LOG_DRAIN: Duration = Duration::from_millis(200);
 
 #[embassy_executor::task]
 pub async fn task(mut wifi: WifiPeripheral<'static>, stack: Stack<'static>) {
@@ -294,6 +305,10 @@ async fn stop(controller: &mut WifiController<'_>) {
 /// Joins the network and waits for an address. Returns `true` if the device
 /// has an address.
 ///
+/// If the driver is connected, the task only waits for an address, unless an
+/// MQTT session failed after the last CONNACK (`HEALTH`). Then the task
+/// leaves the access point and joins again.
+///
 /// The first try uses `path`. If a join with a cached access point fails,
 /// `cache` forgets it, and the task scans all the channels.
 async fn join(
@@ -302,9 +317,23 @@ async fn join(
     cache: &mut ApCache,
     mut path: JoinPath,
 ) -> bool {
-    if controller.is_connected() {
+    let start = HEALTH.lock(|health| health.borrow().join_start(controller.is_connected()));
+    match start {
         // The link is up, so only DHCP is missing.
-        return address(stack).await;
+        JoinStart::Keep => return address(stack).await,
+        JoinStart::Rejoin => {
+            log::warn!("wifi: an MQTT session failed, so leave the access point and join again");
+            leave(controller).await;
+            // Without this wait, the stack keeps the old address, and the
+            // join does not wait for a new lease.
+            if with_timeout(LINK_DOWN_TIMEOUT, stack.wait_config_down())
+                .await
+                .is_err()
+            {
+                log::warn!("wifi: the old address stays after the disconnect");
+            }
+        }
+        JoinStart::Join => {}
     }
     loop {
         let started = Instant::now();
@@ -366,6 +395,8 @@ async fn attempt(
         JoinPath::Scan => JOIN_TIMEOUT,
     };
     log::info!("wifi: join the network with {}", path_name(path));
+    // An address from before the join is not a new lease.
+    let stale = stack.is_config_up();
     let info = match with_timeout(limit, controller.connect_async()).await {
         Ok(Ok(info)) => info,
         Ok(Err(error)) => {
@@ -377,10 +408,44 @@ async fn attempt(
             return None;
         }
     };
-    address(stack).await.then_some(AccessPoint {
+    lease(stack, stale).await.then_some(AccessPoint {
         bssid: info.bssid,
         channel: info.channel,
     })
+}
+
+/// Waits for an address from DHCP after the driver joined an access point,
+/// and records the result in `HEALTH`. `stale` is `true` if the stack had
+/// its address before the join. Returns `true` if the device has an
+/// address.
+///
+/// After an MQTT session failed, if too many joins got no new address,
+/// the function restarts the chip.
+async fn lease(stack: Stack<'static>, stale: bool) -> bool {
+    let leased = address(stack).await;
+    let next = HEALTH.lock(|health| {
+        let mut health = health.borrow_mut();
+        match (leased, stale) {
+            (true, false) => {
+                health.address();
+                NoAddress::Fail
+            }
+            (true, true) => health.stale_address(),
+            (false, _) => health.no_address(),
+        }
+    });
+    if leased && stale {
+        log::warn!("wifi: the address is from before the join, so the stack can be stuck");
+    }
+    if next == NoAddress::Restart {
+        log::warn!(
+            "wifi: {RESTART_AFTER} joins after an MQTT session failed got no new address. \
+             The Wi-Fi driver can be stuck, so restart the chip"
+        );
+        Timer::after(LOG_DRAIN).await;
+        software_reset();
+    }
+    leased
 }
 
 /// Waits for an address from DHCP. Returns `true` if the device has one.
