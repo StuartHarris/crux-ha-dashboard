@@ -11,7 +11,7 @@ use core::time::Duration;
 
 use crux_core::App;
 
-use crate::tests::{asleep as is_asleep, flows::house, settings, shell::Shell, start};
+use crate::tests::{asleep as is_asleep, flows::house, settings, shell::Shell, sleep_lines, start};
 use crate::{
     Connection, Dashboard, Effect, EffectTestExt, Event, Model, PowerSource,
     capabilities::{
@@ -22,7 +22,7 @@ use crate::{
     fake::radio::{HALL, LANDING},
     features::{
         connection::{RECONNECT_MAX, RECONNECT_MIN},
-        power::{self, IDLE_TIMEOUT},
+        power::{self, IDLE_TIMEOUT, SleepStep},
         wifi::{
             ADDRESS_TIMEOUT, JOIN_TIMEOUT, LEAVE_TIMEOUT, OFF_TIMEOUT, Phase, SCAN_TIMEOUT,
             STOP_SCAN_TIMEOUT,
@@ -96,6 +96,7 @@ fn asleep() -> Shell {
     shell.advance(IDLE_TIMEOUT);
     assert!(shell.sleep.is_some());
     shell.take_log();
+    assert_eq!(shell.take_logs(), sleep_lines(1));
     shell
 }
 
@@ -152,7 +153,8 @@ fn the_usual_steps_write_no_line_to_the_log() {
     assert_eq!(shell.view().connection, Connection::Online);
     shell.advance(IDLE_TIMEOUT);
     assert!(shell.sleep.is_some());
-    assert_eq!(shell.take_logs(), Vec::<String>::new());
+    // Only the steps of the sleep write lines, with the area `power`.
+    assert_eq!(shell.take_logs(), sleep_lines(1));
 }
 
 #[test]
@@ -187,8 +189,11 @@ fn a_stop_of_the_broker_writes_only_the_waits_of_the_reconnects() {
     assert!(shell.sleep.is_some());
 
     // Each failure of the broker host schedules a reconnect, so the core
-    // writes the wait. The other steps write no line.
-    assert_eq!(shell.take_logs(), [connect_again(1), connect_again(2)]);
+    // writes the wait. The other steps write no line, except the steps of
+    // the sleep.
+    let mut expected = alloc::vec![connect_again(1), connect_again(2)];
+    expected.extend(sleep_lines(1));
+    assert_eq!(shell.take_logs(), expected);
 }
 
 #[test]
@@ -784,7 +789,7 @@ fn a_wake_while_the_radio_turns_off_joins_after_the_answer() {
 
     // The tap wakes the device. The core waits for the radio to turn off.
     shell.send(Event::Tapped(None));
-    assert!(!shell.model.power.asleep);
+    assert!(!shell.model.power.is_asleep());
     assert_eq!(radio(&shell.take_log()), Vec::<&str>::new());
 
     shell.hold_radio = false;
@@ -1003,13 +1008,8 @@ fn the_status_stays_online_while_the_core_changes_access_point() {
 /// with settings. The radio request with the id 9 waits in `phase`.
 fn sleeping_with(phase: Phase) -> Model {
     let mut model = Model {
-        power: power::State {
-            source: PowerSource::Battery,
-            asleep: true,
-            sleep: 1,
-            ..power::State::default()
-        },
-        settings: Some(settings()),
+        power: power::State::asleep_in(1),
+        startup: crate::Startup::Started(settings()),
         ..Model::default()
     };
     model.wifi.phase = phase;
@@ -1105,11 +1105,19 @@ fn a_time_limit_after_the_sleep_started_changes_nothing_in_the_cache() {
 #[test]
 fn a_restart_wins_over_a_sleep() {
     let mut model = sleeping_with(Phase::Restarting);
-    // The stream closed for the sleep. The core does not turn the radio off.
+    // The stream closed for the sleep. The core does not turn the radio off,
+    // and writes why.
     Dashboard
         .update(Event::Power(power::Event::Offline(1)), &mut model)
-        .expect_no_effects();
+        .expect_only_log_with(|log| {
+            assert_eq!(log.level, Level::Warn);
+            assert_eq!(
+                log.to_string(),
+                "power: sleep 1 stops before the radio turns off, because the chip restarts"
+            );
+        });
     assert_eq!(model.wifi.phase, Phase::Restarting);
+    assert_eq!(power::sleep_step(&model), Some(SleepStep::Stalled));
 }
 
 #[test]
@@ -1191,7 +1199,7 @@ fn a_better_access_point_found_during_a_sleep_is_for_the_next_wake() {
 #[test]
 fn the_count_of_joins_with_no_new_address_comes_before_the_restart() {
     let mut model = Model {
-        settings: Some(settings()),
+        startup: crate::Startup::Started(settings()),
         ..Model::default()
     };
     model.wifi.phase = Phase::Leasing {
@@ -1227,7 +1235,7 @@ fn the_count_of_joins_with_no_new_address_comes_before_the_restart() {
 #[test]
 fn a_stale_address_on_a_link_that_is_not_suspect_writes_no_line() {
     let mut model = Model {
-        settings: Some(settings()),
+        startup: crate::Startup::Started(settings()),
         ..Model::default()
     };
     model.wifi.phase = Phase::Leasing {
@@ -1255,7 +1263,7 @@ fn a_stale_address_on_a_link_that_is_not_suspect_writes_no_line() {
 #[test]
 fn a_scan_with_no_signal_for_the_current_access_point_stays() {
     let mut model = Model {
-        settings: Some(settings()),
+        startup: crate::Startup::Started(settings()),
         ..Model::default()
     };
     model.wifi.phase = Phase::Scanning(HALL);
@@ -1345,6 +1353,123 @@ fn a_wake_during_the_scan_stop_of_a_sleep_does_not_disconnect() {
         crate::features::connection::Link::Up
     );
     assert!(!is_asleep(&shell.model));
+}
+
+#[test]
+fn a_new_sleep_during_the_scan_stop_of_an_old_sleep_waits_for_the_stop() {
+    let mut shell = scanning();
+    // The first sleep stops the scan. A tap wakes the device before the
+    // answer, and turns the light on.
+    shell.send(Event::SleepNow);
+    let old = shell.model.power.sleep;
+    shell.send(Event::Tapped(None));
+    assert!(!is_asleep(&shell.model));
+    shell.take_log();
+
+    // The second sleep turns the light off. Then it takes over the
+    // `StopScan` request of the first sleep, so the DISCONNECT waits.
+    shell.send(Event::SleepNow);
+    let new = shell.model.power.sleep;
+    assert_ne!(new, old);
+    let log = shell.take_log();
+    assert!(log.contains(&"FrontLight 0".into()), "{log:?}");
+    assert_eq!(radio(&log), Vec::<&str>::new());
+    assert!(!log.contains(&"MqttDisconnect".into()), "{log:?}");
+    assert_eq!(shell.held_radio(), 1);
+    assert!(matches!(
+        shell.model.wifi.phase,
+        Phase::StoppingScan { sleep, .. } if sleep == new
+    ));
+    assert_eq!(power::sleep_step(&shell.model), Some(SleepStep::StopScan));
+    let stop = shell.model.wifi.radio;
+
+    // The answer to the old request continues the second sleep: publish
+    // `asleep`, disconnect, turn the radio off and sleep.
+    shell.answer_radio();
+    shell.answer_radio();
+    let log = shell.take_log();
+    let disconnect = place(&log, "MqttDisconnect");
+    assert!(
+        place(&log, "MqttPublish dashboard/hall/status asleep") < disconnect,
+        "{log:?}"
+    );
+    assert!(disconnect < place(&log, "StreamClose"), "{log:?}");
+    assert!(
+        place(&log, "StreamClose") < place(&log, "WifiOff"),
+        "{log:?}"
+    );
+    assert!(place(&log, "WifiOff") < place(&log, "Sleep"), "{log:?}");
+    assert!(shell.sleep.is_some());
+    assert!(is_asleep(&shell.model));
+    assert_eq!(shell.model.power.sleep, new);
+    assert_eq!(shell.view().connection, Connection::Offline);
+
+    // A second answer with the id of the old request does nothing.
+    shell.send(Event::Wifi(wifi::Event::ScanStopped(stop)));
+    assert_eq!(shell.take_log(), Vec::<String>::new());
+    assert_eq!(shell.model.wifi.phase, Phase::Off);
+}
+
+#[test]
+fn a_wake_after_a_new_sleep_took_over_the_scan_stop_does_not_disconnect() {
+    let mut shell = scanning();
+    shell.send(Event::SleepNow);
+    shell.send(Event::Tapped(None));
+    // The second sleep takes over the `StopScan` request, and a tap wakes
+    // the device again before the answer.
+    shell.send(Event::SleepNow);
+    assert!(matches!(shell.model.wifi.phase, Phase::StoppingScan { .. }));
+    shell.send(Event::Tapped(None));
+    assert!(!is_asleep(&shell.model));
+    shell.take_log();
+
+    // The answer does not continue either sleep.
+    shell.answer_radio();
+    let log = shell.take_log();
+    assert!(!log.contains(&"MqttDisconnect".into()), "{log:?}");
+    assert_eq!(shell.model.wifi.phase, Phase::Up(HALL));
+    assert_eq!(
+        shell.model.connection.link(),
+        crate::features::connection::Link::Up
+    );
+    assert!(!is_asleep(&shell.model));
+}
+
+#[test]
+fn a_sleep_during_a_scan_goes_through_each_step_and_writes_one_line_for_each() {
+    let mut shell = scanning();
+    // The tap turns the light on, so the sleep first turns it off.
+    shell.send(Event::Tapped(None));
+    assert_eq!(power::sleep_step(&shell.model), None);
+
+    // The shell answers `FrontLight` at once. Then the `StopScan` request
+    // waits.
+    shell.send(Event::SleepNow);
+    assert_eq!(power::sleep_step(&shell.model), Some(SleepStep::StopScan));
+
+    // The answer disconnects. Then the `Off` request waits.
+    shell.answer_radio();
+    assert_eq!(power::sleep_step(&shell.model), Some(SleepStep::RadioOff));
+
+    // The answer draws the last image. Then the `Sleep` request waits.
+    shell.answer_radio();
+    assert!(shell.sleep.is_some());
+    assert_eq!(power::sleep_step(&shell.model), Some(SleepStep::Sleep));
+    assert_eq!(
+        shell.take_logs(),
+        [
+            "info power: sleep 2 turns the front light off",
+            "info power: sleep 2 waits for the end of the scan",
+            "info power: sleep 2 closes the connection",
+            "info power: sleep 2 turns the radio off",
+            "info power: sleep 2 draws the last image and sleeps",
+        ]
+    );
+
+    // The wake ends the sleep.
+    shell.hold_radio = false;
+    shell.wake(Wake::Timer);
+    assert_eq!(power::sleep_step(&shell.model), None);
 }
 
 #[test]

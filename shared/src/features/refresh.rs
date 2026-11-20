@@ -202,7 +202,7 @@ pub fn draw_due(id: u32, model: &mut Model) -> Cmd {
     if !model.refresh.draw_timer.expired(id) {
         return Cmd::done();
     }
-    if model.power.asleep {
+    if model.power.is_asleep() {
         return Cmd::done();
     }
     redraw(model, false)
@@ -215,7 +215,7 @@ pub fn draw_due(id: u32, model: &mut Model) -> Cmd {
 /// for a full refresh. Otherwise, the panel has no new ghost image, so the
 /// core only starts the timer again.
 pub fn timer_expired(id: u32, model: &mut Model) -> Cmd {
-    if !model.refresh.full.expired(id) || model.power.asleep {
+    if !model.refresh.full.expired(id) || model.power.is_asleep() {
         return Cmd::done();
     }
     if model.refresh.partials == 0 {
@@ -230,7 +230,7 @@ fn restart_timer(model: &mut Model) -> Cmd {
     let state = &mut model.refresh;
     state.timer = state.timer.wrapping_add(1);
     state.full.stop();
-    if model.power.asleep {
+    if model.power.is_asleep() {
         return Cmd::done();
     }
     let id = state.timer;
@@ -384,7 +384,8 @@ mod tests {
         let app = Dashboard;
         let (mut model, _wire) = drive_to_connected(PowerSource::Battery);
         let id = model.refresh.timer;
-        model.power.asleep = true;
+        let _ = app.update(Event::SleepNow, &mut model);
+        assert!(model.power.is_asleep());
 
         app.update(
             Event::Refresh(refresh::Event::FullRefreshDue(id)),
@@ -550,14 +551,18 @@ mod tests {
         crate::tests::set_state(&mut model, "light.all_lights", "on");
         let _timer = redraw_soon(&mut model);
         let id = model.refresh.draw;
-        model.power.asleep = true;
+        let _ = app.update(Event::SleepNow, &mut model);
+        assert!(model.power.is_asleep());
 
         app.update(Event::Refresh(refresh::Event::DrawDue(id)), &mut model)
             .expect_no_effects();
 
         // The timer no longer waits, so the next change after the wake starts a
         // new timer.
-        model.power.asleep = false;
+        // A wake through an event draws, and the draw clears the draw timer.
+        // Thus the test wakes the device with no draw.
+        model.power.wake_with_no_draw();
+        assert!(!model.power.is_asleep());
         redraw_soon(&mut model).expect_only_time_notify_after_with(|notify| {
             assert_eq!(Duration::from(notify.duration), DRAW_DELAY);
         });

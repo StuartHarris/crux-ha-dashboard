@@ -4,7 +4,7 @@
 use serde::Serialize;
 
 use crate::{
-    Cmd, Control, Model,
+    Cmd, Control, Model, Startup,
     features::{
         connection::{self, Call},
         light,
@@ -51,7 +51,7 @@ impl<'a> ServiceCall<'a> {
 /// Acts on a tap on `control`, or on no control. Refer to
 /// [`Event::Tapped`](crate::Event::Tapped).
 pub fn tapped(control: Option<Control>, model: &mut Model) -> Cmd {
-    if model.power.asleep {
+    if model.power.is_asleep() {
         // The tap wakes the device, then acts on its control. A service call
         // waits in the outbox until the connection is open.
         let wake = power::wake_up(model);
@@ -77,7 +77,7 @@ pub fn tapped(control: Option<Control>, model: &mut Model) -> Cmd {
 /// Shows the page at `route`. The core ignores a route that has no page,
 /// and it ignores the event while the device sleeps.
 pub fn navigate(route: Route, model: &mut Model) -> Cmd {
-    if model.power.asleep || !model.pages.iter().any(|page| page.is_at(&route)) {
+    if model.power.is_asleep() || !model.pages.iter().any(|page| page.is_at(&route)) {
         return Cmd::done();
     }
     let idle = power::restart_idle_timer(model);
@@ -92,7 +92,7 @@ pub fn navigate(route: Route, model: &mut Model) -> Cmd {
 /// ignores the event while the device sleeps.
 pub fn turn_page(model: &mut Model, forward: bool) -> Cmd {
     let count = model.pages.len();
-    if model.power.asleep || count == 0 {
+    if model.power.is_asleep() || count == 0 {
         return Cmd::done();
     }
     let index = model.page_index();
@@ -262,19 +262,20 @@ fn room_tapped(index: usize, model: &mut Model) -> Cmd {
 /// Starts or stops a dry run. The core keeps the value until the next
 /// `Start`, which gives the value of the shell again.
 ///
-/// Before `Start`, the core keeps the request. At `Start`, the dashboard does
-/// a dry run if the settings or the request ask for one. The core draws the
-/// change only while the device is awake. The next wake shows it.
+/// Before `Start`, the core keeps the request in [`Startup::Waiting`], and
+/// does not draw. At `Start`, the dashboard does a dry run if the settings or
+/// the request ask for one. After `Start`, the core draws the change only
+/// while the device is awake. The next wake shows it.
 pub fn set_read_only(read_only: bool, model: &mut Model) -> Cmd {
-    let Some(settings) = &mut model.settings else {
-        model.read_only_requested = read_only;
+    let Startup::Started(settings) = &mut model.startup else {
+        model.startup = Startup::Waiting { read_only };
         return Cmd::done();
     };
     if settings.read_only == read_only {
         return Cmd::done();
     }
     settings.read_only = read_only;
-    if model.power.asleep {
+    if model.power.is_asleep() {
         Cmd::done()
     } else {
         redraw(model, false)
@@ -290,7 +291,7 @@ pub fn set_read_only(read_only: bool, model: &mut Model) -> Cmd {
 /// the entity does not change. The view model tells the shell that the
 /// dashboard does a dry run, so the shell can show it.
 fn call_service(model: &mut Model, call: &ServiceCall<'_>, confirm: Confirm) -> Cmd {
-    let Some(settings) = &model.settings else {
+    let Some(settings) = model.startup.settings() else {
         return Cmd::done();
     };
     if settings.read_only {

@@ -565,7 +565,7 @@ fn a_tap_before_the_connection_opens_waits_in_the_outbox_and_goes_first() {
 /// Drives the core to an open connection on the stand, in a dry run.
 fn connected_in_a_dry_run() -> Model {
     let (mut model, _wire) = drive_to_connected(PowerSource::Stand);
-    if let Some(settings) = &mut model.settings {
+    if let crate::Startup::Started(settings) = &mut model.startup {
         settings.read_only = true;
     }
     model
@@ -643,7 +643,7 @@ fn a_dry_run_before_the_start_is_kept() {
     // The settings do not ask for a dry run, but the request wins.
     let _ = app.update(start_at(PowerSource::Stand, None), &mut model);
     assert!(app.view(&model).read_only);
-    assert!(model.settings.as_ref().unwrap().read_only);
+    assert!(model.startup.settings().unwrap().read_only);
 }
 
 #[test]
@@ -697,7 +697,7 @@ fn set_read_only_while_asleep_does_not_draw() {
         Event::Power(power::Event::IdleTimeout(model.power.idle)),
         &mut model,
     );
-    assert!(model.power.asleep);
+    assert!(model.power.is_asleep());
 
     app.update(Event::SetReadOnly(true), &mut model)
         .expect_no_effects();

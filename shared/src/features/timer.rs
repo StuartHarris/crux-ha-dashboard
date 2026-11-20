@@ -69,6 +69,12 @@ impl Running {
 pub struct Slot(Option<Running>);
 
 impl Slot {
+    /// Returns a slot with no timer.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self(None)
+    }
+
     /// Starts the timer `id` of `after`, which sends `event` when it
     /// completes. Clears the timer that runs now, if there is one.
     pub fn start(&mut self, id: u32, after: Duration, event: Event) -> Cmd {

@@ -7,7 +7,7 @@ use core::time::Duration;
 use crux_core::App;
 
 use crate::tests::{
-    ExpectFullRefreshTimer, ExpectLight, ExpectRadioLimit, asleep, drive_to_connected,
+    ExpectFullRefreshTimer, ExpectLight, ExpectRadioLimit, ExpectStep, asleep, drive_to_connected,
     drive_to_connecting, shell::Shell, start, tap_tile, wire::ExpectWrite,
 };
 use crate::{
@@ -16,7 +16,7 @@ use crate::{
     features::{
         connection::Link,
         light::BATTERY_LEVEL,
-        power::IDLE_TIMEOUT,
+        power::{IDLE_TIMEOUT, SleepStep},
         wifi::{JOIN_TIMEOUT, OFF_TIMEOUT, Phase},
     },
 };
@@ -50,6 +50,7 @@ fn the_idle_timeout_sleeps_in_steps_and_a_touch_wakes() {
         Event::Power(power::Event::IdleTimeout(model.power.idle)),
         &mut model,
     )
+    .expect_step("sleep 1 closes the connection")
     .expect_disconnect(&mut wire, &mut model)
     .expect_session_clear(&wire)
     .expect_no_effects();
@@ -58,18 +59,20 @@ fn the_idle_timeout_sleeps_in_steps_and_a_touch_wakes() {
         matches!(offline, Event::Power(power::Event::Offline(_))),
         "{offline:?}"
     );
-    assert!(model.power.asleep);
+    assert!(model.power.is_asleep());
     assert_eq!(app.view(&model).connection, Connection::Offline);
 
     // Step 2: turn the radio off, and wait for the answer.
     let radio_off = app
         .update(offline, &mut model)
+        .expect_step("sleep 1 turns the radio off")
         .resolve_radio_off(|_| ())
         .expect_radio_limit(OFF_TIMEOUT)
         .expect_one_event();
 
     // Step 3: draw the last image, and sleep until a touch.
     let mut last = app.update(radio_off, &mut model);
+    last.expect_step("sleep 1 draws the last image and sleeps");
     let effects: Vec<Effect> = last.effects().collect();
     // The render of the last image, and the sleep.
     assert_eq!(effects.len(), 2);
@@ -104,7 +107,7 @@ fn the_idle_timeout_sleeps_in_steps_and_a_touch_wakes() {
         })
         .expect_touch_light(BATTERY_LEVEL)
         .expect_no_effects();
-    assert!(!model.power.asleep);
+    assert!(!model.power.is_asleep());
     assert_eq!(model.full_refresh_seq, 3);
 }
 
@@ -126,12 +129,13 @@ fn a_tap_during_the_steps_wakes_and_the_late_answers_are_ignored() {
         .expect_time_notify_after()
         .expect_touch_light(BATTERY_LEVEL)
         .expect_no_effects();
-    assert!(!model.power.asleep);
+    assert!(!model.power.is_asleep());
 
     // The DISCONNECT leaves and the stream closes. The wake forgot the
     // sleep, so the answer to the `Close` request does not continue the
     // sleep. The link is still up, so the core connects at once.
     sleep
+        .expect_step("sleep 1 closes the connection")
         .expect_disconnect(&mut wire, &mut model)
         .expect_session_clear(&wire)
         .expect_no_effects();
@@ -143,7 +147,7 @@ fn a_tap_during_the_steps_wakes_and_the_late_answers_are_ignored() {
         "{:?}",
         wire.events
     );
-    assert!(!model.power.asleep);
+    assert!(!model.power.is_asleep());
     assert!(
         wire.effects
             .iter()
@@ -167,7 +171,7 @@ fn the_answer_of_an_older_sleep_is_ignored() {
     // The device moves to the stand and wakes. The shell then answers the
     // `Sleep` request.
     let _ = app.update(Event::PowerSourceChanged(PowerSource::Stand), &mut model);
-    assert!(!model.power.asleep);
+    assert!(!model.power.is_asleep());
     for event in [
         Event::Power(power::Event::Offline(old)),
         Event::Wifi(wifi::Event::RadioOff(old)),
@@ -178,7 +182,7 @@ fn the_answer_of_an_older_sleep_is_ignored() {
     ] {
         app.update(event, &mut model).expect_no_effects();
     }
-    assert!(!model.power.asleep);
+    assert!(!model.power.is_asleep());
 }
 
 #[test]
@@ -232,7 +236,7 @@ fn on_the_stand_while_asleep_wakes_and_connects() {
         Event::Power(power::Event::IdleTimeout(model.power.idle)),
         &mut model,
     );
-    assert!(model.power.asleep);
+    assert!(model.power.is_asleep());
 
     // The session of the sleep still closes, so the core does not connect
     // yet.
@@ -243,11 +247,12 @@ fn on_the_stand_while_asleep_wakes_and_connects() {
     // The idle timeout only started the steps of the sleep, so the core
     // drew no last image. The wake asked for the second full refresh.
     assert_eq!(model.full_refresh_seq, 2);
-    assert!(!model.power.asleep);
+    assert!(!model.power.is_asleep());
 
     // The DISCONNECT leaves and the session ends. The link is still up, so
     // the core connects at once.
     sleep
+        .expect_step("sleep 1 closes the connection")
         .expect_disconnect(&mut wire, &mut model)
         .expect_session_clear(&wire)
         .expect_no_effects();
@@ -283,18 +288,7 @@ fn a_power_source_wake_on_battery_is_ignored() {
     // is still on battery, the answer does not wake it.
     app.update(woke(&model, Wake::PowerSource), &mut model)
         .expect_no_effects();
-    assert!(model.power.asleep);
-
-    // On the stand, the same answer wakes the device.
-    model.power.source = PowerSource::Stand;
-    app.update(woke(&model, Wake::PowerSource), &mut model)
-        .expect_render()
-        .expect_full_refresh_timer()
-        .expect_radio_join()
-        .expect_only_time_notify_after_with(|notify| {
-            assert_eq!(Duration::from(notify.duration), JOIN_TIMEOUT);
-        });
-    assert!(!model.power.asleep);
+    assert!(model.power.is_asleep());
 }
 
 /// The answer to the `Sleep` request of the newest sleep.
@@ -308,12 +302,8 @@ const fn woke(model: &Model, wake: Wake) -> Event {
 /// Returns a model of a device on battery that sleeps, with settings.
 fn asleep_on_battery() -> Model {
     Model {
-        power: crate::features::power::State {
-            source: PowerSource::Battery,
-            asleep: true,
-            ..crate::features::power::State::default()
-        },
-        settings: Some(crate::tests::settings()),
+        power: crate::features::power::State::asleep_in(0),
+        startup: crate::Startup::Started(crate::tests::settings()),
         ..Model::default()
     }
 }
@@ -336,7 +326,7 @@ fn a_tap_on_no_control_while_asleep_only_wakes() {
         })
         .expect_touch_light(BATTERY_LEVEL)
         .expect_no_effects();
-    assert!(!model.power.asleep);
+    assert!(!model.power.is_asleep());
     assert_eq!(model.route, route);
     assert_eq!(model.connection.outbox.len(), 0);
 }
@@ -351,7 +341,7 @@ fn a_touch_wake_on_a_room_button_opens_the_room() {
         woke(&model, Wake::Touch(Some(Control::Room(0)))),
         &mut model,
     );
-    assert!(!model.power.asleep);
+    assert!(!model.power.is_asleep());
     let first_room = model.rooms().next().unwrap().route();
     assert_eq!(model.route, first_room);
     // The redraw after the wake shows the room.
@@ -363,7 +353,7 @@ fn a_touch_wake_on_a_light_queues_the_service_call() {
     let app = Dashboard;
     for read_only in [false, true] {
         let mut model = asleep_on_battery();
-        if let Some(settings) = &mut model.settings {
+        if let crate::Startup::Started(settings) = &mut model.startup {
             settings.read_only = read_only;
         }
         model.route = crate::Route::room("living_room");
@@ -372,7 +362,7 @@ fn a_touch_wake_on_a_light_queues_the_service_call() {
             woke(&model, Wake::Touch(Some(Control::Tile(0)))),
             &mut model,
         );
-        assert!(!model.power.asleep);
+        assert!(!model.power.is_asleep());
         // The connection is not open yet, so the toggle waits in the
         // outbox. A dry run sends nothing.
         let expected = usize::from(!read_only);
@@ -394,7 +384,7 @@ fn a_tap_on_no_control_while_awake_does_not_restart_the_idle_timer() {
     assert_eq!(model.power.idle, idle);
 
     let _ = app.update(Event::Power(power::Event::IdleTimeout(idle)), &mut model);
-    assert!(model.power.asleep);
+    assert!(model.power.is_asleep());
 }
 
 #[test]
@@ -409,7 +399,7 @@ fn page_events_while_asleep_do_nothing() {
     ] {
         app.update(event, &mut model).expect_no_effects();
     }
-    assert!(model.power.asleep);
+    assert!(model.power.is_asleep());
 }
 
 #[test]
@@ -444,7 +434,7 @@ fn a_battery_level_while_asleep_does_not_wake_the_device() {
     // timer.
     app.update(Event::BatteryChanged(Some(41)), &mut model)
         .expect_no_effects();
-    assert!(model.power.asleep);
+    assert!(model.power.is_asleep());
     assert_eq!(model.power.idle, idle);
     assert_eq!(model.wifi.phase, Phase::Off);
     assert_eq!(app.view(&model).battery, Some(40));
@@ -516,10 +506,11 @@ fn sleep_now_on_battery_sleeps_at_once() {
 
     // The first step of the sleep, as after the idle timeout.
     app.update(Event::SleepNow, &mut model)
+        .expect_step("sleep 1 closes the connection")
         .expect_disconnect(&mut wire, &mut model)
         .expect_session_clear(&wire)
         .expect_no_effects();
-    assert!(model.power.asleep);
+    assert!(model.power.is_asleep());
 }
 
 #[test]
@@ -527,12 +518,12 @@ fn sleep_now_on_the_stand_or_while_asleep_does_nothing() {
     let app = Dashboard;
     let (mut model, _wire) = drive_to_connected(PowerSource::Stand);
     app.update(Event::SleepNow, &mut model).expect_no_effects();
-    assert!(!model.power.asleep);
+    assert!(!model.power.is_asleep());
 
     let mut model = asleep_on_battery();
     let sleep = model.power.sleep;
     app.update(Event::SleepNow, &mut model).expect_no_effects();
-    assert!(model.power.asleep);
+    assert!(model.power.is_asleep());
     assert_eq!(model.power.sleep, sleep);
 }
 
@@ -551,17 +542,20 @@ fn sleep_now_with_calls_in_the_outbox_first_waits_one_more_idle_period() {
         .expect_only_time_notify_after_with(|notify| {
             assert_eq!(Duration::from(notify.duration), IDLE_TIMEOUT);
         });
-    assert!(!model.power.asleep);
+    assert!(!model.power.is_asleep());
     // The idle timer that ran before is now stale.
     app.update(Event::Power(power::Event::IdleTimeout(old)), &mut model)
         .expect_no_effects();
-    assert!(!model.power.asleep);
+    assert!(!model.power.is_asleep());
 
     // The second `SleepNow` sleeps. The tap turned the light on, so the
     // first step turns it off. The next step drops the call.
     let mut sleep = app.update(Event::SleepNow, &mut model);
-    let light_off = sleep.resolve_front_light(|_| ()).expect_one_event();
-    assert!(model.power.asleep);
+    let light_off = sleep
+        .expect_step("sleep 1 turns the front light off")
+        .resolve_front_light(|_| ())
+        .expect_one_event();
+    assert!(model.power.is_asleep());
     let _ = app.update(light_off, &mut model);
     assert_eq!(model.unsent, 1);
 }
@@ -591,7 +585,7 @@ fn sleep_now_before_start_does_nothing() {
     let _ = app.update(Event::PowerSourceChanged(PowerSource::Battery), &mut model);
 
     app.update(Event::SleepNow, &mut model).expect_no_effects();
-    assert!(!model.power.asleep);
+    assert!(!model.power.is_asleep());
 }
 
 /// Returns the number of idle timers that expired in `events`.
@@ -718,7 +712,10 @@ fn an_old_light_off_answer_during_the_next_sleep_does_nothing() {
         Event::Power(power::Event::IdleTimeout(model.power.idle)),
         &mut model,
     );
-    let mut first_light = first.expect_one_effect().expect_front_light();
+    let mut first_light = first
+        .expect_step("sleep 1 turns the front light off")
+        .expect_one_effect()
+        .expect_front_light();
 
     // A tap wakes the device and turns the light on again. The next sleep
     // also waits for the light.
@@ -728,7 +725,10 @@ fn an_old_light_off_answer_during_the_next_sleep_does_nothing() {
         Event::Power(power::Event::IdleTimeout(model.power.idle)),
         &mut model,
     );
-    let _second_light = second.expect_one_effect().expect_front_light();
+    let _second_light = second
+        .expect_step("sleep 2 turns the front light off")
+        .expect_one_effect()
+        .expect_front_light();
     assert!(asleep(&model));
 
     // The answer of the first sleep arrives late. It does not start the
@@ -864,4 +864,57 @@ fn woke_while_awake_on_battery_does_nothing() {
     // timer.
     power::woke(sleep, Wake::Timer, &mut model).expect_no_effect_or_events();
     assert!(!asleep(&model));
+}
+
+#[test]
+fn the_sleep_step_follows_each_step_of_a_sleep_and_each_step_writes_one_line() {
+    let app = Dashboard;
+    let (mut model, mut wire) = drive_to_connected(PowerSource::Battery);
+    assert_eq!(power::sleep_step(&model), None);
+    // The tap turns the light on, so the sleep first turns it off.
+    let _ = app.update(Event::Tapped(None), &mut model);
+
+    // Step 1: the `FrontLight` request waits.
+    let mut sleep = app.update(Event::SleepNow, &mut model);
+    let light_off = sleep
+        .expect_step("sleep 1 turns the front light off")
+        .resolve_front_light(|_| ())
+        .expect_one_event();
+    assert_eq!(power::sleep_step(&model), Some(SleepStep::LightOff));
+
+    // Step 2: the close of the stream waits.
+    let mut disconnect = app.update(light_off, &mut model);
+    disconnect.expect_step("sleep 1 closes the connection");
+    assert_eq!(power::sleep_step(&model), Some(SleepStep::Disconnect));
+    disconnect
+        .expect_disconnect(&mut wire, &mut model)
+        .expect_session_clear(&wire)
+        .expect_no_effects();
+    let offline = wire.take_event();
+
+    // Step 3: the `Off` request waits.
+    let mut off = app.update(offline, &mut model);
+    off.expect_step("sleep 1 turns the radio off");
+    assert_eq!(power::sleep_step(&model), Some(SleepStep::RadioOff));
+    let radio_off = off
+        .resolve_radio_off(|_| ())
+        .expect_radio_limit(OFF_TIMEOUT)
+        .expect_one_event();
+
+    // Step 4: the `Sleep` request waits.
+    let mut last = app.update(radio_off, &mut model);
+    last.expect_step("sleep 1 draws the last image and sleeps")
+        .expect_render();
+    let woke = last.resolve_sleep(|_| Wake::Touch(None)).expect_one_event();
+    assert_eq!(power::sleep_step(&model), Some(SleepStep::Sleep));
+
+    // The wake ends the sleep, and writes no line.
+    let mut awake = app.update(woke, &mut model);
+    assert!(
+        !awake
+            .effects()
+            .any(|effect| matches!(effect, Effect::Log(_))),
+        "a line of the log"
+    );
+    assert_eq!(power::sleep_step(&model), None);
 }

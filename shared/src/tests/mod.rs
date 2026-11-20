@@ -220,6 +220,24 @@ impl ExpectRadioLimit for Cmd {
     }
 }
 
+/// Expects the line of the log for the start of a step of a sleep.
+pub trait ExpectStep {
+    /// Expects the next effect to write `message` with the area `power` at
+    /// the level `Info`. Refer to [`crate::features::power::sleep_step`].
+    fn expect_step(&mut self, message: &str) -> &mut Self;
+}
+
+impl ExpectStep for Cmd {
+    #[track_caller]
+    fn expect_step(&mut self, message: &str) -> &mut Self {
+        self.expect_log_with(|log| {
+            assert_eq!(log.level, crate::capabilities::log::Level::Info);
+            assert_eq!(log.area, crate::capabilities::log::Area::Power);
+            assert_eq!(log.message, message);
+        })
+    }
+}
+
 /// Answers the radio requests of a link with a fake radio, one at a time:
 /// a `Leave` if the core leaves first, the `Join` and the `Address`. Each
 /// request must be the next effect, with the start of its time limit after
@@ -316,6 +334,17 @@ pub fn topic(entity_id: &str, key: &str) -> alloc::string::String {
 /// command of the update.
 pub fn send(model: &mut Model, wire: &mut Wire, topic: &str, payload: &str) -> Cmd {
     wire.send(model, topic, payload)
+}
+
+/// Returns the lines of the log, as [`shell::Shell::logs`] keeps them, of
+/// the sleep `id` with the light off and no scan: disconnect, turn the radio
+/// off, then sleep.
+pub fn sleep_lines(id: u32) -> [alloc::string::String; 3] {
+    [
+        format!("info power: sleep {id} closes the connection"),
+        format!("info power: sleep {id} turns the radio off"),
+        format!("info power: sleep {id} draws the last image and sleeps"),
+    ]
 }
 
 /// Returns `true` if the view shows that the device is asleep. A test that

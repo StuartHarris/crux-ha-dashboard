@@ -99,7 +99,7 @@ pub fn touched(model: &mut Model) -> Cmd {
         .light
         .running
         .start(id, LIGHT_TIMEOUT, Event::Timeout(id).into());
-    set(level_for(model.power.source), model).and(timer)
+    set(level_for(model.power.source()), model).and(timer)
 }
 
 /// The light timer with the id `id` expired. If it is the newest timer,
@@ -136,7 +136,7 @@ pub fn source_changed(model: &mut Model) -> Cmd {
     if !is_on(model) {
         return Cmd::done();
     }
-    set(level_for(model.power.source), model)
+    set(level_for(model.power.source()), model)
 }
 
 /// Sets the light to `level`. If the light already has that level, the
@@ -157,7 +157,9 @@ mod tests {
     use crate::features::{light, power};
     use crux_core::App;
 
-    use crate::tests::{ExpectLight, drive_to_connected, shell::Shell, start, wire::ExpectWrite};
+    use crate::tests::{
+        ExpectLight, ExpectStep, drive_to_connected, shell::Shell, start, wire::ExpectWrite,
+    };
     use crate::{
         Dashboard, EffectTestExt, Event, Model, PowerSource,
         capabilities::power::Wake,
@@ -267,15 +269,19 @@ mod tests {
             Event::Power(power::Event::IdleTimeout(model.power.idle)),
             &mut model,
         );
-        let mut light = sleep.expect_one_effect().expect_front_light();
+        let mut light = sleep
+            .expect_step("sleep 1 turns the front light off")
+            .expect_one_effect()
+            .expect_front_light();
         assert_eq!(light.operation.level, 0);
-        assert!(model.power.asleep);
+        assert!(model.power.is_asleep());
         assert_eq!(model.light.level, 0);
 
         light.resolve(()).unwrap();
         let light_off = sleep.expect_one_event();
         let mut disconnect = app.update(light_off, &mut model);
         disconnect
+            .expect_step("sleep 1 closes the connection")
             .expect_disconnect(&mut wire, &mut model)
             .expect_session_clear(&wire)
             .expect_no_effects();
@@ -297,12 +303,15 @@ mod tests {
             Event::Power(power::Event::IdleTimeout(model.power.idle)),
             &mut model,
         );
-        let mut light = sleep.expect_one_effect().expect_front_light();
+        let mut light = sleep
+            .expect_step("sleep 1 turns the front light off")
+            .expect_one_effect()
+            .expect_front_light();
 
         // The user taps before the light is off. The tap wakes the device and
         // turns the light on again.
         let _ = app.update(Event::Tapped(None), &mut model);
-        assert!(!model.power.asleep);
+        assert!(!model.power.is_asleep());
         assert_eq!(model.light.level, BATTERY_LEVEL);
 
         // The answer of the sleep comes late. The core does not continue the
@@ -310,7 +319,7 @@ mod tests {
         light.resolve(()).unwrap();
         let light_off = sleep.expect_one_event();
         app.update(light_off, &mut model).expect_no_effects();
-        assert!(!model.power.asleep);
+        assert!(!model.power.is_asleep());
     }
 
     #[test]
@@ -329,13 +338,17 @@ mod tests {
         // The first idle timer expires while the light is on. The first step of
         // the sleep turns the light off, and only then the core disconnects.
         let mut sleep = app.update(Event::Power(power::Event::IdleTimeout(idle)), &mut model);
-        let mut light = sleep.expect_one_effect().expect_front_light();
+        let mut light = sleep
+            .expect_step("sleep 1 turns the front light off")
+            .expect_one_effect()
+            .expect_front_light();
         assert_eq!(light.operation.level, 0);
-        assert!(model.power.asleep);
+        assert!(model.power.is_asleep());
 
         light.resolve(()).unwrap();
         let light_off = sleep.expect_one_event();
         app.update(light_off, &mut model)
+            .expect_step("sleep 1 closes the connection")
             .expect_disconnect(&mut wire, &mut model)
             .expect_session_clear(&wire)
             .expect_no_effects();
@@ -351,6 +364,7 @@ mod tests {
             Event::Power(power::Event::IdleTimeout(model.power.idle)),
             &mut model,
         )
+        .expect_step("sleep 1 closes the connection")
         .expect_disconnect(&mut wire, &mut model)
         .expect_session_clear(&wire)
         .expect_no_effects();
@@ -436,11 +450,11 @@ mod tests {
         // A wake tap turns the light on again, and the new light timer turns it
         // off before the next sleep.
         shell.wake(Wake::Touch(None));
-        assert!(!shell.model.power.asleep);
+        assert!(!shell.model.power.is_asleep());
         assert_eq!(shell.light, BATTERY_LEVEL);
         shell.advance(LIGHT_TIMEOUT);
         assert_eq!(shell.light, 0);
-        assert!(!shell.model.power.asleep);
+        assert!(!shell.model.power.is_asleep());
     }
 
     #[test]

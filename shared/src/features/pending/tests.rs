@@ -7,7 +7,7 @@ use core::time::Duration;
 use crux_core::App;
 
 use crate::tests::{
-    ExpectLight, ExpectServiceCall,
+    ExpectLight, ExpectServiceCall, ExpectStep,
     broker::{iso_time, publish_of},
     drive_to_connected, drive_to_connecting, send, set_state,
     shell::Shell,
@@ -264,10 +264,13 @@ fn a_call_that_the_sleep_drops_loses_its_mark() {
         Event::Power(power::Event::IdleTimeout(model.power.idle)),
         &mut model,
     );
-    assert!(model.power.asleep);
+    assert!(model.power.is_asleep());
     // The tap turned the light on, so the first step of the sleep turns it
     // off. The core drops the call in the next step.
-    let light_off = sleep.resolve_front_light(|_| ()).expect_one_event();
+    let light_off = sleep
+        .expect_step("sleep 1 turns the front light off")
+        .resolve_front_light(|_| ())
+        .expect_one_event();
     assert_eq!(model.unsent, 0);
     let _ = app.update(light_off, &mut model);
     assert_eq!(model.unsent, 1);
@@ -288,7 +291,7 @@ fn a_timeout_while_asleep_removes_the_mark_but_does_not_draw() {
         Event::Power(power::Event::IdleTimeout(model.power.idle)),
         &mut model,
     );
-    assert!(model.power.asleep);
+    assert!(model.power.is_asleep());
     // The call went out before the sleep, so the mark stays.
     assert_eq!(tile_state(&model, 1), TileState::Pending);
 

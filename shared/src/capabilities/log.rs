@@ -6,8 +6,8 @@
 //! the line as `{area}: {message}` (the [`Display`](core::fmt::Display) of
 //! [`Log`]) at its [`Level`].
 //!
-//! The core logs only what is not usual: a decision of the Wi-Fi policy, or
-//! a failure. A start, a join, a connect and a sleep give no lines.
+//! The core logs a decision of the Wi-Fi policy, a failure, and the start
+//! of each step of a sleep. A start, a join and a connect give no lines.
 
 use alloc::string::String;
 use core::fmt;
@@ -39,6 +39,9 @@ pub enum Area {
     Wifi,
     /// The MQTT session. Refer to [`crate::features::connection`].
     Mqtt,
+    /// The power policy and the steps of a sleep. Refer to
+    /// [`crate::features::power`].
+    Power,
 }
 
 impl fmt::Display for Area {
@@ -46,6 +49,7 @@ impl fmt::Display for Area {
         f.write_str(match self {
             Self::Wifi => "wifi",
             Self::Mqtt => "mqtt",
+            Self::Power => "power",
         })
     }
 }

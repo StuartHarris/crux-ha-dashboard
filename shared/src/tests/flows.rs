@@ -293,7 +293,7 @@ fn a_battery_wake_shows_the_changes_from_while_it_slept() {
     let mut shell = house();
     shell.send(start(PowerSource::Battery));
     shell.advance(IDLE_TIMEOUT);
-    assert!(shell.model.power.asleep);
+    assert!(shell.model.power.is_asleep());
 
     shell.broker.time += 3600;
     shell.broker.set_state("light.all_lights", "off", &[]);
@@ -326,7 +326,7 @@ fn a_move_to_the_stand_while_asleep_connects_and_stays_awake() {
     let mut shell = house();
     shell.send(start(PowerSource::Battery));
     shell.advance(IDLE_TIMEOUT);
-    assert!(shell.model.power.asleep);
+    assert!(shell.model.power.is_asleep());
 
     shell.send(Event::PowerSourceChanged(PowerSource::Stand));
     assert!(shell.radio.associated.is_some());
@@ -552,7 +552,7 @@ fn a_join_that_fails_on_battery_is_tried_again_until_the_device_sleeps() {
             .any(|event| matches!(event, Event::Connection(connection::Event::Reconnect(_)))),
         "{events:?}"
     );
-    assert!(shell.model.power.asleep);
+    assert!(shell.model.power.is_asleep());
     assert_eq!(joins(&shell.take_log()), 0);
     assert!(!shell.radio.on);
 }
@@ -1039,7 +1039,7 @@ fn a_touch_wake_on_a_light_sends_the_toggle_after_the_reconnect() {
     let log = shell.take_log();
     assert_eq!(log[0], "Wake Touch(Some(AllLights))");
     assert_eq!(joins(&log), 1, "{log:?}");
-    assert!(!shell.model.power.asleep);
+    assert!(!shell.model.power.is_asleep());
     assert_eq!(shell.view().connection, Connection::Online);
     assert_eq!(shell.broker.service_calls.len(), 1);
     assert_eq!(shell.sleep, None);
@@ -1060,7 +1060,7 @@ fn the_stand_while_asleep_wakes_and_the_shell_answers_sleep() {
     assert_eq!(log.last().map(String::as_str), Some("Wake PowerSource"));
     assert_eq!(joins(&log), 1, "{log:?}");
     assert_eq!(shell.sleep, None);
-    assert!(!shell.model.power.asleep);
+    assert!(!shell.model.power.is_asleep());
     assert_eq!(shell.view().connection, Connection::Online);
     // On the stand, the device does not sleep again. No idle timer with the
     // current id fires.

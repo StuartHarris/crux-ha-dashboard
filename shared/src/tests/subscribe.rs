@@ -117,7 +117,7 @@ fn a_wake_subscribes_again_and_then_the_link_is_quiet() {
     let mut shell = cached_house();
     shell.send(start(PowerSource::Battery));
     shell.advance(IDLE_TIMEOUT);
-    assert!(shell.model.power.asleep);
+    assert!(shell.model.power.is_asleep());
     shell.take_log();
 
     shell.wake(Wake::Timer);
@@ -135,7 +135,7 @@ fn the_link_is_not_quiet_during_the_sleep_steps() {
     shell.broker.hold_suback = true;
     shell.send(start(PowerSource::Battery));
     shell.advance(IDLE_TIMEOUT);
-    assert!(shell.model.power.asleep);
+    assert!(shell.model.power.is_asleep());
     // The subscribe ended with `Failed` at the disconnect of the sleep.
     assert_eq!(count(&shell.take_log(), "RadioScan"), 0);
 }

@@ -125,7 +125,7 @@ fn a_broker_that_does_not_answer_the_ping_ends_the_session_in_55_seconds() {
 fn a_sleep_sends_asleep_and_disconnect_then_closes_and_turns_wifi_off() {
     let mut shell = connected(PowerSource::Battery);
     shell.advance(IDLE_TIMEOUT);
-    assert!(shell.model.power.asleep);
+    assert!(shell.model.power.is_asleep());
 
     let log = shell.take_log();
     let asleep = place(&log, "MqttPublish dashboard/hall/status asleep");
@@ -149,7 +149,7 @@ fn a_sleep_with_a_dead_link_still_turns_wifi_off_and_sleeps() {
     let mut shell = connected(PowerSource::Battery);
     shell.broker.hold_writes = true;
     shell.advance(IDLE_TIMEOUT);
-    assert!(shell.model.power.asleep);
+    assert!(shell.model.power.is_asleep());
     assert!(!shell.take_log().contains(&"WifiOff".into()));
 
     // The write of `asleep` and the DISCONNECT does not end. The send timer
@@ -172,12 +172,12 @@ fn a_wake_during_the_close_connects_again_after_the_close() {
     shell.broker.hold_writes = true;
     shell.broker.hold_closes = true;
     shell.advance(IDLE_TIMEOUT);
-    assert!(shell.model.power.asleep);
+    assert!(shell.model.power.is_asleep());
 
     // A tap wakes the device while the DISCONNECT waits. The session of the
     // sleep still closes, so the core does not connect yet.
     shell.send(Event::Tapped(None));
-    assert!(!shell.model.power.asleep);
+    assert!(!shell.model.power.is_asleep());
     shell.take_log();
 
     // The DISCONNECT leaves, and the core closes the stream. The core does
@@ -198,7 +198,7 @@ fn a_wake_during_the_close_connects_again_after_the_close() {
     place(&log, "MqttConnect");
     assert!(!log.contains(&"WifiOff".into()), "{log:?}");
     assert_eq!(shell.model.connection.link(), Link::Up);
-    assert!(!shell.model.power.asleep);
+    assert!(!shell.model.power.is_asleep());
     assert_eq!(shell.broker.retained(STATUS), Some("online"));
 }
 
@@ -207,7 +207,7 @@ fn a_tap_during_the_sleep_close_connects_after_the_answer_to_the_close() {
     let mut shell = connected(PowerSource::Battery);
     shell.broker.hold_closes = true;
     shell.advance(IDLE_TIMEOUT);
-    assert!(shell.model.power.asleep);
+    assert!(shell.model.power.is_asleep());
     let log = shell.take_log();
     place(&log, "StreamClose");
     assert!(!log.contains(&"WifiOff".into()), "{log:?}");
@@ -215,7 +215,7 @@ fn a_tap_during_the_sleep_close_connects_after_the_answer_to_the_close() {
     // The DISCONNECT left, and the `Close` request waits. A tap wakes the
     // device, but the core does not open a new stream yet.
     shell.send(Event::Tapped(None));
-    assert!(!shell.model.power.asleep);
+    assert!(!shell.model.power.is_asleep());
     let log = shell.take_log();
     assert!(!log.contains(&"MqttConnect".into()), "{log:?}");
     assert_eq!(shell.broker.retained(STATUS), Some("asleep"));
@@ -279,7 +279,7 @@ fn a_close_with_no_answer_lets_the_core_connect_after_the_close_timeout() {
     // The idle timer fired at most one draw delay before this time.
     let closed_at = shell.now();
     shell.send(Event::Tapped(None));
-    assert!(!shell.model.power.asleep);
+    assert!(!shell.model.power.is_asleep());
     shell.take_log();
 
     // The shell does not answer the `Close` request. At the timeout, the
@@ -327,7 +327,7 @@ fn a_sleep_continues_after_the_close_timeout_if_the_close_has_no_answer() {
     let mut shell = connected(PowerSource::Battery);
     shell.broker.hold_closes = true;
     shell.advance(IDLE_TIMEOUT);
-    assert!(shell.model.power.asleep);
+    assert!(shell.model.power.is_asleep());
     let log = shell.take_log();
     place(&log, "StreamClose");
     assert!(!log.contains(&"WifiOff".into()), "{log:?}");
@@ -599,7 +599,7 @@ fn a_message_during_the_close_for_a_sleep_does_not_change_the_entities() {
     // The DISCONNECT waits, so the session stays open in its close.
     shell.broker.hold_writes = true;
     shell.send(Event::SleepNow);
-    assert!(shell.model.power.asleep);
+    assert!(shell.model.power.is_asleep());
     place(&shell.take_log(), "MqttDisconnect");
 
     shell.broker.set_state(lamp, "off", &[]);
@@ -635,9 +635,9 @@ fn a_subscribe_that_is_done_during_the_close_for_a_sleep_does_not_make_the_link_
     // The DISCONNECT waits. A tap wakes the device during the close.
     shell.broker.hold_writes = true;
     shell.send(Event::SleepNow);
-    assert!(shell.model.power.asleep);
+    assert!(shell.model.power.is_asleep());
     shell.send(Event::Tapped(None));
-    assert!(!shell.model.power.asleep);
+    assert!(!shell.model.power.is_asleep());
     assert!(!online(&shell));
     shell.take_log();
 
@@ -695,7 +695,7 @@ fn a_start_forgets_the_close_that_waits() {
     let old = shell.model.connection.id;
     shell.broker.hold_closes = true;
     shell.advance(IDLE_TIMEOUT);
-    assert!(shell.model.power.asleep);
+    assert!(shell.model.power.is_asleep());
     let log = shell.take_log();
     place(&log, "StreamClose");
     assert!(!log.contains(&"WifiOff".into()), "{log:?}");
@@ -703,7 +703,7 @@ fn a_start_forgets_the_close_that_waits() {
     // A tap wakes the device while the `Close` request waits. The core
     // connects only after the answer.
     shell.send(Event::Tapped(None));
-    assert!(!shell.model.power.asleep);
+    assert!(!shell.model.power.is_asleep());
     assert!(!online(&shell));
 
     // The shell starts again. The core connects at once.
@@ -796,7 +796,7 @@ fn a_sleep_before_the_connack_closes_the_stream_with_no_disconnect() {
 
     shell.broker.hold_closes = true;
     shell.send(Event::SleepNow);
-    assert!(shell.model.power.asleep);
+    assert!(shell.model.power.is_asleep());
     let log = shell.take_log();
     assert_eq!(shell.writes.len(), writes, "{log:?}");
     assert!(!log.contains(&"MqttDisconnect".into()), "{log:?}");
@@ -820,9 +820,9 @@ fn a_failure_after_a_wake_during_the_close_for_a_sleep_connects_after_the_backof
     let mut shell = connected(PowerSource::Battery);
     shell.broker.hold_writes = true;
     shell.advance(IDLE_TIMEOUT);
-    assert!(shell.model.power.asleep);
+    assert!(shell.model.power.is_asleep());
     shell.send(Event::Tapped(None));
-    assert!(!shell.model.power.asleep);
+    assert!(!shell.model.power.is_asleep());
     shell.take_log();
 
     // The DISCONNECT does not leave, so the send timer ends the session.
@@ -842,7 +842,7 @@ fn a_failure_after_a_wake_during_the_close_for_a_sleep_connects_after_the_backof
     assert!(!log.contains(&"WifiOff".into()), "{log:?}");
     assert!(!log.contains(&"Sleep".into()), "{log:?}");
     assert!(online(&shell));
-    assert!(!shell.model.power.asleep);
+    assert!(!shell.model.power.is_asleep());
     assert!(shell.sleep.is_none());
 }
 
@@ -858,7 +858,7 @@ fn a_sleep_with_no_stream_turns_wifi_off_at_once_with_no_close() {
     shell.take_log();
 
     shell.send(Event::SleepNow);
-    assert!(shell.model.power.asleep);
+    assert!(shell.model.power.is_asleep());
     let log = shell.take_log();
     assert!(!log.contains(&"StreamClose".into()), "{log:?}");
     assert!(place(&log, "WifiOff") < place(&log, "Sleep"), "{log:?}");
@@ -878,7 +878,7 @@ fn a_wake_after_a_sleep_with_no_stream_connects() {
 
     shell.radio.blocked = false;
     shell.wake(Wake::Touch(None));
-    assert!(!shell.model.power.asleep);
+    assert!(!shell.model.power.is_asleep());
     let log = shell.take_log();
     place(&log, "MqttConnect");
     assert!(!log.contains(&"WifiOff".into()), "{log:?}");
@@ -900,7 +900,7 @@ fn a_sleep_while_the_stream_drains_waits_for_the_answer_to_its_close() {
     assert_eq!(shell.closes.len(), 1);
 
     shell.send(Event::SleepNow);
-    assert!(shell.model.power.asleep);
+    assert!(shell.model.power.is_asleep());
     let log = shell.take_log();
     assert!(!log.contains(&"StreamClose".into()), "{log:?}");
     assert!(!log.contains(&"WifiOff".into()), "{log:?}");
@@ -933,7 +933,7 @@ fn a_sleep_that_waits_for_its_close() -> (Shell, u32) {
     let mut shell = connected(PowerSource::Battery);
     shell.broker.hold_closes = true;
     shell.send(Event::SleepNow);
-    assert!(shell.model.power.asleep);
+    assert!(shell.model.power.is_asleep());
     let log = shell.take_log();
     place(&log, "StreamClose");
     assert!(!log.contains(&"WifiOff".into()), "{log:?}");
@@ -984,9 +984,9 @@ fn a_second_sleep_replaces_the_sleep_that_waits_for_the_close() {
     let first = shell.model.power.sleep;
 
     shell.send(Event::Tapped(None));
-    assert!(!shell.model.power.asleep);
+    assert!(!shell.model.power.is_asleep());
     shell.send(Event::SleepNow);
-    assert!(shell.model.power.asleep);
+    assert!(shell.model.power.is_asleep());
     let second = shell.model.power.sleep;
     assert_ne!(first, second);
     let log = shell.take_log();
