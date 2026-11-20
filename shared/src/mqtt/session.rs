@@ -532,7 +532,8 @@ impl Session {
     /// [`Limits::subscribe_packet`] bytes, in order. All the packets go in
     /// the next [`Action::Send`]. When the broker acknowledged all the
     /// packets, the session gives [`Action::Subscribed`] with `Done`. If the
-    /// broker refused a filter, the outcome is `Failed`.
+    /// broker acknowledged all the packets but refused a filter, the outcome
+    /// is `Refused`.
     ///
     /// The outcome is `Failed` at once if the session is not connected, if
     /// a filter is too long, or if the bytes that wait would go above
@@ -896,7 +897,7 @@ impl Session {
         if job.packets.is_empty() {
             let job = self.jobs.remove(index);
             let outcome = if job.failed {
-                SubscribeOutcome::Failed
+                SubscribeOutcome::Refused
             } else {
                 SubscribeOutcome::Done
             };

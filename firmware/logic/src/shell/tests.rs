@@ -470,7 +470,7 @@ fn a_session_timer_ends_the_session_and_closes_the_stream() {
 }
 
 #[test]
-fn a_refused_subscribe_does_not_make_the_link_quiet() {
+fn a_refused_subscribe_still_makes_the_link_quiet() {
     let (mut device, _) = started(PowerSource::Stand, true);
     device.handle(joined(1));
     let jobs = device.connect(FIRST);
@@ -486,7 +486,7 @@ fn a_refused_subscribe_does_not_make_the_link_quiet() {
         .expect("a subscribe");
     device.broker.refuse = Some(filter);
     let jobs = device.deliver(&jobs);
-    assert!(!names(&jobs).contains(&"wifi quiet".into()));
+    assert!(names(&jobs).contains(&"wifi quiet".into()));
 }
 
 #[test]

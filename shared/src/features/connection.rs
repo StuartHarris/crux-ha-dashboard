@@ -498,8 +498,9 @@ fn handle(id: u32, input: Input, model: &mut Model) -> Cmd {
 /// - `Connected` publishes the outbox and `online`, and subscribes, so all
 ///   three go in one `Write`.
 /// - `Message` changes the state of an entity.
-/// - `Subscribed` with `Done` for the subscribe of the connection sends
-///   `WifiQuiet`.
+/// - `Subscribed` with `Done` or `Refused` for the subscribe of the
+///   connection sends `WifiQuiet`. After `Refused`, the link is up and
+///   quiet, but the core has no effect to report the refused filter.
 /// - `Ended` closes the stream, and connects again if the core wants a
 ///   connection. The new stream opens after the answer to the `Close`
 ///   request.
@@ -618,12 +619,14 @@ fn on_message(message: &Message, model: &mut Model) -> Cmd {
     }
 }
 
-/// Handles the result of a subscribe job. After `Done` for the subscribe of
-/// the connection, the link is quiet, so the core sends `WifiQuiet`.
+/// Handles the result of a subscribe job. After `Done` or `Refused` for the
+/// subscribe of the connection, the link is quiet, so the core sends
+/// `WifiQuiet`. After `Failed`, the connection ended or never got the
+/// acknowledgements, so the core sends nothing.
 fn subscribed(id: SubscribeId, outcome: SubscribeOutcome, model: &Model) -> Cmd {
     let state = &model.connection;
     let current = state.session.as_ref().and_then(|live| live.subscribe);
-    if current != Some(id) || state.mqtt != Link::Up || outcome != SubscribeOutcome::Done {
+    if current != Some(id) || state.mqtt != Link::Up || outcome == SubscribeOutcome::Failed {
         return Cmd::done();
     }
     Network::quiet()

@@ -294,12 +294,12 @@ fn the_retained_flood_in_random_chunks_gives_the_same_messages() {
 }
 
 #[test]
-fn a_refused_filter_fails_the_subscribe() {
+fn a_refused_filter_refuses_the_subscribe() {
     let (mut wire, topics) = house();
     wire.broker.refuse = Some(topics[50].clone());
     let _ = wire.session.subscribe(&topics);
     wire.run();
-    assert_eq!(outcomes(&wire.log), [SubscribeOutcome::Failed]);
+    assert_eq!(outcomes(&wire.log), [SubscribeOutcome::Refused]);
 }
 
 #[test]

@@ -55,8 +55,17 @@ use crate::{HEALTH, LINK_CHANGED, SIGNALS, STREAM};
 
 /// The size of each buffer of the socket.
 const BUFFER: usize = 8 * 1024;
-/// The largest chunk of bytes that one `Received` item holds.
-const READ_CHUNK: usize = 1024;
+/// The largest chunk of bytes that one `Received` item holds, and the size of
+/// the read buffer of the task.
+///
+/// Each read makes one `Received` item, and each item is one update of the
+/// core. After a connect, the broker sends about 115 retained messages in a
+/// burst of more than 10 KiB. A chunk of 4 KiB needs about a quarter of the
+/// updates that a chunk of 1 KiB needs. The read buffer is part of the
+/// static state of the task, so it takes RAM all the time. For that reason
+/// the chunk is half of [`BUFFER`] and not the whole of it. An item copies
+/// only the bytes that the read returned, so a larger chunk adds no heap.
+const READ_CHUNK: usize = 4 * 1024;
 /// The longest time for the DNS query of the host.
 const DNS_TIMEOUT: Duration = Duration::from_secs(5);
 /// The longest time to open the TCP connection.

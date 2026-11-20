@@ -71,8 +71,12 @@ pub struct Connect {
 pub enum SubscribeOutcome {
     /// The broker acknowledged each topic filter with success.
     Done,
-    /// The broker refused a topic filter, or the connection closed before
-    /// all the acknowledgements arrived.
+    /// The broker acknowledged each packet, but refused one or more topic
+    /// filters. The connection is up and the broker sends no more
+    /// acknowledgements, so the link is quiet.
+    Refused,
+    /// The subscribe could not run, or the connection ended before all the
+    /// acknowledgements arrived.
     Failed,
 }
 
