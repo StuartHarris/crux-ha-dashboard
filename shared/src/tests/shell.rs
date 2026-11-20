@@ -44,27 +44,10 @@ use crate::{
         power::{Sleep, Wake},
         stream::Close,
     },
-    features::connection::KEEP_ALIVE_SECS,
-    mqtt::{
-        ACK_TIMEOUT, CONNACK_TIMEOUT, OPEN_TIMEOUT, PING_RESPONSE_TIMEOUT, SEND_TIMEOUT,
-        codec::server::Packet, ping_interval, silence_limit,
-    },
+    mqtt::codec::server::Packet,
 };
 
-/// Returns the durations of the timers of the MQTT session. No timer of a
-/// feature has one of these durations. A test checks this.
-pub fn session_timers() -> Vec<Duration> {
-    let mut durations = alloc::vec![
-        OPEN_TIMEOUT,
-        CONNACK_TIMEOUT,
-        PING_RESPONSE_TIMEOUT,
-        SEND_TIMEOUT,
-        ACK_TIMEOUT,
-    ];
-    durations.extend(ping_interval(KEEP_ALIVE_SECS));
-    durations.extend(silence_limit(KEEP_ALIVE_SECS));
-    durations
-}
+pub use crate::fake::session_timers;
 
 /// A timer that waits.
 struct Timer {

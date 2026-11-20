@@ -13,5 +13,33 @@
 pub mod broker;
 pub mod home_assistant;
 
+use alloc::vec::Vec;
+use core::time::Duration;
+
 pub use broker::{Broker, matches};
 pub use home_assistant::{MAX_TEMP, MIN_TEMP, ServiceCall, iso_time};
+
+use crate::{
+    features::connection::KEEP_ALIVE_SECS,
+    mqtt::{
+        ACK_TIMEOUT, CONNACK_TIMEOUT, OPEN_TIMEOUT, PING_RESPONSE_TIMEOUT, SEND_TIMEOUT,
+        ping_interval, silence_limit,
+    },
+};
+
+/// Returns the durations of the timers of the MQTT session. No timer of a
+/// feature has one of these durations. A test checks this, so a test shell
+/// can find a timer of the session by its duration.
+#[must_use]
+pub fn session_timers() -> Vec<Duration> {
+    let mut durations = alloc::vec![
+        OPEN_TIMEOUT,
+        CONNACK_TIMEOUT,
+        PING_RESPONSE_TIMEOUT,
+        SEND_TIMEOUT,
+        ACK_TIMEOUT,
+    ];
+    durations.extend(ping_interval(KEEP_ALIVE_SECS));
+    durations.extend(silence_limit(KEEP_ALIVE_SECS));
+    durations
+}

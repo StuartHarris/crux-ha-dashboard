@@ -12,19 +12,16 @@ use shared::{
         power::Wake,
         stream::{StreamItem, Written},
     },
-    fake::Broker,
+    fake::{Broker, session_timers},
     features::{
-        connection::KEEP_ALIVE_SECS,
         light::{BATTERY_LEVEL, LIGHT_TIMEOUT, STAND_LEVEL},
         power::IDLE_TIMEOUT,
         refresh::DRAW_DELAY,
     },
     mqtt::{
-        ACK_TIMEOUT, CONNACK_TIMEOUT, MAX_PACKET, OPEN_TIMEOUT, PING_RESPONSE_TIMEOUT,
-        SEND_TIMEOUT,
+        CONNACK_TIMEOUT, MAX_PACKET,
         codec::server::{self, Packet},
         framer::{Frame, Framer},
-        ping_interval, silence_limit,
     },
 };
 
@@ -149,16 +146,7 @@ fn packets(bytes: &[u8]) -> Vec<Packet> {
 /// Returns `true` if `duration` is the duration of a timer of the MQTT
 /// session. No timer of a feature has one of these durations.
 fn is_session_timer(duration: Duration) -> bool {
-    let mut durations = vec![
-        OPEN_TIMEOUT,
-        CONNACK_TIMEOUT,
-        PING_RESPONSE_TIMEOUT,
-        SEND_TIMEOUT,
-        ACK_TIMEOUT,
-    ];
-    durations.extend(ping_interval(KEEP_ALIVE_SECS));
-    durations.extend(silence_limit(KEEP_ALIVE_SECS));
-    durations.contains(&duration)
+    session_timers().contains(&duration)
 }
 
 /// Returns the first stream job in `jobs`.

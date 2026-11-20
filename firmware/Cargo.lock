@@ -150,12 +150,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32b13ea120a812beba79e34316b3942a857c86ec1593cb34f27bb28272ce2cca"
 
 [[package]]
-name = "const_fn"
-version = "0.4.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "413d67b29ef1021b4d60f4aa1e925ca031751e213832b4b1d588fae623c05c60"
-
-[[package]]
 name = "cordyceps"
 version = "0.3.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -356,7 +350,6 @@ dependencies = [
  "embassy-sync 0.8.0",
  "embassy-time",
  "embedded-graphics",
- "embedded-io-async 0.7.0",
  "esp-alloc",
  "esp-backtrace",
  "esp-bootloader-esp-idf",
@@ -366,7 +359,6 @@ dependencies = [
  "esp-rtos",
  "firmware-logic",
  "log",
- "rust-mqtt",
  "shared",
  "static_cell",
  "ui",
@@ -1973,18 +1965,6 @@ dependencies = [
  "const-default",
  "libc",
  "rustversion",
-]
-
-[[package]]
-name = "rust-mqtt"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9345427199453b4961a0a275edbca86d0472942d731c6d79a23517c1db8f7ca3"
-dependencies = [
- "const_fn",
- "embedded-io-async 0.7.0",
- "heapless 0.9.3",
- "log",
 ]
 
 [[package]]
