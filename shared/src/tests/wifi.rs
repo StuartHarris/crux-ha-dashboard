@@ -116,6 +116,41 @@ fn the_first_start_joins_the_strongest_access_point_and_does_not_scan() {
 }
 
 #[test]
+fn the_usual_steps_write_no_line_to_the_log() {
+    // The first start joins the strongest access point, gets a new address,
+    // connects and subscribes.
+    let mut shell = house();
+    shell.send(start(PowerSource::Battery));
+    assert_eq!(shell.view().connection, Connection::Online);
+    shell.take_log();
+
+    // The broker stops and starts again. Each reconnect keeps the
+    // association.
+    shell.broker.stop();
+    shell.run();
+    shell.advance(RECONNECT_MIN);
+    shell.broker.down = false;
+    shell.advance(RECONNECT_MIN * 2);
+    assert_eq!(shell.view().connection, Connection::Online);
+    let log = shell.take_log();
+    assert_eq!(
+        radio(&log),
+        [
+            "RadioJoin Cached keep",
+            "RadioAddress",
+            "RadioJoin Cached keep",
+            "RadioAddress",
+        ]
+    );
+
+    // The idle timer puts the device to sleep.
+    shell.advance(IDLE_TIMEOUT);
+    assert!(shell.sleep.is_some());
+
+    assert_eq!(shell.take_logs(), Vec::<String>::new());
+}
+
+#[test]
 fn a_wake_joins_the_cached_access_point_and_stays_if_the_scan_finds_less_than_the_margin() {
     let mut shell = asleep();
     // The other access point is stronger, but by less than the margin.

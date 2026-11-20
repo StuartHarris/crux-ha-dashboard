@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     capabilities::{
         light::FrontLight,
+        log::Log,
         power::{PowerSource, Sleep, Wake},
         radio::{Address, Join, Joined, Lease, Leave, Off, Restart, Scan, Scanned, StopScan},
         stream::{Close, Open, StreamItem, Write, Written},
@@ -349,6 +350,8 @@ pub enum Effect {
     Sleep(Sleep),
     /// Set the brightness of the front light.
     FrontLight(FrontLight),
+    /// Write a line to the log.
+    Log(Log),
     /// Start a timer.
     TimeNotifyAfter(time::NotifyAfter),
     /// Clear a timer.

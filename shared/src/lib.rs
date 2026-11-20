@@ -7,7 +7,7 @@
 //!   the front light, the refresh of the panel and the marks of taps that
 //!   wait for Home Assistant.
 //! - [`capabilities`] has the custom effects: a byte stream, the radio,
-//!   power and the front light.
+//!   power, the front light and the log.
 //! - [`mqtt`] is an MQTT 3.1.1 client with no I/O: a codec, a framer and the
 //!   state machine of a connection.
 //! - [`view`] makes the view model, which has all the text that the `ui`

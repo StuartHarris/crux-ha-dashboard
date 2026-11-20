@@ -6,10 +6,11 @@ use core::{
 
 use embedded_graphics::prelude::Point;
 use shared::{
-    Connection, Event, PowerSource,
+    Cmd, Connection, Effect, Event, PowerSource,
     capabilities::{
+        log::{self, Area, Level, Log},
         power::Wake,
-        radio::{Joined, Lease, Restart, Scanned},
+        radio::{Joined, Lease, Radio, Restart, Scanned},
         stream::{StreamItem, Written},
     },
     fake::{Broker, FakeRadio, radio::HALL, session_timers},
@@ -227,7 +228,7 @@ fn stream_job(jobs: &[Job]) -> Option<(u32, &StreamOp)> {
 /// A short name for each job, to compare lists of jobs. A `Write` job has
 /// one name for each packet in it, but one name for the SUBSCRIBE packets
 /// that follow each other. The names leave out the timers of the MQTT
-/// session.
+/// session and the lines of the log. Refer to [`logs`].
 fn names(jobs: &[Job]) -> Vec<String> {
     jobs.iter()
         .flat_map(|job| match job {
@@ -264,6 +265,7 @@ fn names(jobs: &[Job]) -> Vec<String> {
                 RadioOp::Off(_) => "wifi off".into(),
             }],
             Job::Restart(_) => vec!["restart".into()],
+            Job::Log(_) => Vec::new(),
             Job::Sleep(_) => vec!["sleep".into()],
             Job::FrontLight { token, level } => vec![format!("light {level} {token}")],
             Job::Timer {
@@ -278,6 +280,17 @@ fn names(jobs: &[Job]) -> Vec<String> {
                 token,
                 op: TimerOp::ClearTimer(_),
             } => vec![format!("cancel timer {token}")],
+        })
+        .collect()
+}
+
+/// Returns each line of the log in `jobs` as `{level} {area}: {message}`,
+/// in order.
+fn logs(jobs: &[Job]) -> Vec<String> {
+    jobs.iter()
+        .filter_map(|job| match job {
+            Job::Log(log) => Some(format!("{} {log}", log.level)),
+            _ => None,
         })
         .collect()
 }
@@ -1306,4 +1319,30 @@ fn a_join_with_no_answer_is_stopped_by_the_next_join() {
     };
     assert_eq!(device.handle(late), Vec::new());
     assert_eq!(names(&device.link()), [format!("open {FIRST}")]);
+}
+
+#[test]
+fn a_line_of_the_log_keeps_its_place_before_a_restart() {
+    let mut shell = Shell::new();
+    let mut cmd: Cmd = log::warn(Area::Wifi, "3 of 3 joins got no new address")
+        .and(Radio::restart("no address after 3 joins".into()));
+    let effects: Vec<Effect> = cmd.effects().collect();
+
+    let jobs = shell.process(effects);
+
+    assert_eq!(
+        jobs,
+        [
+            Job::Log(Log {
+                level: Level::Warn,
+                area: Area::Wifi,
+                message: "3 of 3 joins got no new address".into(),
+            }),
+            Job::Restart(Restart {
+                reason: "no address after 3 joins".into(),
+            }),
+        ]
+    );
+    assert_eq!(names(&jobs), ["restart"]);
+    assert_eq!(logs(&jobs), ["warn wifi: 3 of 3 joins got no new address"]);
 }

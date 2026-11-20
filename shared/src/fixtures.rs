@@ -166,7 +166,9 @@ impl FixedShell {
                     self.timers.retain(|timer| timer.operation.id != id);
                     self.resolve(&mut request, id)
                 }
-                Effect::Render(_) | Effect::Sleep(_) | Effect::RadioRestart(_) => Vec::new(),
+                Effect::Render(_) | Effect::Sleep(_) | Effect::RadioRestart(_) | Effect::Log(_) => {
+                    Vec::new()
+                }
             };
             queue.extend(more);
         }

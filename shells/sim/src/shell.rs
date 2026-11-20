@@ -32,6 +32,9 @@
 //! core sends `RadioRestart`, the shell does a cold restart: it stops all
 //! the tasks, makes a new core and sends `Start`, as the firmware does.
 //!
+//! The shell prints each line of the log of the core to stderr as
+//! `{area}: {message}`, with `warning: ` first for a warning.
+//!
 //! The shell writes each effect to an [`Inspector`], which the window shows.
 //! The inspector also finds the MQTT packets in a copy of the bytes of each
 //! stream.
@@ -49,6 +52,7 @@ use crux_time::{TimerId, operation::NotifyAfter};
 use shared::{
     Core, Dashboard, Effect, Event, PowerSource, Settings, Start, ViewModel,
     capabilities::{
+        log::Level,
         power::{Sleep, Wake},
         radio::AccessPoint,
         stream::{Close, Open, StreamItem, Write, Written},
@@ -666,6 +670,21 @@ impl Shell {
             | Effect::RadioStopScan(_)
             | Effect::RadioOff(_)
             | Effect::RadioRestart(_) => self.radio(effect),
+            Effect::Log(request) => {
+                let line = request.operation;
+                let outcome = match line.level {
+                    Level::Info => {
+                        eprintln!("{line}");
+                        "printed"
+                    }
+                    Level::Warn => {
+                        eprintln!("warning: {line}");
+                        "printed as a warning"
+                    }
+                };
+                self.inspector.effect("Log", line.to_string(), outcome);
+                Vec::new()
+            }
             Effect::Sleep(request) => {
                 eprintln!("power: asleep. Click the panel or press W to wake it.");
                 self.inspector.effect(

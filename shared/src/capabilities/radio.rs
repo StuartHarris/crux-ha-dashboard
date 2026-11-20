@@ -32,7 +32,8 @@
 //!   and then it does the new request. For example, `Off` stops a `Join`,
 //!   and a `Leave` stops a `Scan`.
 
-use alloc::{string::String, vec::Vec};
+use alloc::{format, string::String, vec::Vec};
+use core::fmt;
 
 use crux_core::{Command, Request, command::RequestBuilder, macros::Operation};
 use facet::Facet;
@@ -45,6 +46,27 @@ pub struct AccessPoint {
     pub bssid: [u8; 6],
     /// The primary channel of the access point.
     pub channel: u8,
+}
+
+/// Shows the BSSID and the channel, for the log. For example
+/// `24:5a:4c:01:02:03 on channel 6`.
+impl fmt::Display for AccessPoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, byte) in self.bssid.iter().enumerate() {
+            if index > 0 {
+                f.write_str(":")?;
+            }
+            write!(f, "{byte:02x}")?;
+        }
+        write!(f, " on channel {}", self.channel)
+    }
+}
+
+/// Returns the text of a signal for the log: `-62 dBm`, or `no signal` if
+/// the shell cannot read the signal.
+#[must_use]
+pub fn signal(rssi: Option<i32>) -> String {
+    rssi.map_or_else(|| "no signal".into(), |rssi| format!("{rssi} dBm"))
 }
 
 /// An access point that a scan found.
@@ -311,7 +333,11 @@ impl Radio {
 
 #[cfg(test)]
 mod tests {
-    use alloc::{string::String, vec, vec::Vec};
+    use alloc::{
+        string::{String, ToString},
+        vec,
+        vec::Vec,
+    };
     use core::fmt::Debug;
 
     use crux_core::{Command, Request};
@@ -319,7 +345,7 @@ mod tests {
 
     use super::{
         AccessPoint, Address, Join, Joined, Lease, Leave, Off, Radio, Restart, Scan, Scanned, Seen,
-        StopScan, Target,
+        StopScan, Target, signal,
     };
 
     const HALL: AccessPoint = AccessPoint {
@@ -510,6 +536,18 @@ mod tests {
         );
         assert!(command.events().next().is_none());
         assert!(command.is_done());
+    }
+
+    #[test]
+    fn the_log_shows_an_access_point_and_a_signal() {
+        let access_point = AccessPoint {
+            bssid: [0x24, 0x5A, 0x4C, 0x01, 0x02, 0x03],
+            channel: 6,
+        };
+        assert_eq!(access_point.to_string(), "24:5a:4c:01:02:03 on channel 6");
+        assert_eq!(KITCHEN.to_string(), "02:66:77:88:99:aa on channel 11");
+        assert_eq!(signal(Some(-62)), "-62 dBm");
+        assert_eq!(signal(None), "no signal");
     }
 
     #[test]
