@@ -3,9 +3,10 @@
 //! - On the stand, the device stays awake and connected.
 //! - On battery, the device connects when it wakes. After [`IDLE_TIMEOUT`]
 //!   without a touch, or at [`Event::SleepNow`], it sleeps in steps. Each
-//!   step waits for the answer of the shell: publish `asleep` and
-//!   disconnect, then turn Wi-Fi off, then draw the last image with the
-//!   time of the last state message and sleep until a touch.
+//!   step waits for the answer of the shell: stop a scan for a better
+//!   access point if one runs, publish `asleep` and disconnect, then turn
+//!   the radio off, then draw the last image with the time of the last
+//!   state message and sleep until a touch.
 //! - If the front light is still on at the sleep, one more step turns it
 //!   off first. Usually the light timer turned it off already. Refer to
 //!   [`LIGHT_TIMEOUT`](crate::features::light::LIGHT_TIMEOUT).
@@ -20,11 +21,8 @@ use crux_time::clock::Time;
 
 use crate::{
     Cmd, Event, Model,
-    capabilities::{
-        network::Network,
-        power::{Power, PowerSource, Wake, WakeSource},
-    },
-    features::{connection, light, refresh::redraw, rooms},
+    capabilities::power::{Power, PowerSource, Wake, WakeSource},
+    features::{connection, light, refresh::redraw, rooms, wifi},
     view::rounded_level,
 };
 
@@ -71,16 +69,17 @@ pub fn woke(id: u32, wake: Wake, model: &mut Model) -> Cmd {
     }
 }
 
-/// The stream of the MQTT connection of the sleep `id` closed: turn Wi-Fi
-/// off.
+/// The stream of the MQTT connection of the sleep `id` closed: turn the
+/// radio off. Refer to [`wifi::off`].
 pub fn offline(id: u32, model: &mut Model) -> Cmd {
     if id != model.power.sleep || !model.power.asleep {
         return Cmd::done();
     }
-    Network::wifi_off().then_send(move |()| Event::RadioOff(id))
+    wifi::off(id, model)
 }
 
-/// The radio of the sleep `id` is off: draw the last image and sleep.
+/// The radio of the sleep `id` is off: draw the last image and sleep. The
+/// Wi-Fi feature calls this function. Refer to [`wifi::radio_off`].
 pub fn radio_off(id: u32, model: &mut Model) -> Cmd {
     if id != model.power.sleep || !model.power.asleep {
         return Cmd::done();
@@ -215,6 +214,18 @@ fn sleep(model: &mut Model) -> Cmd {
     disconnect(id, model)
 }
 
+/// The scan for the sleep `id` stopped: publish `asleep` and disconnect.
+/// The Wi-Fi feature calls this function. Refer to [`wifi::stop_scan`].
+///
+/// The core ignores this answer if a tap or a move to the stand woke the
+/// device first.
+pub fn scan_stopped(id: u32, model: &mut Model) -> Cmd {
+    if id != model.power.sleep || !model.power.asleep {
+        return Cmd::done();
+    }
+    disconnect(id, model)
+}
+
 /// The front light of the sleep `id` is off: publish `asleep` and
 /// disconnect.
 ///
@@ -231,9 +242,16 @@ pub fn light_off(id: u32, model: &mut Model) -> Cmd {
 /// stream starts the next step ([`offline`]). Refer to
 /// [`connection::go_offline`].
 ///
+/// If a scan for a better access point runs, the core first stops it, and
+/// the answer starts this step again ([`scan_stopped`]). A scan can drop
+/// the link, so the DISCONNECT packet waits for the end of the scan.
+///
 /// The core drops the service calls that wait in the outbox, and the view
 /// shows how many. The last image shows the time of the last state message.
 fn disconnect(id: u32, model: &mut Model) -> Cmd {
+    if let Some(stop) = wifi::stop_scan(id, model) {
+        return stop;
+    }
     model.unsent += model.connection.outbox.len();
     connection::go_offline(id, model)
 }

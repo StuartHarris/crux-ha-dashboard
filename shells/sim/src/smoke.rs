@@ -1,9 +1,9 @@
 //! Connects to the broker, waits for the retained entity states, draws the
 //! page to a PNG file and stops.
 //!
-//! The broker sends the retained states after the SUBACK packet. The core
-//! sends `WifiQuiet` at the SUBACK packet, so the smoke test stops when no
-//! bytes arrive for [`QUIET`] after `WifiQuiet`.
+//! The broker sends the retained states after the SUBACK packet, so the
+//! smoke test stops when no bytes arrive for [`QUIET`] after the SUBACK
+//! packet.
 //!
 //! The core does a dry run in this mode, so it publishes no service call.
 
@@ -23,8 +23,8 @@ use crate::{
     stream,
 };
 
-/// The time with no bytes from the broker, after `WifiQuiet`, after which
-/// the shell has the retained states.
+/// The time with no bytes from the broker, after the SUBACK packet, after
+/// which the shell has the retained states.
 const QUIET: Duration = Duration::from_millis(300);
 /// The longest time to wait.
 const LIMIT: Duration = Duration::from_secs(20);
@@ -49,8 +49,8 @@ pub fn run(options: Options, out: &Path) -> Result<(), String> {
     shell.send(Event::BatteryChanged(Some(options.level)));
 
     let started = Instant::now();
-    // The time of the last bytes from the broker, or of `WifiQuiet` if no
-    // bytes arrived after it.
+    // The time of the last bytes from the broker, or of the SUBACK packet if
+    // no bytes arrived after it.
     let mut last_bytes = Instant::now();
     let mut quiet = false;
     let complete = loop {
@@ -66,7 +66,7 @@ pub fn run(options: Options, out: &Path) -> Result<(), String> {
             }
             shell.handle(signal);
         }
-        if !quiet && shell.quiet_count() > 0 {
+        if !quiet && shell.suback_count() > 0 {
             quiet = true;
             last_bytes = last_bytes.max(Instant::now());
         }

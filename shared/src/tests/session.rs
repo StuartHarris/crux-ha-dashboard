@@ -19,6 +19,10 @@ use crate::{
         pending::{PENDING_TIMEOUT, QUEUED_TIMEOUT, SCENE_TIMEOUT, TARGET_TIMEOUT},
         power::IDLE_TIMEOUT,
         refresh::{DRAW_DELAY, FULL_REFRESH_INTERVAL},
+        wifi::{
+            ADDRESS_TIMEOUT, JOIN_TIMEOUT, LEAVE_TIMEOUT, OFF_TIMEOUT, SCAN_TIMEOUT,
+            STOP_SCAN_TIMEOUT,
+        },
     },
     mqtt::{MAX_IN_FLIGHT, MAX_PACKET, SEND_TIMEOUT, codec::server::Packet},
 };
@@ -59,6 +63,12 @@ fn feature_timers() -> Vec<Duration> {
         IDLE_TIMEOUT,
         DRAW_DELAY,
         FULL_REFRESH_INTERVAL,
+        JOIN_TIMEOUT,
+        ADDRESS_TIMEOUT,
+        LEAVE_TIMEOUT,
+        SCAN_TIMEOUT,
+        STOP_SCAN_TIMEOUT,
+        OFF_TIMEOUT,
     ];
     let mut backoff = RECONNECT_MIN;
     while backoff < RECONNECT_MAX {

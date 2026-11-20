@@ -234,6 +234,10 @@ pub struct Inspector {
     /// The number of messages from the broker. A clear of the MQTT log does
     /// not change it.
     pub messages: u64,
+    /// The number of subscribes that the broker acknowledged in full: each
+    /// SUBSCRIBE packet of the stream has its SUBACK packet. A clear of the
+    /// MQTT log does not change it.
+    pub subscribed: u64,
 }
 
 impl Default for Inspector {
@@ -242,6 +246,7 @@ impl Default for Inspector {
             effects: Log::new(CAPACITY),
             mqtt: Log::new(CAPACITY),
             messages: 0,
+            subscribed: 0,
         }
     }
 }
@@ -325,6 +330,9 @@ impl Inspector {
             }
         }
         for packet in packets {
+            if matches!(packet, server::Packet::Subscribe { .. }) {
+                wire.subacks += 1;
+            }
             self.sent_packet(&wire.target, packet);
         }
     }
@@ -381,6 +389,12 @@ impl Inspector {
                         stop = true;
                         break;
                     };
+                    if matches!(packet, Inbound::SubAck { .. }) && wire.subacks > 0 {
+                        wire.subacks -= 1;
+                        if wire.subacks == 0 {
+                            self.subscribed += 1;
+                        }
+                    }
                     self.received_packet(first, packet);
                 }
                 Ok(Some(Frame::Oversize { length, .. })) => {
@@ -456,6 +470,8 @@ pub struct Wire {
     target: String,
     sent: Option<Framer>,
     received: Option<Framer>,
+    /// The number of SUBSCRIBE packets that wait for their SUBACK packets.
+    subacks: usize,
 }
 
 impl Wire {
@@ -466,6 +482,7 @@ impl Wire {
             target,
             sent: Some(Framer::new(MAX_PACKET)),
             received: Some(Framer::new(MAX_PACKET)),
+            subacks: 0,
         }
     }
 
@@ -538,16 +555,16 @@ mod tests {
         let mut log = Log::new(10);
         log.push(effect("StreamClose", "dashboard/sim/cmd"));
         log.push(effect("Render", ""));
-        log.push(effect("WifiOn", ""));
+        log.push(effect("RadioJoin", ""));
         let names = |filter| {
             log.filtered(filter)
                 .map(|entry| entry.effect)
                 .collect::<Vec<_>>()
         };
-        assert_eq!(names(""), ["WifiOn", "Render", "StreamClose"]);
+        assert_eq!(names(""), ["RadioJoin", "Render", "StreamClose"]);
         assert_eq!(names("  RENDER "), ["Render"]);
         assert_eq!(names("cmd"), ["StreamClose"]);
-        assert_eq!(names("SENT"), ["WifiOn", "Render", "StreamClose"]);
+        assert_eq!(names("SENT"), ["RadioJoin", "Render", "StreamClose"]);
         assert_eq!(names("nothing"), Vec::<&str>::new());
     }
 
@@ -595,7 +612,7 @@ mod tests {
     #[test]
     fn routine_effects_can_be_hidden() {
         let mut log = Log::new(10);
-        log.push(effect("WifiOn", ""));
+        log.push(effect("RadioJoin", ""));
         log.push(effect("StreamClose", "dashboard/sim/cmd"));
         log.push(effect("Render", ""));
         let names = |hide| {
@@ -603,8 +620,8 @@ mod tests {
                 .map(|entry| entry.effect)
                 .collect::<Vec<_>>()
         };
-        assert_eq!(names(true), ["StreamClose", "WifiOn"]);
-        assert_eq!(names(false), ["Render", "StreamClose", "WifiOn"]);
+        assert_eq!(names(true), ["StreamClose", "RadioJoin"]);
+        assert_eq!(names(false), ["Render", "StreamClose", "RadioJoin"]);
         assert_eq!(
             log.shown("render", false).count(),
             1,

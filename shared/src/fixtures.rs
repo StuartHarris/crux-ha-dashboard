@@ -1,12 +1,12 @@
 //! A shell with fixed answers, for tests and pictures.
 //!
 //! [`FixedShell`] drives the real core with no clock and no network. It
-//! answers each effect at once: Wi-Fi and the connection always work, and
-//! the fake broker sends [`states`]. Home Assistant updated each entity at
-//! [`NOW`]. Timers expire
-//! only when you call [`FixedShell::fire_timers`]. Each run gives the same
-//! views, so the golden-image tests of the `ui` crate and the PNG mode of
-//! the simulator use it.
+//! answers each effect at once: the fake radio ([`fake::FakeRadio`]) and
+//! the connection always work, and the fake broker sends [`states`]. Home
+//! Assistant updated each entity at [`NOW`]. Timers expire only when you
+//! call [`FixedShell::fire_timers`]. Each run gives the same views, so the
+//! golden-image tests of the `ui` crate and the PNG mode of the simulator
+//! use it.
 //!
 //! Turn on the `fixtures` feature to use this module.
 
@@ -22,10 +22,7 @@ use crux_time::operation::NotifyAfter;
 
 use crate::{
     Core, Dashboard, Effect, Event, PowerSource, Settings, Start, TileKind, ViewModel,
-    capabilities::{
-        network::WifiStatus,
-        stream::{Open, StreamItem, Written},
-    },
+    capabilities::stream::{Open, StreamItem, Written},
     fake,
     pages::PAGES,
 };
@@ -46,6 +43,7 @@ pub const NOW_TEXT: &str = "2026-07-01T09:41:00+00:00";
 pub struct FixedShell {
     core: Core<Dashboard>,
     broker: fake::Broker,
+    radio: fake::FakeRadio,
     stream: Option<Request<Open>>,
     timers: Vec<Request<NotifyAfter>>,
 }
@@ -73,6 +71,7 @@ impl FixedShell {
         let mut shell = Self {
             core: Core::new(),
             broker,
+            radio: fake::FakeRadio::default(),
             stream: None,
             timers: Vec::new(),
         };
@@ -106,7 +105,30 @@ impl FixedShell {
         let mut queue = VecDeque::from(effects);
         while let Some(effect) = queue.pop_front() {
             let more = match effect {
-                Effect::WifiOn(mut request) => self.resolve(&mut request, WifiStatus::Connected),
+                Effect::RadioJoin(mut request) => {
+                    let joined = self.radio.join(&request.operation);
+                    self.resolve(&mut request, joined)
+                }
+                Effect::RadioAddress(mut request) => {
+                    let lease = self.radio.address(&request.operation);
+                    self.resolve(&mut request, lease)
+                }
+                Effect::RadioLeave(mut request) => {
+                    self.radio.leave(&request.operation);
+                    self.resolve(&mut request, ())
+                }
+                Effect::RadioScan(mut request) => {
+                    let scanned = self.radio.scan(&request.operation);
+                    self.resolve(&mut request, scanned)
+                }
+                Effect::RadioStopScan(mut request) => {
+                    self.radio.stop_scan(&request.operation);
+                    self.resolve(&mut request, ())
+                }
+                Effect::RadioOff(mut request) => {
+                    self.radio.off(&request.operation);
+                    self.resolve(&mut request, ())
+                }
                 Effect::StreamOpen(mut request) => {
                     let mut more = self.end_stream();
                     self.broker.open().expect("the fake broker is up");
@@ -134,7 +156,6 @@ impl FixedShell {
                     more.extend(self.resolve(&mut request, ()));
                     more
                 }
-                Effect::WifiOff(mut request) => self.resolve(&mut request, ()),
                 Effect::FrontLight(mut request) => self.resolve(&mut request, ()),
                 Effect::TimeNotifyAfter(request) => {
                     self.timers.push(request);
@@ -145,7 +166,7 @@ impl FixedShell {
                     self.timers.retain(|timer| timer.operation.id != id);
                     self.resolve(&mut request, id)
                 }
-                Effect::Render(_) | Effect::Sleep(_) | Effect::WifiQuiet(_) => Vec::new(),
+                Effect::Render(_) | Effect::Sleep(_) | Effect::RadioRestart(_) => Vec::new(),
             };
             queue.extend(more);
         }

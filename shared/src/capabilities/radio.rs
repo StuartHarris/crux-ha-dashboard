@@ -7,8 +7,9 @@
 //!
 //! Each operation, except `Restart`, carries the `radio` id of the core. The
 //! core makes a new id for each request, and it ignores an answer with an
-//! older id. The core sends no more than one radio request at a time, except
-//! when the stop rule applies.
+//! older id. The core waits for one radio request at a time. When it sends a
+//! new request, it no longer waits for an older one: the older request
+//! reached the time limit of the core, or the new request stops it.
 //!
 //! - [`Join`] is a request. The shell associates with an access point and
 //!   answers with [`Joined`].
@@ -26,11 +27,10 @@
 //!
 //! - Each request has a time limit in the shell, which its documentation
 //!   gives. The core also has a time limit for each request.
-//! - A new request stops a `Scan`. An `Off` or a `Leave` also stops a `Join`
-//!   or an `Address`. The shell answers the stopped request with `Stopped`
-//!   (or `()`) first, and then it does the new request.
-//! - Other requests wait in a queue until the shell completes the request
-//!   that runs.
+//! - A new request stops each older request that did not get its answer.
+//!   The shell answers each stopped request with `Stopped` (or `()`) first,
+//!   and then it does the new request. For example, `Off` stops a `Join`,
+//!   and a `Leave` stops a `Scan`.
 
 use alloc::{string::String, vec::Vec};
 

@@ -42,10 +42,10 @@ use crux_time::{TimerId, operation::NotifyAfter};
 use shared::{
     Core, Dashboard, Effect, Event, PowerSource, Settings, Start, ViewModel,
     capabilities::{
-        network::WifiStatus,
         power::{Sleep, Wake},
         stream::{Close, Open, StreamItem, Write, Written},
     },
+    fake::FakeRadio,
 };
 use tokio::{runtime::Handle, task::JoinHandle};
 
@@ -151,8 +151,8 @@ pub struct Shell {
     inspector: Inspector,
     /// The settings that [`Shell::start`] gave, for [`Shell::restart`].
     settings: Option<Settings>,
-    /// The number of `WifiQuiet` effects.
-    quiet: u32,
+    /// The fake radio, which answers each radio request at once.
+    radio: FakeRadio,
     /// The `Sleep` request that waits for a wake.
     sleep: Option<Request<Sleep>>,
     /// The level of the front light, in percent. The window shows the
@@ -193,7 +193,7 @@ impl Shell {
             render: false,
             inspector: Inspector::default(),
             settings: None,
-            quiet: 0,
+            radio: FakeRadio::default(),
             sleep: None,
             light: 0,
         }
@@ -364,10 +364,10 @@ impl Shell {
         self.streams.last().map(|live| live.connection)
     }
 
-    /// Returns the number of `WifiQuiet` effects. The core sends `WifiQuiet`
-    /// when the broker accepted the subscribe, after the retained states.
-    pub const fn quiet_count(&self) -> u32 {
-        self.quiet
+    /// Returns the number of subscribes that the broker acknowledged in
+    /// full. Refer to [`Inspector::subscribed`].
+    pub const fn suback_count(&self) -> u64 {
+        self.inspector.subscribed
     }
 
     /// Returns the logs of the shell.
@@ -518,20 +518,13 @@ impl Shell {
             Effect::StreamOpen(request) => self.open(request),
             Effect::StreamWrite(request) => self.write(request),
             Effect::StreamClose(request) => self.close(request),
-            Effect::WifiOn(mut request) => {
-                self.inspector
-                    .effect("WifiOn", String::new(), "resolved: Connected");
-                resolve(&self.core, &mut request, WifiStatus::Connected)
-            }
-            Effect::WifiOff(mut request) => {
-                self.inspector.effect(
-                    "WifiOff",
-                    String::new(),
-                    "resolved: the simulator has no Wi-Fi",
-                );
-                resolve(&self.core, &mut request, ())
-            }
-            Effect::WifiQuiet(_) => self.quiet(),
+            Effect::RadioJoin(_)
+            | Effect::RadioAddress(_)
+            | Effect::RadioLeave(_)
+            | Effect::RadioScan(_)
+            | Effect::RadioStopScan(_)
+            | Effect::RadioOff(_)
+            | Effect::RadioRestart(_) => self.radio(effect),
             Effect::Sleep(request) => {
                 eprintln!("power: asleep. Click the panel or press W to wake it.");
                 self.inspector.effect(
@@ -592,16 +585,60 @@ impl Shell {
         }
     }
 
-    /// Logs `WifiQuiet`. The simulator has no access points, so it does
-    /// nothing else.
-    fn quiet(&mut self) -> Vec<Effect> {
-        self.quiet += 1;
-        self.inspector.effect(
-            "WifiQuiet",
-            String::new(),
-            "ignored: the simulator has no access points",
-        );
-        Vec::new()
+    /// Answers a radio request at once with the fake radio, and returns the
+    /// new effects of the core. The simulator does not restart, so it logs
+    /// `Restart` and ignores it.
+    fn radio(&mut self, effect: Effect) -> Vec<Effect> {
+        let core = &self.core;
+        let (name, request, outcome, effects) = match effect {
+            Effect::RadioJoin(mut request) => {
+                let join = &request.operation;
+                let text = format!("{:?}, keep: {}", join.target, join.keep);
+                let joined = self.radio.join(join);
+                let outcome = format!("resolved: {joined:?}");
+                (
+                    "RadioJoin",
+                    text,
+                    outcome,
+                    resolve(core, &mut request, joined),
+                )
+            }
+            Effect::RadioAddress(mut request) => {
+                let lease = self.radio.address(&request.operation);
+                let outcome = format!("resolved: {lease:?}");
+                let effects = resolve(core, &mut request, lease);
+                ("RadioAddress", String::new(), outcome, effects)
+            }
+            Effect::RadioLeave(mut request) => {
+                self.radio.leave(&request.operation);
+                let effects = resolve(core, &mut request, ());
+                ("RadioLeave", String::new(), "resolved".into(), effects)
+            }
+            Effect::RadioScan(mut request) => {
+                let scanned = self.radio.scan(&request.operation);
+                let outcome = format!("resolved: {scanned:?}");
+                let effects = resolve(core, &mut request, scanned);
+                ("RadioScan", String::new(), outcome, effects)
+            }
+            Effect::RadioStopScan(mut request) => {
+                self.radio.stop_scan(&request.operation);
+                let effects = resolve(core, &mut request, ());
+                ("RadioStopScan", String::new(), "resolved".into(), effects)
+            }
+            Effect::RadioOff(mut request) => {
+                self.radio.off(&request.operation);
+                let effects = resolve(core, &mut request, ());
+                ("RadioOff", String::new(), "resolved".into(), effects)
+            }
+            Effect::RadioRestart(request) => {
+                let reason = request.operation.reason;
+                eprintln!("radio: the core asks for a restart: {reason}");
+                ("RadioRestart", reason, "ignored".into(), Vec::new())
+            }
+            _ => return Vec::new(),
+        };
+        self.inspector.effect(name, request, outcome);
+        effects
     }
 
     /// Opens a stream for `request`. If a stream is open, the new stream
@@ -1007,8 +1044,8 @@ mod tests {
         /// Waits until the core gets the SUBACK packet of the next
         /// connection, after the broker sent the retained messages.
         fn connect(&mut self) {
-            let quiet = self.shell().quiet_count();
-            self.until("SUBACK", |fixture| fixture.shell().quiet_count() > quiet);
+            let subacks = self.shell().suback_count();
+            self.until("SUBACK", |fixture| fixture.shell().suback_count() > subacks);
         }
 
         /// Waits until the core reaches the `Sleep` effect.
@@ -1241,22 +1278,22 @@ mod tests {
     }
 
     #[test]
-    fn the_link_is_quiet_after_the_suback() {
+    fn the_shell_counts_the_suback() {
         let mut fixture = Fixture::new();
         fixture.net().broker.hold_suback = true;
         fixture.start(PowerSource::Stand);
         fixture.wait_log(4);
         fixture.settle();
-        assert_eq!(fixture.shell().quiet_count(), 0);
+        assert_eq!(fixture.shell().suback_count(), 0);
 
         let mut fixture = Fixture::new();
         fixture.start(PowerSource::Stand);
         fixture.connect();
-        assert_eq!(fixture.shell().quiet_count(), 1);
+        assert_eq!(fixture.shell().suback_count(), 1);
     }
 
     #[test]
-    fn a_stream_that_ends_before_the_suback_leaves_the_link_not_quiet() {
+    fn a_stream_that_ends_before_the_suback_counts_no_suback() {
         let mut fixture = Fixture::new();
         fixture.net().broker.hold_suback = true;
         fixture.start(PowerSource::Stand);
@@ -1270,7 +1307,7 @@ mod tests {
             fixture.shell().current_connection().is_none()
         });
         fixture.settle();
-        assert_eq!(fixture.shell().quiet_count(), 0);
+        assert_eq!(fixture.shell().suback_count(), 0);
     }
 
     #[test]
@@ -1620,12 +1657,12 @@ mod tests {
         let effects = fixture.effects();
         for name in [
             "Render",
-            "WifiOn",
+            "RadioJoin",
+            "RadioAddress",
             "StreamOpen",
             "StreamWrite",
             "StreamClose",
             "TimeNotifyAfter",
-            "WifiQuiet",
             "Sleep",
         ] {
             assert!(effects.contains(&name), "{name} is not in {effects:?}");
@@ -1738,7 +1775,7 @@ mod tests {
             Some("asleep")
         );
         let effects = fixture.effects();
-        for name in ["WifiOff", "Render", "Sleep"] {
+        for name in ["RadioOff", "Render", "Sleep"] {
             assert!(effects.contains(&name), "{name} is not in {effects:?}");
         }
         assert!(!fixture.shell().can_sleep_now());
