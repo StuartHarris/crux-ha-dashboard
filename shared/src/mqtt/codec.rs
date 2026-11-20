@@ -7,7 +7,7 @@
 
 use alloc::vec::Vec;
 
-use crate::capabilities::mqtt::{Connect, Qos};
+use super::types::{Connect, Qos};
 
 /// The protocol level of MQTT 3.1.1.
 pub const PROTOCOL_LEVEL: u8 = 4;
@@ -339,8 +339,8 @@ pub fn decode(first: u8, body: &[u8]) -> Result<Inbound<'_>, Malformed> {
     }
 }
 
-/// The broker side of the codec, for the fake broker in the tests.
-#[cfg(test)]
+/// The broker side of the codec, for the fake broker in [`crate::fake`].
+#[cfg(any(test, feature = "fixtures"))]
 pub mod server {
     use alloc::{string::String, vec::Vec};
 

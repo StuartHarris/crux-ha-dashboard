@@ -22,7 +22,7 @@ const fn change_the_view(model: &mut Model, count: usize) {
 
 #[test]
 fn the_render_after_the_last_partial_render_is_a_full_refresh() {
-    let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Stand);
+    let (mut model, _wire) = drive_to_connected(PowerSource::Stand);
     // The start was a full refresh, and `Connected` drew once.
     let seq = model.full_refresh_seq;
     let partials = model.refresh.partials;
@@ -49,7 +49,7 @@ fn the_render_after_the_last_partial_render_is_a_full_refresh() {
 
 #[test]
 fn a_render_with_no_change_to_the_view_does_not_draw_or_count() {
-    let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Stand);
+    let (mut model, _wire) = drive_to_connected(PowerSource::Stand);
     let partials = model.refresh.partials;
     redraw(&mut model, false).expect_no_effects();
     assert_eq!(model.refresh.partials, partials);
@@ -80,7 +80,7 @@ fn a_repeated_state_message_does_not_draw_or_count() {
 
 #[test]
 fn a_full_refresh_starts_the_count_again() {
-    let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Stand);
+    let (mut model, _wire) = drive_to_connected(PowerSource::Stand);
     for count in 0..10 {
         change_the_view(&mut model, count + 1);
         let _ = redraw(&mut model, false);
@@ -93,7 +93,7 @@ fn a_full_refresh_starts_the_count_again() {
 #[test]
 fn the_timer_asks_for_a_full_refresh_while_the_device_is_awake() {
     let app = Dashboard;
-    let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Stand);
+    let (mut model, _wire) = drive_to_connected(PowerSource::Stand);
     // `Connected` drew once, so a partial render occurred.
     assert!(model.refresh.partials > 0);
     let seq = model.full_refresh_seq;
@@ -112,7 +112,7 @@ fn the_timer_asks_for_a_full_refresh_while_the_device_is_awake() {
 #[test]
 fn the_timer_with_no_partial_render_only_starts_again() {
     let app = Dashboard;
-    let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Stand);
+    let (mut model, _wire) = drive_to_connected(PowerSource::Stand);
     let _ = app.update(Event::NextPage, &mut model);
     assert_eq!(model.refresh.partials, 0);
     let seq = model.full_refresh_seq;
@@ -129,7 +129,7 @@ fn the_timer_with_no_partial_render_only_starts_again() {
 #[test]
 fn the_timer_does_nothing_while_the_device_sleeps() {
     let app = Dashboard;
-    let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Battery);
+    let (mut model, _wire) = drive_to_connected(PowerSource::Battery);
     let id = model.refresh.timer;
     model.power.asleep = true;
 
@@ -287,7 +287,7 @@ fn the_retained_messages_at_a_connection_give_one_draw_timer_and_one_render() {
 #[test]
 fn a_draw_timer_that_expires_while_the_device_sleeps_draws_nothing() {
     let app = Dashboard;
-    let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Battery);
+    let (mut model, _wire) = drive_to_connected(PowerSource::Battery);
     super::set_state(&mut model, "light.all_lights", "on");
     let _timer = redraw_soon(&mut model);
     let id = model.refresh.draw;
@@ -333,7 +333,7 @@ fn a_draw_timer_that_waits_when_the_device_sleeps_draws_nothing() {
 #[test]
 fn a_draw_timer_after_a_newer_timer_draws_nothing() {
     let app = Dashboard;
-    let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Stand);
+    let (mut model, _wire) = drive_to_connected(PowerSource::Stand);
 
     // A change starts the first timer.
     super::set_state(&mut model, "light.all_lights", "on");

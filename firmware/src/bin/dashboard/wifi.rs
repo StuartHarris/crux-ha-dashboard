@@ -11,8 +11,8 @@
 //! Before the drop, the task disconnects, which stops new frames, and waits
 //! [`TX_DRAIN`]. The driver counts the frames that it did not send yet, and
 //! a drop does not reset that count. If a frame stays in the count after a
-//! drop, the next controller can send fewer frames. The core closes the MQTT
-//! connection before it sends `WifiOff`, so no MQTT packet waits.
+//! drop, the next controller can send fewer frames. The core closes the
+//! stream before it sends `WifiOff`, so no MQTT packet waits.
 //!
 //! A `WifiOff` during a join stops the join, and the task does not answer
 //! the `WifiOn`, because the shell already answered it. A `WifiOn` during a
@@ -25,8 +25,8 @@
 //! join fails, the task forgets the access point and scans all the channels
 //! in the same `WifiOn`. After a join with the cached access point, the task
 //! scans all the channels once, when the core sends `WifiQuiet`, and changes
-//! to an access point that is clearly better. A `Hold` (the first network
-//! step of a sleep) or any other request stops that scan. The log tells which
+//! to an access point that is clearly better. A `Hold` (the clean close of
+//! the stream for a sleep) or any other request stops that scan. The log tells which
 //! path each join took, its time, the scan result and each change.
 //!
 //! After an MQTT session failed, `HEALTH` says that the link is suspect. If
@@ -199,8 +199,8 @@ enum Roamed {
 ///
 /// The core sends `WifiQuiet` when the MQTT connection is ready, so a
 /// change does not delay the connect. Any request stops the scan. After a
-/// change, the task sets [`LINK_CHANGED`], and the MQTT task closes its
-/// connection. The core then connects again and subscribes.
+/// change, the task sets [`LINK_CHANGED`], and the stream task closes its
+/// stream. The core then connects again and subscribes.
 async fn roam(
     controller: &mut WifiController<'_>,
     stack: Stack<'static>,
@@ -306,8 +306,8 @@ async fn stop(controller: &mut WifiController<'_>) {
 /// has an address.
 ///
 /// If the driver is connected, the task only waits for an address, unless an
-/// MQTT session failed after the last CONNACK (`HEALTH`). Then the task
-/// leaves the access point and joins again.
+/// MQTT session failed after the last proof of traffic (`HEALTH`). Then the
+/// task leaves the access point and joins again.
 ///
 /// The first try uses `path`. If a join with a cached access point fails,
 /// `cache` forgets it, and the task scans all the channels.

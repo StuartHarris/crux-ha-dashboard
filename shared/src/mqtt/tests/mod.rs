@@ -3,14 +3,15 @@
 //! The codec tests compare the bytes with the examples and the rules of the
 //! MQTT 3.1.1 specification. The framer tests give the same byte stream in
 //! chunks of different sizes. The session tests run the session against
-//! [`wire::WireBroker`], a fake broker that reads and writes bytes.
+//! [`crate::fake::Broker`], a fake broker that reads and writes bytes.
 
 mod codec;
 mod framer;
 mod session;
+mod types;
 mod wire;
 
-use crate::capabilities::mqtt::{Connect, Credentials, LastWill};
+use super::{Connect, Credentials, LastWill};
 
 /// The password in [`connect`]. No `Debug` output can show it.
 const PASSWORD: &str = "secret-password";

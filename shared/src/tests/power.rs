@@ -9,6 +9,7 @@ use super::{
     ExpectFullRefreshTimer, ExpectLight,
     connection::{drive_to_connected, drive_to_connecting},
     start, tap_tile,
+    wire::{ExpectWrite, Wire},
 };
 use crate::{
     Connection, Control, Dashboard, Effect, EffectTestExt, Event, Model, PowerSource,
@@ -38,18 +39,16 @@ fn start_on_battery_also_starts_the_idle_timer() {
 #[test]
 fn the_idle_timeout_sleeps_in_steps_and_a_touch_wakes() {
     let app = Dashboard;
-    let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Battery);
+    let (mut model, mut wire) = drive_to_connected(PowerSource::Battery);
     model.last_sync = chrono::DateTime::from_timestamp(super::NOW.cast_signed(), 0);
 
     // Step 1: publish `asleep`, then disconnect. The core waits for the
-    // answer of the shell.
-    let mut sleep = app.update(Event::IdleTimeout(model.power.idle), &mut model);
-    sleep.expect_mqtt_publish_with(|publish| {
-        assert_eq!(publish.topic, "dashboard/hall/status");
-        assert_eq!(publish.payload, b"asleep");
-        assert!(publish.retain);
-    });
-    let offline = sleep.resolve_mqtt_disconnect(|_| ()).expect_one_event();
+    // answer to the close of the stream.
+    app.update(Event::IdleTimeout(model.power.idle), &mut model)
+        .expect_disconnect(&mut wire, &mut model)
+        .expect_no_effects();
+    let offline = wire.take_event();
+    assert!(matches!(offline, Event::Offline(_)), "{offline:?}");
     assert!(model.power.asleep);
     assert_eq!(app.view(&model).connection, Connection::Offline);
 
@@ -101,10 +100,9 @@ fn the_idle_timeout_sleeps_in_steps_and_a_touch_wakes() {
 #[test]
 fn a_tap_during_the_steps_wakes_and_the_late_answers_are_ignored() {
     let app = Dashboard;
-    let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Battery);
+    let (mut model, mut wire) = drive_to_connected(PowerSource::Battery);
+    // The write of the DISCONNECT packet waits.
     let mut sleep = app.update(Event::IdleTimeout(model.power.idle), &mut model);
-    sleep.expect_mqtt_publish();
-    let mut disconnect = sleep.expect_effect().expect_mqtt_disconnect();
 
     // The user taps before the disconnect ends.
     app.update(Event::Tapped(None), &mut model)
@@ -116,17 +114,27 @@ fn a_tap_during_the_steps_wakes_and_the_late_answers_are_ignored() {
         .expect_no_effects();
     assert!(!model.power.asleep);
 
-    // The disconnect ends. The core does not continue the sleep.
-    disconnect.resolve(()).unwrap();
-    let offline = sleep.expect_one_event();
+    // The DISCONNECT leaves and the stream closes. The core does not
+    // continue the sleep. It asks for Wi-Fi again, to connect at once.
+    sleep
+        .expect_disconnect(&mut wire, &mut model)
+        .expect_no_effects();
+    let offline = wire.take_event();
     app.update(offline, &mut model).expect_no_effects();
     assert!(!model.power.asleep);
+    assert!(
+        wire.effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::WifiOn(_))),
+        "{:?}",
+        wire.effects
+    );
 }
 
 #[test]
 fn the_answer_of_an_older_sleep_is_ignored() {
     let app = Dashboard;
-    let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Battery);
+    let (mut model, _wire) = drive_to_connected(PowerSource::Battery);
     let old = model.power.sleep.wrapping_add(1);
     let _ = app.update(Event::IdleTimeout(model.power.idle), &mut model);
     assert_eq!(model.power.sleep, old);
@@ -151,7 +159,7 @@ fn the_answer_of_an_older_sleep_is_ignored() {
 #[test]
 fn a_tap_restarts_the_idle_timer_and_the_old_timer_is_ignored() {
     let app = Dashboard;
-    let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Battery);
+    let (mut model, _wire) = drive_to_connected(PowerSource::Battery);
     let old = model.power.idle;
 
     app.update(Event::NextPage, &mut model)
@@ -168,7 +176,7 @@ fn a_tap_restarts_the_idle_timer_and_the_old_timer_is_ignored() {
 #[test]
 fn on_the_stand_there_is_no_idle_timer() {
     let app = Dashboard;
-    let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Stand);
+    let (mut model, _wire) = drive_to_connected(PowerSource::Stand);
 
     app.update(Event::NextPage, &mut model)
         .expect_render()
@@ -180,7 +188,7 @@ fn on_the_stand_there_is_no_idle_timer() {
 #[test]
 fn off_the_stand_starts_the_idle_timer() {
     let app = Dashboard;
-    let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Stand);
+    let (mut model, _wire) = drive_to_connected(PowerSource::Stand);
 
     app.update(Event::PowerSourceChanged(PowerSource::Battery), &mut model)
         .expect_render()
@@ -191,8 +199,8 @@ fn off_the_stand_starts_the_idle_timer() {
 #[test]
 fn on_the_stand_while_asleep_wakes_and_connects() {
     let app = Dashboard;
-    let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Battery);
-    let _ = app.update(Event::IdleTimeout(model.power.idle), &mut model);
+    let (mut model, mut wire) = drive_to_connected(PowerSource::Battery);
+    let mut sleep = app.update(Event::IdleTimeout(model.power.idle), &mut model);
     assert!(model.power.asleep);
 
     let event = app
@@ -206,10 +214,30 @@ fn on_the_stand_while_asleep_wakes_and_connects() {
     assert_eq!(model.full_refresh_seq, 2);
     assert!(!model.power.asleep);
 
-    let _connect = app
-        .update(event, &mut model)
-        .expect_one_effect()
-        .expect_mqtt_connect();
+    // The session of the sleep still closes, so the core does not connect
+    // yet.
+    app.update(event, &mut model).expect_no_effects();
+
+    // The DISCONNECT leaves and the session ends. The core asks for Wi-Fi
+    // again, and then connects.
+    sleep
+        .expect_disconnect(&mut wire, &mut model)
+        .expect_no_effects();
+    let index = wire
+        .effects
+        .iter()
+        .position(|effect| matches!(effect, Effect::WifiOn(_)))
+        .expect("a WifiOn request");
+    let mut wifi = wire.effects.remove(index).unwrap().expect_wifi_on();
+    wifi.resolve(WifiStatus::Connected).unwrap();
+    wire.run(&mut model);
+    let event = wire
+        .events
+        .iter()
+        .position(|event| matches!(event, Event::Wifi { .. }))
+        .and_then(|index| wire.events.remove(index))
+        .expect("a Wifi event");
+    let _wire = Wire::new(app.update(event, &mut model));
 }
 
 #[test]
@@ -330,7 +358,7 @@ fn a_touch_wake_on_a_light_queues_the_service_call() {
 #[test]
 fn a_tap_on_no_control_while_awake_does_not_restart_the_idle_timer() {
     let app = Dashboard;
-    let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Battery);
+    let (mut model, _wire) = drive_to_connected(PowerSource::Battery);
     let idle = model.power.idle;
 
     // A touch by accident turns the light on, but it does not keep the
@@ -362,7 +390,7 @@ fn page_events_while_asleep_do_nothing() {
 #[test]
 fn a_battery_level_draws_once_and_the_same_level_draws_nothing() {
     let app = Dashboard;
-    let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Battery);
+    let (mut model, _wire) = drive_to_connected(PowerSource::Battery);
     let idle = model.power.idle;
     assert_eq!(app.view(&model).battery, None);
 
@@ -406,7 +434,7 @@ fn a_battery_level_while_asleep_does_not_wake_the_device() {
 fn the_status_text_does_not_give_the_power_source() {
     let app = Dashboard;
     for source in [PowerSource::Stand, PowerSource::Battery] {
-        let (mut model, _cmd, _request) = drive_to_connected(source);
+        let (mut model, _wire) = drive_to_connected(source);
         let _ = app.update(Event::BatteryChanged(Some(55)), &mut model);
         let view = app.view(&model);
         assert_eq!(view.status, "Online", "{source:?}");
@@ -438,7 +466,7 @@ fn the_view_rounds_the_battery_level_to_the_nearest_step() {
 #[test]
 fn a_battery_change_that_does_not_change_the_rounded_level_does_not_draw() {
     let app = Dashboard;
-    let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Battery);
+    let (mut model, _wire) = drive_to_connected(PowerSource::Battery);
     app.update(Event::BatteryChanged(Some(80)), &mut model)
         .expect_only_render();
 
@@ -459,21 +487,19 @@ fn a_battery_change_that_does_not_change_the_rounded_level_does_not_draw() {
 #[test]
 fn sleep_now_on_battery_sleeps_at_once() {
     let app = Dashboard;
-    let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Battery);
+    let (mut model, mut wire) = drive_to_connected(PowerSource::Battery);
 
     // The first step of the sleep, as after the idle timeout.
-    let _request = app
-        .update(Event::SleepNow, &mut model)
-        .expect_mqtt_publish()
-        .expect_one_effect()
-        .expect_mqtt_disconnect();
+    app.update(Event::SleepNow, &mut model)
+        .expect_disconnect(&mut wire, &mut model)
+        .expect_no_effects();
     assert!(model.power.asleep);
 }
 
 #[test]
 fn sleep_now_on_the_stand_or_while_asleep_does_nothing() {
     let app = Dashboard;
-    let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Stand);
+    let (mut model, _wire) = drive_to_connected(PowerSource::Stand);
     app.update(Event::SleepNow, &mut model).expect_no_effects();
     assert!(!model.power.asleep);
 
@@ -487,7 +513,7 @@ fn sleep_now_on_the_stand_or_while_asleep_does_nothing() {
 #[test]
 fn sleep_now_with_calls_in_the_outbox_first_waits_one_more_idle_period() {
     let app = Dashboard;
-    let (mut model, _cmd, _request) = drive_to_connecting(PowerSource::Battery);
+    let (mut model, _wire) = drive_to_connecting(PowerSource::Battery);
     model.route = crate::Route::room("living_room");
     // The connection is not open, so the call waits in the outbox.
     let _ = app.update(tap_tile(0), &mut model);
@@ -517,7 +543,7 @@ fn sleep_now_with_calls_in_the_outbox_first_waits_one_more_idle_period() {
 #[test]
 fn an_idle_timer_that_expires_after_sleep_now_is_ignored() {
     let app = Dashboard;
-    let (mut model, _cmd, _request) = drive_to_connected(PowerSource::Battery);
+    let (mut model, _wire) = drive_to_connected(PowerSource::Battery);
     let idle = model.power.idle;
     let _ = app.update(Event::SleepNow, &mut model);
     let sleep = model.power.sleep;

@@ -244,6 +244,12 @@ fn on_battery_the_dashboard_wakes_syncs_accepts_taps_then_sleeps() {
             // Each step of the sleep waits for the answer of the shell.
             "MqttPublish dashboard/hall/status asleep",
             "MqttDisconnect",
+            // The answer to the close of the stream comes after the shell
+            // sent the DISCONNECT packet.
+            "StreamClose",
+            // The core does not wait for the answer for longer than
+            // `CLOSE_TIMEOUT`.
+            "TimeNotifyAfter 6000ms",
             "WifiOff",
             // No full-refresh timer runs while the device sleeps.
             "TimeClear",
@@ -399,13 +405,31 @@ fn while_the_broker_is_down_the_wait_doubles_up_to_a_limit() {
     shell.broker.down = true;
     shell.send(start(PowerSource::Stand));
 
-    // Only the reconnect timer and the full-refresh timer run, and the
-    // reconnect timer is due first.
+    // Only the reconnect timer, the timers of the `Close` requests and the
+    // full-refresh timer run. The shell answered each `Close` request, so
+    // the core ignores the timers of the `Close` requests. A reconnect timer
+    // is due before the full-refresh timer.
     let mut waits = vec![];
     for _ in 0..9 {
         let before = shell.now();
-        let events = shell.advance_to_next();
-        assert!(matches!(events[..], [Event::Reconnect(_)]), "{events:?}");
+        loop {
+            let events = shell.advance_to_next();
+            let reconnects = events
+                .iter()
+                .filter(|event| matches!(event, Event::Reconnect(_)))
+                .count();
+            let closes = events
+                .iter()
+                .filter(|event| matches!(event, Event::CloseTimeout { .. }))
+                .count();
+            assert!(
+                reconnects <= 1 && reconnects + closes == events.len(),
+                "{events:?}"
+            );
+            if reconnects == 1 {
+                break;
+            }
+        }
         waits.push(shell.now().saturating_sub(before));
     }
     let secs = |seconds| Duration::from_secs(seconds);
@@ -426,10 +450,10 @@ fn while_the_broker_is_down_the_wait_doubles_up_to_a_limit() {
 
     // The next try after the longest wait connects.
     shell.broker.down = false;
-    let before = shell.now();
-    let events = shell.advance_to_next();
+    shell.advance(RECONNECT_MAX.saturating_sub(Duration::from_millis(1)));
+    assert!(!shell.broker.is_connected());
+    let events = shell.advance(Duration::from_millis(1));
     assert!(matches!(events[..], [Event::Reconnect(_)]), "{events:?}");
-    assert_eq!(shell.now().saturating_sub(before), RECONNECT_MAX);
     assert!(shell.broker.is_connected());
     assert_eq!(shell.model.connection.backoff, RECONNECT_MIN);
 }

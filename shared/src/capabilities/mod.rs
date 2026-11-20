@@ -4,9 +4,9 @@
 //! Each shell has the other half, which performs the operations.
 
 pub mod light;
-pub mod mqtt;
 pub mod network;
 pub mod power;
+pub mod stream;
 
 use crux_core::{Command, Request, capability::Operation};
 

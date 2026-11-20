@@ -19,8 +19,8 @@ with the std shells of the root workspace would pull std into it.
 
 | Module | What it does |
 | --- | --- |
-| `shell` | Owns the core. Routes each effect to a task as a `Command`, and gives each `Signal` from a task to the core. Keeps the MQTT connection ids, the timer tokens, the `WifiOn` tokens and the `FrontLight` tokens, and the `Disconnect`, `WifiOff`, `Sleep` and `FrontLight` requests until their tasks answer. Gives at most one `Render` for each batch of effects, with the last view. Sends each tap to the core as `Tapped`, with the control from `ui::hit_test`. While `Sleep` waits, a tap or a change of the power source answers it. The core does not publish service calls in a dry run. |
-| `mqtt` | The bookkeeping of the MQTT task. The stream of each connection ends with exactly one `Disconnected` item. `supersede` removes the queued connections that a later command makes useless. `Outbox` keeps a publish while the client has no quota, and closes the connection if the publish cannot be sent. |
+| `shell` | Owns the core. Routes each effect to a task as a `Command`, and gives each `Signal` from a task to the core. Keeps the connection ids of the streams, the timer tokens, the `WifiOn` tokens and the `FrontLight` tokens, and the `Write`, `Close`, `WifiOff`, `Sleep` and `FrontLight` requests until their tasks answer. Gives at most one `Render` for each batch of effects, with the last view. Sends each tap to the core as `Tapped`, with the control from `ui::hit_test`. While `Sleep` waits, a tap or a change of the power source answers it. The core does not publish service calls in a dry run. |
+| `stream` | The bookkeeping of the stream task. The stream of each connection ends with exactly one `Closed` item. `supersede` removes the queued streams that a later job makes useless. `UpdateStats` counts the updates of the core and their time. |
 | `wifi` | A `WifiOff` during a join stops the join. A `WifiOn` during a join continues it with the newer token. `LinkHealth` decides when a `WifiOn` leaves and joins again, and when the Wi-Fi task restarts the chip. |
 | `backoff` | A wait that doubles from 1 s to 30 s after each failure, for the start of the touch controller. |
 | `timers` | The timers of the timer task, in milliseconds since the start. |
@@ -42,43 +42,44 @@ cannot block each other. This is the pattern of the `cpb` example in Crux.
 | `timers` | Starts and cancels the timers of the core. | `Signal::Timer` |
 | `display` | Draws the newest view model with `ui::draw`, and refreshes the panel as `ui::Refresher` decides. Reads the touch controller every 30 ms between refreshes. Sets the front light. Runs the `Sleep` job. | `Signal::Tap`, `Signal::Event`, `Signal::Woke`, `Signal::Light` |
 | `wifi` | For `WifiOn`, turns the radio on, joins the network and waits for DHCP. For `WifiOff`, leaves the network and turns the radio off. Keeps the access point of the last good join, and joins it again with no scan of all the channels. After `WifiQuiet`, scans all the channels once, and changes to an access point that is at least 10 dB stronger. | `Signal::Wifi`, `Signal::RadioOff` |
-| `mqtt` | Opens one connection at a time with `rust-mqtt` (MQTT 5) over TCP, with a clean start. Subscribes, publishes, sends pings, and closes. | `Signal::Mqtt`, `Signal::Subscribed` |
+| `stream` | Opens one TCP stream at a time. Writes the bytes of the core to it, gives the bytes that arrive to the core, and closes it. Knows nothing of MQTT. | `Signal::Stream`, `Signal::Written` |
 | `net` | Runs the network stack. | |
 
-### MQTT transport
+### The byte stream
 
-`rust-mqtt` flushes its transport after each packet, also after each automatic
-PUBACK. The `flush` of the embassy-net `TcpSocket` waits until the broker acknowledged
-all the sent data (the TCP ACK). With Wi-Fi power save, each ACK takes 30 ms to 50 ms.
-Thus the subscribe of 115 topics took about 6.5 s.
+The core runs MQTT 3.1.1 (`shared/src/mqtt/`). The stream task
+(`src/bin/dashboard/stream.rs`) only moves bytes. The task takes the receive buffer
+and the send buffer of the socket (8 KiB each) from the heap once, so the allocator
+puts them in PSRAM. The 115 topic filters need about 7.9 KiB of SUBSCRIBE packets,
+and the core gives them to the socket in one `Write`.
 
-The MQTT task gives `rust-mqtt` its own transport (`src/bin/dashboard/transport.rs`).
-Its `flush` returns at once if the socket can send. A `write` returns when the data is
-in the send buffer of the socket (2048 bytes), and smoltcp sends it from there.
+A `Write` ends when all its bytes are in the send buffer, and smoltcp sends them from
+there. The task does not wait for the TCP ACK of the broker, so a write of many
+packets does not wait for a round trip for each packet.
 
-A send does not wait for the ACK, so the task finds a dead link in these ways:
+The task never waits without a limit, and one select waits for all its events. The
+core finds a dead link with its own timers (refer to "Find a dead link" in
+`docs/mqtt.md`). The task has only these limits:
 
-- A `write` waits while the send buffer is full. Each send has a limit of 10 s
-  (`WRITE_TIMEOUT`), so a send that cannot get buffer space ends the connection.
-- `logic::mqtt::AckWatch` reads the send buffer before and after each write, and when
-  its deadline comes. If data waits and no new data gets an ACK for 10 s (`ACK_LIMIT`),
-  the task ends the connection. Each new ACK starts the time again, so a long burst on
-  a slow link continues. A tap on a dead link ends the connection after about 10 s.
-- Before each ping, the task checks the silence of the broker. After 120 s with no
-  packet, the task ends the connection. The TCP timeout of the socket has the same
-  limit.
-- Two reads are outside the main loop, so the checks above do not run while they
-  wait. Each has a limit of 10 s (`READ_TIMEOUT`): the read of the body of a packet
-  (with the automatic PUBACK), and the read while all 16 subscribe packets are in
-  flight.
+- The DNS query has a limit of 5 s, and the TCP connect has a limit of 10 s. A newer
+  `Open`, a `Close` and a change of access point stop each of them.
+- A `Write` that gets no space in the send buffer for 10 s (`WRITE_STALL`) ends the
+  stream.
+- A `Close` sends a TCP FIN, waits up to 2 s (`CLOSE_FLUSH`) for the broker to
+  acknowledge the bytes that wait, and then aborts the socket.
+- A change of access point closes the stream with the reason `access point changed`.
+  The core sends no DISCONNECT, so Home Assistant sees a short retained `offline`
+  and then `online`.
 
 The core then connects again, as after any other drop.
 
 ### Recovery after a failed session
 
-When a session ends with an error, the MQTT task records it in `HEALTH`
-(`logic::wifi::LinkHealth`) before the stream ends. A session that a new connection
-replaces, a change of access point and a disconnect for the core are not errors.
+When a session ends with an error, the firmware records it in `HEALTH`
+(`logic::wifi::LinkHealth`) before the stream ends. The core task records a `Close`
+with `clean: false`. The stream task records a socket error and a reset from the
+broker. A stream that a new stream replaces, a change of access point and a clean
+close are not errors.
 
 - At the next `WifiOn`, if the driver is still connected, the Wi-Fi task leaves the
   access point, waits for the stack to drop the address, and joins again. The log
@@ -110,9 +111,10 @@ and each step waits for the answer of the firmware:
    light is still on at the sleep. The core then sends `FrontLight` with the level 0.
    The display task sets the duty to 0 and answers with `Signal::Light`. If the light
    is off, the core starts the next step at once.
-2. The core publishes `asleep` and sends `Disconnect`. The MQTT task sends the
-   disconnect packet (with a limit of 2 seconds) and ends the session. The stream of
-   the connection then ends, and the shell answers `Disconnect`. If no connection is
+2. The core publishes `asleep` and sends DISCONNECT. The core then sends `Close`
+   with `clean: true`. The stream task sends the FIN (with a limit of 2 seconds)
+   and ends the stream. The shell then answers `Close`, and only then does the core
+   report offline, so the last will does not replace `asleep`. If no connection is
    current, the shell answers at once.
 3. The core sends `WifiOff`. The Wi-Fi task disconnects, waits 100 ms for the frames
    in the driver, and drops the `WifiController`. The drop stops the Wi-Fi driver and
@@ -338,9 +340,9 @@ Do the steps in this order. Each step needs the steps before it.
    `logic/src/touch.rs` and its tests.
 9. **Wi-Fi.** Find `step 7`. The log shows `joined` and an address.
 10. **MQTT and the retained states.** Set `read_only = true` in `cfg.toml`. Run
-    `just flash`. The log shows `mqtt: connected` and
-    `mqtt: sent the subscribe for N topics`,
-    and the tiles show the states from Home Assistant. The footer shows "Last changed
+    `just flash`. The log shows `stream: N is open` and,
+    at `WifiQuiet`, the count and the time of the updates of the core. The tiles show the
+    states from Home Assistant. The footer shows "Last changed
     HH:MM" in UK time: the latest `last_updated` time of the entities on the page. On the
     Pi, run
     `mosquitto_sub -h localhost -u dashboard -P <password> -t 'dashboard/#' -v`
@@ -381,10 +383,9 @@ These items stay open:
 - VCOM is 1600 mV, the value of the vendor firmware (`src/panel/ed047tc1.rs`).
 - The core asks for a full refresh after 30 partial renders and after 30 minutes
   (`shared/src/features/refresh.rs`). Change the numbers if ghost images show.
-- `rust-mqtt` sends one topic filter in each subscribe packet, and keeps up to 16
-  subscribe packets in flight. Measure the time to get all retained states with the
-  transport that does not wait for each TCP ACK, and the size of the receive buffer
-  (4096 bytes).
+- Measure the time from the CONNACK to `WifiQuiet` with the 7 SUBSCRIBE packets in
+  one write. At `WifiQuiet`, the log shows the count and the time of the updates of the
+  core since the stream opened. A warning shows for an update of more than 50 ms.
 
 ## Power check (phase 6)
 

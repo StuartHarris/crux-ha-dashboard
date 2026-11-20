@@ -12,9 +12,9 @@ use serde::{Deserialize, Serialize};
 use crate::{
     capabilities::{
         light::FrontLight,
-        mqtt::{Connect, Credentials, Disconnect, MqttEvent, Publish, Subscribe, SubscribeOutcome},
         network::{WifiOff, WifiOn, WifiQuiet, WifiStatus},
         power::{PowerSource, Sleep, Wake},
+        stream::{Close, Open, StreamItem, Write, Written},
     },
     entities::Entities,
     features::{
@@ -23,6 +23,7 @@ use crate::{
         rooms,
     },
     layout::Page,
+    mqtt::{Credentials, Timer},
     pages::PAGES,
     route::Route,
     view::{self, ViewModel},
@@ -143,26 +144,52 @@ pub enum Event {
         /// The answer.
         status: WifiStatus,
     },
-    /// An item from the stream of the MQTT connection with this id.
+    /// An item from the byte stream of the MQTT connection with this id.
     #[serde(skip)]
     #[facet(skip)]
-    Mqtt {
+    Stream {
         /// The id of the connection. The core ignores an item from an older
         /// connection.
         connection: u32,
         /// The item from the stream.
-        event: MqttEvent,
+        item: StreamItem,
     },
-    /// The answer to the `Subscribe` request on the MQTT connection with
-    /// this id.
+    /// The answer to a `Write` request on the MQTT connection with this id.
     #[serde(skip)]
     #[facet(skip)]
-    Subscribed {
+    Written {
         /// The id of the connection. The core ignores the answer for an
         /// older connection.
         connection: u32,
         /// The answer.
-        outcome: SubscribeOutcome,
+        outcome: Written,
+    },
+    /// The answer to the `Close` request for the MQTT connection with this
+    /// id.
+    #[serde(skip)]
+    #[facet(skip)]
+    StreamClosed {
+        /// The id of the connection.
+        connection: u32,
+    },
+    /// The wait for the answer to the `Close` request for the MQTT
+    /// connection with this id is over. Refer to
+    /// [`connection::CLOSE_TIMEOUT`].
+    #[serde(skip)]
+    #[facet(skip)]
+    CloseTimeout {
+        /// The id of the connection.
+        connection: u32,
+    },
+    /// A timer of the MQTT session of the connection with this id expired.
+    #[serde(skip)]
+    #[facet(skip)]
+    SessionTimer {
+        /// The id of the connection. The core ignores the timer of an older
+        /// connection.
+        connection: u32,
+        /// The timer.
+        timer: Timer,
     },
     /// The wait before the reconnect with this id is over.
     #[serde(skip)]
@@ -177,7 +204,7 @@ pub enum Event {
     #[serde(skip)]
     #[facet(skip)]
     LightOffForSleep(u32),
-    /// The MQTT connection closed for the sleep with this id.
+    /// The stream of the MQTT connection closed for the sleep with this id.
     #[serde(skip)]
     #[facet(skip)]
     Offline(u32),
@@ -265,14 +292,12 @@ pub enum Control {
 pub enum Effect {
     /// Draw the view model.
     Render(RenderOperation),
-    /// Open an MQTT connection.
-    MqttConnect(Connect),
-    /// Subscribe to MQTT topics.
-    MqttSubscribe(Subscribe),
-    /// Publish an MQTT message.
-    MqttPublish(Publish),
-    /// Close the MQTT connection.
-    MqttDisconnect(Disconnect),
+    /// Open a byte stream to the broker.
+    StreamOpen(Open),
+    /// Send bytes on the stream.
+    StreamWrite(Write),
+    /// Close the stream.
+    StreamClose(Close),
     /// Turn Wi-Fi on.
     WifiOn(WifiOn),
     /// Turn Wi-Fi off.
@@ -403,11 +428,16 @@ impl App for Dashboard {
             Event::Navigate(route) => rooms::navigate(route, model),
             Event::SetReadOnly(read_only) => rooms::set_read_only(read_only, model),
             Event::Wifi { request, status } => connection::wifi(request, status, model),
-            Event::Mqtt { connection, event } => connection::mqtt(connection, event, model),
-            Event::Subscribed {
+            Event::Stream { connection, item } => connection::stream(connection, item, model),
+            Event::Written {
                 connection,
                 outcome,
-            } => connection::subscribed(connection, outcome, model),
+            } => connection::written(connection, outcome, model),
+            Event::StreamClosed { connection } => connection::stream_closed(connection, model),
+            Event::CloseTimeout { connection } => connection::close_timeout(connection, model),
+            Event::SessionTimer { connection, timer } => {
+                connection::session_timer(connection, timer, model)
+            }
             Event::Reconnect(id) => connection::reconnect(id, model),
             Event::SleepNow => power::sleep_now(model),
             Event::IdleTimeout(id) => power::idle_timeout(id, model),

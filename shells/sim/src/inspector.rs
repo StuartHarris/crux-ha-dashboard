@@ -4,12 +4,21 @@
 //! The shell writes to an [`Inspector`]. The window only reads it, so the
 //! tests can examine the logs with no window.
 //!
-//! Do not put a `Debug` text of an effect, a request or a `Start` event in a
-//! log. These values contain the MQTT password.
+//! The core gives the shell only bytes. A [`Wire`] finds the MQTT packets in
+//! a copy of the bytes of a stream, in each direction, and the inspector
+//! adds a row to the MQTT log for each packet.
+//!
+//! Do not put a `Debug` text of an effect, a request, a packet or a `Start`
+//! event in a log. These values contain the MQTT password.
 
 use std::collections::VecDeque;
 
 use chrono::{DateTime, Local};
+use shared::mqtt::{
+    MAX_PACKET,
+    codec::{self, Inbound, server},
+    framer::{Frame, Framer},
+};
 
 /// The largest number of entries in each log. A new entry removes the
 /// oldest entry when the log is full.
@@ -97,7 +106,7 @@ pub trait Matches {
 pub struct EffectEntry {
     /// The time of the entry.
     pub time: DateTime<Local>,
-    /// The name of the effect, for example `MqttPublish`.
+    /// The name of the effect, for example `StreamWrite`.
     pub effect: &'static str,
     /// The facts of the request, for example the topic. It never contains
     /// a password.
@@ -108,7 +117,7 @@ pub struct EffectEntry {
 
 /// The effects that the core asks for many times. The effect log can hide
 /// them, so that the other effects stay visible.
-pub const ROUTINE_EFFECTS: [&str; 1] = ["Render"];
+pub const ROUTINE_EFFECTS: [&str; 2] = ["Render", "StreamWrite"];
 
 impl EffectEntry {
     /// Returns `true` if the effect is in [`ROUTINE_EFFECTS`].
@@ -153,27 +162,18 @@ pub enum Direction {
 pub enum Packet {
     /// A request to connect. The log does not show the credentials.
     Connect,
-    /// The broker accepted the connection.
+    /// The answer of the broker to the request to connect.
     ConnAck,
     /// A subscription to one or more topics.
     Subscribe,
+    /// The answer of the broker to a subscription.
+    SubAck,
     /// A message.
     Publish,
+    /// A PINGREQ packet out, or a PINGRESP packet in.
+    Ping,
     /// The end of the connection.
     Disconnect,
-}
-
-/// What happened to an MQTT packet.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Delivery {
-    /// The shell received the packet.
-    Received,
-    /// The shell gave the packet to the client.
-    Sent,
-    /// The shell has no connection, so it did not send the packet.
-    NoConnection,
-    /// The client refused the packet, with this message.
-    Failed(String),
 }
 
 /// One MQTT packet, in or out.
@@ -192,12 +192,11 @@ pub struct MqttEntry {
     /// packets.
     pub topics: Vec<String>,
     /// The payload as text, cut to [`PAYLOAD_LIMIT`] characters. For a
-    /// connect packet, the broker and the client id.
+    /// connect packet, the broker and the client id. For a CONNACK or a
+    /// SUBACK packet, the result.
     pub payload: String,
     /// The retained flag of a message.
     pub retained: bool,
-    /// What happened to the packet.
-    pub delivery: Delivery,
 }
 
 impl Matches for MqttEntry {
@@ -232,6 +231,9 @@ pub struct Inspector {
     pub effects: Log<EffectEntry>,
     /// The MQTT packets, from the newest.
     pub mqtt: Log<MqttEntry>,
+    /// The number of messages from the broker. A clear of the MQTT log does
+    /// not change it.
+    pub messages: u64,
 }
 
 impl Default for Inspector {
@@ -239,6 +241,7 @@ impl Default for Inspector {
         Self {
             effects: Log::new(CAPACITY),
             mqtt: Log::new(CAPACITY),
+            messages: 0,
         }
     }
 }
@@ -262,7 +265,6 @@ impl Inspector {
         topic: impl Into<String>,
         payload: String,
         retained: bool,
-        delivery: Delivery,
     ) {
         self.mqtt.push(MqttEntry {
             time: Local::now(),
@@ -272,23 +274,209 @@ impl Inspector {
             topics: Vec::new(),
             payload,
             retained,
-            delivery,
         });
     }
 
-    /// Adds one entry to the MQTT log for a subscribe request to `topics`,
+    /// Adds one entry to the MQTT log for a subscribe packet with `topics`,
     /// with the time now.
-    pub fn subscribe(&mut self, topics: &[String], delivery: Delivery) {
+    pub fn subscribe(&mut self, topics: Vec<String>) {
         self.mqtt.push(MqttEntry {
             time: Local::now(),
             direction: Direction::Out,
             packet: Packet::Subscribe,
             topic: format!("{} topics", topics.len()),
-            topics: topics.to_vec(),
+            topics,
             payload: String::new(),
             retained: false,
-            delivery,
         });
+    }
+
+    /// Adds an entry to the MQTT log for each packet that the bytes from the
+    /// shell complete on `wire`.
+    pub fn sent(&mut self, wire: &mut Wire, bytes: &[u8]) {
+        let Some(framer) = &mut wire.sent else {
+            return;
+        };
+        framer.push(bytes.to_vec());
+        let mut packets = Vec::new();
+        loop {
+            match framer.next_packet() {
+                Ok(Some(Frame::Packet { first, body })) => {
+                    let Ok(packet) = server::decode(first, body) else {
+                        wire.stop_sent();
+                        break;
+                    };
+                    packets.push(packet);
+                }
+                Ok(Some(Frame::Oversize { length, .. })) => {
+                    self.packet(
+                        Direction::Out,
+                        Packet::Publish,
+                        "",
+                        format!("not shown: {length} bytes"),
+                        false,
+                    );
+                }
+                Ok(None) => break,
+                Err(codec::Malformed) => {
+                    wire.stop_sent();
+                    break;
+                }
+            }
+        }
+        for packet in packets {
+            self.sent_packet(&wire.target, packet);
+        }
+    }
+
+    /// Adds an entry to the MQTT log for a packet from the shell. A CONNECT
+    /// packet shows only the target and the client id, never the
+    /// credentials.
+    fn sent_packet(&mut self, target: &str, packet: server::Packet) {
+        match packet {
+            server::Packet::Connect { client_id, .. } => self.packet(
+                Direction::Out,
+                Packet::Connect,
+                "",
+                format!("{target} as {client_id}"),
+                false,
+            ),
+            server::Packet::Publish {
+                flags,
+                topic,
+                payload,
+                ..
+            } => self.packet(
+                Direction::Out,
+                Packet::Publish,
+                topic,
+                truncate(&payload),
+                flags & RETAIN != 0,
+            ),
+            server::Packet::Subscribe { filters, .. } => {
+                self.subscribe(filters.into_iter().map(|(topic, _)| topic).collect());
+            }
+            server::Packet::PingReq => {
+                self.packet(Direction::Out, Packet::Ping, "", String::new(), false);
+            }
+            server::Packet::Disconnect => {
+                self.packet(Direction::Out, Packet::Disconnect, "", String::new(), false);
+            }
+            server::Packet::PubAck(_) => {}
+        }
+    }
+
+    /// Adds an entry to the MQTT log for each packet that the bytes from the
+    /// broker complete on `wire`.
+    pub fn received(&mut self, wire: &mut Wire, bytes: &[u8]) {
+        let Some(framer) = &mut wire.received else {
+            return;
+        };
+        framer.push(bytes.to_vec());
+        let mut stop = false;
+        loop {
+            match framer.next_packet() {
+                Ok(Some(Frame::Packet { first, body })) => {
+                    let Ok(packet) = codec::decode(first, body) else {
+                        stop = true;
+                        break;
+                    };
+                    self.received_packet(first, packet);
+                }
+                Ok(Some(Frame::Oversize { length, .. })) => {
+                    self.messages += 1;
+                    self.packet(
+                        Direction::In,
+                        Packet::Publish,
+                        "",
+                        format!("skipped: {length} bytes"),
+                        false,
+                    );
+                }
+                Ok(None) => break,
+                Err(codec::Malformed) => {
+                    stop = true;
+                    break;
+                }
+            }
+        }
+        if stop {
+            wire.stop_received();
+        }
+    }
+
+    /// Adds an entry to the MQTT log for a packet from the broker. `first`
+    /// is the first byte of the fixed header.
+    fn received_packet(&mut self, first: u8, packet: Inbound<'_>) {
+        match packet {
+            Inbound::ConnAck { code, .. } => {
+                let result = if code == 0 {
+                    "accepted".to_string()
+                } else {
+                    format!("refused: code {code}")
+                };
+                self.packet(Direction::In, Packet::ConnAck, "", result, false);
+            }
+            Inbound::Publish { topic, payload, .. } => {
+                self.messages += 1;
+                self.packet(
+                    Direction::In,
+                    Packet::Publish,
+                    topic,
+                    truncate(payload),
+                    first & RETAIN != 0,
+                );
+            }
+            Inbound::SubAck { codes, .. } => {
+                let refused = codes.iter().fold(0, |count, code| {
+                    count + usize::from(*code == codec::SUBACK_FAILURE)
+                });
+                let result = format!("{} topics, {refused} refused", codes.len());
+                self.packet(Direction::In, Packet::SubAck, "", result, false);
+            }
+            Inbound::PingResp => {
+                self.packet(Direction::In, Packet::Ping, "", String::new(), false);
+            }
+            Inbound::PubAck { .. } => {}
+        }
+    }
+}
+
+/// The retain flag in the first byte of a PUBLISH packet.
+const RETAIN: u8 = 0x01;
+
+/// Finds the MQTT packets in the bytes of one stream, in each direction, for
+/// the MQTT log.
+///
+/// If the bytes in a direction are not valid MQTT, the wire does not read
+/// that direction again. The core ends the session in that case.
+#[derive(Debug)]
+pub struct Wire {
+    /// The host and the port of the stream, for the CONNECT entry.
+    target: String,
+    sent: Option<Framer>,
+    received: Option<Framer>,
+}
+
+impl Wire {
+    /// Makes a wire for a stream to `target`, for example `broker:1883`.
+    #[must_use]
+    pub const fn new(target: String) -> Self {
+        Self {
+            target,
+            sent: Some(Framer::new(MAX_PACKET)),
+            received: Some(Framer::new(MAX_PACKET)),
+        }
+    }
+
+    fn stop_sent(&mut self) {
+        eprintln!("inspector: the bytes to the broker are not valid MQTT");
+        self.sent = None;
+    }
+
+    fn stop_received(&mut self) {
+        eprintln!("inspector: the bytes from the broker are not valid MQTT");
+        self.received = None;
     }
 }
 
@@ -296,9 +484,13 @@ impl Inspector {
 mod tests {
     use chrono::Local;
 
+    use shared::mqtt::{
+        Connect, Credentials, LastWill, Qos,
+        codec::{self, Flags, server},
+    };
+
     use super::{
-        Delivery, Direction, EffectEntry, Inspector, Log, MqttEntry, PAYLOAD_LIMIT, Packet,
-        truncate,
+        Direction, EffectEntry, Inspector, Log, MqttEntry, PAYLOAD_LIMIT, Packet, Wire, truncate,
     };
 
     fn effect(name: &'static str, request: &str) -> EffectEntry {
@@ -319,7 +511,6 @@ mod tests {
             topics: Vec::new(),
             payload: "on".into(),
             retained: true,
-            delivery: Delivery::Received,
         }
     }
 
@@ -345,7 +536,7 @@ mod tests {
     #[test]
     fn the_effect_filter_ignores_case_and_looks_at_all_the_text() {
         let mut log = Log::new(10);
-        log.push(effect("MqttPublish", "dashboard/sim/cmd"));
+        log.push(effect("StreamClose", "dashboard/sim/cmd"));
         log.push(effect("Render", ""));
         log.push(effect("WifiOn", ""));
         let names = |filter| {
@@ -353,10 +544,10 @@ mod tests {
                 .map(|entry| entry.effect)
                 .collect::<Vec<_>>()
         };
-        assert_eq!(names(""), ["WifiOn", "Render", "MqttPublish"]);
+        assert_eq!(names(""), ["WifiOn", "Render", "StreamClose"]);
         assert_eq!(names("  RENDER "), ["Render"]);
-        assert_eq!(names("cmd"), ["MqttPublish"]);
-        assert_eq!(names("SENT"), ["WifiOn", "Render", "MqttPublish"]);
+        assert_eq!(names("cmd"), ["StreamClose"]);
+        assert_eq!(names("SENT"), ["WifiOn", "Render", "StreamClose"]);
         assert_eq!(names("nothing"), Vec::<&str>::new());
     }
 
@@ -405,15 +596,15 @@ mod tests {
     fn routine_effects_can_be_hidden() {
         let mut log = Log::new(10);
         log.push(effect("WifiOn", ""));
-        log.push(effect("MqttPublish", "dashboard/sim/cmd"));
+        log.push(effect("StreamClose", "dashboard/sim/cmd"));
         log.push(effect("Render", ""));
         let names = |hide| {
             log.shown("", hide)
                 .map(|entry| entry.effect)
                 .collect::<Vec<_>>()
         };
-        assert_eq!(names(true), ["MqttPublish", "WifiOn"]);
-        assert_eq!(names(false), ["Render", "MqttPublish", "WifiOn"]);
+        assert_eq!(names(true), ["StreamClose", "WifiOn"]);
+        assert_eq!(names(false), ["Render", "StreamClose", "WifiOn"]);
         assert_eq!(
             log.shown("render", false).count(),
             1,
@@ -428,12 +619,135 @@ mod tests {
             "homeassistant/statestream/light/kitchen/state".to_string(),
             "homeassistant/statestream/light/hall/state".to_string(),
         ];
-        inspector.subscribe(&topics, Delivery::Sent);
+        inspector.subscribe(topics.clone());
         assert_eq!(inspector.mqtt.len(), 1);
         let entry = inspector.mqtt.iter().next().unwrap();
         assert_eq!(entry.topic, "2 topics");
         assert_eq!(entry.topics, topics);
         assert_eq!(inspector.mqtt.filtered("hall").count(), 1);
         assert_eq!(inspector.mqtt.filtered("garage").count(), 0);
+    }
+
+    /// Returns the rows of the MQTT log, from the oldest, as text.
+    fn rows(inspector: &Inspector) -> Vec<String> {
+        let mut rows: Vec<String> = inspector
+            .mqtt
+            .iter()
+            .map(|entry| {
+                format!(
+                    "{:?} {:?} {} {}{}",
+                    entry.direction,
+                    entry.packet,
+                    entry.topic,
+                    entry.payload,
+                    if entry.retained { " retained" } else { "" }
+                )
+            })
+            .collect();
+        rows.reverse();
+        rows
+    }
+
+    #[test]
+    fn the_wire_shows_the_packets_out_with_no_credentials() {
+        let mut bytes = Vec::new();
+        let connect = Connect {
+            host: "broker".into(),
+            port: 1883,
+            client_id: "dashboard-sim".into(),
+            credentials: Some(Credentials {
+                username: "dashboard".into(),
+                password: "secret-password".into(),
+            }),
+            keep_alive_secs: 60,
+            last_will: LastWill {
+                topic: "dashboard/sim/status".into(),
+                payload: b"offline".to_vec(),
+                retain: true,
+            },
+        };
+        codec::connect(&mut bytes, &connect).unwrap();
+        let flags = Flags {
+            qos: Qos::AtLeastOnce,
+            retain: true,
+        };
+        codec::publish(
+            &mut bytes,
+            "dashboard/sim/status",
+            b"online",
+            flags,
+            Some(1),
+        )
+        .unwrap();
+        codec::subscribe(&mut bytes, 2, &["a/state", "b/state"]).unwrap();
+        codec::pingreq(&mut bytes);
+        codec::disconnect(&mut bytes);
+
+        let mut inspector = Inspector::default();
+        let mut wire = Wire::new("broker:1883".into());
+        // The bytes arrive in two chunks, and the first chunk ends in the
+        // middle of a packet.
+        let (first, second) = bytes.split_at(5);
+        inspector.sent(&mut wire, first);
+        assert_eq!(inspector.mqtt.len(), 0);
+        inspector.sent(&mut wire, second);
+        assert_eq!(
+            rows(&inspector),
+            [
+                "Out Connect  broker:1883 as dashboard-sim",
+                "Out Publish dashboard/sim/status online retained",
+                "Out Subscribe 2 topics ",
+                "Out Ping  ",
+                "Out Disconnect  ",
+            ]
+        );
+        let text = format!("{:?}", inspector.mqtt);
+        assert!(!text.contains("secret-password"));
+        assert!(!text.contains("dashboard\""), "the user name is not shown");
+    }
+
+    #[test]
+    fn the_wire_shows_the_packets_in() {
+        let mut bytes = Vec::new();
+        server::connack(&mut bytes, false, 0);
+        server::suback(&mut bytes, 1, &[0, codec::SUBACK_FAILURE]);
+        let retained = Flags {
+            qos: Qos::AtMostOnce,
+            retain: true,
+        };
+        codec::publish(&mut bytes, "light/kitchen/state", b"on", retained, None).unwrap();
+        server::pingresp(&mut bytes);
+
+        let mut inspector = Inspector::default();
+        let mut wire = Wire::new("broker:1883".into());
+        inspector.received(&mut wire, &bytes);
+        assert_eq!(
+            rows(&inspector),
+            [
+                "In ConnAck  accepted",
+                "In SubAck  2 topics, 1 refused",
+                "In Publish light/kitchen/state on retained",
+                "In Ping  ",
+            ]
+        );
+        assert_eq!(inspector.messages, 1);
+    }
+
+    #[test]
+    fn the_wire_stops_a_direction_that_is_not_mqtt() {
+        let mut inspector = Inspector::default();
+        let mut wire = Wire::new("broker:1883".into());
+        // A remaining length of more than four bytes is not valid.
+        inspector.received(&mut wire, &[0x30, 0xFF, 0xFF, 0xFF, 0xFF, 0x01]);
+        let mut bytes = Vec::new();
+        server::pingresp(&mut bytes);
+        inspector.received(&mut wire, &bytes);
+        assert_eq!(inspector.mqtt.len(), 0);
+
+        // The other direction continues.
+        let mut bytes = Vec::new();
+        codec::pingreq(&mut bytes);
+        inspector.sent(&mut wire, &bytes);
+        assert_eq!(rows(&inspector), ["Out Ping  "]);
     }
 }

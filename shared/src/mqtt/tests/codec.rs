@@ -2,9 +2,9 @@
 
 use alloc::{vec, vec::Vec};
 
-use crate::{
-    capabilities::mqtt::{Connect, Qos},
-    mqtt::codec::{
+use crate::mqtt::{
+    Connect, Qos,
+    codec::{
         self, Flags, Inbound, MAX_REMAINING_LENGTH, Malformed, TooLong, decode, decode_length,
         encode_length,
         server::{self, Packet},
@@ -93,7 +93,7 @@ fn short_connect(credentials: bool, retain: bool) -> Connect {
     connect.last_will.topic = "w".into();
     connect.last_will.payload = b"o".to_vec();
     connect.last_will.retain = retain;
-    connect.credentials = credentials.then(|| crate::capabilities::mqtt::Credentials {
+    connect.credentials = credentials.then(|| crate::mqtt::Credentials {
         username: "u".into(),
         password: "p".into(),
     });

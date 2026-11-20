@@ -6,8 +6,8 @@
 //! - [`features`] has the logic for rooms, the connection, power, the front
 //!   light, the refresh of the panel and the marks of taps that wait for
 //!   Home Assistant.
-//! - [`capabilities`] has the custom effects: MQTT, network, power and the
-//!   front light.
+//! - [`capabilities`] has the custom effects: a byte stream, network,
+//!   power and the front light.
 //! - [`mqtt`] is an MQTT 3.1.1 client with no I/O: a codec, a framer and the
 //!   state machine of a connection.
 //! - [`view`] makes the view model, which has all the text that the `ui`
@@ -20,6 +20,8 @@
 //!   the view shows.
 //! - `fixtures` (with the `fixtures` feature) is a shell with fixed answers,
 //!   for tests and pictures.
+//! - `fake` (with the `fixtures` feature) is a fake MQTT broker that reads
+//!   and writes bytes, with a fake Home Assistant behind it.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 // The `Facet` derive generates `unsafe` code, which this lint does not expect.
@@ -30,6 +32,8 @@ extern crate alloc;
 pub mod app;
 pub mod capabilities;
 pub mod entities;
+#[cfg(any(test, feature = "fixtures"))]
+pub mod fake;
 pub mod features;
 #[cfg(feature = "fixtures")]
 pub mod fixtures;

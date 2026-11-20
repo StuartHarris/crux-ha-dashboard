@@ -9,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use shared::{PowerSource, Settings, capabilities::mqtt::Credentials};
+use shared::{PowerSource, Settings, mqtt::Credentials};
 
 /// The help text.
 pub const USAGE: &str = "\

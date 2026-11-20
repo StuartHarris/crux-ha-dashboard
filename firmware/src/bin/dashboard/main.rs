@@ -10,13 +10,15 @@
 //! | `timers` | `StartTimer`, `CancelTimer` | `Signal::Timer` |
 //! | `display` | draws the latest view model, reads the touch controller, the charger and the fuel gauge, sets the front light, and runs the `Sleep` job | `Signal::Tap`, `Signal::Event`, `Signal::Woke`, `Signal::Light` |
 //! | `wifi` | `WifiOn`, `WifiOff`, the radio on and off, and a change to a better access point after `WifiQuiet` | `Signal::Wifi`, `Signal::RadioOff` |
-//! | `mqtt` | the MQTT operations, one connection at a time | `Signal::Mqtt`, `Signal::Subscribed` |
+//! | `stream` | the TCP stream to the broker, one at a time: `Open`, `Write`, `Close` | `Signal::Stream`, `Signal::Written` |
 //! | `net` | runs the network stack | |
 //!
+//! The core runs the MQTT session, and the stream task moves only bytes.
+//!
 //! After a change of access point, the Wi-Fi task sets [`LINK_CHANGED`]. The
-//! MQTT task then closes its connection, and the core connects again. The two
-//! tasks share [`HEALTH`], so the Wi-Fi task joins again after an MQTT session
-//! failed.
+//! stream task then closes its stream, and the core connects again. The core
+//! task, the stream task and the Wi-Fi task share [`HEALTH`], so the Wi-Fi
+//! task joins again after an MQTT session failed.
 
 #![no_std]
 #![no_main]
@@ -26,9 +28,8 @@ extern crate alloc;
 
 mod core_task;
 mod display;
-mod mqtt;
+mod stream;
 mod timers;
-mod transport;
 mod wifi;
 
 use core::cell::RefCell;
@@ -41,7 +42,7 @@ use embassy_sync::{
 };
 use esp_backtrace as _;
 use logic::{
-    shell::{MqttOp, Signal},
+    shell::{Signal, StreamOp},
     sleep::Plan,
     wifi::{LinkHealth, WifiRequest},
 };
@@ -68,17 +69,19 @@ pub static SIGNALS: Lane<Signal> = Lane::new();
 pub static RENDER: Latest<CriticalSectionRawMutex, alloc::boxed::Box<ViewModel>> = Latest::new();
 /// The work of the timer task.
 pub static TIMERS: Lane<timers::Request> = Lane::new();
-/// The work of the MQTT task, with the id of the connection.
-pub static MQTT: Lane<(u32, MqttOp)> = Lane::new();
+/// The work of the stream task, with the connection id of the core.
+pub static STREAM: Lane<(u32, StreamOp)> = Lane::new();
 /// The work of the Wi-Fi task.
 pub static WIFI: Lane<WifiRequest> = Lane::new();
-/// Set by the Wi-Fi task after it changed to another access point. The MQTT
-/// task closes the open connection, because its TCP connection can be dead.
+/// Set by the Wi-Fi task after it changed to another access point. The stream
+/// task closes the open stream, because its TCP connection can be dead.
 pub static LINK_CHANGED: Latest<CriticalSectionRawMutex, ()> = Latest::new();
 /// The health of the link (`logic::wifi::LinkHealth`).
 ///
-/// The MQTT task records each session that failed and each CONNACK. The
-/// Wi-Fi task reads it at each `WifiOn`, and records each address from DHCP.
+/// The core task records each `Close` of a session that failed. The stream
+/// task records each stream that failed, and the first bytes on each stream.
+/// The Wi-Fi task reads it at each `WifiOn`, and records each address from
+/// DHCP.
 pub static HEALTH: Mutex<CriticalSectionRawMutex, RefCell<LinkHealth>> =
     Mutex::new(RefCell::new(LinkHealth::new()));
 /// The `FrontLight` jobs for the display task, with their tokens.
@@ -88,7 +91,7 @@ pub static LIGHT: Lane<(u32, u8)> = Lane::new();
 pub static SLEEP: Latest<CriticalSectionRawMutex, Option<Plan>> = Latest::new();
 
 /// The number of sockets. `embassy_net::new` takes one socket for DNS, and
-/// one for DHCP while DHCP runs. The MQTT task has one TCP socket at a
+/// one for DHCP while DHCP runs. The stream task has one TCP socket at a
 /// time. That is 3 at most, and there is 1 spare.
 const SOCKETS: usize = 4;
 
@@ -147,7 +150,7 @@ async fn main(spawner: Spawner) -> ! {
 
     spawner.spawn(net_task(runner).expect("spawn the network task"));
     spawner.spawn(wifi::task(peripherals.WIFI, stack).expect("spawn the Wi-Fi task"));
-    spawner.spawn(mqtt::task(stack).expect("spawn the MQTT task"));
+    spawner.spawn(stream::task(stack).expect("spawn the stream task"));
     spawner.spawn(timers::task().expect("spawn the timer task"));
     // The display task drives the front light, because it must turn the
     // light off before each light sleep.

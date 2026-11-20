@@ -13,10 +13,10 @@ use super::{
     wire::{Chunks, Wire, client_packets, remaining_lengths},
 };
 use crate::{
-    capabilities::mqtt::{Message, Publish, Qos, SubscribeOutcome},
     entities::topics,
     mqtt::{
-        Action, End, Input, Limits, Refused, Session, TimerKind,
+        Action, End, Input, Limits, Message, Publish, Qos, Refused, Session, SubscribeOutcome,
+        TimerKind,
         codec::{self, Flags, server::Packet},
     },
     pages::PAGES,
@@ -676,7 +676,8 @@ fn broken_framing_ends_the_session_after_the_messages_before_it() {
     wire.run();
     wire.log.clear();
 
-    let mut bytes = wire.broker.publish(&topics[0], b"on", false);
+    wire.broker.publish(&topics[0], b"on", false);
+    let mut bytes = wire.broker.take();
     bytes.extend_from_slice(&[0x30, 0xFF, 0xFF, 0xFF, 0xFF, 0x01]);
     wire.deliver(&bytes);
     wire.run();
@@ -741,8 +742,9 @@ fn an_oversize_packet_is_skipped_and_the_session_stays_connected() {
     wire.run();
     wire.log.clear();
 
-    let mut bytes = wire.broker.publish("big", &[0; 500], false);
-    bytes.extend(wire.broker.publish("small", b"ok", false));
+    wire.broker.publish("big", &[0; 500], false);
+    wire.broker.publish("small", b"ok", false);
+    let bytes = wire.broker.take();
     wire.chunks = Chunks::Random(3, 100);
     wire.deliver(&bytes);
     wire.run();

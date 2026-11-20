@@ -29,9 +29,9 @@ pub enum WifiRequest {
     /// The link is quiet. Scan for a better access point, if a scan is due
     /// ([`ApCache::scan_due`]).
     Roam,
-    /// The core started to close the connection, for example for a sleep.
-    /// Stop a scan for a better access point. A change of access point that
-    /// started continues.
+    /// The core closes the stream after a clean end of the session, for
+    /// example for a sleep. Stop a scan for a better access point. A change
+    /// of access point that started continues.
     Hold,
 }
 
@@ -264,24 +264,27 @@ pub enum NoAddress {
     Restart,
 }
 
-/// The health of the link, which the MQTT task and the Wi-Fi task share.
+/// The health of the link, which the core task, the stream task and the
+/// Wi-Fi task share.
 ///
 /// The rules:
 ///
 /// - An MQTT session that ends with an error makes the link suspect
-///   ([`LinkHealth::session_failed`]). A session that a new connection
-///   replaced, a change of access point and a disconnect that the core asked
-///   for are not errors.
+///   ([`LinkHealth::session_failed`]). The core task records a `Close` with
+///   `clean: false` from the core. The stream task records a socket error, a
+///   reset from the broker, a write that stalls, and a stream that did not
+///   open. A stream that a new `Open` replaced, a change of access point, a
+///   FIN from the broker and a clean close are not errors.
 /// - While the link is suspect, a `WifiOn` with the driver connected leaves
 ///   and joins again ([`JoinStart::Rejoin`]), so the task does not keep a
 ///   link that is stuck.
 /// - While the link is suspect, each join that gets no address from DHCP
 ///   counts ([`LinkHealth::no_address`]). At [`RESTART_AFTER`], the task
 ///   restarts the chip.
-/// - A CONNACK proves that the link moves data in both directions. It clears
-///   the suspicion and the count ([`LinkHealth::traffic`]). A new address
-///   from DHCP also proves traffic, so it clears the count
-///   ([`LinkHealth::address`]).
+/// - The first bytes from the broker on a stream prove that the link moves
+///   data in both directions. They clear the suspicion and the count
+///   ([`LinkHealth::traffic`]). A new address from DHCP also proves traffic,
+///   so it clears the count ([`LinkHealth::address`]).
 /// - If the network stack kept its old address through the join, the address
 ///   proves nothing. It counts as a join with no address
 ///   ([`LinkHealth::stale_address`]), but the task keeps the address.
@@ -313,7 +316,7 @@ impl LinkHealth {
         self.suspect = true;
     }
 
-    /// Records a CONNACK from the broker.
+    /// Records the first bytes from the broker on a stream.
     pub const fn traffic(&mut self) {
         self.suspect = false;
         self.no_address = 0;
@@ -324,7 +327,8 @@ impl LinkHealth {
         self.no_address = 0;
     }
 
-    /// Returns `true` if an MQTT session failed after the last CONNACK.
+    /// Returns `true` if an MQTT session failed after the last proof of
+    /// traffic.
     #[must_use]
     pub const fn suspect(&self) -> bool {
         self.suspect
@@ -563,7 +567,8 @@ mod tests {
         assert_eq!(health.join_start(true), JoinStart::Rejoin);
         // After a leave, the driver is not connected.
         assert_eq!(health.join_start(false), JoinStart::Join);
-        // The rejoin got an address, but the link is suspect until a CONNACK.
+        // The rejoin got an address, but the link is suspect until the first
+        // bytes from the broker.
         health.address();
         assert_eq!(health.join_start(true), JoinStart::Rejoin);
         health.traffic();

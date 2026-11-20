@@ -16,9 +16,9 @@ embedded-graphics.workspace = true
 # The simulator uses the display of the simulator crate as the panel, for its
 # `diff` and its PNG output. It does not use SDL.
 embedded-graphics-simulator = { version = "0.8.0", default-features = false }
-# The MQTT client. The broker is on the LAN with no TLS, so TLS is off.
-rumqttc = { version = "0.25", default-features = false }
-tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros"] }
+# The core runs MQTT. The shell gives it a TCP stream to the broker, with no
+# TLS, because the broker is on the LAN.
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros", "net", "io-util"] }
 # The window. eframe runs egui on winit and draws with OpenGL (glow). It
 # loads X11 or Wayland at run time, so a build on Linux needs no system
 # packages.

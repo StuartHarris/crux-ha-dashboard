@@ -31,9 +31,10 @@ The Home Assistant `mqtt_statestream` integration publishes each entity on the
 For each change, the integration publishes `state`, then `last_updated`, then
 `last_changed`, then each attribute.
 
-- All messages are retained, with QoS 1. When the dashboard subscribes, the broker
-  sends the last state of each entity immediately. A wake on battery gets the full
-  state in one connection.
+- All messages are retained, with QoS 1. The dashboard subscribes at QoS 0, so the
+  broker delivers each message at QoS 0, and the dashboard sends no PUBACK. When the
+  dashboard subscribes, the broker sends the last state of each entity immediately. A
+  wake on battery gets the full state in one connection.
 - The integration publishes all attributes of each entity. For each entity, the
   dashboard subscribes to `state`, to `last_updated`, and only to the attributes that
   its tile shows:
@@ -108,22 +109,69 @@ the automation. Run `just ha-entities` for a bare list to compare with the Pi.
 The dashboard uses the client id `dashboard-<device_id>` and a keep-alive of 60
 seconds. `<device_id>` comes from `Settings::device_id`, for example `hall`.
 
+The core runs MQTT 3.1.1 itself (`shared/src/mqtt/`) over a byte stream
+(`shared/src/capabilities/stream.rs`). The shell only opens a TCP stream to the
+broker, writes the bytes that the core gives it, and closes the stream. The shell
+knows nothing of MQTT.
+
 ### The connect and the subscribe
 
-Each connect has a clean start, so the broker keeps no session for the dashboard.
-After each connect, the dashboard publishes the service calls that wait, then
-`online`, and then subscribes to all its exact topics. The broker sends the retained
-state of each topic with the subscribe.
+Each connect uses a clean session (the term of MQTT 3.1.1), so the broker keeps no
+session for the dashboard. After the CONNACK, the core sends one write that has these
+parts, in this order:
 
-The `Subscribe` request of the core ends when the broker acknowledged each topic
-filter. If the broker refuses a filter, or the connection closes first, the shell
-answers `Failed`. After a `Done` answer, the core sends `WifiQuiet`. The firmware can
-then scan for a better access point. A change of access point closes the MQTT
-connection, and the core connects again.
+1. The service calls that wait (the outbox).
+2. The `online` status.
+3. The SUBSCRIBE packets for all the topic filters.
 
-The firmware does not wait for the TCP ACK of the broker after each packet (refer to
-"MQTT transport" in `firmware/README.md`). Thus the 115 subscribe packets and the
-acknowledgements of the retained states do not each wait for a round trip.
+The session packs the filters into SUBSCRIBE packets of up to 1024 bytes. The 115
+filters need about 7 packets, 7.9 KiB in all. The broker sends the retained state of
+each topic after it accepts the filter.
+
+The `Subscribe` job of the session ends when the broker acknowledged each topic
+filter. If the broker refuses a filter, or the stream closes first, the job fails.
+After the job succeeds, the core sends `WifiQuiet`. The firmware can then scan for a
+better access point.
+
+### Find a dead link
+
+The core finds a link that stopped, and the shell has no part in it. The session has
+these timers:
+
+| Timer | Limit | What happens at the limit |
+| --- | --- | --- |
+| Ping | 45 s (three quarters of the keep-alive) | The session sends a PINGREQ packet. |
+| PINGRESP | 10 s after the ping | The session ends. |
+| Ack | 10 s | The session ends if a SUBACK or a PUBACK does not arrive. |
+| Send | 10 s | The session ends if the shell does not confirm a write. |
+| Silence | 120 s | The session ends if no bytes arrive. This timer is a backstop. |
+
+When the session ends with an error, the core closes the stream and connects again
+after a backoff and after the close of the stream.
+
+### Close the stream
+
+When the dashboard goes to sleep on battery, the core does these steps in order:
+
+1. The core publishes `asleep`.
+2. The core sends DISCONNECT.
+3. The shell closes the stream and sends a TCP FIN.
+4. The core reports that the dashboard is offline.
+
+The core waits for the close of the stream before it reports offline. Thus the
+broker has `asleep` and the DISCONNECT before the Wi-Fi turns off, and the last will
+does not replace `asleep` with `offline`.
+
+After a session ends, the core does not open a new stream until the shell closed the
+old stream. A new stream makes the shell abort the old stream, and an abort can make
+the broker lose the DISCONNECT. Thus a tap during the close for a sleep wakes the
+device, but the core connects only after the close.
+If the shell does not answer the `Close` request in 6 seconds (`CLOSE_TIMEOUT`), the
+core acts as if the answer arrived. Thus a shell cannot stop a reconnect or a sleep.
+
+A change of access point (a Wi-Fi roam) closes the stream with no DISCONNECT. The
+broker then publishes the last will. Home Assistant sees a short retained `offline`,
+and then `online` after the dashboard connects again.
 
 ### Commands
 
@@ -210,8 +258,8 @@ has no state, so its button shows the pattern for 2 seconds. Refer to
 | Payload | When |
 | --- | --- |
 | `online` | The dashboard publishes it after it connects. |
-| `asleep` | The dashboard publishes it before it disconnects to sleep on battery. |
-| `offline` | The broker publishes it as the last will if the connection stops without a disconnect. |
+| `asleep` | The dashboard publishes it before it sends DISCONNECT to sleep on battery. |
+| `offline` | The broker publishes it as the last will if the connection stops without a DISCONNECT. A change of access point does this. |
 
 ## Test from a shell
 

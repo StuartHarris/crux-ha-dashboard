@@ -29,9 +29,9 @@ pub fn init() -> Peripherals {
 /// stays free for the Wi-Fi driver and the scheduler, which ask for internal
 /// RAM explicitly.
 ///
-/// Do not add the internal region first. The core, the MQTT client and the
-/// strings then fill it, and the Wi-Fi driver cannot get receive buffers. The
-/// device can then send packets but cannot receive them.
+/// Do not add the internal region first. The core, the stream buffers and
+/// the strings then fill it, and the Wi-Fi driver cannot get receive
+/// buffers. The device can then send packets but cannot receive them.
 pub fn start(psram: PSRAM<'static>, timg0: TIMG0<'static>, interrupt: FROM_CPU_INTR0<'static>) {
     // The board has an ESP32-S3-WROOM-1-N16R8, which has octal PSRAM. The
     // automatic detection is not reliable, so the mode is fixed.
