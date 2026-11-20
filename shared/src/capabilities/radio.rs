@@ -36,11 +36,9 @@ use alloc::{format, string::String, vec::Vec};
 use core::fmt;
 
 use crux_core::{Command, Request, command::RequestBuilder, macros::Operation};
-use facet::Facet;
-use serde::{Deserialize, Serialize};
 
 /// An access point: its BSSID and its channel.
-#[derive(Facet, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AccessPoint {
     /// The BSSID (the MAC address) of the access point.
     pub bssid: [u8; 6],
@@ -70,7 +68,7 @@ pub fn signal(rssi: Option<i32>) -> String {
 }
 
 /// An access point that a scan found.
-#[derive(Facet, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Seen {
     /// The access point.
     pub access_point: AccessPoint,
@@ -79,8 +77,7 @@ pub struct Seen {
 }
 
 /// The access point that a [`Join`] goes to.
-#[derive(Facet, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Target {
     /// Join this access point on its channel, with no scan of all the
     /// channels.
@@ -100,7 +97,7 @@ pub enum Target {
 /// The shell gives up after 8 seconds for a `Cached` target and after 20
 /// seconds for `Strongest`. Each limit includes the leave before the join
 /// and the disconnect after a failure.
-#[derive(Operation, Facet, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Operation, Clone, Copy, Debug, PartialEq, Eq)]
 #[operation(request, output = Joined)]
 pub struct Join {
     /// The id of the request in the core.
@@ -112,8 +109,7 @@ pub struct Join {
 }
 
 /// The answer to a [`Join`] request.
-#[derive(Facet, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[repr(C)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Joined {
     /// The device is associated with an access point.
     Associated {
@@ -137,7 +133,7 @@ pub enum Joined {
 /// Waits for an IP address from DHCP.
 ///
 /// The shell gives up after 20 seconds.
-#[derive(Operation, Facet, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Operation, Clone, Copy, Debug, PartialEq, Eq)]
 #[operation(request, output = Lease)]
 pub struct Address {
     /// The id of the request in the core.
@@ -145,8 +141,7 @@ pub struct Address {
 }
 
 /// The answer to an [`Address`] request.
-#[derive(Facet, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Lease {
     /// The device has an IP address.
     Leased,
@@ -161,7 +156,7 @@ pub enum Lease {
 /// The shell disconnects (time limit 1 second), and then waits until the IP
 /// address is gone (time limit 2 seconds). If the device is not associated,
 /// the shell answers at once.
-#[derive(Operation, Facet, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Operation, Clone, Copy, Debug, PartialEq, Eq)]
 #[operation(request, output = ())]
 pub struct Leave {
     /// The id of the request in the core.
@@ -172,7 +167,7 @@ pub struct Leave {
 ///
 /// The link can drop for a short time during the scan. The shell gives up
 /// after 10 seconds.
-#[derive(Operation, Facet, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Operation, Clone, Copy, Debug, PartialEq, Eq)]
 #[operation(request, output = Scanned)]
 pub struct Scan {
     /// The id of the request in the core.
@@ -180,8 +175,7 @@ pub struct Scan {
 }
 
 /// The answer to a [`Scan`] request.
-#[derive(Facet, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[repr(C)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Scanned {
     /// The scan is complete.
     Found {
@@ -202,7 +196,7 @@ pub enum Scanned {
 /// The shell stops the scan at once. The `Scan` request gets `Stopped`
 /// first, and then the shell answers this request. If no scan runs, the
 /// shell answers at once.
-#[derive(Operation, Facet, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Operation, Clone, Copy, Debug, PartialEq, Eq)]
 #[operation(request, output = ())]
 pub struct StopScan {
     /// The id of the request in the core.
@@ -214,7 +208,7 @@ pub struct StopScan {
 /// The shell stops the request that runs, leaves the access point, waits
 /// 100 ms for the last frames to go, and then turns the radio off. If the
 /// radio is already off, the shell answers at once.
-#[derive(Operation, Facet, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Operation, Clone, Copy, Debug, PartialEq, Eq)]
 #[operation(request, output = ())]
 pub struct Off {
     /// The id of the request in the core.
@@ -227,7 +221,7 @@ pub struct Off {
 /// recover. The shell writes `reason` to its log, waits 200 ms for the log
 /// to go, and restarts the chip. A shell that cannot restart the chip
 /// starts a new core.
-#[derive(Operation, Facet, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Operation, Clone, Debug, PartialEq, Eq)]
 #[operation(notify)]
 pub struct Restart {
     /// Why the core restarts the chip, for the log of the shell.
@@ -338,10 +332,8 @@ mod tests {
         vec,
         vec::Vec,
     };
-    use core::fmt::Debug;
 
     use crux_core::{Command, Request};
-    use serde::{Serialize, de::DeserializeOwned};
 
     use super::{
         AccessPoint, Address, Join, Joined, Lease, Leave, Off, Radio, Restart, Scan, Scanned, Seen,
@@ -394,13 +386,6 @@ mod tests {
         let mut effects: Vec<Effect> = command.effects().collect();
         assert_eq!(effects.len(), 1, "one effect");
         effects.remove(0)
-    }
-
-    /// Checks that `value` is the same after a JSON round trip.
-    fn round_trip<T: Serialize + DeserializeOwned + Debug + PartialEq>(value: &T) {
-        let json = serde_json::to_string(value).expect("serialize");
-        let back: T = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(&back, value, "{json}");
     }
 
     #[test]
@@ -548,47 +533,5 @@ mod tests {
         assert_eq!(KITCHEN.to_string(), "02:66:77:88:99:aa on channel 11");
         assert_eq!(signal(Some(-62)), "-62 dBm");
         assert_eq!(signal(None), "no signal");
-    }
-
-    #[test]
-    fn operations_and_answers_survive_a_round_trip() {
-        round_trip(&Join {
-            radio: 1,
-            target: Target::Cached(HALL),
-            keep: false,
-        });
-        round_trip(&Join {
-            radio: 2,
-            target: Target::Strongest,
-            keep: true,
-        });
-        round_trip(&Address { radio: 3 });
-        round_trip(&Leave { radio: 4 });
-        round_trip(&Scan { radio: 5 });
-        round_trip(&StopScan { radio: 6 });
-        round_trip(&Off { radio: 7 });
-        round_trip(&Restart {
-            reason: "stale lease".into(),
-        });
-        round_trip(&Joined::Associated {
-            access_point: KITCHEN,
-            rssi: None,
-            kept: true,
-            had_address: false,
-        });
-        round_trip(&Joined::Failed("no access point".into()));
-        round_trip(&Joined::Stopped);
-        round_trip(&Lease::Leased);
-        round_trip(&Lease::NoLease);
-        round_trip(&Lease::Stopped);
-        round_trip(&Scanned::Found {
-            seen: vec![Seen {
-                access_point: KITCHEN,
-                rssi: -49,
-            }],
-            rssi: Some(-63),
-        });
-        round_trip(&Scanned::Failed("driver busy".into()));
-        round_trip(&Scanned::Stopped);
     }
 }

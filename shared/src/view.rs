@@ -8,8 +8,6 @@
 use alloc::{format, string::String, vec::Vec};
 
 use chrono::{DateTime, Timelike, Utc};
-use facet::Facet;
-use serde::{Deserialize, Serialize};
 
 use crate::{
     Model,
@@ -25,7 +23,7 @@ use crate::{
 };
 
 /// The data that a shell needs to draw the screen.
-#[derive(Facet, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ViewModel {
     /// The path of the current route, for example `/room/kitchen`. The shell
     /// keeps it during a deep sleep and gives it back in `Start`.
@@ -134,8 +132,7 @@ impl ViewModel {
 }
 
 /// The content of a page.
-#[derive(Facet, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[repr(C)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PageView {
     /// The home page: the index of the rooms.
     Index(IndexView),
@@ -144,7 +141,7 @@ pub enum PageView {
 }
 
 /// What a renderer needs to draw the index page.
-#[derive(Facet, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IndexView {
     /// The weather, from the first weather tile of the home page, or `None`
     /// if the home page has no weather tile. The text is the temperature and
@@ -161,7 +158,7 @@ pub struct IndexView {
 
 /// What a renderer needs to draw the button of one room on the index page.
 /// Refer to [`summarise`](crate::summary::summarise).
-#[derive(Facet, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RoomSummary {
     /// The name of the room.
     pub title: String,
@@ -180,8 +177,7 @@ pub struct RoomSummary {
 }
 
 /// The state of one light or switch in the summary of a room.
-#[derive(Facet, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LightState {
     /// The light or switch is on.
     On,
@@ -193,7 +189,7 @@ pub enum LightState {
 }
 
 /// What a renderer needs to draw the page of one room.
-#[derive(Facet, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RoomView {
     /// The tiles on the page, in reading order.
     pub tiles: Vec<TileView>,
@@ -202,7 +198,7 @@ pub struct RoomView {
 }
 
 /// What a renderer needs to draw one tile.
-#[derive(Facet, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TileView {
     /// The text on the tile.
     pub label: String,
@@ -236,7 +232,7 @@ pub struct TileView {
 }
 
 /// What a renderer needs to draw one scene button.
-#[derive(Facet, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SceneView {
     /// The text on the button.
     pub label: String,
@@ -249,8 +245,7 @@ pub struct SceneView {
 }
 
 /// The connection to Home Assistant, as the dashboard shows it.
-#[derive(Facet, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Connection {
     /// The dashboard has no connection and does not try to connect.
     Offline,
@@ -422,8 +417,7 @@ fn status(connection: Connection, asleep: bool, unsent: usize, read_only: bool) 
 }
 
 /// How a tile shows its entity.
-#[derive(Facet, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TileState {
     /// The light or switch is on.
     On,

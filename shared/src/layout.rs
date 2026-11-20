@@ -3,9 +3,6 @@
 //! The layout data is in [`crate::pages`]. The layout is `const` data, so it
 //! needs no allocator and no parser on the device.
 
-use facet::Facet;
-use serde::{Deserialize, Serialize};
-
 use crate::{entities::EntityState, route::Route, temperature};
 
 /// The largest number of tiles on one page. The `ui` grid has this many cells.
@@ -76,8 +73,7 @@ pub struct Scene {
 }
 
 /// The kind of entity that a tile shows.
-#[derive(Facet, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TileKind {
     /// A light. A tap toggles it. The tile shows the brightness.
     Light,

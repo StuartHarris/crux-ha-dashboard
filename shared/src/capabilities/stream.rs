@@ -36,15 +36,13 @@ use crux_core::{
     command::{RequestBuilder, StreamBuilder},
     macros::Operation,
 };
-use facet::Facet;
-use serde::{Deserialize, Serialize};
 
 /// Opens a TCP stream to a host.
 ///
 /// The shell answers with a stream of [`StreamItem`] values. The last item is
 /// always `Closed`, also when the stream does not open. The shell does not
 /// open the stream again by itself. The core decides when to try again.
-#[derive(Operation, Facet, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Operation, Clone, Debug, PartialEq, Eq)]
 #[operation(stream, output = StreamItem)]
 pub struct Open {
     /// The id of the connection in the core.
@@ -58,8 +56,7 @@ pub struct Open {
 /// An item in the stream of an [`Open`] request.
 ///
 /// The `Debug` output of `Received` shows only the number of bytes.
-#[derive(Facet, Serialize, Deserialize, Clone, PartialEq, Eq)]
-#[repr(C)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum StreamItem {
     /// The stream is open.
     Opened,
@@ -128,7 +125,7 @@ impl fmt::Debug for StreamItem {
 /// The shell sends the bytes in the order of the `Write` requests. The
 /// `Debug` output shows only the number of bytes, because the CONNECT packet
 /// holds the password.
-#[derive(Operation, Facet, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[derive(Operation, Clone, PartialEq, Eq)]
 #[operation(request, output = Written)]
 pub struct Write {
     /// The id of the connection in the core.
@@ -147,8 +144,7 @@ impl fmt::Debug for Write {
 }
 
 /// The answer to a [`Write`] request.
-#[derive(Facet, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[repr(C)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Written {
     /// The shell sent all the bytes.
     Sent,
@@ -161,7 +157,7 @@ pub enum Written {
 /// Closes the stream of a connection.
 ///
 /// The stream ends with `Closed`, and then the shell answers this request.
-#[derive(Operation, Facet, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Operation, Clone, Debug, PartialEq, Eq)]
 #[operation(request, output = ())]
 pub struct Close {
     /// The id of the connection in the core.

@@ -25,8 +25,6 @@
 //!   radio.
 
 #![cfg_attr(not(feature = "std"), no_std)]
-// The `Facet` derive generates `unsafe` code, which this lint does not expect.
-#![allow(clippy::unsafe_derive_deserialize)]
 
 extern crate alloc;
 

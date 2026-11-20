@@ -4,14 +4,11 @@
 use alloc::{string::String, vec::Vec};
 use core::fmt;
 
-use facet::Facet;
-use serde::{Deserialize, Serialize};
-
 /// The user name and password for the broker.
 ///
 /// The `Debug` output does not show the password, so a log of a [`Connect`]
 /// value or of the settings is safe.
-#[derive(Facet, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Credentials {
     /// The user name.
     pub username: String,

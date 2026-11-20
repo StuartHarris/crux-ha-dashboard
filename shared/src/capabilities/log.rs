@@ -13,12 +13,9 @@ use alloc::string::String;
 use core::fmt;
 
 use crux_core::{Command, Request, macros::Operation};
-use facet::Facet;
-use serde::{Deserialize, Serialize};
 
 /// How important a line of the log is.
-#[derive(Facet, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Level {
     /// A decision of the core.
     Info,
@@ -36,8 +33,7 @@ impl fmt::Display for Level {
 }
 
 /// The part of the core that writes a line of the log.
-#[derive(Facet, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Area {
     /// The Wi-Fi policy. Refer to [`crate::features::wifi`].
     Wifi,
@@ -58,7 +54,7 @@ impl fmt::Display for Area {
 ///
 /// The shell writes the line as `{area}: {message}` at `level`. A
 /// notification has no answer.
-#[derive(Operation, Facet, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Operation, Clone, Debug, PartialEq, Eq)]
 #[operation(notify)]
 pub struct Log {
     /// How important the line is.
@@ -163,21 +159,5 @@ mod tests {
         assert_eq!(Area::Mqtt.to_string(), "mqtt");
         assert_eq!(Level::Info.to_string(), "info");
         assert_eq!(Level::Warn.to_string(), "warn");
-    }
-
-    #[test]
-    fn a_line_survives_a_round_trip() {
-        for level in [Level::Info, Level::Warn] {
-            for area in [Area::Wifi, Area::Mqtt] {
-                let log = Log {
-                    level,
-                    area,
-                    message: "connect again in 2 s".into(),
-                };
-                let json = serde_json::to_string(&log).expect("serialize");
-                let back: Log = serde_json::from_str(&json).expect("deserialize");
-                assert_eq!(back, log, "{json}");
-            }
-        }
     }
 }

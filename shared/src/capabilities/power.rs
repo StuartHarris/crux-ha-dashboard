@@ -3,14 +3,11 @@
 use alloc::vec::Vec;
 
 use crux_core::{Command, Request, command::RequestBuilder, macros::Operation};
-use facet::Facet;
 
 use crate::Control;
-use serde::{Deserialize, Serialize};
 
 /// Where the device gets its power.
-#[derive(Facet, Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PowerSource {
     /// The device is on its stand, which charges it.
     #[default]
@@ -20,8 +17,7 @@ pub enum PowerSource {
 }
 
 /// A thing that wakes the device from sleep.
-#[derive(Facet, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[repr(C)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WakeSource {
     /// A touch on the panel.
     Touch,
@@ -33,8 +29,7 @@ pub enum WakeSource {
 }
 
 /// What ended a sleep. The answer to [`Sleep`].
-#[derive(Facet, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Wake {
     /// A touch on the panel, on this control or (`None`) on no control. The
     /// shell gets the control from `ui::hit_test`, as for
@@ -65,7 +60,7 @@ pub enum Wake {
 ///
 /// After a deep sleep, the device starts again and the shell sends
 /// [`Event::Start`](crate::Event::Start). Then no answer comes.
-#[derive(Operation, Facet, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Operation, Clone, Debug, PartialEq, Eq)]
 #[operation(request, output = Wake)]
 pub struct Sleep {
     /// The things that wake the device.

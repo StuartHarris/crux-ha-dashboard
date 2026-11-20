@@ -29,8 +29,6 @@ use alloc::{
 };
 use core::{fmt, mem, time::Duration};
 
-use facet::Facet;
-
 use super::types::{Connect, Message, Publish, Qos, SubscribeOutcome};
 use super::{
     codec::{self, Flags, Inbound, TooLong},
@@ -82,8 +80,7 @@ impl Default for Limits {
 }
 
 /// The kinds of timer of a session.
-#[derive(Facet, Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TimerKind {
     /// The stream must open before this timer expires.
     Open,
@@ -135,9 +132,7 @@ impl TimerKind {
 
 /// A timer that the session started. The caller gives it back as
 /// [`Input::Timer`] when the time is over.
-///
-/// The core keeps it in an event, so it derives `Facet`.
-#[derive(Facet, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Timer {
     /// The kind of the timer.
     pub kind: TimerKind,

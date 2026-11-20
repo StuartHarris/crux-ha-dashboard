@@ -6,8 +6,6 @@ use alloc::{format, string::String};
 use chrono::{DateTime, Utc};
 use crux_core::{App, Command, macros::effect, render::RenderOperation};
 use crux_time::operation as time;
-use facet::Facet;
-use serde::{Deserialize, Serialize};
 
 use crate::{
     capabilities::{
@@ -31,7 +29,7 @@ use crate::{
 };
 
 /// The broker and device settings, which the shell supplies.
-#[derive(Facet, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settings {
     /// The id of this dashboard in MQTT topics, for example `hall`.
     pub device_id: String,
@@ -68,7 +66,7 @@ impl Settings {
 }
 
 /// The facts that the shell sends when it starts the core.
-#[derive(Facet, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Start {
     /// The broker and device settings.
     pub settings: Settings,
@@ -90,8 +88,7 @@ pub struct Start {
 /// The public variants are facts from the shell and intents from the user.
 /// The skipped variants are internal. The core makes them from the answers to
 /// its effects.
-#[derive(Facet, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[repr(C)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
     /// The shell started. On battery, the device also starts after a deep
     /// sleep.
@@ -136,8 +133,6 @@ pub enum Event {
     SleepNow,
 
     /// The answer to the `Join` request with this id.
-    #[serde(skip)]
-    #[facet(skip)]
     Joined {
         /// The id of the radio request. The core ignores the answer to an
         /// older request.
@@ -146,8 +141,6 @@ pub enum Event {
         joined: Joined,
     },
     /// The answer to the `Address` request with this id.
-    #[serde(skip)]
-    #[facet(skip)]
     Leased {
         /// The id of the radio request. The core ignores the answer to an
         /// older request.
@@ -156,12 +149,8 @@ pub enum Event {
         lease: Lease,
     },
     /// The answer to the `Leave` request with this id.
-    #[serde(skip)]
-    #[facet(skip)]
     Left(u32),
     /// The answer to the `Scan` request with this id.
-    #[serde(skip)]
-    #[facet(skip)]
     Scanned {
         /// The id of the radio request. The core ignores the answer to an
         /// older request.
@@ -170,17 +159,11 @@ pub enum Event {
         scanned: Scanned,
     },
     /// The answer to the `StopScan` request with this id.
-    #[serde(skip)]
-    #[facet(skip)]
     ScanStopped(u32),
     /// The time limit of the radio request with this id expired. Refer to
     /// [`wifi`].
-    #[serde(skip)]
-    #[facet(skip)]
     RadioTimeout(u32),
     /// An item from the byte stream of the MQTT connection with this id.
-    #[serde(skip)]
-    #[facet(skip)]
     Stream {
         /// The id of the connection. The core ignores an item from an older
         /// connection.
@@ -189,8 +172,6 @@ pub enum Event {
         item: StreamItem,
     },
     /// The answer to a `Write` request on the MQTT connection with this id.
-    #[serde(skip)]
-    #[facet(skip)]
     Written {
         /// The id of the connection. The core ignores the answer for an
         /// older connection.
@@ -200,8 +181,6 @@ pub enum Event {
     },
     /// The answer to the `Close` request for the MQTT connection with this
     /// id.
-    #[serde(skip)]
-    #[facet(skip)]
     StreamClosed {
         /// The id of the connection.
         connection: u32,
@@ -209,15 +188,11 @@ pub enum Event {
     /// The wait for the answer to the `Close` request for the MQTT
     /// connection with this id is over. Refer to
     /// [`connection::CLOSE_TIMEOUT`].
-    #[serde(skip)]
-    #[facet(skip)]
     CloseTimeout {
         /// The id of the connection.
         connection: u32,
     },
     /// A timer of the MQTT session of the connection with this id expired.
-    #[serde(skip)]
-    #[facet(skip)]
     SessionTimer {
         /// The id of the connection. The core ignores the timer of an older
         /// connection.
@@ -226,29 +201,17 @@ pub enum Event {
         timer: Timer,
     },
     /// The wait before the reconnect with this id is over.
-    #[serde(skip)]
-    #[facet(skip)]
     Reconnect(u32),
     /// The idle timer with this id expired.
-    #[serde(skip)]
-    #[facet(skip)]
     IdleTimeout(u32),
     /// The front light is off for the sleep with this id. Refer to
     /// [`power::light_off`].
-    #[serde(skip)]
-    #[facet(skip)]
     LightOffForSleep(u32),
     /// The stream of the MQTT connection closed for the sleep with this id.
-    #[serde(skip)]
-    #[facet(skip)]
     Offline(u32),
     /// The answer to the `Off` request with this id.
-    #[serde(skip)]
-    #[facet(skip)]
     RadioOff(u32),
     /// The `Sleep` request of the sleep with this id ended.
-    #[serde(skip)]
-    #[facet(skip)]
     Woke {
         /// The id of the sleep. The core ignores the answer of an older
         /// sleep.
@@ -257,28 +220,19 @@ pub enum Event {
         wake: Wake,
     },
     /// The full-refresh timer with this id expired.
-    #[serde(skip)]
-    #[facet(skip)]
     FullRefreshDue(u32),
     /// The draw timer with this id expired. Refer to
     /// [`refresh::redraw_soon`].
-    #[serde(skip)]
-    #[facet(skip)]
     DrawDue(u32),
     /// The timer of a mark with this id expired. Refer to
     /// [`pending`](crate::features::pending).
-    #[serde(skip)]
-    #[facet(skip)]
     PendingTimeout(u32),
     /// The light timer with this id expired. Refer to [`light`].
-    #[serde(skip)]
-    #[facet(skip)]
     LightTimeout(u32),
 }
 
 /// A control on the panel.
-#[derive(Facet, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Control {
     /// The button that shows the previous page.
     PreviousPage,
