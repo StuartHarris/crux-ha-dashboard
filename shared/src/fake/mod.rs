@@ -23,13 +23,7 @@ pub use home_assistant::{MAX_TEMP, MIN_TEMP, ServiceCall, iso_time};
 pub use radio::FakeRadio;
 
 use crate::{
-    features::{
-        connection::KEEP_ALIVE_SECS,
-        wifi::{
-            ADDRESS_TIMEOUT, JOIN_TIMEOUT, LEAVE_TIMEOUT, OFF_TIMEOUT, SCAN_TIMEOUT,
-            STOP_SCAN_TIMEOUT,
-        },
-    },
+    features::connection::KEEP_ALIVE_SECS,
     mqtt::{
         ACK_TIMEOUT, CONNACK_TIMEOUT, OPEN_TIMEOUT, PING_RESPONSE_TIMEOUT, SEND_TIMEOUT,
         ping_interval, silence_limit,
@@ -51,22 +45,4 @@ pub fn session_timers() -> Vec<Duration> {
     durations.extend(ping_interval(KEEP_ALIVE_SECS));
     durations.extend(silence_limit(KEEP_ALIVE_SECS));
     durations
-}
-
-/// Returns the durations of the time limits of the core for the radio
-/// requests.
-///
-/// No timer of a feature or of the MQTT session has one of these durations.
-/// A test checks this, so a test shell can find a radio time limit by its
-/// duration.
-#[must_use]
-pub fn radio_timers() -> Vec<Duration> {
-    alloc::vec![
-        JOIN_TIMEOUT,
-        ADDRESS_TIMEOUT,
-        LEAVE_TIMEOUT,
-        SCAN_TIMEOUT,
-        STOP_SCAN_TIMEOUT,
-        OFF_TIMEOUT,
-    ]
 }

@@ -189,6 +189,9 @@ impl FakeRadio {
     /// device is associated, or else the strongest one. If the network has
     /// no access points, the function returns `None`.
     pub fn move_strongest(&mut self) -> Option<AccessPoint> {
+        if self.access_points.is_empty() {
+            return None;
+        }
         let current = self.associated.or_else(|| {
             self.access_points
                 .iter()
@@ -422,6 +425,13 @@ mod tests {
     #[test]
     fn move_strongest_in_a_network_with_no_access_points_does_nothing() {
         let mut radio = FakeRadio::new(Vec::new());
+        assert_eq!(radio.move_strongest(), None);
+    }
+
+    #[test]
+    fn move_strongest_after_the_network_lost_all_its_access_points_does_nothing() {
+        let mut radio = up();
+        radio.access_points.clear();
         assert_eq!(radio.move_strongest(), None);
     }
 }

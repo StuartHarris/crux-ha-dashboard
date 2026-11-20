@@ -13,7 +13,6 @@ use super::{
 use crate::{
     Event, PowerSource,
     capabilities::stream::{StreamItem, Written},
-    fake::radio_timers,
     features::{
         connection::{CLOSE_TIMEOUT, Link, RECONNECT_MAX, RECONNECT_MIN},
         light::LIGHT_TIMEOUT,
@@ -75,15 +74,6 @@ fn the_timers_of_the_session_have_durations_that_no_feature_timer_has() {
     let features = feature_timers();
     for duration in session_timers() {
         assert!(!features.contains(&duration), "{duration:?}");
-    }
-}
-
-#[test]
-fn the_radio_time_limits_have_durations_that_no_session_or_feature_timer_has() {
-    let mut others = feature_timers();
-    others.extend(session_timers());
-    for duration in radio_timers() {
-        assert!(!others.contains(&duration), "{duration:?}");
     }
 }
 

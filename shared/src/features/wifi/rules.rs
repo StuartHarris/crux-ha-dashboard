@@ -96,6 +96,13 @@ impl ApCache {
         self.roaming = true;
     }
 
+    /// Records a join that a request stopped (`Joined::Stopped`). The next
+    /// join is not the join of a change of access point, so a scan is due
+    /// after it as usual.
+    pub const fn stopped(&mut self) {
+        self.roaming = false;
+    }
+
     /// Returns `true` if a scan for a better access point is due: after a
     /// join with the cached access point, until a scan completes or fails.
     /// A scan that a request stops does not count, so the scan stays due.
@@ -161,7 +168,8 @@ pub const RESTART_AFTER: u32 = 3;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Recovery {
     /// Continue. The core leaves and joins again, or keeps the stale
-    /// address.
+    /// address. While the link is not suspect, nothing counts toward a
+    /// restart, so the answer is always `Continue`.
     Continue,
     /// The link is stuck. Restart the chip.
     Restart,
@@ -352,6 +360,16 @@ mod tests {
         assert!(!cache.scan_due());
         assert_eq!(cache.current(), Some(FAR));
         // The next cached join is not a roam, so a scan is due again.
+        cache.joined(Target::Cached(FAR), FAR);
+        assert!(cache.scan_due());
+    }
+
+    #[test]
+    fn a_roam_join_that_a_request_stops_makes_a_scan_due_after_the_next_join() {
+        let mut cache = ApCache::default();
+        cache.joined(Target::Cached(NEAR), NEAR);
+        cache.roam_to(FAR);
+        cache.stopped();
         cache.joined(Target::Cached(FAR), FAR);
         assert!(cache.scan_due());
     }
