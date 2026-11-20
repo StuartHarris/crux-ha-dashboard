@@ -25,6 +25,12 @@
 //! - The core does not clear the timers of the session. Such a timer runs
 //!   until it expires, and the core then ignores it.
 //!
+//! The shell answers each radio request at once with a [`FakeRadio`]. The
+//! window can change the fake radio: it drops the link, blocks the device,
+//! moves the strongest access point and makes the driver stuck. When the
+//! core sends `RadioRestart`, the shell does a cold restart: it stops all
+//! the tasks, makes a new core and sends `Start`, as the firmware does.
+//!
 //! The shell writes each effect to an [`Inspector`], which the window shows.
 //! The inspector also finds the MQTT packets in a copy of the bytes of each
 //! stream.
@@ -43,6 +49,7 @@ use shared::{
     Core, Dashboard, Effect, Event, PowerSource, Settings, Start, ViewModel,
     capabilities::{
         power::{Sleep, Wake},
+        radio::AccessPoint,
         stream::{Close, Open, StreamItem, Write, Written},
     },
     fake::FakeRadio,
@@ -51,7 +58,7 @@ use tokio::{runtime::Handle, task::JoinHandle};
 
 use crate::{
     inspector::{Inspector, Wire},
-    stream::{FLUSH_LIMIT, Opener, REPLACED, Task},
+    stream::{FLUSH_LIMIT, LINK_LOST, Opener, REPLACED, Task},
 };
 
 /// The reason in the answer to a `Write` request for a stream that is not
@@ -153,6 +160,9 @@ pub struct Shell {
     settings: Option<Settings>,
     /// The fake radio, which answers each radio request at once.
     radio: FakeRadio,
+    /// If `true`, the core sent `RadioRestart`, and the shell must restart
+    /// the core when it finishes the effect that it performs.
+    restarting: bool,
     /// The `Sleep` request that waits for a wake.
     sleep: Option<Request<Sleep>>,
     /// The level of the front light, in percent. The window shows the
@@ -194,6 +204,7 @@ impl Shell {
             inspector: Inspector::default(),
             settings: None,
             radio: FakeRadio::default(),
+            restarting: false,
             sleep: None,
             light: 0,
         }
@@ -249,16 +260,7 @@ impl Shell {
             String::new(),
             "deep sleep: new core, the page and the last update kept",
         );
-        for live in self.streams.drain(..) {
-            live.task.abort();
-        }
-        for (_, timer) in self.timers.drain() {
-            timer.task.abort();
-        }
-        self.writes.clear();
-        self.closes.clear();
-        self.sleep = None;
-        self.core = Core::new();
+        self.stop_all();
         self.send(Event::Start(Start {
             settings,
             power: view.power,
@@ -269,6 +271,132 @@ impl Shell {
             self.send(Event::BatteryChanged(view.battery));
         }
         true
+    }
+
+    /// Stops all the tasks, forgets the requests that wait, and makes a new
+    /// core.
+    fn stop_all(&mut self) {
+        for live in self.streams.drain(..) {
+            live.task.abort();
+        }
+        for (_, timer) in self.timers.drain() {
+            timer.task.abort();
+        }
+        self.writes.clear();
+        self.closes.clear();
+        self.sleep = None;
+        self.restarting = false;
+        self.core = Core::new();
+    }
+
+    /// Does the cold restart that `RadioRestart` asks for, and returns the
+    /// effects of the new core.
+    ///
+    /// The new core gets `Start` with no `path` and no `last_sync`, as the
+    /// firmware sends it after a chip restart. The chip restart resets the
+    /// driver, so the radio is off and not associated, and the driver is not
+    /// stuck. The access points and the block of the router stay. The power
+    /// source, the dry run and the charge of the battery stay, as on the
+    /// device.
+    fn cold_restart(&mut self) -> Vec<Effect> {
+        let view = self.view();
+        let Some(mut settings) = self.settings.clone() else {
+            return Vec::new();
+        };
+        settings.read_only |= view.read_only;
+        eprintln!("radio: cold restart");
+        self.stop_all();
+        // The chip restart turns the front light off.
+        self.light = 0;
+        let blocked = self.radio.blocked;
+        self.radio = FakeRadio::new(std::mem::take(&mut self.radio.access_points));
+        self.radio.blocked = blocked;
+        let mut effects = self.core.process_event(Event::Start(Start {
+            settings,
+            power: view.power,
+            path: None,
+            last_sync: None,
+        }));
+        if view.battery.is_some() {
+            effects.extend(self.core.process_event(Event::BatteryChanged(view.battery)));
+        }
+        effects
+    }
+
+    /// Returns the fake radio.
+    pub const fn radio_state(&self) -> &FakeRadio {
+        &self.radio
+    }
+
+    /// Drops the link, as when the access point goes off. The device is not
+    /// associated, and the address goes. The open stream ends with
+    /// `Closed("link lost")`, as for a socket that is dead.
+    pub fn drop_link(&mut self) {
+        eprintln!("radio: the link drops");
+        self.radio.drop_link();
+        self.inspector
+            .effect("Radio", "drop link".into(), "the device lost the link");
+        let Some(live) = self.streams.last() else {
+            return;
+        };
+        let token = live.token;
+        live.task.abort();
+        self.stream(token, StreamItem::Closed(LINK_LOST.into()));
+    }
+
+    /// Blocks the device, or removes the block, as the router does. A block
+    /// also removes the device from its access point, as a router does, so the
+    /// link drops. While the block lasts, each join fails. Returns `true` if
+    /// the device is blocked now.
+    pub fn toggle_blocked(&mut self) -> bool {
+        self.radio.blocked = !self.radio.blocked;
+        let blocked = self.radio.blocked;
+        eprintln!("radio: blocked: {blocked}");
+        self.inspector.effect(
+            "Radio",
+            if blocked { "block" } else { "unblock" }.into(),
+            if blocked {
+                "each join fails"
+            } else {
+                "each join works"
+            },
+        );
+        if blocked {
+            self.drop_link();
+        }
+        blocked
+    }
+
+    /// Makes another access point the strongest, so that the next quiet scan
+    /// finds a better access point. Returns the new strongest access point.
+    pub fn move_strongest(&mut self) -> Option<AccessPoint> {
+        let strongest = self.radio.move_strongest();
+        eprintln!("radio: the strongest access point is now {strongest:?}");
+        self.inspector.effect(
+            "Radio",
+            "move the strongest access point".into(),
+            format!("now {strongest:?}"),
+        );
+        strongest
+    }
+
+    /// Makes the driver stuck, or frees it. A driver that is stuck gets no
+    /// address from DHCP, so the core restarts the chip after 3 joins.
+    /// Returns `true` if the driver is stuck now.
+    pub fn toggle_stuck(&mut self) -> bool {
+        self.radio.stuck = !self.radio.stuck;
+        let stuck = self.radio.stuck;
+        eprintln!("radio: stuck: {stuck}");
+        self.inspector.effect(
+            "Radio",
+            if stuck { "stick" } else { "free" }.into(),
+            if stuck {
+                "each join gets no address"
+            } else {
+                "each join gets an address"
+            },
+        );
+        stuck
     }
 
     /// Sends an event to the core and performs the effects.
@@ -503,6 +631,10 @@ impl Shell {
         let mut queue = VecDeque::from(effects);
         while let Some(effect) = queue.pop_front() {
             queue.extend(self.perform(effect));
+            if std::mem::take(&mut self.restarting) {
+                // The new core does not know the old effects.
+                queue = self.cold_restart().into();
+            }
         }
     }
 
@@ -586,8 +718,8 @@ impl Shell {
     }
 
     /// Answers a radio request at once with the fake radio, and returns the
-    /// new effects of the core. The simulator does not restart, so it logs
-    /// `Restart` and ignores it.
+    /// new effects of the core. `RadioRestart` has no answer. It makes the
+    /// shell restart the core after this effect.
     fn radio(&mut self, effect: Effect) -> Vec<Effect> {
         let core = &self.core;
         let (name, request, outcome, effects) = match effect {
@@ -633,7 +765,13 @@ impl Shell {
             Effect::RadioRestart(request) => {
                 let reason = request.operation.reason;
                 eprintln!("radio: the core asks for a restart: {reason}");
-                ("RadioRestart", reason, "ignored".into(), Vec::new())
+                self.restarting = true;
+                (
+                    "RadioRestart",
+                    reason,
+                    "cold restart: a new core, and Start with no path".into(),
+                    Vec::new(),
+                )
             }
             _ => return Vec::new(),
         };
@@ -763,6 +901,7 @@ fn resolve<Op: Operation>(
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::HashMap,
         future::pending,
         sync::{Arc, Mutex, MutexGuard, mpsc},
         time::{Duration, Instant},
@@ -775,7 +914,7 @@ mod tests {
         capabilities::stream::{Stream, StreamItem, Written},
         fake::Broker,
         features::{
-            connection::{KEEP_ALIVE_SECS, RECONNECT_MIN},
+            connection::{KEEP_ALIVE_SECS, RECONNECT_MAX, RECONNECT_MIN},
             power::IDLE_TIMEOUT,
             refresh::{DRAW_DELAY, FULL_REFRESH_INTERVAL},
         },
@@ -946,6 +1085,10 @@ mod tests {
         shell: Option<Shell>,
         signals: mpsc::Receiver<Signal>,
         net: Shared,
+        /// The time that [`Fixture::advance`] simulated.
+        now: Duration,
+        /// The simulated time at which each timer expires, by token.
+        due: HashMap<u64, Duration>,
     }
 
     impl Fixture {
@@ -979,6 +1122,8 @@ mod tests {
                 shell: Some(shell),
                 signals,
                 net,
+                now: Duration::ZERO,
+                due: HashMap::new(),
             }
         }
 
@@ -1039,6 +1184,54 @@ mod tests {
                 }
                 Err(_) => false,
             }
+        }
+
+        /// Simulates `time`: it fires each timer of the shell at its time,
+        /// in the order of the times, and lets the streams settle after each
+        /// one. A timer starts when this function first sees it, so a timer
+        /// that a stream signal starts has the simulated time of the last
+        /// call.
+        fn advance(&mut self, time: Duration) {
+            let end = self.now + time;
+            loop {
+                let timers: Vec<_> = self
+                    .shell()
+                    .timers
+                    .iter()
+                    .map(|(id, timer)| {
+                        (
+                            *id,
+                            timer.token,
+                            Duration::from(timer.request.operation.duration),
+                        )
+                    })
+                    .collect();
+                let now = self.now;
+                self.due
+                    .retain(|token, _| timers.iter().any(|timer| timer.1 == *token));
+                for (_, token, duration) in &timers {
+                    self.due.entry(*token).or_insert(now + *duration);
+                }
+                let next = timers
+                    .iter()
+                    .map(|(id, token, _)| (self.due[token], *token, *id))
+                    .filter(|(due, _, _)| *due <= end)
+                    .min_by_key(|(due, token, _)| (*due, *token));
+                let Some((due, token, id)) = next else {
+                    break;
+                };
+                self.now = due;
+                self.shell().handle(Signal::Timer { id, token });
+                while self.next(Duration::from_millis(20)) {}
+            }
+            self.now = end;
+        }
+
+        /// Waits until the core is online.
+        fn online(&mut self) {
+            self.until("the online state", |fixture| {
+                fixture.shell().view().connection == shared::Connection::Online
+            });
         }
 
         /// Waits until the core gets the SUBACK packet of the next
@@ -1966,6 +2159,149 @@ mod tests {
         assert_eq!(
             fixture.shell().view().connection,
             shared::Connection::Online
+        );
+    }
+
+    /// Returns the number of entries of `effect` in the effect log.
+    fn count(fixture: &mut Fixture, effect: &str) -> usize {
+        fixture.outcomes(effect).len()
+    }
+
+    #[test]
+    fn a_dropped_link_ends_the_stream_and_the_core_joins_again() {
+        let mut fixture = Fixture::new();
+        fixture.start(PowerSource::Stand);
+        fixture.connect();
+        let joins = fixture.shell().radio_state().joins;
+        let leaves = count(&mut fixture, "RadioLeave");
+
+        fixture.shell().drop_link();
+        assert!(fixture.shell().current_connection().is_none());
+        assert_eq!(fixture.shell().radio_state().associated, None);
+        assert!(!fixture.shell().radio_state().has_address);
+        assert!(
+            fixture.outcomes("StreamOpen")[0].ends_with("item: Closed (link lost)"),
+            "{:?}",
+            fixture.outcomes("StreamOpen")
+        );
+        assert_ne!(
+            fixture.shell().view().connection,
+            shared::Connection::Online
+        );
+
+        // The core waits for the backoff, joins again and connects again.
+        fixture.advance(RECONNECT_MIN);
+        fixture.online();
+        assert!(fixture.shell().radio_state().has_address);
+        assert!(fixture.shell().radio_state().joins > joins);
+        assert!(count(&mut fixture, "RadioLeave") > leaves);
+        assert_eq!(fixture.shell().suback_count(), 2);
+        assert_eq!(count(&mut fixture, "RadioRestart"), 0);
+    }
+
+    #[test]
+    fn a_block_of_3_minutes_does_not_restart_and_the_link_comes_back_after_the_unblock() {
+        let mut fixture = Fixture::new();
+        fixture.start(PowerSource::Stand);
+        fixture.connect();
+
+        assert!(fixture.shell().toggle_blocked());
+        fixture.shell().drop_link();
+        fixture.advance(Duration::from_secs(180));
+        let failed = fixture
+            .outcomes("RadioJoin")
+            .iter()
+            .filter(|outcome| outcome.contains("Failed"))
+            .count();
+        assert!(failed > 3, "{failed} failed joins");
+        assert_eq!(count(&mut fixture, "RadioRestart"), 0);
+        assert_eq!(fixture.shell().radio_state().associated, None);
+        assert_ne!(
+            fixture.shell().view().connection,
+            shared::Connection::Online
+        );
+
+        assert!(!fixture.shell().toggle_blocked());
+        fixture.advance(RECONNECT_MAX);
+        fixture.online();
+        assert!(fixture.shell().radio_state().has_address);
+        assert_eq!(count(&mut fixture, "RadioRestart"), 0);
+    }
+
+    #[test]
+    fn a_stuck_driver_makes_the_core_restart_with_a_new_core_and_start() {
+        let mut fixture = Fixture::new();
+        fixture.start(PowerSource::Stand);
+        fixture.connect();
+        assert_eq!(fixture.shell().view().path, "/room/living_room");
+
+        assert!(fixture.shell().toggle_stuck());
+        fixture.shell().drop_link();
+        // The joins of the first reconnect get no address, and the core
+        // restarts the chip after the third join.
+        fixture.advance(RECONNECT_MIN * 3);
+        assert_eq!(fixture.outcomes("RadioRestart").len(), 1);
+        // The new core got `Start` with no path, so it shows the default
+        // page. The driver is free, so the new core connects.
+        assert_ne!(fixture.shell().view().path, "/room/living_room");
+        assert!(!fixture.shell().radio_state().stuck);
+        fixture.online();
+        assert!(fixture.shell().radio_state().has_address);
+        assert_eq!(fixture.outcomes("RadioRestart").len(), 1);
+    }
+
+    #[test]
+    fn a_moved_access_point_makes_the_next_quiet_scan_roam() {
+        let mut fixture = Fixture::new();
+        fixture.start(PowerSource::Battery);
+        fixture.connect();
+        let first = fixture.shell().radio_state().associated.unwrap();
+        assert!(fixture.shell().sleep_now());
+        fixture.sleep();
+
+        let moved = fixture.shell().move_strongest().unwrap();
+        assert_ne!(moved, first);
+        fixture.shell().wake();
+        fixture.until("the second SUBACK", |fixture| {
+            fixture.shell().suback_count() >= 2
+        });
+        fixture.until("the roam", |fixture| fixture.shell().suback_count() >= 3);
+        fixture.online();
+
+        assert_eq!(fixture.shell().radio_state().associated, Some(moved));
+        // The effect log starts with the newest entry. After the scan: a
+        // clean close (the DISCONNECT), the leave and the cached join.
+        let effects = fixture.effects();
+        let place = |name: &str| effects.iter().position(|effect| *effect == name).unwrap();
+        let scan = place("RadioScan");
+        let close = effects[..scan]
+            .iter()
+            .rposition(|effect| *effect == "StreamClose")
+            .unwrap();
+        let leave = effects[..close]
+            .iter()
+            .rposition(|effect| *effect == "RadioLeave")
+            .unwrap();
+        let join = effects[..leave]
+            .iter()
+            .rposition(|effect| *effect == "RadioJoin")
+            .unwrap();
+        assert!(join < leave && leave < close && close < scan, "{effects:?}");
+        let joins: Vec<String> = fixture
+            .shell()
+            .inspector()
+            .effects
+            .iter()
+            .map(|entry| format!("{} {}", entry.effect, entry.request))
+            .collect();
+        assert!(joins[join].starts_with("RadioJoin Cached"), "{joins:?}");
+        assert_eq!(
+            fixture
+                .take_log()
+                .iter()
+                .filter(|line| *line == "disconnect 2")
+                .count(),
+            1
         );
     }
 }

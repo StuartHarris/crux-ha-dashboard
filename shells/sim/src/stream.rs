@@ -37,6 +37,8 @@ pub const CLOSED: &str = "closed";
 pub const REPLACED: &str = "replaced";
 /// The reason in the `Closed` item after the peer closed the stream.
 pub const PEER_CLOSED: &str = "the broker closed the stream";
+/// The reason in the `Closed` item after the link dropped.
+pub const LINK_LOST: &str = "link lost";
 /// The longest time that a close waits for the bytes to go and for the peer
 /// to close its side.
 pub const FLUSH_LIMIT: Duration = Duration::from_secs(2);

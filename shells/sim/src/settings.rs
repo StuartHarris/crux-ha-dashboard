@@ -23,6 +23,11 @@ Modes:
                       battery so that the core sleeps, R restarts the
                       sleeping device with a new core (a deep sleep), [ and ]
                       decrease and increase the charge of the battery by 10%,
+                      L drops the Wi-Fi link, B blocks or unblocks the device
+                      (as the router does), A moves the strongest access
+                      point so that the next quiet scan roams, K makes the
+                      driver stuck or free (after 3 joins with no address,
+                      the core restarts the chip with a new core),
                       D shows the area of each partial refresh, Left and
                       Right turn the page, Q quits.
                       The window also shows the controls, the view model,
