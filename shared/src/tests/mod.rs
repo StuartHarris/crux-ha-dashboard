@@ -244,9 +244,17 @@ fn link_up(cmd: &mut Cmd, model: &mut Model) -> Cmd {
 /// Answers the radio request that is the next effect of `cmd` with `radio`,
 /// and expects the start of its time limit. Returns the event of the
 /// answer.
+///
+/// The function skips the lines of the log before the request, for example
+/// the line of a leave for a suspect link. A test that checks a line uses
+/// `expect_log_with` before it calls this function.
 #[track_caller]
 fn answer_radio(cmd: &mut Cmd, radio: &mut FakeRadio) -> Event {
-    let limit = match cmd.expect_effect() {
+    let mut effect = cmd.expect_effect();
+    while matches!(effect, Effect::Log(_)) {
+        effect = cmd.expect_effect();
+    }
+    let limit = match effect {
         Effect::RadioJoin(mut request) => {
             let joined = radio.join(&request.operation);
             request

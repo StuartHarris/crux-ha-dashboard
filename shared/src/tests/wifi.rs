@@ -5,17 +5,18 @@
 //! each request in the log. A test that needs a request that waits sets
 //! [`Shell::hold_radio`].
 
-use alloc::{string::String, vec::Vec};
+use alloc::{format, string::String, vec::Vec};
 use core::time::Duration;
 
 use crux_core::App;
 
 use super::{flows::house, settings, shell::Shell, start};
 use crate::{
-    Connection, Dashboard, EffectTestExt, Event, Model, PowerSource,
+    Connection, Dashboard, Effect, EffectTestExt, Event, Model, PowerSource,
     capabilities::{
+        log::Level,
         power::Wake,
-        radio::{Joined, Target},
+        radio::{Joined, Lease, Scanned, Seen, Target},
     },
     fake::radio::{HALL, LANDING},
     features::{
@@ -32,6 +33,26 @@ use crate::{
 
 /// The status topic of the dashboard in the tests.
 const STATUS: &str = "dashboard/hall/status";
+
+/// The log line of a session that failed because the fake broker dropped
+/// the connection. Refer to [`fail_the_session`].
+const SUSPECT: &str = "warn wifi: the link is suspect, because the MQTT session failed: the stream closed: connection lost";
+
+/// The log line of a rejoin from [`HALL`] while the link is suspect.
+const LEAVE_HALL: &str =
+    "warn wifi: the link is suspect, so leave 02:00:00:00:00:01 on channel 6 and join again";
+
+/// The log line of a join to [`HALL`] from the cache that failed.
+const JOIN_TO_HALL_FAILED: &str = "warn wifi: the join to the cached access point \
+    02:00:00:00:00:01 on channel 6 failed, so join the strongest access point";
+
+/// Returns the log line after `count` joins with no new address while the
+/// link is suspect.
+fn no_new_address(count: u32) -> String {
+    format!(
+        "warn wifi: {count} of {RESTART_AFTER} joins got no new address while the link is suspect"
+    )
+}
 
 /// Returns the radio entries of `log` in order: the radio requests,
 /// `WifiOff` and `RadioRestart`.
@@ -168,6 +189,13 @@ fn a_wake_joins_the_cached_access_point_and_stays_if_the_scan_finds_less_than_th
         "{log:?}"
     );
     assert_eq!(log[place(&log, "RadioScan") + 1], "TimeNotifyAfter 15000ms");
+    assert_eq!(
+        shell.take_logs(),
+        [
+            "info wifi: the scan found no access point that is 10 dB stronger than \
+             02:00:00:00:00:01 on channel 6 (-55 dBm), so stay"
+        ]
+    );
     assert_eq!(shell.radio.associated, Some(HALL));
     assert_eq!(shell.model.wifi.phase, Phase::Up(HALL));
     assert!(!shell.model.wifi.cache.scan_due());
@@ -210,6 +238,13 @@ fn a_better_access_point_closes_cleanly_and_the_core_joins_it_once() {
     assert!(scan < disconnect && disconnect < close, "{log:?}");
     assert!(close < place(&log, "RadioLeave"), "{log:?}");
     assert_eq!(disconnects(&shell), before + 1);
+    assert_eq!(
+        shell.take_logs(),
+        [
+            "info wifi: change to 02:00:00:00:00:02 on channel 11 (-45 dBm), because the \
+             signal of 02:00:00:00:00:01 on channel 6 is -75 dBm"
+        ]
+    );
     let roam = shell.closes.last().expect("a Close request");
     assert!(roam.clean, "{roam:?}");
 
@@ -275,6 +310,7 @@ fn a_cached_join_that_fails_joins_the_strongest_access_point_with_no_backoff() {
         ["RadioJoin Cached", "RadioJoin Strongest", "RadioAddress"]
     );
     assert!(!log.contains(&"TimeNotifyAfter 1000ms".into()), "{log:?}");
+    assert_eq!(shell.take_logs(), [JOIN_TO_HALL_FAILED]);
     assert_eq!(shell.radio.associated, Some(LANDING));
     assert_eq!(shell.model.wifi.cache.plan(), Target::Cached(LANDING));
     assert!(!shell.model.wifi.cache.scan_due());
@@ -296,6 +332,13 @@ fn a_join_to_the_strongest_that_fails_waits_for_the_backoff() {
     );
     assert_eq!(shell.model.wifi.cache.plan(), Target::Strongest);
     assert_eq!(shell.view().connection, Connection::Connecting);
+    assert_eq!(
+        shell.take_logs(),
+        [
+            JOIN_TO_HALL_FAILED,
+            "warn wifi: the join to the strongest access point failed, so the link is down",
+        ]
+    );
 
     // After the backoff, the core joins the strongest access point.
     shell.radio.blocked = false;
@@ -303,6 +346,7 @@ fn a_join_to_the_strongest_that_fails_waits_for_the_backoff() {
     let log = shell.take_log();
     assert_eq!(radio(&log), ["RadioJoin Strongest", "RadioAddress"]);
     assert_eq!(shell.view().connection, Connection::Online);
+    assert_eq!(shell.take_logs(), Vec::<String>::new());
 }
 
 #[test]
@@ -387,15 +431,13 @@ fn a_broker_that_is_down_for_3_minutes_keeps_the_association_on_each_reconnect()
 }
 
 #[test]
-fn a_refused_connect_clears_a_suspect_link_and_its_count() {
+fn a_refused_connect_clears_a_suspect_link() {
     let mut shell = online();
     shell.broker.down = true;
     fail_the_session(&mut shell);
 
     // The reconnect leaves and joins again, because the link is suspect.
-    // The network stack keeps its old address, which counts toward a
-    // restart. Then the broker host refuses the connect.
-    shell.radio.has_address = true;
+    // Then the broker host refuses the connect.
     shell.advance(RECONNECT_MIN);
     let log = shell.take_log();
     assert_eq!(
@@ -408,12 +450,58 @@ fn a_refused_connect_clears_a_suspect_link_and_its_count() {
     );
     assert_eq!(shell.model.wifi.health, Health::default());
 
+    assert_eq!(
+        shell.take_logs(),
+        [
+            SUSPECT,
+            LEAVE_HALL,
+            "info wifi: the broker host ended the session, so the link moves data and is not \
+             suspect",
+        ]
+    );
+
     // The link is not suspect, so the next reconnect keeps the association.
     shell.radio.has_address = false;
     shell.advance(RECONNECT_MIN * 2);
     let log = shell.take_log();
     assert_eq!(radio(&log), ["RadioJoin Cached keep", "RadioAddress"]);
     assert_eq!(shell.restarts, Vec::<String>::new());
+    assert_eq!(shell.take_logs(), Vec::<String>::new());
+}
+
+#[test]
+fn a_refused_connect_clears_a_suspect_link_and_its_count() {
+    let mut shell = online();
+    shell.broker.down = true;
+    fail_the_session(&mut shell);
+    shell.hold_radio = true;
+    shell.advance(RECONNECT_MIN);
+    // The `Leave` waits.
+    shell.answer_radio();
+
+    // The network stack keeps its address through the join, which counts
+    // toward a restart. Then the broker host refuses the connect, which
+    // clears the count.
+    shell.radio.has_address = true;
+    shell.answer_radio();
+    shell.answer_radio();
+    let log = shell.take_log();
+    assert!(
+        place(&log, "RadioAddress") < place(&log, "MqttConnect"),
+        "{log:?}"
+    );
+    assert_eq!(shell.model.wifi.health, Health::default());
+    assert_eq!(
+        shell.take_logs(),
+        [
+            SUSPECT,
+            LEAVE_HALL,
+            "warn wifi: the address is from before the join, so the network stack can be stuck",
+            &no_new_address(1),
+            "info wifi: the broker host ended the session, so the link moves data and is not \
+             suspect",
+        ]
+    );
 }
 
 #[test]
@@ -453,7 +541,7 @@ fn an_end_by_the_host_while_the_device_has_no_link_does_not_clear_the_suspicion(
     shell.advance(RECONNECT_MIN);
     assert!(matches!(shell.model.wifi.phase, Phase::Leaving(_)));
     let end = crate::mqtt::End::ByHost("TCP connect failed: ConnectionReset".into());
-    crate::features::wifi::session_ended(&end, &mut shell.model);
+    crate::features::wifi::session_ended(&end, &mut shell.model).expect_no_effects();
     assert!(shell.model.wifi.health.suspect());
 }
 
@@ -513,6 +601,20 @@ fn a_stuck_driver_restarts_the_chip_after_3_joins_with_no_address() {
     );
     assert_eq!(shell.restarts, ["no address after 3 joins"]);
     assert_eq!(shell.model.wifi.phase, Phase::Restarting);
+    assert_eq!(
+        shell.take_logs(),
+        [
+            SUSPECT,
+            LEAVE_HALL,
+            &no_new_address(1),
+            "warn wifi: 02:00:00:00:00:01 on channel 6 gave no address, so leave it and join \
+             the strongest access point",
+            &no_new_address(2),
+            "warn wifi: the strongest access point 02:00:00:00:00:01 on channel 6 gave no \
+             address, so leave it",
+            &no_new_address(3),
+        ]
+    );
 
     // The core does no more radio work. The shell restarts the chip.
     shell.advance(RECONNECT_MAX * 2);
@@ -543,6 +645,15 @@ fn a_stale_lease_counts_and_bytes_from_the_broker_clear_the_count() {
     assert_eq!(shell.model.wifi.health.joins_with_no_lease(), 1);
     assert!(shell.model.wifi.health.suspect());
     assert_eq!(shell.restarts, Vec::<String>::new());
+    assert_eq!(
+        shell.take_logs(),
+        [
+            SUSPECT,
+            LEAVE_HALL,
+            "warn wifi: the address is from before the join, so the network stack can be stuck",
+            &no_new_address(1),
+        ]
+    );
 
     // The broker is up again. The next join gets a new address, and the
     // CONNACK packet proves that the link moves data.
@@ -738,6 +849,13 @@ fn a_scan_with_no_answer_in_its_time_limit_is_complete_and_the_late_answer_is_ig
     shell.advance(SCAN_TIMEOUT);
     assert_eq!(shell.model.wifi.phase, Phase::Up(HALL));
     assert!(!shell.model.wifi.cache.scan_due());
+    assert_eq!(
+        shell.take_logs(),
+        [
+            "warn wifi: the scan request got no answer in its time limit",
+            "warn wifi: the scan failed, so stay on 02:00:00:00:00:01 on channel 6",
+        ]
+    );
 
     // The late answer finds a better access point, but the core ignores it.
     shell.radio.move_strongest();
@@ -940,7 +1058,12 @@ fn a_time_limit_after_the_sleep_started_changes_nothing_in_the_cache() {
     model.wifi.cache.joined(Target::Cached(HALL), HALL);
     Dashboard
         .update(Event::RadioTimeout(9), &mut model)
-        .expect_no_effects();
+        .expect_only_log_with(|log| {
+            assert_eq!(
+                log.to_string(),
+                "wifi: the address request got no answer in its time limit"
+            );
+        });
     assert_eq!(model.wifi.phase, Phase::Idle);
     assert_eq!(model.wifi.cache.plan(), Target::Cached(HALL));
 }
@@ -953,4 +1076,176 @@ fn a_restart_wins_over_a_sleep() {
         .update(Event::Offline(1), &mut model)
         .expect_no_effects();
     assert_eq!(model.wifi.phase, Phase::Restarting);
+}
+
+#[test]
+fn bytes_from_the_broker_clear_a_suspect_link_with_one_line() {
+    let mut shell = online();
+    fail_the_session(&mut shell);
+
+    // The reconnect gets a new address. The CONNACK and the SUBACK packets
+    // arrive in separate chunks, but only the first chunk writes a line.
+    shell.advance(RECONNECT_MIN);
+    assert_eq!(shell.view().connection, Connection::Online);
+    assert!(!shell.model.wifi.health.suspect());
+    assert_eq!(
+        shell.take_logs(),
+        [
+            SUSPECT,
+            LEAVE_HALL,
+            "info wifi: bytes from the broker arrived, so the link is not suspect",
+            // The join went to the cached access point, so a scan follows.
+            "info wifi: the scan found no access point that is 10 dB stronger than \
+             02:00:00:00:00:01 on channel 6 (-55 dBm), so stay",
+        ]
+    );
+}
+
+#[test]
+fn a_rejoin_that_keeps_the_association_and_its_address_writes_no_line() {
+    let mut shell = house();
+    // The broker refuses the connection. The link is not suspect, so the
+    // reconnect keeps the association, and the network stack keeps its
+    // address.
+    shell.broker.code = 5;
+    shell.send(start(PowerSource::Stand));
+    shell.take_log();
+
+    shell.advance(RECONNECT_MIN);
+    let log = shell.take_log();
+    assert_eq!(radio(&log), ["RadioJoin Cached keep", "RadioAddress"]);
+    assert!(shell.radio.has_address);
+    assert_eq!(shell.take_logs(), Vec::<String>::new());
+}
+
+#[test]
+fn a_better_access_point_found_during_a_sleep_is_for_the_next_wake() {
+    let mut model = sleeping_with(Phase::Scanning(HALL));
+    model.wifi.cache.joined(Target::Cached(HALL), HALL);
+    let scanned = Scanned::Found {
+        seen: alloc::vec![
+            Seen {
+                access_point: HALL,
+                rssi: -75,
+            },
+            Seen {
+                access_point: LANDING,
+                rssi: -45,
+            },
+        ],
+        rssi: None,
+    };
+    Dashboard
+        .update(Event::Scanned { radio: 9, scanned }, &mut model)
+        .expect_only_log_with(|log| {
+            assert_eq!(
+                log.to_string(),
+                "wifi: change to 02:00:00:00:00:02 on channel 11 at the next wake, because \
+                 the signal of 02:00:00:00:00:01 on channel 6 is -75 dBm"
+            );
+        });
+    assert_eq!(model.wifi.cache.plan(), Target::Cached(LANDING));
+}
+
+#[test]
+fn the_count_of_joins_with_no_new_address_comes_before_the_restart() {
+    let mut model = Model {
+        settings: Some(settings()),
+        ..Model::default()
+    };
+    model.wifi.phase = Phase::Leasing {
+        target: Target::Strongest,
+        access_point: HALL,
+        had_address: false,
+        kept: false,
+    };
+    model.wifi.radio = 9;
+    let health = &mut model.wifi.health;
+    health.failed();
+    assert_eq!(health.no_lease(), Recovery::Continue);
+    assert_eq!(health.no_lease(), Recovery::Continue);
+
+    let leased = Event::Leased {
+        radio: 9,
+        lease: Lease::NoLease,
+    };
+    Dashboard
+        .update(leased, &mut model)
+        .expect_log_with(|log| {
+            assert_eq!(log.level, Level::Warn);
+            assert_eq!(
+                log.message,
+                "3 of 3 joins got no new address while the link is suspect"
+            );
+        })
+        .expect_only_radio_restart_with(|restart| {
+            assert_eq!(restart.reason, "no address after 3 joins");
+        });
+}
+
+#[test]
+fn a_stale_address_on_a_link_that_is_not_suspect_writes_no_line() {
+    let mut model = Model {
+        settings: Some(settings()),
+        ..Model::default()
+    };
+    model.wifi.phase = Phase::Leasing {
+        target: Target::Cached(HALL),
+        access_point: HALL,
+        had_address: true,
+        kept: false,
+    };
+    model.wifi.radio = 9;
+
+    let leased = Event::Leased {
+        radio: 9,
+        lease: Lease::Leased,
+    };
+    let mut cmd = Dashboard.update(leased, &mut model);
+    let lines: Vec<Effect> = cmd
+        .effects()
+        .filter(|effect| matches!(effect, Effect::Log(_)))
+        .collect();
+    assert!(lines.is_empty(), "{lines:?}");
+    assert_eq!(model.wifi.phase, Phase::Up(HALL));
+    assert_eq!(model.wifi.health, Health::default());
+}
+
+#[test]
+fn a_scan_with_no_signal_for_the_current_access_point_stays() {
+    let mut model = Model {
+        settings: Some(settings()),
+        ..Model::default()
+    };
+    model.wifi.phase = Phase::Scanning(HALL);
+    model.wifi.radio = 9;
+    model.wifi.cache.joined(Target::Cached(HALL), HALL);
+    let scanned = Scanned::Found {
+        seen: alloc::vec![Seen {
+            access_point: LANDING,
+            rssi: -45,
+        }],
+        rssi: None,
+    };
+    Dashboard
+        .update(Event::Scanned { radio: 9, scanned }, &mut model)
+        .expect_only_log_with(|log| {
+            assert_eq!(log.level, Level::Info);
+            assert_eq!(
+                log.to_string(),
+                "wifi: the signal of 02:00:00:00:00:01 on channel 6 is unknown, so stay"
+            );
+        });
+    assert_eq!(model.wifi.phase, Phase::Up(HALL));
+    assert_eq!(model.wifi.cache.plan(), Target::Cached(HALL));
+}
+
+#[test]
+fn a_strongest_join_that_fails_after_the_sleep_started_writes_no_line() {
+    let mut model = sleeping_with(Phase::Joining(Target::Strongest));
+    let joined = Joined::Failed("no access point found".into());
+    Dashboard
+        .update(Event::Joined { radio: 9, joined }, &mut model)
+        .expect_no_effects();
+    assert_eq!(model.wifi.phase, Phase::Idle);
 }

@@ -1237,11 +1237,16 @@ fn a_stuck_driver_gives_a_restart_job_after_3_joins_with_no_address() {
     };
     device.handle(Signal::Timer { id, token });
 
-    // The third join gets no address. The core asks for a restart.
+    // The third join gets no address. The core logs the count, and then
+    // asks for a restart.
     let jobs = device.link();
     assert_eq!(names(&jobs), ["restart"]);
     assert_eq!(
-        jobs,
+        logs(&jobs),
+        ["warn wifi: 3 of 3 joins got no new address while the link is suspect"]
+    );
+    assert_eq!(
+        jobs[1..],
         [Job::Restart(Restart {
             reason: "no address after 3 joins".into(),
         })]
@@ -1256,10 +1261,19 @@ fn a_change_of_access_point_leaves_only_after_the_end_of_the_stream() {
     let jobs = device.deliver(&jobs);
     assert!(scans(&jobs), "{:?}", names(&jobs));
 
-    // The scan finds a better access point. The core sends a DISCONNECT.
+    // The scan finds a better access point. The core logs the reason, and
+    // then it sends a DISCONNECT.
     device.radio.move_strongest();
     let jobs = device.link();
     assert_eq!(names(&jobs), [format!("disconnect {SECOND}")]);
+    assert_eq!(
+        logs(&jobs),
+        [
+            "info wifi: change to 02:00:00:00:00:02 on channel 11 (-45 dBm), because the signal \
+             of 02:00:00:00:00:01 on channel 6 is -75 dBm"
+        ]
+    );
+    assert!(matches!(jobs[0], Job::Log(_)), "{jobs:?}");
     // The session ended, so the view shows `Connecting`.
     let jobs = device.deliver(&jobs);
     assert_eq!(names(&jobs), [format!("close {SECOND}"), "render".into()]);

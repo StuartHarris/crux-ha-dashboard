@@ -126,6 +126,19 @@ impl ApCache {
 /// short time.
 pub const ROAM_MARGIN_DB: i32 = 10;
 
+/// Returns the signal of `current` in dBm that [`better_access_point`]
+/// compares: `rssi` from the shell, or else the signal of `current` in
+/// `seen`. Returns `None` if there is no signal for `current`.
+#[must_use]
+pub fn current_signal(current: AccessPoint, rssi: Option<i32>, seen: &[Seen]) -> Option<i32> {
+    rssi.or_else(|| {
+        seen.iter()
+            .filter(|found| found.access_point.bssid == current.bssid)
+            .map(|found| found.rssi)
+            .max()
+    })
+}
+
 /// Returns the access point to change to, or `None` to stay.
 ///
 /// `current` is the access point of the link, and `rssi` its signal in dBm
@@ -136,12 +149,7 @@ pub const ROAM_MARGIN_DB: i32 = 10;
 /// [`ROAM_MARGIN_DB`] stronger.
 #[must_use]
 pub fn better_access_point(current: AccessPoint, rssi: Option<i32>, seen: &[Seen]) -> Option<Seen> {
-    let rssi = rssi.or_else(|| {
-        seen.iter()
-            .filter(|found| found.access_point.bssid == current.bssid)
-            .map(|found| found.rssi)
-            .max()
-    })?;
+    let rssi = current_signal(current, rssi, seen)?;
     seen.iter()
         .filter(|found| found.access_point.bssid != current.bssid)
         .max_by_key(|found| found.rssi)

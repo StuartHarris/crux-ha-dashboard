@@ -352,9 +352,16 @@ fn a_lost_connection_shows_the_time_of_the_last_message_and_retries_after_a_back
     let connection = model.connection.id;
 
     // The time is the time of the last update from Home Assistant, not the
-    // time of the disconnect. The core closes the stream, which failed.
+    // time of the disconnect. The link is suspect, and the core closes the
+    // stream, which failed.
     let reconnect = wire
         .drop_connection(&mut model, "connection lost")
+        .expect_log_with(|log| {
+            assert_eq!(
+                log.to_string(),
+                "wifi: the link is suspect, because the MQTT session failed: the stream closed: connection lost"
+            );
+        })
         .expect_stream_close_with(|close| assert!(!close.clean))
         .expect_time_notify_after_with(|notify| {
             assert_eq!(Duration::from(notify.duration), CLOSE_TIMEOUT);
@@ -376,6 +383,12 @@ fn a_lost_connection_shows_the_time_of_the_last_message_and_retries_after_a_back
     // The lost connection makes the link suspect, so the reconnect leaves
     // and joins again first.
     let mut cmd = app.update(reconnect, &mut model);
+    cmd.expect_log_with(|log| {
+        assert_eq!(
+            log.to_string(),
+            "wifi: the link is suspect, so leave 02:00:00:00:00:01 on channel 6 and join again"
+        );
+    });
     let _wire = Wire::new(link_up(&mut cmd, &mut model));
 }
 
@@ -460,6 +473,12 @@ fn a_join_that_fails_is_tried_again_after_a_backoff() {
         .expect_one_event();
     let event = app
         .update(event, &mut model)
+        .expect_log_with(|log| {
+            assert_eq!(
+                log.to_string(),
+                "wifi: the join to the strongest access point failed, so the link is down"
+            );
+        })
         .resolve_time_notify_after(|notify| {
             assert_eq!(Duration::from(notify.duration), RECONNECT_MIN);
             notify.id

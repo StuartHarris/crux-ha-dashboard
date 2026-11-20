@@ -416,17 +416,18 @@ fn connect(model: &mut Model) -> Cmd {
 /// broker host proves it too. The session then ends with [`End::ByHost`],
 /// and [`wifi::session_ended`] records the proof.
 pub fn stream(id: u32, item: StreamItem, model: &mut Model) -> Cmd {
+    let mut proof = Cmd::done();
     let input = match item {
         StreamItem::Opened => Input::Opened,
         StreamItem::Received(bytes) => {
             if id == model.connection.id && model.connection.session.is_some() {
-                wifi::traffic(model);
+                proof = wifi::traffic(model);
             }
             Input::Received(bytes)
         }
         StreamItem::Closed { reason, by_host } => Input::Closed { reason, by_host },
     };
-    handle(id, input, model)
+    proof.and(handle(id, input, model))
 }
 
 /// Handles the answer to a `Write` request on the connection `id`.
@@ -665,7 +666,7 @@ fn subscribed(id: SubscribeId, outcome: SubscribeOutcome, model: &mut Model) -> 
 ///
 /// The Wi-Fi feature records the end. Refer to [`wifi::session_ended`].
 fn ended(end: &End, model: &mut Model) -> Cmd {
-    wifi::session_ended(end, model);
+    let health = wifi::session_ended(end, model);
     let state = &mut model.connection;
     state.session = None;
     let id = state.id;
@@ -675,7 +676,7 @@ fn ended(end: &End, model: &mut Model) -> Cmd {
     state.id = state.id.wrapping_add(1);
     state.mqtt = Link::Down;
     if model.power.asleep {
-        return close;
+        return health.and(close);
     }
     let retry = match end {
         _ if !model.wants_online() => Cmd::done(),
@@ -687,7 +688,7 @@ fn ended(end: &End, model: &mut Model) -> Cmd {
         }
         _ => schedule_reconnect(model),
     };
-    close.and(redraw(model, false)).and(retry)
+    health.and(close).and(redraw(model, false)).and(retry)
 }
 
 /// Returns `true` if the current page shows the entity `entity_id`. On a
