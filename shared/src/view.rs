@@ -272,7 +272,7 @@ pub fn view(model: &Model) -> ViewModel {
     let index = model.page_index();
     let page = model.pages.get(index);
 
-    let connection = if model.connection.mqtt == Link::Up {
+    let connection = if model.connection.link() == Link::Up {
         Connection::Online
     } else if model.wants_online() {
         Connection::Connecting

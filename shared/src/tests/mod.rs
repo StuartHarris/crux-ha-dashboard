@@ -302,7 +302,7 @@ pub fn drive_to_connected(power: PowerSource) -> (Model, Wire) {
     wire.effects.clear();
     wire.events.clear();
     wire.packets.clear();
-    assert_eq!(model.connection.mqtt, Link::Up);
+    assert_eq!(model.connection.link(), Link::Up);
     (model, wire)
 }
 

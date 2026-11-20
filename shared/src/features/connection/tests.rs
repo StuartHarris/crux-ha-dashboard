@@ -318,7 +318,7 @@ fn a_failed_write_does_not_hide_an_end_by_the_host_in_either_order() {
                 .contains("the broker host ended the stream"),
             "{closes:?}"
         );
-        assert_eq!(model.connection.mqtt, Link::Down);
+        assert_eq!(model.connection.link(), Link::Down);
         assert!(!model.wifi.health.suspect(), "failed first: {failed_first}");
     }
 }
@@ -439,7 +439,7 @@ fn an_item_from_an_old_connection_is_ignored() {
         &mut model,
     )
     .expect_no_effects();
-    assert_eq!(model.connection.mqtt, Link::Up);
+    assert_eq!(model.connection.link(), Link::Up);
 }
 
 #[test]
@@ -1084,4 +1084,24 @@ fn a_message_before_the_connack_does_not_change_the_entities() {
     assert!(!closes[0].clean);
     assert_eq!(model.entities.get(VISIBLE), None);
     assert_ne!(app.view(&model).connection, Connection::Online);
+}
+
+/// During the close for a change of access point, the view shows that
+/// the core connects, and a state message does not change the entities.
+#[test]
+fn a_close_for_a_roam_shows_connecting_and_drops_the_messages() {
+    let app = Dashboard;
+    let (mut model, mut wire) = drive_to_connected(PowerSource::Stand);
+
+    // The DISCONNECT waits, so the session stays open in its close.
+    let mut roam = connection::close_for_roam(&mut model);
+    assert!(
+        roam.effects()
+            .any(|effect| matches!(effect, Effect::StreamWrite(_)))
+    );
+    assert_eq!(model.connection.link(), Link::Down);
+    assert_eq!(app.view(&model).connection, Connection::Connecting);
+
+    send(&mut model, &mut wire, &topic(VISIBLE, "state"), "on").expect_no_effects();
+    assert_eq!(model.entities.get(VISIBLE), None);
 }
