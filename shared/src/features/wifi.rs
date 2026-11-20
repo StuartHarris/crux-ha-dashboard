@@ -43,7 +43,8 @@ use crate::{
 use rules::{AfterFailure, ApCache, Health, RESTART_AFTER, Recovery, better_access_point};
 
 /// The time limit of the core for a `Join` request. The shell gives up
-/// after 20 seconds at most.
+/// after 20 seconds at most, with the leave before the join and the
+/// disconnect after a failure.
 pub const JOIN_TIMEOUT: Duration = Duration::from_secs(25);
 
 /// The time limit of the core for an `Address` request. The shell gives up
@@ -63,7 +64,8 @@ pub const SCAN_TIMEOUT: Duration = Duration::from_secs(15);
 pub const STOP_SCAN_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// The time limit of the core for an `Off` request. The shell needs about
-/// 100 ms.
+/// 1.1 seconds at most: a disconnect of 1 second, and 100 ms for the last
+/// frames.
 pub const OFF_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// The reason of a failure when a time limit of the core expires.

@@ -75,8 +75,9 @@ pub enum Target {
 /// `Associated { kept: true }` at once. If the device is already associated
 /// and `keep` is `false`, the shell leaves the access point first.
 ///
-/// The shell gives up after 5 seconds for a `Cached` target and after 20
-/// seconds for `Strongest`.
+/// The shell gives up after 8 seconds for a `Cached` target and after 20
+/// seconds for `Strongest`. Each limit includes the leave before the join
+/// and the disconnect after a failure.
 #[derive(Operation, Facet, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[operation(request, output = Joined)]
 pub struct Join {
