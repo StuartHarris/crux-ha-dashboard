@@ -128,10 +128,10 @@ The session packs the filters into SUBSCRIBE packets of up to 1024 bytes. The 11
 filters need about 7 packets, 7.9 KiB in all. The broker sends the retained state of
 each topic after it accepts the filter.
 
-The `Subscribe` job of the session ends when the broker acknowledged each topic
-filter. If the broker refuses a filter, or the stream closes first, the job fails.
-After the job succeeds, the core sends `WifiQuiet`. The firmware can then scan for a
-better access point.
+The `Subscribe` job of the session ends when the broker acknowledged each packet.
+If the broker refused a filter, the outcome is `Refused`. If the stream closes
+first, the outcome is `Failed`. After `Done` or `Refused`, the link is quiet, so the
+core sends `WifiQuiet`. The firmware can then scan for a better access point.
 
 ### Find a dead link
 
