@@ -6,14 +6,20 @@ use crate::features::connection;
 use alloc::{string::String, vec, vec::Vec};
 use core::time::Duration;
 
+use crux_core::App;
+
 use super::{
     flows::house,
     shell::{Shell, session_timers},
     start, start_at, tap_tile,
 };
 use crate::{
-    Event, PowerSource,
-    capabilities::stream::{StreamItem, Written},
+    Connection, Dashboard, Event, PowerSource,
+    capabilities::{
+        radio::Target,
+        stream::{StreamItem, Written},
+    },
+    fake::radio::HALL,
     features::{
         connection::{CLOSE_TIMEOUT, Link, RECONNECT_MAX, RECONNECT_MIN},
         light::LIGHT_TIMEOUT,
@@ -25,7 +31,10 @@ use crate::{
             STOP_SCAN_TIMEOUT,
         },
     },
-    mqtt::{MAX_IN_FLIGHT, MAX_PACKET, SEND_TIMEOUT, codec::server::Packet},
+    mqtt::{
+        MAX_IN_FLIGHT, MAX_PACKET, SEND_TIMEOUT,
+        codec::server::{Packet, suback},
+    },
 };
 
 /// The page of the living room. Tile 1 is a lamp.
@@ -532,4 +541,306 @@ fn only_the_first_message_that_is_too_long_on_a_connection_has_a_line() {
         lines[0].starts_with("warn mqtt: a message of "),
         "{lines:?}"
     );
+}
+
+/// Returns `true` if the view shows that the dashboard is online.
+fn online(shell: &Shell) -> bool {
+    shell.view().connection == Connection::Online
+}
+
+/// Returns `true` if `log` has a radio request.
+fn has_radio(log: &[String]) -> bool {
+    log.iter()
+        .any(|effect| effect.starts_with("Radio") || effect == "WifiOff")
+}
+
+/// Returns the house with the access point [`HALL`] in the cache, so that a
+/// scan for a better access point is due when the link is quiet.
+fn cached_house() -> Shell {
+    let mut shell = house();
+    shell.model.wifi.cache.joined(Target::Cached(HALL), HALL);
+    shell
+}
+
+/// Returns the SUBACK packets for each SUBSCRIBE packet that the shell
+/// wrote, with no refused filter.
+fn subacks(shell: &Shell) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for packet in shell.writes.iter().flatten() {
+        if let Packet::Subscribe { id, filters } = packet {
+            suback(&mut bytes, *id, &vec![0; filters.len()]);
+        }
+    }
+    assert!(!bytes.is_empty(), "a SUBSCRIBE in {:?}", shell.writes);
+    bytes
+}
+
+/// Gives `bytes` from the broker to the core on the current connection.
+fn receive(shell: &mut Shell, bytes: Vec<u8>) {
+    let connection = shell.model.connection.id;
+    shell.send(Event::Connection(connection::Event::Stream {
+        connection,
+        item: StreamItem::Received(bytes),
+    }));
+}
+
+/// During the close for a sleep, a state message does not change
+/// the entities.
+#[test]
+fn a_message_during_the_close_for_a_sleep_does_not_change_the_entities() {
+    let mut shell = connected(PowerSource::Battery);
+    let lamp = "light.living_room_rocket_lamp";
+    let state = |shell: &Shell| shell.model.entities.get(lamp).unwrap().state.clone();
+    shell.broker.set_state(lamp, "on", &[]);
+    shell.run();
+    assert_eq!(state(&shell).as_deref(), Some("on"));
+
+    // The DISCONNECT waits, so the session stays open in its close.
+    shell.broker.hold_writes = true;
+    shell.send(Event::SleepNow);
+    assert!(shell.model.power.asleep);
+    place(&shell.take_log(), "MqttDisconnect");
+
+    shell.broker.set_state(lamp, "off", &[]);
+    shell.run();
+    assert_eq!(state(&shell).as_deref(), Some("on"));
+}
+
+/// A subscribe that is done makes the link quiet while the link is up.
+/// A scan for a better access point then starts.
+#[test]
+fn a_subscribe_that_is_done_while_the_link_is_up_makes_the_link_quiet() {
+    let mut shell = cached_house();
+    shell.broker.hold_suback = true;
+    shell.send(start_at(PowerSource::Battery, Some(LIVING_ROOM)));
+    assert!(online(&shell));
+    assert!(!shell.take_log().contains(&"RadioScan".into()));
+
+    let bytes = subacks(&shell);
+    receive(&mut shell, bytes);
+    assert!(shell.take_log().contains(&"RadioScan".into()));
+}
+
+/// A subscribe that is done after the link went down does not make the
+/// link quiet. The device woke during the close for a sleep, so the
+/// core wants a connection, but it does not scan.
+#[test]
+fn a_subscribe_that_is_done_during_the_close_for_a_sleep_does_not_make_the_link_quiet() {
+    let mut shell = cached_house();
+    shell.broker.hold_suback = true;
+    shell.send(start_at(PowerSource::Battery, Some(LIVING_ROOM)));
+    assert!(online(&shell));
+
+    // The DISCONNECT waits. A tap wakes the device during the close.
+    shell.broker.hold_writes = true;
+    shell.send(Event::SleepNow);
+    assert!(shell.model.power.asleep);
+    shell.send(Event::Tapped(None));
+    assert!(!shell.model.power.asleep);
+    assert!(!online(&shell));
+    shell.take_log();
+
+    let bytes = subacks(&shell);
+    receive(&mut shell, bytes);
+    let log = shell.take_log();
+    assert!(!log.contains(&"RadioScan".into()), "{log:?}");
+}
+
+/// A call that the full session refuses goes to the front of the
+/// outbox, ahead of an older call that waits.
+#[test]
+fn a_call_that_the_full_session_refuses_goes_ahead_of_an_older_call_that_waits() {
+    let mut shell = connected(PowerSource::Stand);
+    shell.broker.hold_puback = true;
+    for _ in 0..MAX_IN_FLIGHT {
+        shell.send(tap_tile(1));
+    }
+    assert!(shell.model.connection.outbox.is_empty());
+
+    // Tile 0 is the light group, and tile 2 is the standard lamp.
+    let group = "light.living_room_lights";
+    let lamp = "light.living_room_standard_lamp";
+    shell.send(tap_tile(0));
+    shell.send(tap_tile(2));
+    let outbox: Vec<&str> = shell
+        .model
+        .connection
+        .outbox
+        .iter()
+        .map(|call| call.entity_id)
+        .collect();
+    assert_eq!(outbox, [lamp, group]);
+
+    // The PUBACK packets arrive, and the calls go in the order of the
+    // outbox.
+    shell.broker.hold_puback = false;
+    shell.broker.release_pubacks();
+    shell.broker.flush();
+    shell.run();
+    assert!(shell.model.connection.outbox.is_empty());
+    let last: Vec<&str> = shell.broker.service_calls[MAX_IN_FLIGHT..]
+        .iter()
+        .map(|call| call.entity_id.as_str())
+        .collect();
+    assert_eq!(last, [lamp, group]);
+}
+
+/// A new `Start` forgets the stream that drains and clears its close
+/// timer. A late answer to the `Close` request or a late close timeout then
+/// does nothing.
+#[test]
+fn a_start_forgets_the_close_that_waits() {
+    let mut shell = connected(PowerSource::Battery);
+    let old = shell.model.connection.id;
+    shell.broker.hold_closes = true;
+    shell.advance(IDLE_TIMEOUT);
+    assert!(shell.model.power.asleep);
+    let log = shell.take_log();
+    place(&log, "StreamClose");
+    assert!(!log.contains(&"WifiOff".into()), "{log:?}");
+
+    // A tap wakes the device while the `Close` request waits. The core
+    // connects only after the answer.
+    shell.send(Event::Tapped(None));
+    assert!(!shell.model.power.asleep);
+    assert!(!online(&shell));
+
+    // The shell starts again. The core connects at once.
+    shell.take_log();
+    shell.send(start_at(PowerSource::Battery, Some(LIVING_ROOM)));
+    place(&shell.take_log(), "MqttConnect");
+    assert!(online(&shell));
+
+    // A late answer or a late close timeout for the old connection gives no
+    // effects and no events, so also no step of the sleep.
+    for event in [
+        connection::Event::StreamClosed { connection: old },
+        connection::Event::CloseTimeout { connection: old },
+    ] {
+        Dashboard
+            .update(Event::Connection(event), &mut shell.model)
+            .expect_no_effect_or_events();
+    }
+    assert!(online(&shell));
+
+    // The close timer does not fire.
+    let events = shell.advance(CLOSE_TIMEOUT);
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            Event::Connection(connection::Event::CloseTimeout { .. })
+        )),
+        "{events:?}"
+    );
+
+    // The late answer does nothing.
+    shell.broker.release_closes();
+    shell.run();
+    let log = shell.take_log();
+    assert!(!log.contains(&"MqttConnect".into()), "{log:?}");
+    assert!(!has_radio(&log), "{log:?}");
+    assert!(!log.contains(&"Sleep".into()), "{log:?}");
+    assert!(online(&shell));
+}
+
+/// After a failure, a service call while the old stream drains makes the
+/// core connect at the answer to the `Close` request, before the backoff
+/// ends.
+#[test]
+fn a_call_while_the_stream_drains_after_a_failure_connects_at_the_answer_to_the_close() {
+    let mut shell = connected(PowerSource::Stand);
+    shell.broker.hold_closes = true;
+    let failed_at = shell.now();
+    shell.broker.drop_connection();
+    shell.run();
+    assert!(!online(&shell));
+    place(&shell.take_log(), "StreamClose");
+
+    // The call waits. The core does not connect and makes no radio request
+    // yet.
+    shell.send(tap_tile(1));
+    let log = shell.take_log();
+    assert!(!log.contains(&"MqttConnect".into()), "{log:?}");
+    assert!(!has_radio(&log), "{log:?}");
+    assert_eq!(shell.model.connection.outbox.len(), 1);
+
+    // The answer arrives before the backoff ends, and the core connects.
+    shell.broker.release_closes();
+    shell.run();
+    place(&shell.take_log(), "MqttConnect");
+    assert!(online(&shell));
+    assert!(shell.now() < failed_at + RECONNECT_MIN);
+    assert!(shell.model.connection.outbox.is_empty());
+
+    // The end of the backoff does not connect again.
+    shell.advance(RECONNECT_MAX);
+    let log = shell.take_log();
+    assert!(!log.contains(&"MqttConnect".into()), "{log:?}");
+    assert!(online(&shell));
+}
+
+/// A sleep while the stream opens ends the session at once. The
+/// core writes no DISCONNECT, and sends a clean `Close` for the connection.
+/// The next step of the sleep waits for the answer to the `Close` request.
+#[test]
+fn a_sleep_before_the_connack_closes_the_stream_with_no_disconnect() {
+    let mut shell = house();
+    // The CONNECT does not leave, so the session waits for its CONNACK.
+    shell.broker.hold_writes = true;
+    shell.send(start_at(PowerSource::Battery, Some(LIVING_ROOM)));
+    assert_eq!(shell.view().connection, Connection::Connecting);
+    let opening = shell.model.connection.id;
+    let writes = shell.writes.len();
+    shell.take_log();
+
+    shell.broker.hold_closes = true;
+    shell.send(Event::SleepNow);
+    assert!(shell.model.power.asleep);
+    let log = shell.take_log();
+    assert_eq!(shell.writes.len(), writes, "{log:?}");
+    assert!(!log.contains(&"MqttDisconnect".into()), "{log:?}");
+    place(&log, "StreamClose");
+    assert!(!log.contains(&"WifiOff".into()), "{log:?}");
+    let close = shell.closes.last().unwrap();
+    assert_eq!(close.connection, opening);
+    assert!(close.clean);
+
+    // The answer arrives, and the sleep continues.
+    shell.broker.release_closes();
+    shell.run();
+    let log = shell.take_log();
+    assert!(place(&log, "WifiOff") < place(&log, "Sleep"), "{log:?}");
+}
+
+/// A wake during the close for a sleep, and then a failure end,
+/// connects after the backoff. The device does not sleep.
+#[test]
+fn a_failure_after_a_wake_during_the_close_for_a_sleep_connects_after_the_backoff() {
+    let mut shell = connected(PowerSource::Battery);
+    shell.broker.hold_writes = true;
+    shell.advance(IDLE_TIMEOUT);
+    assert!(shell.model.power.asleep);
+    shell.send(Event::Tapped(None));
+    assert!(!shell.model.power.asleep);
+    shell.take_log();
+
+    // The DISCONNECT does not leave, so the send timer ends the session.
+    shell.broker.hold_writes = false;
+    shell.advance_session(SEND_TIMEOUT);
+    let log = shell.take_log();
+    place(&log, "StreamClose");
+    assert!(!shell.closes.last().unwrap().clean);
+    assert!(!log.contains(&"MqttConnect".into()), "{log:?}");
+    assert!(!log.contains(&"WifiOff".into()), "{log:?}");
+    assert!(!log.contains(&"Sleep".into()), "{log:?}");
+
+    // The core connects after the backoff.
+    shell.advance(RECONNECT_MIN);
+    let log = shell.take_log();
+    place(&log, "MqttConnect");
+    assert!(!log.contains(&"WifiOff".into()), "{log:?}");
+    assert!(!log.contains(&"Sleep".into()), "{log:?}");
+    assert!(online(&shell));
+    assert!(!shell.model.power.asleep);
+    assert!(shell.sleep.is_none());
 }
