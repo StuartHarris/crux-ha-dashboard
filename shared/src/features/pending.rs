@@ -69,8 +69,9 @@
 //!
 //! The timeout of a call starts when the core issues the call: at once while
 //! the connection is open, or when the outbox drains after the connect. Thus
-//! the reconnect after a wake does not use the time of the timeout. Each
-//! timer has an id, and the core ignores a timer that is not a timer of a
+//! the reconnect after a wake does not use the time of the timeout. The
+//! core clears a timer when the mark no longer needs it. Each timer has an
+//! id, and the core ignores the expiry of a timer that is not a timer of a
 //! mark now.
 //!
 //! # Drop
@@ -85,15 +86,16 @@
 use alloc::{string::String, vec::Vec};
 use core::time::Duration;
 
-use chrono::{DateTime, Utc};
-use crux_time::{TimerHandle, clock::Time};
-
 use crate::{
     Cmd, Event, Model,
     entities::EntityState,
-    features::refresh::{redraw, redraw_soon},
+    features::{
+        refresh::{redraw, redraw_soon},
+        timer::Running,
+    },
     temperature::{self, Centi},
 };
+use chrono::{DateTime, Utc};
 
 /// The time after which the core removes the mark of a service call that
 /// Home Assistant did not confirm.
@@ -133,20 +135,6 @@ pub enum Confirm {
     Scene,
 }
 
-/// A timer of a mark: its id and its handle.
-#[derive(Debug)]
-struct Timer {
-    id: u32,
-    handle: TimerHandle,
-}
-
-impl Timer {
-    /// Clears the timer.
-    fn clear(self) {
-        self.handle.clear();
-    }
-}
-
 /// The mark of one entity.
 #[derive(Debug)]
 pub struct Mark {
@@ -162,10 +150,10 @@ pub struct Mark {
     pub since: Option<DateTime<Utc>>,
     /// The timeout of the call that the core issued last, or `None` if no
     /// timeout runs.
-    timeout: Option<Timer>,
+    timeout: Option<Running>,
     /// The timeout of the calls that wait in the outbox, or `None` if no
     /// timeout runs.
-    queued: Option<Timer>,
+    queued: Option<Running>,
 }
 
 impl Mark {
@@ -174,7 +162,7 @@ impl Mark {
         [&self.timeout, &self.queued]
             .into_iter()
             .flatten()
-            .any(|timer| timer.id == id)
+            .any(|timer| timer.id() == id)
     }
 
     /// Clears the timers of the mark.
@@ -230,12 +218,10 @@ impl State {
     }
 
     /// Starts a timer of `wait`, and returns its command and the timer.
-    fn start(&mut self, wait: Duration) -> (Cmd, Timer) {
+    fn start(&mut self, wait: Duration) -> (Cmd, Running) {
         self.timer = self.timer.wrapping_add(1);
         let id = self.timer;
-        let (timer, handle) = Time::notify_after(wait);
-        let command = timer.then_send(move |_| Event::PendingTimeout(id));
-        (command, Timer { id, handle })
+        Running::start(id, wait, Event::PendingTimeout(id))
     }
 }
 
@@ -399,7 +385,7 @@ pub fn timeout(id: u32, model: &mut Model) -> Cmd {
     };
     let mark = &mut marks[index];
     let waits = outbox.iter().any(|call| call.entity_id == mark.entity_id);
-    if mark.timeout.as_ref().is_some_and(|timer| timer.id == id) {
+    if mark.timeout.as_ref().is_some_and(|timer| timer.id() == id) {
         mark.timeout = None;
         if waits {
             return Cmd::done();

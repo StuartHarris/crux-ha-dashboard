@@ -47,8 +47,9 @@
 //!
 //! Each full refresh makes the draw timer that waits stale, because the full
 //! refresh already drew the newest view. Examples are a page turn, a wake
-//! and the image before sleep. The core ignores a stale draw timer. While
-//! the device sleeps, the draw timer draws nothing.
+//! and the image before sleep. The core clears a stale draw timer. If the
+//! expiry of a stale timer still arrives, the core ignores it. While the
+//! device sleeps, the draw timer draws nothing.
 //!
 //! # The full-refresh timer and sleep
 //!
@@ -68,10 +69,8 @@
 
 use core::time::Duration;
 
+use crate::{Cmd, Event, Model, ViewModel, features::timer::Slot, view::view};
 use crux_core::render::render;
-use crux_time::{TimerHandle, clock::Time};
-
-use crate::{Cmd, Event, Model, ViewModel, view::view};
 
 /// The number of partial renders after which the core asks for a full
 /// refresh. The render after this number is a full refresh.
@@ -101,14 +100,23 @@ pub struct State {
     pub partials: u32,
     /// The id of the newest full-refresh timer.
     pub timer: u32,
-    /// The handle of the timer that runs, to clear it.
-    handle: Option<TimerHandle>,
+    /// The full-refresh timer that runs.
+    full: Slot,
     /// The view of the last render that the core asked for.
     last: Option<ViewModel>,
     /// The id of the newest draw timer.
     pub draw: u32,
-    /// A draw timer waits, so a new change does not start another one.
-    pub draw_pending: bool,
+    /// The draw timer that waits. While it waits, a new change does not
+    /// start another one.
+    draw_timer: Slot,
+}
+
+impl State {
+    /// Returns `true` if a draw timer waits.
+    #[must_use]
+    pub const fn draw_waits(&self) -> bool {
+        self.draw_timer.is_running()
+    }
 }
 
 /// Asks the shell to draw. If `full` is `true`, the core also asks for a
@@ -133,9 +141,9 @@ pub fn redraw(model: &mut Model, full: bool) -> Cmd {
     state.partials = 0;
     // The full refresh draws the newest view, so the draw timer that waits
     // is stale.
-    if state.draw_pending {
+    if state.draw_timer.is_running() {
         state.draw = state.draw.wrapping_add(1);
-        state.draw_pending = false;
+        state.draw_timer.stop();
     }
     model.full_refresh_seq = model.full_refresh_seq.wrapping_add(1);
     // The view is the same, except for the new number.
@@ -149,14 +157,12 @@ pub fn redraw(model: &mut Model, full: bool) -> Cmd {
 /// another one. That timer draws this change too.
 pub fn redraw_soon(model: &mut Model) -> Cmd {
     let state = &mut model.refresh;
-    if state.draw_pending {
+    if state.draw_timer.is_running() {
         return Cmd::done();
     }
     state.draw = state.draw.wrapping_add(1);
-    state.draw_pending = true;
     let id = state.draw;
-    let (timer, _handle) = Time::notify_after(DRAW_DELAY);
-    timer.then_send(move |_| Event::DrawDue(id))
+    state.draw_timer.start(id, DRAW_DELAY, Event::DrawDue(id))
 }
 
 /// The draw timer `id` expired, so the core draws the changes that arrived
@@ -167,11 +173,9 @@ pub fn redraw_soon(model: &mut Model) -> Cmd {
 /// as the last view, the core asks for nothing. An example is a change of
 /// `last_updated` in the same minute as the footer time.
 pub fn draw_due(id: u32, model: &mut Model) -> Cmd {
-    let state = &mut model.refresh;
-    if id != state.draw || !state.draw_pending {
+    if !model.refresh.draw_timer.expired(id) {
         return Cmd::done();
     }
-    state.draw_pending = false;
     if model.power.asleep {
         return Cmd::done();
     }
@@ -185,10 +189,9 @@ pub fn draw_due(id: u32, model: &mut Model) -> Cmd {
 /// for a full refresh. Otherwise, the panel has no new ghost image, so the
 /// core only starts the timer again.
 pub fn timer_expired(id: u32, model: &mut Model) -> Cmd {
-    if id != model.refresh.timer || model.power.asleep {
+    if !model.refresh.full.expired(id) || model.power.asleep {
         return Cmd::done();
     }
-    model.refresh.handle = None;
     if model.refresh.partials == 0 {
         return restart_timer(model);
     }
@@ -200,14 +203,12 @@ pub fn timer_expired(id: u32, model: &mut Model) -> Cmd {
 fn restart_timer(model: &mut Model) -> Cmd {
     let state = &mut model.refresh;
     state.timer = state.timer.wrapping_add(1);
-    if let Some(handle) = state.handle.take() {
-        handle.clear();
-    }
+    state.full.stop();
     if model.power.asleep {
         return Cmd::done();
     }
     let id = state.timer;
-    let (timer, handle) = Time::notify_after(FULL_REFRESH_INTERVAL);
-    state.handle = Some(handle);
-    timer.then_send(move |_| Event::FullRefreshDue(id))
+    state
+        .full
+        .start(id, FULL_REFRESH_INTERVAL, Event::FullRefreshDue(id))
 }

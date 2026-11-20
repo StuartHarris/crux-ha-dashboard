@@ -137,6 +137,7 @@ fn the_plus_and_minus_buttons_of_a_dimmable_light_publish_a_brightness_step() {
             );
         })
         .expect_pending_timer()
+        .expect_session_clear(&wire)
         .expect_no_effects();
     // A light group is dimmable too.
     app.update(tap_minus(0), &mut model)
@@ -401,6 +402,7 @@ fn a_second_step_of_a_thermostat_starts_from_the_target_that_waits() {
             assert_eq!(publish.payload, set_temperature("21.0").as_bytes());
         })
         .expect_pending_timer()
+        .expect_session_clear(&wire)
         .expect_no_effects();
     app.update(tap_minus(4), &mut model)
         .expect_light_timer()
@@ -408,6 +410,7 @@ fn a_second_step_of_a_thermostat_starts_from_the_target_that_waits() {
             assert_eq!(publish.payload, set_temperature("20.5").as_bytes());
         })
         .expect_pending_timer()
+        .expect_session_clear(&wire)
         .expect_no_effects();
     // The tile still shows the target that Home Assistant gave.
     let view = app.view(&model);
@@ -553,7 +556,8 @@ fn a_tap_before_the_connection_opens_waits_in_the_outbox_and_goes_first() {
         })
         // The timer of the mark starts when the core issues the call.
         .expect_pending_timer()
-        .expect_only_render();
+        .expect_render()
+        .expect_only_session_clear(&wire);
     assert_eq!(model.connection.outbox.len(), 0);
     assert_eq!(model.connection.mqtt, Link::Up);
 }

@@ -149,7 +149,14 @@ fn a_keep_alive_of_0_starts_no_ping_or_silence_timer() {
     let mut connack = Vec::new();
     codec::server::connack(&mut connack, false, 0);
     session.handle(Input::Received(connack));
-    assert_eq!(poll_all(&mut session), [Action::Connected]);
+    assert_eq!(
+        poll_all(&mut session),
+        [
+            Action::CancelTimer(TimerKind::Send),
+            Action::CancelTimer(TimerKind::ConnAck),
+            Action::Connected
+        ]
+    );
 }
 
 #[test]
@@ -496,6 +503,51 @@ fn the_session_pings_every_45_seconds() {
 }
 
 #[test]
+fn the_session_cancels_the_open_connack_and_send_timers_during_the_connect() {
+    let mut wire = Wire::new();
+    wire.open();
+    assert_eq!(
+        wire.cancels,
+        [TimerKind::Open, TimerKind::Send, TimerKind::ConnAck]
+    );
+}
+
+#[test]
+fn the_sent_of_each_write_cancels_its_send_timer() {
+    let mut wire = Wire::connected();
+    wire.cancels.clear();
+    wire.timers.clear();
+    wire.session.publish(command("on")).unwrap();
+    wire.run();
+    assert_eq!(
+        wire.timer_kinds(),
+        [
+            (TimerKind::Send, Duration::from_secs(10)),
+            (TimerKind::Ack, Duration::from_secs(10)),
+        ]
+    );
+    assert_eq!(wire.cancels, [TimerKind::Send]);
+}
+
+#[test]
+fn a_pingresp_cancels_its_timer() {
+    let mut wire = Wire::connected();
+    wire.cancels.clear();
+    wire.fire(wire.timer(TimerKind::Ping));
+    // The PINGREQ goes, and the PINGRESP comes back.
+    assert_eq!(wire.cancels, [TimerKind::Send, TimerKind::PingResp]);
+}
+
+#[test]
+fn a_pingresp_that_does_not_come_cancels_nothing() {
+    let mut wire = Wire::connected();
+    wire.broker.hold_pingresp = true;
+    wire.cancels.clear();
+    wire.fire(wire.timer(TimerKind::Ping));
+    assert_eq!(wire.cancels, [TimerKind::Send]);
+}
+
+#[test]
 fn no_pingresp_in_time_ends_the_session() {
     let mut wire = Wire::connected();
     wire.broker.hold_pingresp = true;
@@ -602,6 +654,7 @@ fn no_connack_in_time_ends_the_session() {
     assert_eq!(
         poll_all(&mut wire.session),
         [
+            Action::CancelTimer(TimerKind::Send),
             Action::Close,
             Action::Ended(End::Timeout(TimerKind::ConnAck))
         ]
@@ -687,6 +740,7 @@ fn a_connack_before_the_sent_of_the_connect_still_connects() {
             .any(|action| matches!(action, Action::Send(_)))
     );
     session.handle(Input::Sent);
+    assert_eq!(session.poll(), Some(Action::CancelTimer(TimerKind::Send)));
     assert!(matches!(session.poll(), Some(Action::Send(_))));
 }
 
@@ -840,7 +894,11 @@ fn disconnect_sends_its_packet_last_and_closes_after_its_sent() {
     wire.session.handle(Input::Sent);
     assert_eq!(
         poll_all(&mut wire.session),
-        [Action::Close, Action::Ended(End::Clean)]
+        [
+            Action::CancelTimer(TimerKind::Send),
+            Action::Close,
+            Action::Ended(End::Clean)
+        ]
     );
 }
 
@@ -919,7 +977,14 @@ fn a_connect_field_that_is_too_long_ends_the_session_when_the_stream_opens() {
     let mut session = Session::new(&connect, Limits::default());
     session.handle(Input::Opened);
     let actions = poll_all(&mut session);
-    assert_eq!(actions[1..], [Action::Close, Action::Ended(End::TooLong)]);
+    assert_eq!(
+        actions[1..],
+        [
+            Action::CancelTimer(TimerKind::Open),
+            Action::Close,
+            Action::Ended(End::TooLong)
+        ]
+    );
 }
 
 #[test]

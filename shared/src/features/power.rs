@@ -10,6 +10,9 @@
 //! - If the front light is still on at the sleep, one more step turns it
 //!   off first. Usually the light timer turned it off already. Refer to
 //!   [`LIGHT_TIMEOUT`](crate::features::light::LIGHT_TIMEOUT).
+//! - The core clears the idle timer on a move to the stand, at a sleep and
+//!   at [`Event::SleepNow`]. Each idle timer has an id. If the expiry of an
+//!   older timer still arrives, the core ignores it.
 //! - Each sleep has an id. A tap or a move to the stand wakes the device
 //!   during the steps, and the core then ignores the answers of the steps and
 //!   of `Sleep`.
@@ -17,12 +20,10 @@
 use alloc::vec;
 use core::time::Duration;
 
-use crux_time::clock::Time;
-
 use crate::{
     Cmd, Event, Model,
     capabilities::power::{Power, PowerSource, Wake, WakeSource},
-    features::{connection, light, refresh::redraw, rooms, wifi},
+    features::{connection, light, refresh::redraw, rooms, timer::Slot, wifi},
     view::rounded_level,
 };
 
@@ -44,6 +45,8 @@ pub struct State {
     pub asleep: bool,
     /// The id of the newest idle timer.
     pub idle: u32,
+    /// The idle timer that runs.
+    pub(crate) idle_timer: Slot,
     /// The core waits one more idle period, because service calls wait in
     /// the outbox.
     pub extended: bool,
@@ -113,8 +116,10 @@ pub fn source_changed(source: PowerSource, model: &mut Model) -> Cmd {
         PowerSource::Stand => {
             let was_asleep = model.power.asleep;
             model.power.asleep = false;
-            // The core ignores the idle timer that runs now.
+            // The device stays awake on the stand, so it needs no idle
+            // timer.
             model.power.idle = model.power.idle.wrapping_add(1);
+            model.power.idle_timer.stop();
             connection::restart(model);
             light::source_changed(model)
                 .and(redraw(model, was_asleep))
@@ -150,23 +155,25 @@ pub fn battery_changed(level: Option<u8>, model: &mut Model) -> Cmd {
     redraw(model, false)
 }
 
-/// Starts the idle timer on battery. The core then ignores the timer that
-/// ran before.
+/// Clears the idle timer that runs, and starts a new one on battery.
 pub fn restart_idle_timer(model: &mut Model) -> Cmd {
-    model.power.idle = model.power.idle.wrapping_add(1);
-    model.power.extended = false;
-    if model.power.source != PowerSource::Battery || model.power.asleep {
+    let state = &mut model.power;
+    state.idle = state.idle.wrapping_add(1);
+    state.extended = false;
+    state.idle_timer.stop();
+    if state.source != PowerSource::Battery || state.asleep {
         return Cmd::done();
     }
-    let id = model.power.idle;
-    let (timer, _handle) = Time::notify_after(IDLE_TIMEOUT);
-    timer.then_send(move |_| Event::IdleTimeout(id))
+    let id = state.idle;
+    state
+        .idle_timer
+        .start(id, IDLE_TIMEOUT, Event::IdleTimeout(id))
 }
 
 /// The idle timer with the id `id` expired. If it is the newest idle timer,
 /// the idle time ends ([`idle_ended`]).
 pub fn idle_timeout(id: u32, model: &mut Model) -> Cmd {
-    if id != model.power.idle {
+    if !model.power.idle_timer.expired(id) {
         return Cmd::done();
     }
     idle_ended(model)
@@ -175,10 +182,11 @@ pub fn idle_timeout(id: u32, model: &mut Model) -> Cmd {
 /// The user asked to sleep now. The idle time ends at once, as if the idle
 /// timer expired ([`idle_ended`]).
 ///
-/// The core ignores the idle timer that runs now, also if the event does
+/// The core clears the idle timer that runs, also if the event does
 /// nothing.
 pub fn sleep_now(model: &mut Model) -> Cmd {
     model.power.idle = model.power.idle.wrapping_add(1);
+    model.power.idle_timer.stop();
     idle_ended(model)
 }
 
@@ -206,6 +214,7 @@ fn idle_ended(model: &mut Model) -> Cmd {
 /// ([`light_off`]). Otherwise the core starts that step at once.
 fn sleep(model: &mut Model) -> Cmd {
     model.power.asleep = true;
+    model.power.idle_timer.stop();
     model.power.sleep = model.power.sleep.wrapping_add(1);
     let id = model.power.sleep;
     if light::is_on(model) {

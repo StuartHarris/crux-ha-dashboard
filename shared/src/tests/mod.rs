@@ -134,9 +134,9 @@ impl ExpectFullRefreshTimer for Cmd {
 
 /// Expects the effects of a service call that the core issues at once.
 trait ExpectServiceCall {
-    /// Expects the publish of the service call, the timer of its mark and
-    /// the render of the mark, and no other effect. The publish goes
-    /// through `wire`.
+    /// Expects the publish of the service call, the timer of its mark, the
+    /// render of the mark and the clear of the send timer of the session,
+    /// and no other effect. The publish goes through `wire`.
     fn expect_only_service_call_with(
         &mut self,
         wire: &mut Wire,
@@ -164,7 +164,9 @@ impl ExpectServiceCall for Cmd {
     ) {
         self.expect_publish_with(wire, model, check)
             .expect_pending_timer()
-            .expect_only_render();
+            .expect_render()
+            .expect_session_clear(wire)
+            .expect_no_effect_or_events();
     }
 
     #[track_caller]

@@ -15,6 +15,12 @@
 //! [`Action::StartTimer`] with a relative time, and gets them back as
 //! [`Input::Timer`]. A timer that the session replaced or cancelled has an
 //! old generation, and the session ignores it.
+//!
+//! The session has at most one timer of each [`TimerKind`]. A new
+//! `StartTimer` of a kind replaces the timer of that kind, so the caller can
+//! clear the old timer. When the session cancels a timer, it gives
+//! [`Action::CancelTimer`]. After [`Action::Ended`], the session uses no
+//! timer, so the caller can clear all of them.
 
 use alloc::{
     collections::{BTreeSet, VecDeque},
@@ -110,9 +116,11 @@ pub enum TimerKind {
 }
 
 impl TimerKind {
-    const COUNT: usize = 7;
+    /// The number of kinds.
+    pub(crate) const COUNT: usize = 7;
 
-    const fn index(self) -> usize {
+    /// Returns a different index below [`TimerKind::COUNT`] for each kind.
+    pub(crate) const fn index(self) -> usize {
         match self {
             Self::Open => 0,
             Self::ConnAck => 1,
@@ -171,12 +179,16 @@ pub enum Action {
     /// Close the stream.
     Close,
     /// Start a timer. After the time, give it back as [`Input::Timer`].
+    /// The timer replaces the timer of the same kind, if one runs.
     StartTimer {
         /// The timer.
         timer: Timer,
         /// The time from now.
         after: Duration,
     },
+    /// The session no longer uses the timer of this kind. The caller can
+    /// clear it. If the timer expires first, the session ignores it.
+    CancelTimer(TimerKind),
     /// The broker accepted the connection.
     Connected,
     /// A message arrived on a subscribed topic.
@@ -213,6 +225,7 @@ impl fmt::Debug for Action {
                 .field("timer", timer)
                 .field("after", after)
                 .finish(),
+            Self::CancelTimer(kind) => f.debug_tuple("CancelTimer").field(kind).finish(),
             Self::Connected => f.write_str("Connected"),
             Self::Message(message) => f.debug_tuple("Message").field(message).finish(),
             Self::Skipped { length } => f.debug_struct("Skipped").field("length", length).finish(),
@@ -714,10 +727,12 @@ impl Session {
         self.actions.push_back(Action::StartTimer { timer, after });
     }
 
-    /// Gives the timer of `kind` that runs now an old generation.
-    const fn cancel(&mut self, kind: TimerKind) {
+    /// Gives the timer of `kind` that runs now an old generation, and tells
+    /// the caller to clear it.
+    fn cancel(&mut self, kind: TimerKind) {
         let generation = &mut self.generations[kind.index()];
         *generation = generation.wrapping_add(1);
+        self.actions.push_back(Action::CancelTimer(kind));
     }
 
     /// Ends the session. If `close` is `true`, the caller must close the

@@ -314,7 +314,7 @@ fn a_draw_timer_that_waits_when_the_device_sleeps_draws_nothing() {
     shell.advance(before);
     shell.broker.set_state("light.all_lights", "on", &[]);
     shell.run();
-    assert!(shell.model.refresh.draw_pending);
+    assert!(shell.model.refresh.draw_waits());
 
     // The idle timeout puts the device to sleep. The last image is a full
     // refresh with the change.
@@ -323,9 +323,11 @@ fn a_draw_timer_that_waits_when_the_device_sleeps_draws_nothing() {
     let frames = shell.frames.len();
     assert!(shell.frames.last().unwrap().full);
 
+    // The full refresh cleared the draw timer, so the timer does not fire.
+    assert!(!shell.model.refresh.draw_waits());
     shell.take_log();
     let events = shell.advance(DRAW_DELAY);
-    assert!(matches!(events[..], [Event::DrawDue(_)]), "{events:?}");
+    assert_eq!(events, []);
     assert_eq!(shell.frames.len(), frames);
     assert_eq!(shell.take_log(), [] as [&str; 0]);
 }
@@ -355,4 +357,31 @@ fn a_draw_timer_after_a_newer_timer_draws_nothing() {
     // A timer draws only once.
     app.update(Event::DrawDue(second), &mut model)
         .expect_no_effects();
+}
+
+#[test]
+fn a_full_refresh_clears_the_draw_timer_that_waits() {
+    let mut shell = Shell::new();
+    shell.auto_draw = false;
+    shell.send(start(PowerSource::Stand));
+    shell.broker.set_state("light.all_lights", "on", &[]);
+    shell.run();
+    assert!(shell.model.refresh.draw_waits());
+    shell.take_log();
+
+    // A page turn is a full refresh, so the draw timer is stale.
+    shell.send(Event::NextPage);
+    assert!(!shell.model.refresh.draw_waits());
+    let log = shell.take_log();
+    let clears = log.iter().filter(|effect| *effect == "TimeClear").count();
+    // The full-refresh timer and the draw timer.
+    assert_eq!(clears, 2, "{log:?}");
+
+    let events = shell.advance(DRAW_DELAY);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, Event::DrawDue(_))),
+        "{events:?}"
+    );
 }

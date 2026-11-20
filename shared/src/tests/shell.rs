@@ -8,8 +8,8 @@
 //! fired timers sent to the core, so a test sees what each timer did. The
 //! shell does not find a timer by its kind or by its duration.
 //!
-//! A stale timer (one that the core no longer uses) stays until its
-//! deadline, as on a real device. When it fires, the core ignores its event.
+//! The core clears a timer that it no longer uses. The shell then removes
+//! the timer, so the timer does not fire.
 //!
 //! The timers of the MQTT session are separate. They are not in the log,
 //! and [`Shell::advance`] and [`Shell::advance_to_next`] do not fire them.
@@ -229,7 +229,7 @@ impl Shell {
         if !self.auto_draw {
             return;
         }
-        while self.model.refresh.draw_pending {
+        while self.model.refresh.draw_waits() {
             let Some(index) = self.next_due(limit, false) else {
                 break;
             };
@@ -379,6 +379,12 @@ impl Shell {
         );
         self.broker.time += now.as_secs() - self.now.as_secs();
         self.now = now;
+    }
+
+    /// Returns the number of timers of the MQTT session that wait. A timer
+    /// that the core cleared does not wait.
+    pub fn session_timer_count(&self) -> usize {
+        self.timers.iter().filter(|timer| timer.session).count()
     }
 
     /// Returns the log and clears it, so that a test can check the effects
