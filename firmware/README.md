@@ -113,6 +113,13 @@ The scan for a roam runs when the link is quiet, after the subscribe. The radio
 task dwells 50 to 120 ms on each channel. Three access points took 1.4 s on the
 board. If an access point is at least 10 dB stronger, the core starts a roam.
 
+The core writes its decisions through the log capability. The task prints each line
+as `wifi: <message>` or `mqtt: <message>`, at the level `info` or `warn`. The core
+lines show beside the radio lines `wifi: radio job N: <operation>`. The core line
+shows the reason, and the radio line shows the action. One `grep -a 'wifi:'` on the
+serial log shows both, in the order that they happened. The core writes nothing for
+the usual steps.
+
 The log lines that an operator can search for:
 
 | Log line | Meaning |
@@ -124,6 +131,15 @@ The log lines that an operator can search for:
 | `wifi: address <address>` | DHCP gave an address. |
 | `wifi: the scan found N access points in N ms. Current ..., signal S dBm` | A roam scan ended. |
 | `wifi: restart the chip: <reason>` | The core asked for a restart. |
+| `wifi: the link is suspect, because the MQTT session failed: <end>` | The core thinks the link is bad, so the next rejoin leaves first. |
+| `wifi: the link is suspect, so leave <access point> and join again` | The core leaves before the join, because the link is suspect. |
+| `wifi: N of 3 joins got no new address while the link is suspect` | The count toward a restart of the chip. |
+| `wifi: the join to the cached access point <...> failed, so join the strongest access point` | The core changes the target after a failed join. |
+| `wifi: the scan found no access point that is 10 dB stronger than ..., so stay` | A roam scan ended with no roam. |
+| `mqtt: connect again in N s` | The core waits N seconds before the next connect. |
+| `mqtt: the broker refused one or more topic filters, so some entities get no state` | The broker refused a filter of the subscribe. |
+| `mqtt: a message of N bytes is too long, so the core skipped it` | The core skipped a message that is too long. |
+| `mqtt: the service call for <entity> is too long for a packet, so the core dropped it` | The core dropped a service call. |
 | `stream: N failed: <reason> (by the host)` | The broker host ended the stream. |
 | `core: N updates since the stream opened, ...` | The core task writes it at each close of the stream. |
 

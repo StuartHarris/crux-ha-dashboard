@@ -26,8 +26,9 @@
 //! other one. A time limit that expires acts as a failure of the request,
 //! but it never counts toward a restart.
 //!
-//! The core writes each decision that is not usual to the log of the shell
-//! ([`crate::capabilities::log`]), with the area `wifi`. The line comes
+//! Each decision writes a line through the log capability
+//! ([`crate::capabilities::log`]), with the area `wifi`. The core writes only
+//! the decisions that are not usual. The line comes
 //! before the effects of the decision. The usual steps (a join, a new
 //! address, a rejoin that keeps the association) write no line.
 

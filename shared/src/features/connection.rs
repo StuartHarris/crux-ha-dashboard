@@ -14,6 +14,12 @@
 //! quiet ([`wifi::quiet`]). The Wi-Fi feature can then scan for a better
 //! access point. To change to it, the core closes the session with a
 //! DISCONNECT packet ([`close_for_roam`]), and connects again.
+//!
+//! The core writes a line to the log of the shell
+//! ([`crate::capabilities::log`]) for each decision that is not usual, with
+//! the area `mqtt`. A line comes when the broker refuses a topic filter,
+//! when the core waits to connect again, when the core skips a message that
+//! is too long, and when the core drops a service call that is too long.
 
 use alloc::{
     format,

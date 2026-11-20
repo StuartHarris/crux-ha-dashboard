@@ -132,7 +132,9 @@ The `Subscribe` job of the session ends when the broker acknowledged each packet
 If the broker refused a filter, the outcome is `Refused`. If the stream closes
 first, the outcome is `Failed`. After `Done` or `Refused`, the link is quiet, so the
 core starts the roam scan of the Wi-Fi policy (refer to "Change the access
-point" below). The core sends no other signal to the firmware for this.
+point" below). After `Refused`, the core also writes this line through the log
+capability: `mqtt: the broker refused one or more topic filters, so some entities get
+no state`. The line does not name the filter.
 
 ### Find a dead link
 
