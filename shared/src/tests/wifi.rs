@@ -145,11 +145,22 @@ fn the_first_start_joins_the_strongest_access_point_and_does_not_scan() {
 #[test]
 fn the_usual_steps_write_no_line_to_the_log() {
     // The first start joins the strongest access point, gets a new address,
-    // connects and subscribes.
+    // connects and subscribes. The idle timer puts the device to sleep.
+    let mut shell = house();
+    shell.send(start(PowerSource::Battery));
+    assert_eq!(shell.view().connection, Connection::Online);
+    shell.advance(IDLE_TIMEOUT);
+    assert!(shell.sleep.is_some());
+    assert_eq!(shell.take_logs(), Vec::<String>::new());
+}
+
+#[test]
+fn a_stop_of_the_broker_writes_only_the_waits_of_the_reconnects() {
     let mut shell = house();
     shell.send(start(PowerSource::Battery));
     assert_eq!(shell.view().connection, Connection::Online);
     shell.take_log();
+    shell.take_logs();
 
     // The broker stops and starts again. Each reconnect keeps the
     // association.
@@ -1129,14 +1140,15 @@ fn a_rejoin_that_keeps_the_association_and_its_address_writes_no_line() {
     shell.broker.code = 5;
     shell.send(start(PowerSource::Stand));
     shell.take_log();
+    assert_eq!(shell.take_logs(), [connect_again(1)]);
 
     shell.advance(RECONNECT_MIN);
     let log = shell.take_log();
     assert_eq!(radio(&log), ["RadioJoin Cached keep", "RadioAddress"]);
     assert!(shell.radio.has_address);
     // The rejoin writes no line of its own. The refused connect writes the
-    // wait of the next reconnect, and the start wrote the first wait.
-    assert_eq!(shell.take_logs(), [connect_again(1), connect_again(2)]);
+    // wait of the next reconnect.
+    assert_eq!(shell.take_logs(), [connect_again(2)]);
 }
 
 #[test]

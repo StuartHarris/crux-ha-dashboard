@@ -491,3 +491,39 @@ fn the_fixed_shell_stays_online_when_all_its_timers_fire() {
         assert_eq!(shell.view().connection, Connection::Online);
     }
 }
+
+#[test]
+fn only_the_first_message_that_is_too_long_on_a_connection_has_a_line() {
+    let mut shell = connected(PowerSource::Stand);
+    shell.take_logs();
+    let topic = "homeassistant/statestream/light/all_lights/state";
+    let too_long = vec![b'x'; MAX_PACKET + 1];
+    for _ in 0..2 {
+        shell.broker.publish(topic, &too_long, false);
+        shell.run();
+    }
+    // The core counts both messages, and writes one line.
+    assert_eq!(shell.model.connection.skipped, 2);
+    let lines = shell.take_logs();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0].starts_with("warn mqtt: a message of "),
+        "{lines:?}"
+    );
+
+    // A new connection writes a line again.
+    shell.broker.drop_connection();
+    shell.run();
+    shell.advance(RECONNECT_MIN * 2);
+    assert_eq!(shell.model.connection.mqtt, Link::Up);
+    shell.take_logs();
+    shell.broker.publish(topic, &too_long, false);
+    shell.run();
+    assert_eq!(shell.model.connection.skipped, 3);
+    let lines = shell.take_logs();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0].starts_with("warn mqtt: a message of "),
+        "{lines:?}"
+    );
+}

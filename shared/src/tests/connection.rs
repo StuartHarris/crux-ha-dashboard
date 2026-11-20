@@ -868,3 +868,32 @@ fn a_service_call_that_is_too_long_for_a_packet_is_dropped_with_a_line() {
     // The core did not keep the call.
     assert!(model.connection.outbox.is_empty());
 }
+
+#[test]
+fn a_service_call_that_is_too_long_in_the_outbox_is_dropped_with_a_line_when_the_core_connects() {
+    let (mut model, mut wire) = drive_to_connecting(PowerSource::Stand);
+    let call = Call {
+        publish: Publish {
+            topic: "t".repeat(usize::from(u16::MAX) + 1),
+            payload: vec![],
+            qos: Qos::AtMostOnce,
+            retain: false,
+        },
+        entity_id: "light.all_lights",
+    };
+    let _ = connection::send(call, &mut model);
+    assert_eq!(model.connection.outbox.len(), 1);
+
+    // The CONNACK drains the outbox. The call cannot go, so the core drops
+    // it, and the `Write` has only `online` and the subscribe.
+    wire.connect(&mut model)
+        .expect_write_with(&mut wire, &mut model, |_| {})
+        .expect_log_with(|log| {
+            assert_eq!(
+                log.to_string(),
+                "mqtt: the service call for light.all_lights is too long for a packet, so the core dropped it"
+            );
+        })
+        .expect_only_render();
+    assert!(model.connection.outbox.is_empty());
+}

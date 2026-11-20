@@ -26,7 +26,7 @@ use alloc::{
     string::{String, ToString},
     vec::Vec,
 };
-use core::time::Duration;
+use core::{mem, time::Duration};
 
 use chrono::{DateTime, Utc};
 use crux_time::clock::Time;
@@ -55,6 +55,8 @@ use crate::{
 pub const RECONNECT_MIN: Duration = Duration::from_secs(1);
 /// The longest wait before the core connects again after a failure.
 pub const RECONNECT_MAX: Duration = Duration::from_secs(60);
+// The log line of a reconnect shows whole seconds.
+const _: () = assert!(RECONNECT_MIN.subsec_nanos() == 0 && RECONNECT_MAX.subsec_nanos() == 0);
 /// The longest time that the core waits for the answer to a `Close`
 /// request.
 ///
@@ -127,6 +129,10 @@ pub struct Live {
     pub session: Session,
     /// The subscribe job of the connection, after the CONNACK.
     pub subscribe: Option<SubscribeId>,
+    /// The core wrote the line for a message that is too long on this
+    /// connection. Later messages on the connection only count in
+    /// [`State::skipped`].
+    pub skip_logged: bool,
 }
 
 /// A service call that waits in the outbox.
@@ -407,6 +413,7 @@ fn connect(model: &mut Model) -> Cmd {
     state.session = Some(Live {
         session: Session::new(&request, Limits::default()),
         subscribe: None,
+        skip_logged: false,
     });
     let connection = state.id;
 
@@ -538,7 +545,9 @@ fn handle(id: u32, input: Input, model: &mut Model) -> Cmd {
 /// - `Subscribed` with `Done` or `Refused` for the subscribe of the
 ///   connection makes the link quiet ([`wifi::quiet`]). After `Refused`,
 ///   the link is up and quiet, and the core writes a line to the log.
-/// - `Skipped` counts the message and writes a line to the log.
+/// - `Skipped` counts the message. The core writes a line to the log for the
+///   first skipped message of each connection only, because a flood of
+///   messages that are too long would fill the log.
 /// - `Ended` closes the stream, and connects again if the core wants a
 ///   connection. The new stream opens after the answer to the `Close`
 ///   request.
@@ -571,10 +580,21 @@ pub fn pump(model: &mut Model) -> Cmd {
                 Action::Message(message) => rest.push(on_message(&message, model)),
                 Action::Skipped { length } => {
                     model.connection.skipped = model.connection.skipped.wrapping_add(1);
-                    rest.push(log::warn(
-                        Area::Mqtt,
-                        format!("a message of {length} bytes is too long, so the core skipped it"),
-                    ));
+                    // A retained flood can hold many messages that are too
+                    // long, so only the first one on a connection has a line.
+                    let first = model
+                        .connection
+                        .session
+                        .as_mut()
+                        .is_some_and(|live| !mem::replace(&mut live.skip_logged, true));
+                    if first {
+                        rest.push(log::warn(
+                            Area::Mqtt,
+                            format!(
+                                "a message of {length} bytes is too long, so the core skipped it"
+                            ),
+                        ));
+                    }
                 }
                 Action::Subscribed { id, outcome } => rest.push(subscribed(id, outcome, model)),
                 Action::Ended(end) => rest.push(ended(&end, model)),
@@ -757,7 +777,8 @@ pub fn page_time(model: &Model) -> Option<DateTime<Utc>> {
 
 /// Waits, then tries to connect again. Each wait is double the wait before
 /// it, up to [`RECONNECT_MAX`]. The command writes the wait to the log, in
-/// whole seconds, before the timer starts.
+/// whole seconds, before the timer starts. Both limits are whole seconds,
+/// so each wait is.
 fn schedule_reconnect(model: &mut Model) -> Cmd {
     let state = &mut model.connection;
     state.reconnect = state.reconnect.wrapping_add(1);

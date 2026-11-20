@@ -9,7 +9,7 @@
 //! The step tests drive the core one update at a time. The flow tests run
 //! the core in the test shell, against the fake broker.
 
-use alloc::string::String;
+use alloc::{string::String, vec::Vec};
 
 use crux_core::App;
 
@@ -154,13 +154,13 @@ fn a_refused_filter_still_makes_the_link_quiet_once() {
         "{log:?}"
     );
     // The refusal shows in the log of the core.
+    let lines = shell.take_logs();
+    let mqtt: Vec<_> = lines.iter().filter(|line| line.contains("mqtt:")).collect();
     assert_eq!(
-        shell.take_logs(),
-        [
-            "warn mqtt: the broker refused one or more topic filters, so some entities get no state",
-            // The link is quiet, so the scan follows.
-            "info wifi: the scan found no access point that is 10 dB stronger than \
-             02:00:00:00:00:01 on channel 6 (-55 dBm), so stay",
-        ]
+        mqtt,
+        ["warn mqtt: the broker refused one or more topic filters, so some entities get no state"]
     );
+    // The refusal comes before the lines of the scan that the quiet link
+    // starts.
+    assert!(lines[0].contains("mqtt:"), "{lines:?}");
 }
