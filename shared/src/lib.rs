@@ -8,6 +8,8 @@
 //!   Home Assistant.
 //! - [`capabilities`] has the custom effects: MQTT, network, power and the
 //!   front light.
+//! - [`mqtt`] is an MQTT 3.1.1 client with no I/O: a codec, a framer and the
+//!   state machine of a connection.
 //! - [`view`] makes the view model, which has all the text that the `ui`
 //!   crate draws.
 //! - [`summary`] makes the summary of each room on the index page.
@@ -33,6 +35,7 @@ pub mod features;
 pub mod fixtures;
 pub mod layout;
 pub mod local_time;
+pub mod mqtt;
 pub mod pages;
 pub mod route;
 pub mod summary;

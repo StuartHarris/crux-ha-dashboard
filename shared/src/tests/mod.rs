@@ -5,7 +5,7 @@
 //! effects with a fake MQTT broker, a fake Home Assistant with a clock,
 //! Wi-Fi and timers.
 
-mod broker;
+pub mod broker;
 mod connection;
 mod flows;
 mod light;
