@@ -363,6 +363,13 @@ fn a_message_that_is_too_long_is_skipped_and_the_connection_stays() {
     assert_eq!(shell.model.connection.skipped, 1);
     assert_eq!(shell.model.connection.mqtt, Link::Up);
     assert_eq!(shell.closes, []);
+    assert_eq!(
+        shell.take_logs(),
+        [format!(
+            "warn mqtt: a message of {} bytes is too long, so the core skipped it",
+            MAX_PACKET + 1 + topic.len() + 2
+        )]
+    );
 
     // The next message arrives.
     shell.broker.set_state("light.all_lights", "off", &[]);

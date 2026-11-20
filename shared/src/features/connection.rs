@@ -16,6 +16,7 @@
 //! DISCONNECT packet ([`close_for_roam`]), and connects again.
 
 use alloc::{
+    format,
     string::{String, ToString},
     vec::Vec,
 };
@@ -27,7 +28,10 @@ use futures::StreamExt;
 
 use crate::{
     Cmd, Event, Model,
-    capabilities::stream::{Stream, StreamItem, Written},
+    capabilities::{
+        log::{self, Area},
+        stream::{Stream, StreamItem, Written},
+    },
     entities,
     features::{
         pending,
@@ -300,8 +304,9 @@ pub fn send(call: Call, model: &mut Model) -> Cmd {
 /// Gives a service call to the session and starts the timer of its mark.
 /// Returns the command of the timer.
 ///
-/// A call that is too long for a packet can never go. The core drops it and
-/// removes its mark.
+/// A call that is too long for a packet can never go. The core drops it,
+/// removes its mark, and writes a line to the log. The command that the
+/// function returns holds that line.
 ///
 /// # Errors
 ///
@@ -313,8 +318,15 @@ fn issue(call: Call, model: &mut Model) -> Result<Cmd, Call> {
     match live.session.publish(call.publish.clone()) {
         Ok(()) => Ok(pending::issued(call.entity_id, model)),
         Err(Refused::TooLong) => {
+            let reason = log::warn(
+                Area::Mqtt,
+                format!(
+                    "the service call for {} is too long for a packet, so the core dropped it",
+                    call.entity_id
+                ),
+            );
             pending::forget_dropped(model);
-            Ok(Cmd::done())
+            Ok(reason)
         }
         Err(Refused::Full | Refused::NotConnected) => Err(call),
     }
@@ -519,8 +531,8 @@ fn handle(id: u32, input: Input, model: &mut Model) -> Cmd {
 /// - `Message` changes the state of an entity.
 /// - `Subscribed` with `Done` or `Refused` for the subscribe of the
 ///   connection makes the link quiet ([`wifi::quiet`]). After `Refused`,
-///   the link is up and quiet, but the core has no effect to report the
-///   refused filter.
+///   the link is up and quiet, and the core writes a line to the log.
+/// - `Skipped` counts the message and writes a line to the log.
 /// - `Ended` closes the stream, and connects again if the core wants a
 ///   connection. The new stream opens after the answer to the `Close`
 ///   request.
@@ -551,8 +563,12 @@ pub fn pump(model: &mut Model) -> Cmd {
                 Action::Close => {}
                 Action::Connected => rest.push(connected(model)),
                 Action::Message(message) => rest.push(on_message(&message, model)),
-                Action::Skipped { .. } => {
+                Action::Skipped { length } => {
                     model.connection.skipped = model.connection.skipped.wrapping_add(1);
+                    rest.push(log::warn(
+                        Area::Mqtt,
+                        format!("a message of {length} bytes is too long, so the core skipped it"),
+                    ));
                 }
                 Action::Subscribed { id, outcome } => rest.push(subscribed(id, outcome, model)),
                 Action::Ended(end) => rest.push(ended(&end, model)),
@@ -641,13 +657,21 @@ fn on_message(message: &Message, model: &mut Model) -> Cmd {
 
 /// Handles the result of a subscribe job. After `Done` or `Refused` for the
 /// subscribe of the connection, the link is quiet ([`wifi::quiet`]). After
-/// `Failed`, the connection ended or never got the acknowledgements, so the
-/// link is not quiet.
+/// `Refused`, the core also writes a line to the log. After `Failed`, the
+/// connection ended or never got the acknowledgements, so the link is not
+/// quiet.
 fn subscribed(id: SubscribeId, outcome: SubscribeOutcome, model: &mut Model) -> Cmd {
     let state = &model.connection;
     let current = state.session.as_ref().and_then(|live| live.subscribe);
     if current != Some(id) || state.mqtt != Link::Up || outcome == SubscribeOutcome::Failed {
         return Cmd::done();
+    }
+    if outcome == SubscribeOutcome::Refused {
+        let reason = log::warn(
+            Area::Mqtt,
+            "the broker refused one or more topic filters, so some entities get no state",
+        );
+        return reason.and(wifi::quiet(model));
     }
     wifi::quiet(model)
 }
@@ -726,7 +750,8 @@ pub fn page_time(model: &Model) -> Option<DateTime<Utc>> {
 }
 
 /// Waits, then tries to connect again. Each wait is double the wait before
-/// it, up to [`RECONNECT_MAX`].
+/// it, up to [`RECONNECT_MAX`]. The command writes the wait to the log, in
+/// whole seconds, before the timer starts.
 fn schedule_reconnect(model: &mut Model) -> Cmd {
     let state = &mut model.connection;
     state.reconnect = state.reconnect.wrapping_add(1);
@@ -734,5 +759,6 @@ fn schedule_reconnect(model: &mut Model) -> Cmd {
     let wait = state.backoff;
     state.backoff = (wait * 2).min(RECONNECT_MAX);
     let (timer, _handle) = Time::notify_after(wait);
-    timer.then_send(move |_| Event::Reconnect(id))
+    let reason = log::info(Area::Mqtt, format!("connect again in {} s", wait.as_secs()));
+    reason.and(timer.then_send(move |_| Event::Reconnect(id)))
 }

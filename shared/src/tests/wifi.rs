@@ -54,6 +54,12 @@ fn no_new_address(count: u32) -> String {
     )
 }
 
+/// Returns the log line of a reconnect that the core schedules after `secs`
+/// seconds.
+fn connect_again(secs: u32) -> String {
+    format!("info mqtt: connect again in {secs} s")
+}
+
 /// Returns the radio entries of `log` in order: the radio requests,
 /// `WifiOff` and `RadioRestart`.
 fn radio(log: &[String]) -> Vec<&str> {
@@ -168,7 +174,9 @@ fn the_usual_steps_write_no_line_to_the_log() {
     shell.advance(IDLE_TIMEOUT);
     assert!(shell.sleep.is_some());
 
-    assert_eq!(shell.take_logs(), Vec::<String>::new());
+    // Each failure of the broker host schedules a reconnect, so the core
+    // writes the wait. The other steps write no line.
+    assert_eq!(shell.take_logs(), [connect_again(1), connect_again(2)]);
 }
 
 #[test]
@@ -337,6 +345,7 @@ fn a_join_to_the_strongest_that_fails_waits_for_the_backoff() {
         [
             JOIN_TO_HALL_FAILED,
             "warn wifi: the join to the strongest access point failed, so the link is down",
+            &connect_again(1),
         ]
     );
 
@@ -454,9 +463,11 @@ fn a_refused_connect_clears_a_suspect_link() {
         shell.take_logs(),
         [
             SUSPECT,
+            &connect_again(1),
             LEAVE_HALL,
             "info wifi: the broker host ended the session, so the link moves data and is not \
              suspect",
+            &connect_again(2),
         ]
     );
 
@@ -466,7 +477,8 @@ fn a_refused_connect_clears_a_suspect_link() {
     let log = shell.take_log();
     assert_eq!(radio(&log), ["RadioJoin Cached keep", "RadioAddress"]);
     assert_eq!(shell.restarts, Vec::<String>::new());
-    assert_eq!(shell.take_logs(), Vec::<String>::new());
+    // The refused connect schedules the next wait.
+    assert_eq!(shell.take_logs(), [connect_again(4)]);
 }
 
 #[test]
@@ -495,11 +507,13 @@ fn a_refused_connect_clears_a_suspect_link_and_its_count() {
         shell.take_logs(),
         [
             SUSPECT,
+            &connect_again(1),
             LEAVE_HALL,
             "warn wifi: the address is from before the join, so the network stack can be stuck",
             &no_new_address(1),
             "info wifi: the broker host ended the session, so the link moves data and is not \
              suspect",
+            &connect_again(2),
         ]
     );
 }
@@ -605,6 +619,7 @@ fn a_stuck_driver_restarts_the_chip_after_3_joins_with_no_address() {
         shell.take_logs(),
         [
             SUSPECT,
+            &connect_again(1),
             LEAVE_HALL,
             &no_new_address(1),
             "warn wifi: 02:00:00:00:00:01 on channel 6 gave no address, so leave it and join \
@@ -612,6 +627,7 @@ fn a_stuck_driver_restarts_the_chip_after_3_joins_with_no_address() {
             &no_new_address(2),
             "warn wifi: the strongest access point 02:00:00:00:00:01 on channel 6 gave no \
              address, so leave it",
+            &connect_again(2),
             &no_new_address(3),
         ]
     );
@@ -649,9 +665,11 @@ fn a_stale_lease_counts_and_bytes_from_the_broker_clear_the_count() {
         shell.take_logs(),
         [
             SUSPECT,
+            &connect_again(1),
             LEAVE_HALL,
             "warn wifi: the address is from before the join, so the network stack can be stuck",
             &no_new_address(1),
+            &connect_again(2),
         ]
     );
 
@@ -1092,6 +1110,7 @@ fn bytes_from_the_broker_clear_a_suspect_link_with_one_line() {
         shell.take_logs(),
         [
             SUSPECT,
+            &connect_again(1),
             LEAVE_HALL,
             "info wifi: bytes from the broker arrived, so the link is not suspect",
             // The join went to the cached access point, so a scan follows.
@@ -1115,7 +1134,9 @@ fn a_rejoin_that_keeps_the_association_and_its_address_writes_no_line() {
     let log = shell.take_log();
     assert_eq!(radio(&log), ["RadioJoin Cached keep", "RadioAddress"]);
     assert!(shell.radio.has_address);
-    assert_eq!(shell.take_logs(), Vec::<String>::new());
+    // The rejoin writes no line of its own. The refused connect writes the
+    // wait of the next reconnect, and the start wrote the first wait.
+    assert_eq!(shell.take_logs(), [connect_again(1), connect_again(2)]);
 }
 
 #[test]

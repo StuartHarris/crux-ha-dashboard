@@ -153,4 +153,14 @@ fn a_refused_filter_still_makes_the_link_quiet_once() {
         place(&log, "MqttSubscribe") < place(&log, "RadioScan"),
         "{log:?}"
     );
+    // The refusal shows in the log of the core.
+    assert_eq!(
+        shell.take_logs(),
+        [
+            "warn mqtt: the broker refused one or more topic filters, so some entities get no state",
+            // The link is quiet, so the scan follows.
+            "info wifi: the scan found no access point that is 10 dB stronger than \
+             02:00:00:00:00:01 on channel 6 (-55 dBm), so stay",
+        ]
+    );
 }

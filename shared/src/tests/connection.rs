@@ -1,6 +1,6 @@
 //! Tests of the connection feature, one step at a time.
 
-use alloc::{format, vec::Vec};
+use alloc::{format, vec, vec::Vec};
 use core::time::Duration;
 
 use crux_core::App;
@@ -18,12 +18,12 @@ use crate::{
         stream::{StreamItem, Written},
     },
     features::{
-        connection::{CLOSE_TIMEOUT, Link, RECONNECT_MAX, RECONNECT_MIN},
+        connection::{self, CLOSE_TIMEOUT, Call, Link, RECONNECT_MAX, RECONNECT_MIN},
         refresh::DRAW_DELAY,
         wifi::{JOIN_TIMEOUT, Phase},
     },
     mqtt::{
-        Qos,
+        Publish, Qos,
         codec::{self, Flags, server::Packet},
     },
     view::LightState::{On, Unavailable},
@@ -367,6 +367,9 @@ fn a_lost_connection_shows_the_time_of_the_last_message_and_retries_after_a_back
             assert_eq!(Duration::from(notify.duration), CLOSE_TIMEOUT);
         })
         .expect_render()
+        .expect_log_with(|log| {
+            assert_eq!(log.to_string(), "mqtt: connect again in 1 s");
+        })
         .resolve_time_notify_after(|notify| {
             assert_eq!(Duration::from(notify.duration), RECONNECT_MIN);
             notify.id
@@ -414,6 +417,12 @@ fn the_backoff_doubles_up_to_a_limit_and_resets_on_connect() {
                 assert_eq!(Duration::from(notify.duration), CLOSE_TIMEOUT);
             })
             // The view still shows `Connecting`, so the core does not draw.
+            .expect_log_with(|log| {
+                assert_eq!(
+                    log.to_string(),
+                    format!("mqtt: connect again in {} s", expected.as_secs())
+                );
+            })
             .resolve_time_notify_after(|notify| {
                 assert_eq!(Duration::from(notify.duration), expected);
                 notify.id
@@ -478,6 +487,9 @@ fn a_join_that_fails_is_tried_again_after_a_backoff() {
                 log.to_string(),
                 "wifi: the join to the strongest access point failed, so the link is down"
             );
+        })
+        .expect_log_with(|log| {
+            assert_eq!(log.to_string(), "mqtt: connect again in 1 s");
         })
         .resolve_time_notify_after(|notify| {
             assert_eq!(Duration::from(notify.duration), RECONNECT_MIN);
@@ -831,4 +843,28 @@ fn a_time_from_home_assistant_replaces_the_kept_time() {
         .unwrap()
         .expect_only_render();
     assert_eq!(app.view(&model).updated, "Last changed 09:31");
+}
+
+#[test]
+fn a_service_call_that_is_too_long_for_a_packet_is_dropped_with_a_line() {
+    let (mut model, _wire) = drive_to_connected(PowerSource::Stand);
+    let call = Call {
+        publish: Publish {
+            // A topic must fit a 16-bit length.
+            topic: "t".repeat(usize::from(u16::MAX) + 1),
+            payload: vec![],
+            qos: Qos::AtMostOnce,
+            retain: false,
+        },
+        entity_id: "light.all_lights",
+    };
+    let mut cmd = connection::send(call, &mut model);
+    cmd.expect_log_with(|log| {
+        assert_eq!(
+            log.to_string(),
+            "mqtt: the service call for light.all_lights is too long for a packet, so the core dropped it"
+        );
+    });
+    // The core did not keep the call.
+    assert!(model.connection.outbox.is_empty());
 }
