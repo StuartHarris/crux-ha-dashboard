@@ -312,3 +312,6 @@ fn call_service(model: &mut Model, call: &ServiceCall<'_>, confirm: Confirm) -> 
     };
     connection::send(call, model).and(redraw(model, false))
 }
+
+#[cfg(test)]
+mod tests;

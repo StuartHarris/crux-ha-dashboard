@@ -743,3 +743,6 @@ fn limit(radio: u32, after: Duration, model: &mut Model) -> Cmd {
         .limit
         .start(radio, after, Event::RadioTimeout(radio))
 }
+
+#[cfg(test)]
+mod tests;

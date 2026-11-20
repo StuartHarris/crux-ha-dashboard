@@ -14,11 +14,7 @@ use alloc::{string::String, vec::Vec};
 use crux_core::App;
 
 use super::{
-    connection::{drive_to_connected, drive_to_connecting},
-    flows::house,
-    shell::Shell,
-    start,
-    wire::ExpectWrite,
+    drive_to_connected, drive_to_connecting, flows::house, shell::Shell, start, wire::ExpectWrite,
 };
 use crate::{
     Dashboard, Effect, EffectTestExt, Event, Model, PowerSource,
