@@ -121,9 +121,9 @@ pub enum Signal {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StreamOp {
     /// Open a stream. If a stream is open, close it first, and end it with
-    /// `Closed("replaced")`. The stream task answers with the items of the
-    /// new stream as [`Signal::Stream`], and the last item is always
-    /// `Closed`.
+    /// `Closed` and the reason `"replaced"`. The stream task answers with the
+    /// items of the new stream as [`Signal::Stream`], and the last item is
+    /// always `Closed`.
     Open(Open),
     /// Send the bytes. The stream task answers with [`Signal::Written`].
     Write(Write),
@@ -390,7 +390,7 @@ impl Shell {
             return Vec::new();
         };
         let reason = match &item {
-            StreamItem::Closed(reason) => Some(reason.clone()),
+            StreamItem::Closed { reason, .. } => Some(reason.clone()),
             _ => None,
         };
         let mut effects = resolve(&self.core, &mut self.streams[index].1, item);

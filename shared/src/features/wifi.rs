@@ -207,7 +207,8 @@ fn rejoin(current: AccessPoint, model: &mut Model) -> Cmd {
 }
 
 /// Records the end of an MQTT session with `end`. A failure of the link
-/// makes it suspect.
+/// makes it suspect. A TCP reset from the broker host proves traffic. Refer
+/// to [`Health::ended`].
 ///
 /// After an end that is not clean, the link can be the cause, so the next
 /// [`link`] joins again. A clean end comes from the core, so the link stays
@@ -219,7 +220,9 @@ pub fn session_ended(end: &End, model: &mut Model) {
     }
 }
 
-/// Records bytes from the broker, which prove that the link moves data.
+/// Records bytes from the broker, which prove that the link moves data. A
+/// TCP reset from the broker host is the same proof. Refer to
+/// [`session_ended`].
 pub const fn traffic(model: &mut Model) {
     model.wifi.health.traffic();
 }

@@ -7,10 +7,7 @@
 //! is `Deref` to the fake broker, so a test reads the fake broker and sets
 //! its rules through the adapter.
 
-use alloc::{
-    string::{String, ToString},
-    vec::Vec,
-};
+use alloc::{string::ToString, vec::Vec};
 use core::ops::{Deref, DerefMut};
 
 use crux_core::Request;
@@ -18,7 +15,7 @@ use crux_core::Request;
 pub use crate::fake::iso_time;
 use crate::{
     capabilities::stream::{Close, Open, StreamItem, Write, Written},
-    fake,
+    fake::{self, NoConnection},
     mqtt::{
         MAX_PACKET, Publish, Qos,
         codec::server::{self, Packet},
@@ -107,13 +104,18 @@ impl DerefMut for Broker {
 
 impl Broker {
     /// Opens a stream for the `Open` request. A stream that is open ends
-    /// with `Closed("replaced")`. If the broker is down, the new stream ends
-    /// at once.
+    /// with `Closed` and the reason `"replaced"`. If the broker is down or
+    /// the broker host is unreachable, the new stream ends at once. Only a broker
+    /// that is down gives a reset.
     pub fn open(&mut self, mut request: Request<Open>) {
         self.end("replaced");
-        if let Err(reason) = self.inner.open() {
+        if let Err(failure) = self.inner.open() {
+            let item = match failure {
+                NoConnection::Refused => StreamItem::reset(failure.reason()),
+                NoConnection::Unreachable => StreamItem::closed(failure.reason()),
+            };
             request
-                .resolve(StreamItem::Closed(reason))
+                .resolve(item)
                 .expect("the core listens to the stream");
             return;
         }
@@ -261,9 +263,7 @@ impl Broker {
             let _ = write.resolve(Written::Failed(reason.to_string()));
         }
         if let Some(mut stream) = self.stream.take() {
-            let _ = stream
-                .request
-                .resolve(StreamItem::Closed(String::from(reason)));
+            let _ = stream.request.resolve(StreamItem::closed(reason));
         }
     }
 }

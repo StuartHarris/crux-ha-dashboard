@@ -190,7 +190,7 @@ impl Device {
     fn closed(&mut self, connection: u32, reason: &str) -> Vec<Job> {
         self.handle(Signal::Stream {
             connection,
-            item: StreamItem::Closed(reason.into()),
+            item: StreamItem::closed(reason),
         })
     }
 }

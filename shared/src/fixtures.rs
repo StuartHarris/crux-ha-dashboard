@@ -237,7 +237,7 @@ impl FixedShell {
         let Some(mut request) = self.stream.take() else {
             return Vec::new();
         };
-        self.resolve(&mut request, StreamItem::Closed("test".into()))
+        self.resolve(&mut request, StreamItem::closed("test"))
     }
 
     /// Fires all the timers that wait, also the timers of the MQTT session,

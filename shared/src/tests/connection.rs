@@ -345,7 +345,7 @@ fn the_backoff_doubles_up_to_a_limit_and_resets_on_connect() {
     let mut expected = RECONNECT_MIN;
     for _ in 0..8 {
         let connection = model.connection.id;
-        let refused = StreamItem::Closed("connection refused".into());
+        let refused = StreamItem::reset("connection refused");
         let event = app
             .update(
                 Event::Stream {
@@ -385,7 +385,7 @@ fn an_item_from_an_old_connection_is_ignored() {
     app.update(
         Event::Stream {
             connection: old,
-            item: StreamItem::Closed("connection lost".into()),
+            item: StreamItem::closed("connection lost"),
         },
         &mut model,
     )

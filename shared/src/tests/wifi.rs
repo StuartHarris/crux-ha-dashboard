@@ -297,26 +297,115 @@ fn a_router_that_blocks_the_device_for_3_minutes_does_not_restart_the_chip() {
 }
 
 #[test]
-fn a_broker_that_is_down_for_3_minutes_gets_new_leases_and_no_restart() {
+fn a_broker_host_that_does_not_answer_for_3_minutes_gets_new_leases_and_no_restart() {
     let mut shell = online();
-    shell.broker.down = true;
+    shell.broker.unreachable = true;
     fail_the_session(&mut shell);
 
     shell.advance(Duration::from_secs(180));
     let log = shell.take_log();
-    // The link is suspect, so each reconnect leaves and joins again. Each
-    // join gets a new address.
+    // No answer arrives, so the link stays suspect, and each reconnect
+    // leaves and joins again. Each join gets a new address.
     let leaves = radio(&log)
         .iter()
         .filter(|entry| **entry == "RadioLeave")
         .count();
     assert!(leaves > RESTART_AFTER as usize, "{log:?}");
+    assert!(shell.model.wifi.health.suspect());
     assert_eq!(shell.restarts, Vec::<String>::new());
     assert_eq!(shell.model.wifi.health.joins_with_no_lease(), 0);
+
+    shell.broker.unreachable = false;
+    shell.advance(RECONNECT_MAX);
+    assert_eq!(shell.view().connection, Connection::Online);
+}
+
+#[test]
+fn a_broker_that_is_down_for_3_minutes_keeps_the_association_on_each_reconnect() {
+    let mut shell = house();
+    // The broker is down, but the broker host is up. The host refuses each
+    // connect with a TCP reset, which proves that the link works.
+    shell.broker.down = true;
+    shell.send(start(PowerSource::Stand));
+    assert!(!shell.model.wifi.health.suspect());
+    shell.take_log();
+
+    shell.advance(Duration::from_secs(180));
+    let log = shell.take_log();
+    let joins = radio(&log);
+    assert!(joins.len() > 2 * RESTART_AFTER as usize, "{log:?}");
+    for pair in joins.chunks(2) {
+        assert_eq!(pair, ["RadioJoin Cached keep", "RadioAddress"], "{log:?}");
+    }
+    let opens = log
+        .iter()
+        .filter(|entry| entry.starts_with("MqttConnect"))
+        .count();
+    assert!(opens > RESTART_AFTER as usize, "{log:?}");
+    assert_eq!(shell.radio.joins, 1);
+    assert_eq!(shell.restarts, Vec::<String>::new());
+    assert!(!shell.model.wifi.health.suspect());
 
     shell.broker.down = false;
     shell.advance(RECONNECT_MAX);
     assert_eq!(shell.view().connection, Connection::Online);
+}
+
+#[test]
+fn a_refused_connect_clears_a_suspect_link_and_its_count() {
+    let mut shell = online();
+    shell.broker.down = true;
+    fail_the_session(&mut shell);
+
+    // The reconnect leaves and joins again, because the link is suspect.
+    // The network stack keeps its old address, which counts toward a
+    // restart. Then the broker host refuses the connect.
+    shell.radio.has_address = true;
+    shell.advance(RECONNECT_MIN);
+    let log = shell.take_log();
+    assert_eq!(
+        radio(&log),
+        ["RadioLeave", "RadioJoin Cached", "RadioAddress"]
+    );
+    assert!(
+        place(&log, "RadioAddress") < place(&log, "MqttConnect"),
+        "{log:?}"
+    );
+    assert_eq!(shell.model.wifi.health, Health::default());
+
+    // The link is not suspect, so the next reconnect keeps the association.
+    shell.radio.has_address = false;
+    shell.advance(RECONNECT_MIN * 2);
+    let log = shell.take_log();
+    assert_eq!(radio(&log), ["RadioJoin Cached keep", "RadioAddress"]);
+    assert_eq!(shell.restarts, Vec::<String>::new());
+}
+
+#[test]
+fn a_connect_with_no_answer_keeps_the_link_suspect() {
+    let mut shell = online();
+    shell.broker.unreachable = true;
+    fail_the_session(&mut shell);
+
+    shell.advance(RECONNECT_MIN);
+    let log = shell.take_log();
+    assert_eq!(
+        radio(&log),
+        ["RadioLeave", "RadioJoin Cached", "RadioAddress"]
+    );
+    assert!(
+        log.iter().any(|entry| entry.starts_with("MqttConnect")),
+        "{log:?}"
+    );
+    assert!(shell.model.wifi.health.suspect());
+
+    // The next reconnect leaves again.
+    shell.advance(RECONNECT_MIN * 2);
+    let log = shell.take_log();
+    assert_eq!(
+        radio(&log),
+        ["RadioLeave", "RadioJoin Cached", "RadioAddress"]
+    );
 }
 
 #[test]
@@ -370,9 +459,9 @@ fn a_stale_lease_counts_and_bytes_from_the_broker_clear_the_count() {
     shell.answer_radio();
 
     // The network stack keeps its address through the join, and the broker
-    // is down, so no bytes arrive.
+    // host does not answer, so no bytes arrive.
     shell.radio.has_address = true;
-    shell.broker.down = true;
+    shell.broker.unreachable = true;
     shell.answer_radio();
     shell.answer_radio();
     assert_eq!(shell.model.wifi.health.joins_with_no_lease(), 1);
@@ -382,7 +471,7 @@ fn a_stale_lease_counts_and_bytes_from_the_broker_clear_the_count() {
     // The broker is up again. The next join gets a new address, and the
     // CONNACK packet proves that the link moves data.
     shell.hold_radio = false;
-    shell.broker.down = false;
+    shell.broker.unreachable = false;
     shell.advance(RECONNECT_MAX);
     assert_eq!(shell.view().connection, Connection::Online);
     assert_eq!(shell.model.wifi.health, Health::default());

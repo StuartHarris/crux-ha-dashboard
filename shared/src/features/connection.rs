@@ -395,14 +395,14 @@ fn connect(model: &mut Model) -> Cmd {
     let open = Cmd::new(move |ctx| async move {
         let mut items = Stream::open(connection, host, port).into_stream(ctx.clone());
         while let Some(item) = items.next().await {
-            let last = matches!(item, StreamItem::Closed(_));
+            let last = matches!(item, StreamItem::Closed { .. });
             ctx.send_event(Event::Stream { connection, item });
             if last {
                 return;
             }
         }
         // The shell ended the stream without `Closed`.
-        let item = StreamItem::Closed("the stream ended".to_string());
+        let item = StreamItem::closed("the stream ended");
         ctx.send_event(Event::Stream { connection, item });
     });
     open.and(pump(model))
@@ -412,7 +412,9 @@ fn connect(model: &mut Model) -> Cmd {
 /// an item for an older connection.
 ///
 /// Bytes from the broker prove that the link moves data in both
-/// directions. Refer to [`wifi::traffic`].
+/// directions. Refer to [`wifi::traffic`]. A TCP reset from the broker host
+/// proves it too. The session then ends with [`End::Reset`], and
+/// [`wifi::session_ended`] records the proof.
 pub fn stream(id: u32, item: StreamItem, model: &mut Model) -> Cmd {
     let input = match item {
         StreamItem::Opened => Input::Opened,
@@ -422,17 +424,24 @@ pub fn stream(id: u32, item: StreamItem, model: &mut Model) -> Cmd {
             }
             Input::Received(bytes)
         }
-        StreamItem::Closed(reason) => Input::Closed(reason),
+        StreamItem::Closed { reason, reset } => Input::Closed { reason, reset },
     };
     handle(id, input, model)
 }
 
 /// Handles the answer to a `Write` request on the connection `id`. A write
 /// that failed ends the session, as a closed stream does.
+///
+/// A write that failed is never a reset. The shell gives the `Closed` item
+/// of the stream before it answers the writes that wait, so the `Closed`
+/// item tells the core about a reset.
 pub fn written(id: u32, outcome: Written, model: &mut Model) -> Cmd {
     let input = match outcome {
         Written::Sent => Input::Sent,
-        Written::Failed(reason) => Input::Closed(reason),
+        Written::Failed(reason) => Input::Closed {
+            reason,
+            reset: false,
+        },
     };
     handle(id, input, model)
 }

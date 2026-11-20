@@ -18,7 +18,7 @@ pub mod radio;
 use alloc::vec::Vec;
 use core::time::Duration;
 
-pub use broker::{Broker, matches};
+pub use broker::{Broker, NoConnection, matches};
 pub use home_assistant::{MAX_TEMP, MIN_TEMP, ServiceCall, iso_time};
 pub use radio::FakeRadio;
 

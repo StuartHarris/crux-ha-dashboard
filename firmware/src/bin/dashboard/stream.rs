@@ -32,6 +32,14 @@
 //! the broker, a write that stalls and a stream that does not open are
 //! warnings.
 //!
+//! The task sets `reset` in the `Closed` item only for a TCP reset from the
+//! broker host. embassy-net gives the error `ConnectionReset` for a reset
+//! from the host, and also when smoltcp closes the socket because the
+//! network stack lost its address (the link dropped). For that reason the
+//! task counts the error as a reset only while the link is up and the stack
+//! has an address. Refer to [`host_reset`]. The socket has no smoltcp
+//! timeout and no keep-alive, so no timer of the socket gives the error.
+//!
 //! The receive and send buffers of the socket are 8 KiB each. The task takes
 //! them from the heap once and keeps them, so the allocator puts them in
 //! PSRAM. The SUBSCRIBE packets for all the topics are about 8 KiB, and the
@@ -41,7 +49,11 @@ use alloc::{boxed::Box, collections::VecDeque, format, string::String, vec, vec:
 use core::{net::Ipv4Addr, str::FromStr};
 
 use embassy_futures::select::{Either, Either3, select, select3};
-use embassy_net::{IpAddress, Stack, dns::DnsQueryType, tcp::TcpSocket};
+use embassy_net::{
+    IpAddress, Stack,
+    dns::DnsQueryType,
+    tcp::{ConnectError, Error, TcpSocket},
+};
 use embassy_time::{Duration, Instant, Timer, with_timeout};
 use logic::{
     shell::StreamOp,
@@ -86,6 +98,9 @@ struct End {
     /// `true` if the link or the broker did not work. The task then writes
     /// the end to the log as a warning.
     failed: bool,
+    /// `true` if the broker host answered with a TCP reset. Refer to
+    /// [`host_reset`].
+    reset: bool,
     /// `true` if the task sends a FIN and waits for the bytes that wait
     /// before it aborts the socket.
     graceful: bool,
@@ -97,7 +112,18 @@ impl End {
         Self {
             reason: reason.into(),
             failed: true,
+            reset: false,
             graceful: false,
+        }
+    }
+
+    /// A stream that failed with the error `ConnectionReset` from
+    /// embassy-net. The end is a reset only if the host sent it. Refer to
+    /// [`host_reset`]. The task aborts the socket at once.
+    fn reset(stack: Stack<'static>, reason: impl Into<String>) -> Self {
+        Self {
+            reset: host_reset(stack),
+            ..Self::error(reason)
         }
     }
 
@@ -106,9 +132,24 @@ impl End {
         Self {
             reason: reason.into(),
             failed: false,
+            reset: false,
             graceful: true,
         }
     }
+}
+
+/// Returns `true` if the error `ConnectionReset` that the task just got came
+/// from the broker host: the link is up, and the network stack has an
+/// address.
+///
+/// smoltcp also closes a socket when the stack loses the address of the
+/// socket, and embassy-net then gives the same error. When the link drops,
+/// embassy-net removes the address before smoltcp closes the socket. Thus
+/// such a close always finds no link or no address here. A new address
+/// needs a DHCP exchange, which takes much longer than the task needs to
+/// see the error.
+fn host_reset(stack: Stack<'static>) -> bool {
+    stack.is_link_up() && stack.config_v4().is_some()
 }
 
 /// Returns the next job: a pending one, or the next one from the queue. The
@@ -172,12 +213,17 @@ pub async fn task(stack: Stack<'static>) {
         }
         log::info!("stream: open {connection} to {}:{}", open.host, open.port);
         let end = session(stack, rx, tx, &streams, connection, &open, &mut pending).await;
+        let reset = if end.reset {
+            " (reset by the host)"
+        } else {
+            ""
+        };
         if end.failed {
-            log::warn!("stream: {connection} failed: {}", end.reason);
+            log::warn!("stream: {connection} failed: {}{reset}", end.reason);
         } else {
             log::info!("stream: {connection} closed: {}", end.reason);
         }
-        if let Some(signal) = streams.end(connection, end.reason) {
+        if let Some(signal) = streams.end(connection, end.reason, end.reset) {
             SIGNALS.push(signal);
         }
     }
@@ -203,7 +249,7 @@ async fn session(
             if let Some(signal) = streams.opened(connection) {
                 SIGNALS.push(signal);
             }
-            exchange(&mut socket, streams, connection, pending, writes).await
+            exchange(stack, &mut socket, streams, connection, pending, writes).await
         }
         // The socket sent nothing, so it needs no FIN.
         Err(end) => End {
@@ -245,6 +291,9 @@ async fn connect(
     let attempt = with_timeout(CONNECT_TIMEOUT, socket.connect(endpoint));
     match select(attempt, stop(connection, pending, writes)).await {
         Either::First(Ok(Ok(()))) => Ok(()),
+        Either::First(Ok(Err(error @ ConnectError::ConnectionReset))) => {
+            Err(End::reset(stack, format!("TCP connect failed: {error:?}")))
+        }
         Either::First(Ok(Err(error))) => Err(End::error(format!("TCP connect failed: {error:?}"))),
         Either::First(Err(_)) => {
             let secs = CONNECT_TIMEOUT.as_secs();
@@ -279,6 +328,7 @@ async fn stop(connection: u32, pending: &mut Pending, writes: &mut VecDeque<Vec<
 /// cancel. A write that returns puts some bytes in the send buffer, and the
 /// next pass writes the rest.
 async fn exchange(
+    stack: Stack<'static>,
     socket: &mut TcpSocket<'_>,
     streams: &Streams,
     connection: u32,
@@ -332,7 +382,9 @@ async fn exchange(
                     SIGNALS.push(signal);
                 }
             }
-            Either3::Second(Err(error)) => return End::error(format!("read failed: {error:?}")),
+            Either3::Second(Err(error @ Error::ConnectionReset)) => {
+                return End::reset(stack, format!("read failed: {error:?}"));
+            }
             Either3::Third(Some(Ok(count))) => {
                 sent += count;
                 stall = Instant::now() + WRITE_STALL;
@@ -344,8 +396,8 @@ async fn exchange(
                     }
                 }
             }
-            Either3::Third(Some(Err(error))) => {
-                return End::error(format!("write failed: {error:?}"));
+            Either3::Third(Some(Err(error @ Error::ConnectionReset))) => {
+                return End::reset(stack, format!("write failed: {error:?}"));
             }
             Either3::Third(None) => {
                 let secs = WRITE_STALL.as_secs();

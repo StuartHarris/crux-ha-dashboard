@@ -461,7 +461,7 @@ fn an_answer_or_a_timer_of_an_older_connection_is_ignored() {
         },
         Event::Stream {
             connection: old,
-            item: StreamItem::Closed("late".into()),
+            item: StreamItem::closed("late"),
         },
     ];
     for event in stale {

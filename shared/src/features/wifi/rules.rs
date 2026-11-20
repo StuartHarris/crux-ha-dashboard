@@ -181,9 +181,25 @@ pub enum Recovery {
 /// link. A broker that refuses the connection, a packet that is not valid,
 /// a session that the broker kept and a field that is too long are problems
 /// of the broker or of the configuration. A clean end is not a failure.
+///
+/// A TCP reset from the broker host ([`End::Reset`]) is not a failure of the
+/// link either, because the host answered. Refer to [`proves_traffic`].
 #[must_use]
 pub const fn fails_the_link(end: &End) -> bool {
     matches!(end, End::Timeout(_) | End::Transport(_))
+}
+
+/// Returns `true` if a session that ended with `end` proves that the link
+/// moves data in both directions.
+///
+/// Only a TCP reset from the broker host ([`End::Reset`]) is a proof. The
+/// host got a packet from the device, and its answer arrived. This occurs
+/// when the broker is down on a host that is up, and the host refuses each
+/// connect. The cause is not the link, so the core does not leave and join
+/// again for it.
+#[must_use]
+pub const fn proves_traffic(end: &End) -> bool {
+    matches!(end, End::Reset(_))
 }
 
 /// The health of the link.
@@ -200,8 +216,9 @@ pub const fn fails_the_link(end: &End) -> bool {
 ///   the chip.
 /// - The first bytes from the broker on a stream prove that the link moves
 ///   data in both directions. They clear the suspicion and the count
-///   ([`Health::traffic`]). A new address from DHCP also proves traffic, so
-///   it clears the count ([`Health::leased`]).
+///   ([`Health::traffic`]). A TCP reset from the broker host is the same
+///   proof ([`Health::ended`], [`proves_traffic`]). A new address from DHCP
+///   also proves traffic, so it clears the count ([`Health::leased`]).
 /// - If the network stack kept its old address through the join, the address
 ///   proves nothing. It counts as a join with no address
 ///   ([`Health::stale`]), but the core keeps the address.
@@ -225,15 +242,20 @@ impl Health {
         self.suspect = true;
     }
 
-    /// Records an MQTT session that ended with `end`. Only a failure of the
-    /// link counts. Refer to [`fails_the_link`].
+    /// Records an MQTT session that ended with `end`. A failure of the link
+    /// makes it suspect. A TCP reset from the broker host proves traffic.
+    /// Another end changes nothing. Refer to [`fails_the_link`] and
+    /// [`proves_traffic`].
     pub const fn ended(&mut self, end: &End) {
-        if fails_the_link(end) {
+        if proves_traffic(end) {
+            self.traffic();
+        } else if fails_the_link(end) {
             self.failed();
         }
     }
 
-    /// Records the first bytes from the broker on a stream.
+    /// Records a proof of traffic: the first bytes from the broker on a
+    /// stream, or a TCP reset from the broker host.
     pub const fn traffic(&mut self) {
         self.suspect = false;
         self.no_lease = 0;
@@ -292,7 +314,7 @@ mod tests {
 
     use super::{
         AfterFailure, ApCache, Health, RESTART_AFTER, ROAM_MARGIN_DB, Recovery,
-        better_access_point, fails_the_link,
+        better_access_point, fails_the_link, proves_traffic,
     };
     use crate::{
         capabilities::radio::{AccessPoint, Seen, Target},
@@ -537,10 +559,11 @@ mod tests {
     fn only_a_timeout_or_a_transport_end_fails_the_link() {
         let failures = [
             End::Timeout(TimerKind::PingResp),
-            End::Transport(String::from("reset by peer")),
+            End::Transport(String::from("no TCP connection in 10 s")),
         ];
         for end in &failures {
             assert!(fails_the_link(end), "{end:?}");
+            assert!(!proves_traffic(end), "{end:?}");
             let mut health = Health::default();
             health.ended(end);
             assert!(health.suspect(), "{end:?}");
@@ -558,11 +581,30 @@ mod tests {
         ];
         for end in &others {
             assert!(!fails_the_link(end), "{end:?}");
+            assert!(!proves_traffic(end), "{end:?}");
             let mut health = Health::default();
             health.ended(end);
             assert!(!health.suspect(), "{end:?}");
             assert!(health.keep(), "{end:?}");
+            // The end proves nothing, so a suspect link stays suspect.
+            health.failed();
+            health.ended(end);
+            assert!(health.suspect(), "{end:?}");
         }
+    }
+
+    #[test]
+    fn a_reset_from_the_host_clears_the_suspicion_and_the_count() {
+        let end = End::Reset(String::from("TCP connect failed: ConnectionReset"));
+        assert!(!fails_the_link(&end));
+        assert!(proves_traffic(&end));
+        let mut health = Health::default();
+        health.failed();
+        assert_eq!(health.no_lease(), Recovery::Continue);
+        health.ended(&end);
+        assert!(!health.suspect());
+        assert!(health.keep());
+        assert_eq!(health.joins_with_no_lease(), 0);
     }
 
     #[test]

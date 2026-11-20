@@ -15,7 +15,8 @@
 //!   again, so the signals of a task carry the token. The shell ignores the
 //!   signals of a stream that ended.
 //! - A new `Open` replaces the stream that is open. The shell stops the old
-//!   task, and the old stream ends with `Closed("replaced")`.
+//!   task, and the old stream ends with `Closed` and the reason
+//!   `"replaced"`.
 //! - A `Write` ends at [`Signal::Written`] for its stream, in the order of
 //!   the requests. At the end of the stream, the shell answers each `Write`
 //!   of the stream that waits with `Failed`. If no stream has the connection
@@ -329,8 +330,8 @@ impl Shell {
     }
 
     /// Drops the link, as when the access point goes off. The device is not
-    /// associated, and the address goes. The open stream ends with
-    /// `Closed("link lost")`, as for a socket that is dead.
+    /// associated, and the address goes. The open stream ends with `Closed`,
+    /// the reason `"link lost"` and no reset, as for a socket that is dead.
     pub fn drop_link(&mut self) {
         eprintln!("radio: the link drops");
         self.radio.drop_link();
@@ -341,7 +342,7 @@ impl Shell {
         };
         let token = live.token;
         live.task.abort();
-        self.stream(token, StreamItem::Closed(LINK_LOST.into()));
+        self.stream(token, StreamItem::closed(LINK_LOST));
     }
 
     /// Blocks the device, or removes the block, as the router does. A block
@@ -579,10 +580,17 @@ impl Shell {
                 self.inspector
                     .received(&mut self.streams[index].wire, bytes);
             }
-            StreamItem::Closed(text) => {
-                eprintln!("stream: closed (connection {connection}): {text}");
-                self.inspector
-                    .effect("StreamOpen", request, format!("item: Closed ({text})"));
+            StreamItem::Closed {
+                reason: text,
+                reset,
+            } => {
+                let reset = if *reset { ", reset" } else { "" };
+                eprintln!("stream: closed (connection {connection}): {text}{reset}");
+                self.inspector.effect(
+                    "StreamOpen",
+                    request,
+                    format!("item: Closed ({text}{reset})"),
+                );
                 reason = Some(text.clone());
             }
         }
@@ -780,7 +788,8 @@ impl Shell {
     }
 
     /// Opens a stream for `request`. If a stream is open, the new stream
-    /// replaces it, and the old stream ends with `Closed("replaced")`.
+    /// replaces it, and the old stream ends with `Closed` and the reason
+    /// `"replaced"`.
     fn open(&mut self, request: Request<Open>) -> Vec<Effect> {
         let mut effects = Vec::new();
         for mut live in std::mem::take(&mut self.streams) {
@@ -792,7 +801,7 @@ impl Shell {
                 format!("connection {connection}"),
                 format!("item: Closed ({REPLACED})"),
             );
-            let item = StreamItem::Closed(REPLACED.into());
+            let item = StreamItem::closed(REPLACED);
             effects.extend(resolve(&self.core, &mut live.request, item));
             effects.extend(self.end(live.token, connection, REPLACED));
         }
@@ -912,7 +921,7 @@ mod tests {
     use shared::{
         Control, Effect, Event, PowerSource, Settings,
         capabilities::stream::{Stream, StreamItem, Written},
-        fake::Broker,
+        fake::{Broker, NoConnection},
         features::{
             connection::{KEEP_ALIVE_SECS, RECONNECT_MAX, RECONNECT_MIN},
             power::IDLE_TIMEOUT,
@@ -1064,8 +1073,15 @@ mod tests {
                     client
                 }
                 Mode::Broker => {
-                    if let Err(reason) = guard.broker.open() {
-                        return Box::pin(async move { Err(std::io::Error::other(reason)) });
+                    if let Err(failure) = guard.broker.open() {
+                        // The stream task of the shell finds a reset from the
+                        // kind of the error.
+                        let kind = match failure {
+                            NoConnection::Refused => std::io::ErrorKind::ConnectionRefused,
+                            NoConnection::Unreachable => std::io::ErrorKind::TimedOut,
+                        };
+                        let error = std::io::Error::new(kind, failure.reason());
+                        return Box::pin(async move { Err(error) });
                     }
                     guard.current = number;
                     let nudge = Arc::new(Notify::new());
@@ -2143,7 +2159,7 @@ mod tests {
         });
         fixture.shell().handle(Signal::Stream {
             token: old,
-            item: StreamItem::Closed("late".into()),
+            item: StreamItem::closed("late"),
         });
         assert_eq!(fixture.shell().current_connection(), first);
         assert_eq!(fixture.shell().streams[0].token, 2);
