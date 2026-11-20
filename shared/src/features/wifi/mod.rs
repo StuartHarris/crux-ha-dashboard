@@ -169,7 +169,9 @@ pub enum Phase {
     /// stays up.
     Scanning(AccessPoint),
     /// A `StopScan` request for a sleep waits for its answer. The answer
-    /// starts the next step of the sleep.
+    /// starts the next step of the sleep. If the device wakes and a new
+    /// sleep starts before the answer, the new sleep takes the request
+    /// ([`stop_scan`]).
     StoppingScan {
         /// The access point of the link.
         access_point: AccessPoint,
@@ -368,10 +370,21 @@ pub fn quiet(model: &mut Model) -> Cmd {
 }
 
 /// Stops a scan before the sleep `sleep` disconnects. Returns `None` if no
-/// scan runs. The answer starts the next step of the sleep.
+/// scan runs and no `StopScan` request waits. The answer starts the next
+/// step of the sleep.
+///
+/// If the `StopScan` request of an older sleep still waits, the new sleep
+/// takes it over. The core sends no other request, and the time limit of
+/// the old request stays. The answer then starts the next step of the new
+/// sleep.
 pub fn stop_scan(sleep: u32, model: &mut Model) -> Option<Cmd> {
-    let Phase::Scanning(access_point) = model.wifi.phase else {
-        return None;
+    let access_point = match &mut model.wifi.phase {
+        Phase::Scanning(access_point) => *access_point,
+        Phase::StoppingScan { sleep: waiter, .. } => {
+            *waiter = sleep;
+            return Some(Cmd::done());
+        }
+        _ => return None,
     };
     model.wifi.phase = Phase::StoppingScan {
         access_point,

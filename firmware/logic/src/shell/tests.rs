@@ -1096,9 +1096,15 @@ fn the_render_before_sleep_stays_before_sleep() {
     let sleep = names.iter().position(|name| name == "sleep").unwrap();
     assert!(render < sleep, "{names:?}");
     assert_eq!(names.iter().filter(|name| *name == "render").count(), 1);
-    let Job::Render(view) = &jobs[render] else {
-        unreachable!()
-    };
+    // The names leave out the `Log` jobs, so the test finds the render in
+    // the jobs.
+    let view = jobs
+        .iter()
+        .find_map(|job| match job {
+            Job::Render(view) => Some(view),
+            _ => None,
+        })
+        .unwrap();
     assert!(view.asleep);
 }
 

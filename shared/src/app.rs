@@ -65,6 +65,60 @@ impl Settings {
     }
 }
 
+/// The start of the app: before the first `Start`, or after it with the
+/// settings.
+#[derive(Debug)]
+pub enum Startup {
+    /// The core waits for the first `Start`. It has no settings, and it
+    /// does not connect.
+    ///
+    /// `read_only` is the dry run that the user asked for before `Start`
+    /// ([`rooms::set_read_only`]). At `Start`, the core does a dry run if
+    /// the settings or this request ask for one. `Start` changes the value
+    /// to `Started`.
+    Waiting {
+        /// The user asked for a dry run.
+        read_only: bool,
+    },
+    /// The core has the settings from `Start`, with the dry run of the
+    /// user. A later `Start` replaces the settings and uses only the dry
+    /// run of the shell.
+    Started(Settings),
+}
+
+impl Default for Startup {
+    fn default() -> Self {
+        Self::Waiting { read_only: false }
+    }
+}
+
+impl Startup {
+    /// Returns the settings, or `None` before `Start`.
+    #[must_use]
+    pub const fn settings(&self) -> Option<&Settings> {
+        match self {
+            Self::Waiting { .. } => None,
+            Self::Started(settings) => Some(settings),
+        }
+    }
+
+    /// Returns `true` after `Start`.
+    #[must_use]
+    pub const fn is_started(&self) -> bool {
+        matches!(self, Self::Started(_))
+    }
+
+    /// Returns `true` if the dashboard does a dry run. Before `Start`, this
+    /// is the request of the user.
+    #[must_use]
+    pub const fn read_only(&self) -> bool {
+        match self {
+            Self::Waiting { read_only } => *read_only,
+            Self::Started(settings) => settings.read_only,
+        }
+    }
+}
+
 /// The facts that the shell sends when it starts the core.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Start {
@@ -238,11 +292,9 @@ pub enum Effect {
 pub struct Model {
     /// The pages of the dashboard.
     pub pages: &'static [Page],
-    /// The broker and device settings. The core has none until `Start`.
-    pub settings: Option<Settings>,
-    /// The user asked for a dry run before `Start`. Refer to
-    /// [`rooms::set_read_only`].
-    pub read_only_requested: bool,
+    /// The start of the app, with the broker and device settings after
+    /// `Start`.
+    pub startup: Startup,
     /// The current route.
     pub route: Route,
     /// The entity states from the state stream.
@@ -278,8 +330,7 @@ impl Default for Model {
     fn default() -> Self {
         Self {
             pages: PAGES,
-            settings: None,
-            read_only_requested: false,
+            startup: Startup::default(),
             route: Route::Home,
             entities: Entities::default(),
             connection: connection::State::default(),
@@ -319,11 +370,11 @@ impl Model {
         pages.iter().filter(|page| page.is_room())
     }
 
-    /// Returns `true` if the core wants a connection: it has settings and the
-    /// device is awake.
+    /// Returns `true` if the core wants a connection: the app started and
+    /// the device is awake.
     #[must_use]
     pub const fn wants_online(&self) -> bool {
-        self.settings.is_some() && !self.power.asleep
+        self.startup.is_started() && !self.power.is_asleep()
     }
 }
 
@@ -372,10 +423,13 @@ fn on_start(start: Start, model: &mut Model) -> Cmd {
         path,
         last_sync,
     } = start;
-    let read_only = settings.read_only || model.read_only_requested;
-    model.read_only_requested = false;
-    model.settings = Some(Settings {
-        read_only,
+    // A second `Start` uses only the dry run of the shell.
+    let requested = match model.startup {
+        Startup::Waiting { read_only } => read_only,
+        Startup::Started(_) => false,
+    };
+    model.startup = Startup::Started(Settings {
+        read_only: settings.read_only || requested,
         ..settings
     });
     let kept = last_sync
@@ -388,8 +442,7 @@ fn on_start(start: Start, model: &mut Model) -> Cmd {
         .filter(|route| model.pages.iter().any(|page| page.is_at(route)))
         .or_else(|| model.pages.first().map(Page::route))
         .unwrap_or_default();
-    model.power.source = source;
-    model.power.asleep = false;
+    power::reset(source, model);
     connection::reset(model);
 
     // The state of the light after a reset is not known, so the core turns

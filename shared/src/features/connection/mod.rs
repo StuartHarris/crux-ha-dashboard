@@ -315,6 +315,16 @@ impl State {
         }
     }
 
+    /// Returns the sleep that waits for the close of the stream, or `None`.
+    /// Refer to [`go_offline`].
+    #[must_use]
+    pub const fn sleep_waiter(&self) -> Option<u32> {
+        match self.phase {
+            Phase::Closing { after, .. } | Phase::Draining { after, .. } => after.sleep,
+            Phase::Offline { .. } | Phase::Starting(_) | Phase::Up { .. } => None,
+        }
+    }
+
     /// Returns `true` if a stream is open.
     #[must_use]
     pub const fn has_stream(&self) -> bool {
@@ -521,7 +531,7 @@ pub fn close_for_roam(model: &mut Model) -> Cmd {
 pub fn go_offline(sleep: u32, model: &mut Model) -> Cmd {
     model.connection.outbox.clear();
     pending::forget_dropped(model);
-    let status = model.settings.as_ref().map(|settings| Publish {
+    let status = model.startup.settings().map(|settings| Publish {
         topic: settings.status_topic(),
         payload: STATUS_ASLEEP.into(),
         qos: Qos::AtLeastOnce,
@@ -673,7 +683,7 @@ pub fn reconnect(id: u32, model: &mut Model) -> Cmd {
 /// Without the DISCONNECT, the broker publishes the last will. Refer to
 /// [`stream_closed`].
 fn connect(model: &mut Model) -> Cmd {
-    let Some(settings) = &model.settings else {
+    let Some(settings) = model.startup.settings() else {
         return Cmd::done();
     };
     let state = &mut model.connection;
@@ -959,7 +969,7 @@ fn start_timer(id: u32, timer: Timer, after: Duration) -> (Cmd, TimerHandle) {
 /// publishes before it. The timer of each mark starts now. Refer to
 /// [`pending`].
 fn connected(model: &mut Model) -> Cmd {
-    let Some(settings) = &model.settings else {
+    let Some(settings) = model.startup.settings() else {
         return Cmd::done();
     };
     let status = Publish {
@@ -1085,7 +1095,7 @@ fn ended(end: &End, model: &mut Model) -> Cmd {
             connect: after.connect && clean && wants_online,
         },
     };
-    if model.power.asleep {
+    if model.power.is_asleep() {
         return health.and(close);
     }
     let retry = if !wants_online || clean {

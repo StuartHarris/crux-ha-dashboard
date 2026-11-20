@@ -419,7 +419,7 @@ pub fn timeout(id: u32, model: &mut Model) -> Cmd {
         }
     }
     marks.swap_remove(index).clear_timers();
-    if model.power.asleep {
+    if model.power.is_asleep() {
         return Cmd::done();
     }
     redraw(model, false)

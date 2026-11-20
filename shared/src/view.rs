@@ -284,10 +284,7 @@ pub fn view(model: &Model) -> ViewModel {
         format!("Last changed {}", local_time(time))
     });
 
-    let read_only = model
-        .settings
-        .as_ref()
-        .map_or(model.read_only_requested, |settings| settings.read_only);
+    let read_only = model.startup.read_only();
 
     ViewModel {
         path: model.route.to_path(),
@@ -305,11 +302,11 @@ pub fn view(model: &Model) -> ViewModel {
             |page| page_view(page, model),
         ),
         connection,
-        power: model.power.source,
+        power: model.power.source(),
         battery: model.power.battery.map(rounded_level),
-        status: status(connection, model.power.asleep, model.unsent, read_only),
+        status: status(connection, model.power.is_asleep(), model.unsent, read_only),
         last_sync: time.and_then(|time| u64::try_from(time.timestamp()).ok()),
-        asleep: model.power.asleep,
+        asleep: model.power.is_asleep(),
         read_only,
         updated,
         full_refresh_seq: model.full_refresh_seq,
