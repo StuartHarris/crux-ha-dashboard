@@ -128,14 +128,21 @@ fn a_tap_during_the_steps_wakes_and_the_late_answers_are_ignored() {
         .expect_no_effects();
     assert!(!model.power.asleep);
 
-    // The DISCONNECT leaves and the stream closes. The core does not
-    // continue the sleep. The link is still up, so it connects at once.
+    // The DISCONNECT leaves and the stream closes. The wake forgot the
+    // sleep, so the answer to the `Close` request does not continue the
+    // sleep. The link is still up, so the core connects at once.
     sleep
         .expect_disconnect(&mut wire, &mut model)
         .expect_session_clear(&wire)
         .expect_no_effects();
-    let offline = wire.take_event();
-    app.update(offline, &mut model).expect_no_effects();
+    assert!(
+        !wire
+            .events
+            .iter()
+            .any(|event| matches!(event, Event::Power(power::Event::Offline(_)))),
+        "{:?}",
+        wire.events
+    );
     assert!(!model.power.asleep);
     assert!(
         wire.effects
@@ -214,7 +221,7 @@ fn off_the_stand_starts_the_idle_timer() {
     app.update(Event::PowerSourceChanged(PowerSource::Battery), &mut model)
         .expect_render()
         .expect_only_time_notify_after();
-    assert_eq!(model.connection.mqtt, Link::Up);
+    assert_eq!(model.connection.link(), Link::Up);
 }
 
 #[test]

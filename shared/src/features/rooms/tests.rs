@@ -559,7 +559,7 @@ fn a_tap_before_the_connection_opens_waits_in_the_outbox_and_goes_first() {
         .expect_render()
         .expect_only_session_clear(&wire);
     assert_eq!(model.connection.outbox.len(), 0);
-    assert_eq!(model.connection.mqtt, Link::Up);
+    assert_eq!(model.connection.link(), Link::Up);
 }
 
 /// Drives the core to an open connection on the stand, in a dry run.

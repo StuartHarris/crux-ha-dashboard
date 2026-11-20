@@ -15,6 +15,22 @@
 //! access point. To change to it, the core closes the session with a
 //! DISCONNECT packet ([`close_for_roam`]), and connects again.
 //!
+//! The connection is in one phase at a time. Each phase holds only the
+//! data that is valid in it, so the state cannot contradict itself:
+//!
+//! 1. `Offline`: no stream is open. A reconnect timer can run.
+//! 2. `Starting`: the stream opens, and the session waits for its CONNACK.
+//! 3. `Up`: the broker accepted the connection.
+//! 4. `Closing`: a DISCONNECT packet waits or is in flight, for a sleep or
+//!    for a change of access point.
+//! 5. `Draining`: the session ended, and the `Close` request for its stream
+//!    waits for its answer. Then the phase is `Offline` again.
+//!
+//! A sleep waits for the close of the stream, and then gets
+//! [`power::Event::Offline`]. With no stream, the sleep gets it at once.
+//! Refer to [`go_offline`]. The view shows that the core is online only in
+//! the `Up` phase. Refer to [`State::link`].
+//!
 //! The core writes a line to the log of the shell
 //! ([`crate::capabilities::log`]) for each decision that is not usual, with
 //! the area `mqtt`. A line comes when the broker refuses a topic filter,
@@ -143,13 +159,14 @@ pub const STATUS_ASLEEP: &str = "asleep";
 /// The status payload that the broker publishes if the connection stops.
 pub const STATUS_OFFLINE: &str = "offline";
 
-/// The state of the MQTT connection.
+/// The state of the MQTT connection, as the view shows it. Refer to
+/// [`State::link`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Link {
     /// The link is down.
     #[default]
     Down,
-    /// The core asked for the link and waits for the answer.
+    /// The stream opens, or the session waits for its CONNACK.
     Starting,
     /// The link is up.
     Up,
@@ -158,40 +175,154 @@ pub enum Link {
 /// The state of the MQTT connection.
 #[derive(Debug)]
 pub struct State {
-    /// The state of the MQTT connection, as the view shows it.
-    pub mqtt: Link,
+    /// The phase of the connection.
+    phase: Phase,
     /// The id of the newest MQTT connection. Each stream operation carries
     /// it, and the core ignores the answers for an older connection.
     pub id: u32,
-    /// The session of the connection, until the session ends.
-    pub session: Option<Live>,
-    /// The close of a stream for a sleep: the id of the connection and the
-    /// id of the sleep. The answer to the `Close` request starts the next
-    /// step of the sleep. Refer to [`go_offline`].
-    pub closing: Option<(u32, u32)>,
-    /// The id of the connection of a session that ended, while the `Close`
-    /// request for its stream waits for its answer. Until the answer
-    /// arrives, the core does not open a new stream. Refer to [`connect`].
-    pub draining: Option<u32>,
-    /// The core wanted to connect while the `Close` request of
-    /// [`State::draining`] waited. The core connects when the answer
-    /// arrives.
-    pub connect_waits: bool,
     /// The number of messages that the session skipped, because they were
     /// too long.
     pub skipped: usize,
     /// The id of the newest reconnect timer.
     pub reconnect: u32,
-    /// The reconnect timer that runs.
-    reconnect_timer: Slot,
-    /// The timers of [`CLOSE_TIMEOUT`] that run. The id of each timer is
-    /// the id of the connection of its `Close` request. Two can run at the
-    /// same time: one for the stream that drains, and one for a sleep.
-    closes: Vec<Running>,
     /// The wait before the next reconnect.
     pub backoff: Duration,
     /// The service calls that wait for a connection.
     pub outbox: Vec<Call>,
+}
+
+/// The phase of the MQTT connection. Each phase holds only the data that
+/// is valid in it.
+#[derive(Debug)]
+enum Phase {
+    /// No stream is open. The reconnect timer can run.
+    ///
+    /// The core leaves this phase when it gets a link and opens a stream
+    /// ([`connect`]). Then the phase is `Starting`.
+    Offline {
+        /// The reconnect timer that runs.
+        retry: Slot,
+    },
+    /// The stream opens, or the CONNECT packet waits for its CONNACK.
+    ///
+    /// The CONNACK makes the phase `Up` ([`connected`]). A failure ends the
+    /// session, and the phase is `Draining`. A sleep ends the session at
+    /// once, and the phase is `Draining`.
+    Starting(Live),
+    /// The broker accepted the connection. Messages change the entities.
+    ///
+    /// A sleep or a change of access point sends a DISCONNECT packet, and
+    /// the phase is `Closing`. A failure ends the session, and the phase is
+    /// `Draining`.
+    Up {
+        /// The session of the connection.
+        live: Live,
+        /// The subscribe job of the connection.
+        subscribe: SubscribeId,
+    },
+    /// A DISCONNECT packet waits or is in flight, for a sleep or for a
+    /// change of access point. The core drops the messages.
+    ///
+    /// When the session ends, the phase is `Draining` with the same
+    /// [`After`].
+    Closing {
+        /// The session of the connection.
+        live: Live,
+        /// What the core does after the close.
+        after: After,
+    },
+    /// The session ended, and the `Close` request for its stream waits for
+    /// its answer. The core opens no stream and asks for no link in this
+    /// phase. Refer to [`connect`].
+    ///
+    /// The answer, or the end of [`CLOSE_TIMEOUT`], makes the phase
+    /// `Offline` and does the steps of `after`. Refer to [`stream_closed`].
+    Draining {
+        /// The timer of [`CLOSE_TIMEOUT`]. Its id is the id of the
+        /// connection of the `Close` request.
+        close: Running,
+        /// The reconnect timer that runs.
+        retry: Slot,
+        /// What the core does after the answer.
+        after: After,
+    },
+}
+
+impl Default for Phase {
+    fn default() -> Self {
+        Self::Offline {
+            retry: Slot::default(),
+        }
+    }
+}
+
+impl Phase {
+    /// Returns the session, if a stream is open.
+    const fn live_mut(&mut self) -> Option<&mut Live> {
+        match self {
+            Self::Starting(live) | Self::Up { live, .. } | Self::Closing { live, .. } => Some(live),
+            Self::Offline { .. } | Self::Draining { .. } => None,
+        }
+    }
+
+    /// Returns the reconnect timer, if the phase has no stream.
+    const fn retry_mut(&mut self) -> Option<&mut Slot> {
+        match self {
+            Self::Offline { retry } | Self::Draining { retry, .. } => Some(retry),
+            Self::Starting(_) | Self::Up { .. } | Self::Closing { .. } => None,
+        }
+    }
+
+    /// Clears all the timers of the phase.
+    fn clear_timers(self) {
+        match self {
+            Self::Offline { mut retry } => retry.stop(),
+            Self::Starting(mut live)
+            | Self::Up { mut live, .. }
+            | Self::Closing { mut live, .. } => live.clear_timers(),
+            Self::Draining {
+                close,
+                mut retry,
+                after: _,
+            } => {
+                close.clear();
+                retry.stop();
+            }
+        }
+    }
+}
+
+/// What the core does after the close of a stream: the waiter of a sleep,
+/// and the intent to connect again.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct After {
+    /// The sleep that waits for the close. The answer to the `Close`
+    /// request sends [`power::Event::Offline`] for this sleep.
+    sleep: Option<u32>,
+    /// The core connects again after the close.
+    connect: bool,
+}
+
+impl State {
+    /// Returns the state of the connection, as the view shows it. A stream
+    /// that closes shows as down.
+    #[must_use]
+    pub const fn link(&self) -> Link {
+        match self.phase {
+            Phase::Offline { .. } | Phase::Closing { .. } | Phase::Draining { .. } => Link::Down,
+            Phase::Starting(_) => Link::Starting,
+            Phase::Up { .. } => Link::Up,
+        }
+    }
+
+    /// Returns `true` if a stream is open.
+    #[must_use]
+    pub const fn has_stream(&self) -> bool {
+        matches!(
+            self.phase,
+            Phase::Starting(_) | Phase::Up { .. } | Phase::Closing { .. }
+        )
+    }
 }
 
 /// The session of an open connection.
@@ -199,8 +330,6 @@ pub struct State {
 pub struct Live {
     /// The MQTT session.
     pub session: Session,
-    /// The subscribe job of the connection, after the CONNACK.
-    pub subscribe: Option<SubscribeId>,
     /// The core wrote the line for a message that is too long on this
     /// connection. Later messages on the connection only count in
     /// [`State::skipped`].
@@ -215,7 +344,6 @@ impl Live {
     fn new(session: Session) -> Self {
         Self {
             session,
-            subscribe: None,
             skip_logged: false,
             timers: Default::default(),
         }
@@ -258,16 +386,10 @@ pub struct Call {
 impl Default for State {
     fn default() -> Self {
         Self {
-            mqtt: Link::Down,
+            phase: Phase::default(),
             id: 0,
-            session: None,
-            closing: None,
-            draining: None,
-            connect_waits: false,
             skipped: 0,
             reconnect: 0,
-            reconnect_timer: Slot::default(),
-            closes: Vec::new(),
             backoff: RECONNECT_MIN,
             outbox: Vec::new(),
         }
@@ -276,20 +398,15 @@ impl Default for State {
 
 /// Forgets the connection and the radio after the shell starts. The core
 /// ignores the answers to earlier requests.
+///
+/// The phase becomes `Offline`, and the core clears every timer of the
+/// connection.
 pub fn reset(model: &mut Model) {
     wifi::reset(model);
     let state = &mut model.connection;
-    end_session(state);
-    for timer in mem::take(&mut state.closes) {
-        timer.clear();
-    }
-    state.closing = None;
-    state.draining = None;
-    state.connect_waits = false;
-    state.mqtt = Link::Down;
+    mem::take(&mut state.phase).clear_timers();
     state.id = state.id.wrapping_add(1);
     state.reconnect = state.reconnect.wrapping_add(1);
-    state.reconnect_timer.stop();
     state.backoff = RECONNECT_MIN;
 }
 
@@ -300,24 +417,33 @@ pub const fn restart(model: &mut Model) {
 }
 
 /// Gets a link and connects, if the core wants a connection and has no
-/// session. Refer to [`wifi::link`].
+/// stream. Refer to [`wifi::link`].
 ///
 /// While the `Close` request of an old stream waits for its answer, the
 /// core does not ask for the link yet. A radio request, for example a
 /// `Leave` for a change of access point, can stop the old stream before the
 /// DISCONNECT packet goes. The answer to the `Close` request continues.
 /// Refer to [`stream_closed`].
+///
+/// If the device wakes during the close for a sleep, the core forgets the
+/// sleep and connects again after the close.
 pub fn go_online(model: &mut Model) -> Cmd {
-    let wants_online = model.wants_online();
-    let state = &mut model.connection;
-    if !wants_online || state.mqtt != Link::Down || state.session.is_some() {
+    // `wants_online` is false while the device sleeps. Thus the core can
+    // forget a sleep that waits for a close below.
+    if !model.wants_online() {
         return Cmd::done();
     }
-    if state.draining.is_some() {
-        state.connect_waits = true;
-        return Cmd::done();
+    match &mut model.connection.phase {
+        Phase::Offline { .. } => wifi::link(model),
+        Phase::Closing { after, .. } | Phase::Draining { after, .. } => {
+            *after = After {
+                sleep: None,
+                connect: true,
+            };
+            Cmd::done()
+        }
+        Phase::Starting(_) | Phase::Up { .. } => Cmd::done(),
     }
-    wifi::link(model)
 }
 
 /// The Wi-Fi feature has a link: connect, if the core wants a connection.
@@ -330,7 +456,8 @@ pub fn link_up(model: &mut Model) -> Cmd {
 }
 
 /// The Wi-Fi feature did not get a link: wait for the backoff, and then try
-/// again, if the core wants a connection.
+/// again, if the core wants a connection. With a stream, the core ignores
+/// the failure.
 pub fn link_failed(model: &mut Model) -> Cmd {
     if model.wants_online() {
         schedule_reconnect(model)
@@ -343,28 +470,51 @@ pub fn link_failed(model: &mut Model) -> Cmd {
 /// to a better access point. Refer to [`wifi::quiet`].
 ///
 /// The end is clean, so the broker keeps `online` and does not publish the
-/// last will. The core connects again after the answer to the `Close`
-/// request. Refer to [`ended`]. With no session that is up, the next
-/// connect goes to the better access point, so the core does nothing now.
+/// last will. During the close, the view shows that the core connects, and
+/// the core drops the messages. The core connects again after the answer
+/// to the `Close` request. Refer to [`ended`]. With no session that is up,
+/// the next connect goes to the better access point, so the core does
+/// nothing now.
 pub fn close_for_roam(model: &mut Model) -> Cmd {
     let state = &mut model.connection;
-    if state.mqtt != Link::Up {
-        return Cmd::done();
+    match mem::take(&mut state.phase) {
+        Phase::Up {
+            mut live,
+            subscribe: _,
+        } => {
+            live.session.disconnect();
+            state.phase = Phase::Closing {
+                live,
+                after: After {
+                    sleep: None,
+                    connect: true,
+                },
+            };
+            pump(model)
+        }
+        phase => {
+            state.phase = phase;
+            Cmd::done()
+        }
     }
-    let Some(live) = &mut state.session else {
-        return Cmd::done();
-    };
-    live.session.disconnect();
-    pump(model)
 }
 
-/// Closes the connection for the sleep `sleep`. The answer to the `Close`
-/// request starts the next step of the sleep ([`power::Event::Offline`]).
+/// Closes the connection for the sleep `sleep`. The close then sends
+/// [`power::Event::Offline`] for the sleep, which starts the next step of
+/// the sleep.
 ///
-/// If the connection is up, the core publishes `asleep` on the status topic
-/// and then sends a DISCONNECT packet, so the broker does not publish the
-/// last will. A session that is not up ends at once. With no session, the
-/// core sends `Close` for the current id, and the shell answers at once.
+/// - If the connection is up, the core publishes `asleep` on the status
+///   topic and then sends a DISCONNECT packet, so the broker does not
+///   publish the last will. The answer to the `Close` request sends
+///   `Offline`.
+/// - A session that is not up ends at once. The answer to its `Close`
+///   request sends `Offline`.
+/// - If the `Close` request of an old stream waits for its answer, that
+///   answer sends `Offline`. The core sends no other `Close` request.
+/// - With no stream, the core sends `Offline` at once.
+///
+/// A new sleep replaces the sleep that waits. The core stops the reconnect
+/// timer, and does not connect again after the close.
 ///
 /// The core drops the service calls in the outbox and removes their marks.
 /// The device sleeps, so the core does not draw.
@@ -380,13 +530,31 @@ pub fn go_offline(sleep: u32, model: &mut Model) -> Cmd {
     let state = &mut model.connection;
     // The core ignores the answers to earlier requests.
     state.reconnect = state.reconnect.wrapping_add(1);
-    state.reconnect_timer.stop();
-    let up = state.mqtt == Link::Up;
-    state.mqtt = Link::Down;
-    let id = state.id;
-    state.closing = Some((id, sleep));
-    let Some(live) = &mut state.session else {
-        return close_stream(id, true, STATUS_ASLEEP.to_string(), state);
+    let after = After {
+        sleep: Some(sleep),
+        connect: false,
+    };
+    let (mut live, up) = match mem::take(&mut state.phase) {
+        Phase::Offline { mut retry } => {
+            retry.stop();
+            state.phase = Phase::Offline { retry };
+            return Cmd::event(power::Event::Offline(sleep).into());
+        }
+        Phase::Draining {
+            close,
+            mut retry,
+            after: _,
+        } => {
+            retry.stop();
+            state.phase = Phase::Draining {
+                close,
+                retry,
+                after,
+            };
+            return Cmd::done();
+        }
+        Phase::Starting(live) | Phase::Closing { live, after: _ } => (live, false),
+        Phase::Up { live, subscribe: _ } => (live, true),
     };
     if up && let Some(status) = status {
         // A publish that the session refuses cannot stop the sleep, so the
@@ -394,6 +562,7 @@ pub fn go_offline(sleep: u32, model: &mut Model) -> Cmd {
         let _ = live.session.publish(status);
     }
     live.session.disconnect();
+    state.phase = Phase::Closing { live, after };
     pump(model)
 }
 
@@ -407,7 +576,7 @@ pub fn go_offline(sleep: u32, model: &mut Model) -> Cmd {
 /// If the session cannot take the call now, the call goes first in the
 /// outbox. The outbox drains at the end of each [`pump`].
 pub fn send(call: Call, model: &mut Model) -> Cmd {
-    if model.connection.mqtt == Link::Up {
+    if model.connection.link() == Link::Up {
         return match issue(call, model) {
             Ok(mark) => pump(model).and(mark),
             Err(call) => {
@@ -441,7 +610,7 @@ pub fn send(call: Call, model: &mut Model) -> Cmd {
 ///
 /// Returns the call if the session cannot take it now.
 fn issue(call: Call, model: &mut Model) -> Result<Cmd, Call> {
-    let Some(live) = &mut model.connection.session else {
+    let Some(live) = model.connection.phase.live_mut() else {
         return Err(call);
     };
     match live.session.publish(call.publish.clone()) {
@@ -480,17 +649,22 @@ fn drain_outbox(model: &mut Model) -> Cmd {
 
 /// Tries to connect again after the wait for the reconnect `id`.
 pub fn reconnect(id: u32, model: &mut Model) -> Cmd {
-    if model.connection.reconnect_timer.expired(id) {
+    let expired = model
+        .connection
+        .phase
+        .retry_mut()
+        .is_some_and(|retry| retry.expired(id));
+    if expired {
         go_online(model)
     } else {
         Cmd::done()
     }
 }
 
-/// Opens a stream and starts a session, if there is none.
+/// Opens a stream and starts a session, if there is no stream.
 ///
 /// A session that closes for a sleep is still there after a wake during the
-/// close. The core connects again when that session ends.
+/// close. The core connects again after that close.
 ///
 /// After a session ends, the core does not open a stream until the shell
 /// answers the `Close` request for the old stream. A new `Open` makes the
@@ -503,12 +677,13 @@ fn connect(model: &mut Model) -> Cmd {
         return Cmd::done();
     };
     let state = &mut model.connection;
-    if state.mqtt != Link::Down || state.session.is_some() {
-        return Cmd::done();
-    }
-    if state.draining.is_some() {
-        state.connect_waits = true;
-        return Cmd::done();
+    match &mut state.phase {
+        Phase::Offline { .. } => {}
+        Phase::Draining { after, .. } => {
+            after.connect = true;
+            return Cmd::done();
+        }
+        Phase::Starting(_) | Phase::Up { .. } | Phase::Closing { .. } => return Cmd::done(),
     }
     let request = Connect {
         host: settings.host.clone(),
@@ -523,12 +698,14 @@ fn connect(model: &mut Model) -> Cmd {
         },
     };
     let (host, port) = (request.host.clone(), request.port);
-    state.mqtt = Link::Starting;
     state.id = state.id.wrapping_add(1);
     // The core clears a reconnect timer that runs now.
     state.reconnect = state.reconnect.wrapping_add(1);
-    state.reconnect_timer.stop();
-    state.session = Some(Live::new(Session::new(&request, Limits::default())));
+    mem::replace(
+        &mut state.phase,
+        Phase::Starting(Live::new(Session::new(&request, Limits::default()))),
+    )
+    .clear_timers();
     let connection = state.id;
 
     let open = Cmd::new(move |ctx| async move {
@@ -559,7 +736,7 @@ pub fn stream(id: u32, item: StreamItem, model: &mut Model) -> Cmd {
     let input = match item {
         StreamItem::Opened => Input::Opened,
         StreamItem::Received(bytes) => {
-            if id == model.connection.id && model.connection.session.is_some() {
+            if id == model.connection.id && model.connection.has_stream() {
                 proof = wifi::traffic(model);
             }
             Input::Received(bytes)
@@ -590,35 +767,38 @@ pub fn session_timer(id: u32, timer: Timer, model: &mut Model) -> Cmd {
 }
 
 /// Handles the answer to the `Close` request on the connection `id`, and
-/// clears its timer of [`CLOSE_TIMEOUT`].
+/// clears its timer of [`CLOSE_TIMEOUT`]. The core ignores the answer if
+/// no `Close` request for `id` waits.
 ///
-/// If the core closed the stream for a sleep, it sends [`power::Event::Offline`]
+/// The phase becomes `Offline`, and a reconnect timer that runs continues.
+/// If a sleep waits for the close, the core sends [`power::Event::Offline`]
 /// for the sleep. If the core wanted to connect while the `Close` request
 /// waited, it connects now. Refer to [`connect`].
 pub fn stream_closed(id: u32, model: &mut Model) -> Cmd {
     let state = &mut model.connection;
-    let (done, waiting) = mem::take(&mut state.closes)
-        .into_iter()
-        .partition(|timer| timer.id() == id);
-    state.closes = waiting;
-    for timer in done {
-        timer.clear();
-    }
-    let offline = match state.closing {
-        Some((connection, sleep)) if connection == id => {
-            state.closing = None;
-            Cmd::event(power::Event::Offline(sleep).into())
+    let after = match mem::take(&mut state.phase) {
+        Phase::Draining {
+            close,
+            retry,
+            after,
+        } if close.id() == id => {
+            close.clear();
+            state.phase = Phase::Offline { retry };
+            after
         }
-        _ => Cmd::done(),
+        phase => {
+            state.phase = phase;
+            return Cmd::done();
+        }
     };
-    if state.draining != Some(id) {
-        return offline;
+    let offline = after.sleep.map_or_else(Cmd::done, |sleep| {
+        Cmd::event(power::Event::Offline(sleep).into())
+    });
+    if after.connect {
+        offline.and(go_online(model))
+    } else {
+        offline
     }
-    state.draining = None;
-    if !core::mem::take(&mut state.connect_waits) {
-        return offline;
-    }
-    offline.and(go_online(model))
 }
 
 /// Handles the end of the wait for the answer to the `Close` request on the
@@ -632,8 +812,9 @@ pub fn close_timeout(id: u32, model: &mut Model) -> Cmd {
 }
 
 /// Sends the `Close` request for the stream of the connection `id`, and
-/// starts the timer of [`CLOSE_TIMEOUT`].
-fn close_stream(id: u32, clean: bool, reason: String, state: &mut State) -> Cmd {
+/// starts the timer of [`CLOSE_TIMEOUT`]. Returns the command and the
+/// timer.
+fn close_stream(id: u32, clean: bool, reason: String) -> (Cmd, Running) {
     let close = Stream::close(id, clean, reason)
         .then_send(move |()| Event::StreamClosed { connection: id }.into());
     let (timer, running) = Running::start(
@@ -641,15 +822,7 @@ fn close_stream(id: u32, clean: bool, reason: String, state: &mut State) -> Cmd 
         CLOSE_TIMEOUT,
         Event::CloseTimeout { connection: id }.into(),
     );
-    state.closes.push(running);
-    close.and(timer)
-}
-
-/// Forgets the session, and clears its timers.
-fn end_session(state: &mut State) {
-    if let Some(mut live) = state.session.take() {
-        live.clear_timers();
-    }
+    (close.and(timer), running)
 }
 
 /// Gives `input` to the session of the connection `id`, and does the
@@ -659,7 +832,7 @@ fn handle(id: u32, input: Input, model: &mut Model) -> Cmd {
     if id != state.id {
         return Cmd::done();
     }
-    let Some(live) = &mut state.session else {
+    let Some(live) = state.phase.live_mut() else {
         return Cmd::done();
     };
     live.session.handle(input);
@@ -698,8 +871,8 @@ pub fn pump(model: &mut Model) -> Cmd {
     loop {
         while let Some(action) = model
             .connection
-            .session
-            .as_mut()
+            .phase
+            .live_mut()
             .and_then(|live| live.session.poll())
         {
             let id = model.connection.id;
@@ -715,13 +888,13 @@ pub fn pump(model: &mut Model) -> Cmd {
                 }
                 Action::StartTimer { timer, after } => {
                     let (command, handle) = start_timer(id, timer, after);
-                    if let Some(live) = &mut model.connection.session {
+                    if let Some(live) = model.connection.phase.live_mut() {
                         live.timer_started(timer.kind, handle);
                     }
                     timers.push(command);
                 }
                 Action::CancelTimer(kind) => {
-                    if let Some(live) = &mut model.connection.session {
+                    if let Some(live) = model.connection.phase.live_mut() {
                         live.cancel_timer(kind);
                     }
                 }
@@ -735,8 +908,8 @@ pub fn pump(model: &mut Model) -> Cmd {
                     // long, so only the first one on a connection has a line.
                     let first = model
                         .connection
-                        .session
-                        .as_mut()
+                        .phase
+                        .live_mut()
                         .is_some_and(|live| !mem::replace(&mut live.skip_logged, true));
                     if first {
                         rest.push(log::warn(
@@ -751,7 +924,7 @@ pub fn pump(model: &mut Model) -> Cmd {
                 Action::Ended(end) => rest.push(ended(&end, model)),
             }
         }
-        if model.connection.mqtt != Link::Up || model.connection.outbox.is_empty() {
+        if model.connection.link() != Link::Up || model.connection.outbox.is_empty() {
             break;
         }
         let before = model.connection.outbox.len();
@@ -795,23 +968,30 @@ fn connected(model: &mut Model) -> Cmd {
         qos: Qos::AtLeastOnce,
         retain: true,
     };
-    let state = &mut model.connection;
-    state.mqtt = Link::Up;
-    state.backoff = RECONNECT_MIN;
+    if !matches!(model.connection.phase, Phase::Starting(_)) {
+        return Cmd::done();
+    }
+    model.connection.backoff = RECONNECT_MIN;
     model.unsent = 0;
     let marks = drain_outbox(model);
     let topics = entities::topics(model.pages);
-    if let Some(live) = &mut model.connection.session {
-        // Few bytes wait after a CONNACK, so the session takes the status.
-        let _ = live.session.publish(status);
-        live.subscribe = Some(live.session.subscribe(&topics));
+    let state = &mut model.connection;
+    match mem::take(&mut state.phase) {
+        Phase::Starting(mut live) => {
+            // Few bytes wait after a CONNACK, so the session takes the
+            // status.
+            let _ = live.session.publish(status);
+            let subscribe = live.session.subscribe(&topics);
+            state.phase = Phase::Up { live, subscribe };
+        }
+        phase => state.phase = phase,
     }
     marks.and(redraw(model, false))
 }
 
 /// Handles a message from the broker on a subscribed topic.
 fn on_message(message: &Message, model: &mut Model) -> Cmd {
-    if model.connection.mqtt != Link::Up {
+    if model.connection.link() != Link::Up {
         return Cmd::done();
     }
     let Some(topic_entity) = entities::entity_of(&message.topic) else {
@@ -842,9 +1022,11 @@ fn on_message(message: &Message, model: &mut Model) -> Cmd {
 /// connection ended or never got the acknowledgements, so the link is not
 /// quiet.
 fn subscribed(id: SubscribeId, outcome: SubscribeOutcome, model: &mut Model) -> Cmd {
-    let state = &model.connection;
-    let current = state.session.as_ref().and_then(|live| live.subscribe);
-    if current != Some(id) || state.mqtt != Link::Up || outcome == SubscribeOutcome::Failed {
+    let current = matches!(
+        model.connection.phase,
+        Phase::Up { subscribe, .. } if subscribe == id
+    );
+    if !current || outcome == SubscribeOutcome::Failed {
         return Cmd::done();
     }
     if outcome == SubscribeOutcome::Refused {
@@ -858,7 +1040,7 @@ fn subscribed(id: SubscribeId, outcome: SubscribeOutcome, model: &mut Model) -> 
 }
 
 /// The session ended: close the stream, and connect again if the core wants
-/// a connection.
+/// a connection. The phase becomes `Draining`.
 ///
 /// After a clean end, the core connects again without a wait. This happens
 /// after a close for a change of access point ([`close_for_roam`]), and if
@@ -867,31 +1049,49 @@ fn subscribed(id: SubscribeId, outcome: SubscribeOutcome, model: &mut Model) -> 
 /// cannot stop the DISCONNECT packet. After a failure, the core waits
 /// first. Refer to [`schedule_reconnect`]. In both cases, the new stream
 /// opens only after the answer to the `Close` request. Refer to
-/// [`connect`]. During a sleep, the core does not draw.
+/// [`connect`]. A sleep that waits for the close of the session waits for
+/// the answer too. During a sleep, the core does not draw.
 ///
 /// The Wi-Fi feature records the end. Refer to [`wifi::session_ended`].
 fn ended(end: &End, model: &mut Model) -> Cmd {
     let health = wifi::session_ended(end, model);
+    let wants_online = model.wants_online();
     let state = &mut model.connection;
-    end_session(state);
+    let (mut live, after) = match mem::take(&mut state.phase) {
+        Phase::Starting(live) | Phase::Up { live, subscribe: _ } => (
+            live,
+            After {
+                sleep: None,
+                connect: true,
+            },
+        ),
+        Phase::Closing { live, after } => (live, after),
+        phase @ (Phase::Offline { .. } | Phase::Draining { .. }) => {
+            state.phase = phase;
+            return health;
+        }
+    };
+    live.clear_timers();
+    let clean = *end == End::Clean;
     let id = state.id;
-    state.draining = Some(id);
-    state.connect_waits = false;
-    let close = close_stream(id, *end == End::Clean, end.to_string(), state);
+    let (close, timer) = close_stream(id, clean, end.to_string());
     state.id = state.id.wrapping_add(1);
-    state.mqtt = Link::Down;
+    state.phase = Phase::Draining {
+        close: timer,
+        retry: Slot::default(),
+        after: After {
+            sleep: after.sleep,
+            // After a failure, the core waits for the backoff.
+            connect: after.connect && clean && wants_online,
+        },
+    };
     if model.power.asleep {
         return health.and(close);
     }
-    let retry = match end {
-        _ if !model.wants_online() => Cmd::done(),
-        End::Clean => {
-            // The answer to the `Close` request connects. Refer to
-            // [`stream_closed`].
-            model.connection.connect_waits = true;
-            Cmd::done()
-        }
-        _ => schedule_reconnect(model),
+    let retry = if !wants_online || clean {
+        Cmd::done()
+    } else {
+        schedule_reconnect(model)
     };
     health.and(close).and(redraw(model, false)).and(retry)
 }
@@ -933,16 +1133,17 @@ pub fn page_time(model: &Model) -> Option<DateTime<Utc>> {
 /// Waits, then tries to connect again. Each wait is double the wait before
 /// it, up to [`RECONNECT_MAX`]. The command writes the wait to the log, in
 /// whole seconds, before the timer starts. Both limits are whole seconds,
-/// so each wait is.
+/// so each wait is. With a stream, the core does nothing.
 fn schedule_reconnect(model: &mut Model) -> Cmd {
     let state = &mut model.connection;
+    let Some(retry) = state.phase.retry_mut() else {
+        return Cmd::done();
+    };
     state.reconnect = state.reconnect.wrapping_add(1);
     let id = state.reconnect;
     let wait = state.backoff;
     state.backoff = (wait * 2).min(RECONNECT_MAX);
-    let timer = state
-        .reconnect_timer
-        .start(id, wait, Event::Reconnect(id).into());
+    let timer = retry.start(id, wait, Event::Reconnect(id).into());
     let reason = log::info(Area::Mqtt, format!("connect again in {} s", wait.as_secs()));
     reason.and(timer)
 }

@@ -318,7 +318,7 @@ fn a_failed_write_does_not_hide_an_end_by_the_host_in_either_order() {
                 .contains("the broker host ended the stream"),
             "{closes:?}"
         );
-        assert_eq!(model.connection.mqtt, Link::Down);
+        assert_eq!(model.connection.link(), Link::Down);
         assert!(!model.wifi.health.suspect(), "failed first: {failed_first}");
     }
 }
@@ -439,7 +439,7 @@ fn an_item_from_an_old_connection_is_ignored() {
         &mut model,
     )
     .expect_no_effects();
-    assert_eq!(model.connection.mqtt, Link::Up);
+    assert_eq!(model.connection.link(), Link::Up);
 }
 
 #[test]
@@ -964,4 +964,144 @@ fn the_core_clears_the_session_timers_that_the_session_no_longer_uses() {
     shell.broker.drop_connection();
     shell.run();
     assert_eq!(shell.session_timer_count(), 0);
+}
+
+/// Returns `true` if `effect` is a radio request.
+const fn is_radio(effect: &Effect) -> bool {
+    matches!(
+        effect,
+        Effect::RadioJoin(_)
+            | Effect::RadioAddress(_)
+            | Effect::RadioLeave(_)
+            | Effect::RadioScan(_)
+            | Effect::RadioStopScan(_)
+            | Effect::RadioOff(_)
+            | Effect::RadioRestart(_)
+    )
+}
+
+/// Ends the session with a failure, and keeps the `Close` request of its
+/// stream without an answer, so the old stream drains. Returns the
+/// command that holds the `Close` request.
+fn drive_to_a_drain_after_a_failure() -> (Model, Cmd) {
+    let (mut model, mut wire) = drive_to_connected(PowerSource::Stand);
+    let dropped = wire.drop_connection(&mut model, "connection lost");
+    assert_ne!(Dashboard.view(&model).connection, Connection::Online);
+    (model, dropped)
+}
+
+/// Answers the `Close` request in `dropped`, and returns the command of the
+/// update for the answer.
+#[track_caller]
+fn answer_the_close(dropped: &mut Cmd, model: &mut Model) -> Cmd {
+    let mut close = dropped
+        .effects()
+        .find_map(|effect| match effect {
+            Effect::StreamClose(request) => Some(request),
+            _ => None,
+        })
+        .expect("a Close request");
+    close.resolve(()).unwrap();
+    let answer = dropped
+        .events()
+        .find(|event| {
+            matches!(
+                event,
+                Event::Connection(connection::Event::StreamClosed { .. })
+            )
+        })
+        .expect("the answer to the Close request");
+    Dashboard.update(answer, model)
+}
+
+/// A tap while the old stream drains asks for no link. A radio
+/// request can stop the old stream before its last bytes go. The core asks
+/// for the link at the answer to the `Close` request.
+#[test]
+fn a_tap_while_the_old_stream_drains_makes_no_radio_request() {
+    let (mut model, mut dropped) = drive_to_a_drain_after_a_failure();
+
+    let mut tap = Dashboard.update(tap_all_lights(), &mut model);
+    let radio = tap.effects().filter(is_radio).count();
+    assert_eq!(radio, 0);
+    assert_eq!(model.connection.outbox.len(), 1);
+
+    // The link is suspect, so the core leaves and joins again.
+    let mut answer = answer_the_close(&mut dropped, &mut model);
+    let radio = answer.effects().filter(is_radio).count();
+    assert_eq!(radio, 1);
+}
+
+/// A link while the old stream drains opens no stream. A new `Open`
+/// can stop the old stream before its last bytes go.
+#[test]
+fn a_link_while_the_old_stream_drains_opens_no_stream() {
+    let (mut model, _dropped) = drive_to_a_drain_after_a_failure();
+
+    let mut cmd = connection::link_up(&mut model);
+    let opens = cmd
+        .effects()
+        .filter(|effect| matches!(effect, Effect::StreamOpen(_)))
+        .count();
+    assert_eq!(opens, 0);
+    assert_ne!(Dashboard.view(&model).connection, Connection::Online);
+}
+
+/// A state message after the stream opened and before the CONNACK
+/// does not change the entities.
+#[test]
+fn a_message_before_the_connack_does_not_change_the_entities() {
+    let app = Dashboard;
+    let (mut model, wire) = drive_to_connecting(PowerSource::Stand);
+    let connection = wire.connection();
+    let opened = Event::Connection(connection::Event::Stream {
+        connection,
+        item: StreamItem::Opened,
+    });
+    let _effects: Vec<_> = app.update(opened, &mut model).effects().collect();
+
+    let mut bytes = Vec::new();
+    let flags = Flags {
+        qos: Qos::AtMostOnce,
+        retain: false,
+    };
+    codec::publish(&mut bytes, &topic(VISIBLE, "state"), b"on", flags, None).unwrap();
+    let message = Event::Connection(connection::Event::Stream {
+        connection,
+        item: StreamItem::Received(bytes),
+    });
+    // The session gets the message, and ends with a failure.
+    let closes: Vec<_> = app
+        .update(message, &mut model)
+        .effects()
+        .filter_map(|effect| match effect {
+            Effect::StreamClose(request) => Some(request.operation),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(closes.len(), 1, "{closes:?}");
+    assert_eq!(closes[0].connection, connection);
+    assert!(!closes[0].clean);
+    assert_eq!(model.entities.get(VISIBLE), None);
+    assert_ne!(app.view(&model).connection, Connection::Online);
+}
+
+/// During the close for a change of access point, the view shows that
+/// the core connects, and a state message does not change the entities.
+#[test]
+fn a_close_for_a_roam_shows_connecting_and_drops_the_messages() {
+    let app = Dashboard;
+    let (mut model, mut wire) = drive_to_connected(PowerSource::Stand);
+
+    // The DISCONNECT waits, so the session stays open in its close.
+    let mut roam = connection::close_for_roam(&mut model);
+    assert!(
+        roam.effects()
+            .any(|effect| matches!(effect, Effect::StreamWrite(_)))
+    );
+    assert_eq!(model.connection.link(), Link::Down);
+    assert_eq!(app.view(&model).connection, Connection::Connecting);
+
+    send(&mut model, &mut wire, &topic(VISIBLE, "state"), "on").expect_no_effects();
+    assert_eq!(model.entities.get(VISIBLE), None);
 }

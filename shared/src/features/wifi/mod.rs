@@ -19,6 +19,7 @@
 //! - When the link is quiet, the core scans once for a better access point
 //!   if a scan is due. If it finds one, it closes the MQTT session with a
 //!   DISCONNECT packet, and the reconnect goes to the better access point.
+//!   During the close, the view shows that the core connects.
 //!
 //! The core sends one radio request at a time. Each request has a new id
 //! and a time limit, which is an ordinary timer. The first of the answer

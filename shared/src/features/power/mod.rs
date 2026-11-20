@@ -36,7 +36,8 @@ pub enum Event {
     /// The front light is off for the sleep with this id. Refer to
     /// [`light_off`].
     LightOffForSleep(u32),
-    /// The stream of the MQTT connection closed for the sleep with this id.
+    /// The stream of the MQTT connection closed for the sleep with this id,
+    /// or no stream was open. Refer to [`connection::go_offline`].
     Offline(u32),
     /// The `Sleep` request of the sleep with this id ended.
     Woke {
@@ -284,9 +285,9 @@ pub fn light_off(id: u32, model: &mut Model) -> Cmd {
     disconnect(id, model)
 }
 
-/// Publishes `asleep` and disconnects. The answer to the `Close` of the
-/// stream starts the next step ([`offline`]). Refer to
-/// [`connection::go_offline`].
+/// Publishes `asleep` and disconnects. The close of the stream starts the
+/// next step ([`offline`]). With no stream, the next step starts at once.
+/// Refer to [`connection::go_offline`].
 ///
 /// If a scan for a better access point runs, the core first stops it, and
 /// the answer starts this step again ([`scan_stopped`]). A scan can drop

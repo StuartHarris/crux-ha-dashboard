@@ -766,12 +766,12 @@ fn a_light_answer_is_also_for_the_older_requests() {
 
     // No answer came for jobs 1 to 3. An answer with a newer token answers
     // all of them, so the sleep continues. `Off` stops the join, so the core
-    // clears the time limit of the join (2). Timer 6 is the time limit of
+    // clears the time limit of the join (2). Timer 5 is the time limit of
     // `Off`.
     let jobs = device.handle(Signal::Light { token: 5 });
     assert_eq!(
         names(&jobs),
-        ["cancel timer 2", "wifi off", "start timer 6"]
+        ["cancel timer 2", "wifi off", "start timer 5"]
     );
     // Each request ended, so a second answer does nothing.
     assert_eq!(device.handle(Signal::Light { token: 5 }), Vec::new());
@@ -1072,9 +1072,9 @@ fn a_batch_has_at_most_one_render_with_the_last_view() {
 #[test]
 fn the_render_before_sleep_stays_before_sleep() {
     let (mut device, _) = started(PowerSource::Battery, true);
-    // No stream is open, so the close ends at once. The core clears the
-    // idle timer (3) and the time limit of the join (2), which `Off` stops.
-    // Timer 5 is the time limit of `Off`.
+    // No stream is open, so the radio turns off at once. The core clears
+    // the idle timer (3) and the time limit of the join (2), which `Off`
+    // stops. Timer 4 is the time limit of `Off`.
     let jobs = device.handle(sleep_now());
     assert_eq!(
         names(&jobs),
@@ -1082,7 +1082,7 @@ fn the_render_before_sleep_stays_before_sleep() {
             "cancel timer 3",
             "cancel timer 2",
             "wifi off",
-            "start timer 5"
+            "start timer 4"
         ]
     );
     let jobs = device.link();
@@ -1090,8 +1090,7 @@ fn the_render_before_sleep_stays_before_sleep() {
     // The core clears the full-refresh timer before it sleeps.
     assert!(names.contains(&"cancel timer 1".into()), "{names:?}");
     // No timer runs. The core cleared the idle timer at `SleepNow`, and
-    // the timer of the `Close` request and the time limits of `Join` and
-    // `Off` when their answers came.
+    // the time limits of `Join` and `Off` when their answers came.
     assert_eq!(device.timer_count(), 0);
     let render = names.iter().position(|name| name == "render").unwrap();
     let sleep = names.iter().position(|name| name == "sleep").unwrap();
@@ -1191,11 +1190,11 @@ fn each_step_of_the_sleep_waits_for_the_answer_of_its_task() {
 }
 
 #[test]
-fn a_close_with_no_stream_ends_at_once() {
+fn a_sleep_with_no_stream_turns_the_radio_off_at_once() {
     // The join never ends, so no stream opens.
     let (mut device, _) = started(PowerSource::Battery, true);
     let jobs = device.handle(sleep_now());
-    // The close ends at once, so `Off` and its time limit follow in the
+    // The core sends no close, so `Off` and its time limit follow in the
     // same batch. The core clears the idle timer (3) and the time limit of
     // the join (2), which `Off` stops.
     assert_eq!(
@@ -1204,7 +1203,7 @@ fn a_close_with_no_stream_ends_at_once() {
             "cancel timer 3",
             "cancel timer 2",
             "wifi off",
-            "start timer 5"
+            "start timer 4"
         ]
     );
 }

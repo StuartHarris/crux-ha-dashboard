@@ -176,7 +176,8 @@ When the dashboard goes to sleep on battery, the core does these steps in order:
 
 The core waits for the close of the stream before it reports offline. Thus the
 broker has `asleep` and the DISCONNECT before the Wi-Fi turns off, and the last will
-does not replace `asleep` with `offline`.
+does not replace `asleep` with `offline`. If no stream is open, the core reports
+offline at once.
 
 After a session ends, the core does not open a new stream until the shell closed the
 old stream. A new stream makes the shell abort the old stream, and an abort can make
