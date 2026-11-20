@@ -13,6 +13,7 @@ use super::{
 use crate::{
     Event, PowerSource,
     capabilities::stream::{StreamItem, Written},
+    fake::radio_timers,
     features::{
         connection::{CLOSE_TIMEOUT, Link, RECONNECT_MAX, RECONNECT_MIN},
         light::LIGHT_TIMEOUT,
@@ -46,8 +47,9 @@ fn connected(power: PowerSource) -> Shell {
     shell
 }
 
-#[test]
-fn the_timers_of_the_session_have_durations_that_no_feature_timer_has() {
+/// Returns the durations of the timers of the features, with each step of
+/// the reconnect backoff.
+fn feature_timers() -> Vec<Duration> {
     let mut features = vec![
         CLOSE_TIMEOUT,
         LIGHT_TIMEOUT,
@@ -65,8 +67,23 @@ fn the_timers_of_the_session_have_durations_that_no_feature_timer_has() {
         backoff *= 2;
     }
     features.push(RECONNECT_MAX);
+    features
+}
+
+#[test]
+fn the_timers_of_the_session_have_durations_that_no_feature_timer_has() {
+    let features = feature_timers();
     for duration in session_timers() {
         assert!(!features.contains(&duration), "{duration:?}");
+    }
+}
+
+#[test]
+fn the_radio_time_limits_have_durations_that_no_session_or_feature_timer_has() {
+    let mut others = feature_timers();
+    others.extend(session_timers());
+    for duration in radio_timers() {
+        assert!(!others.contains(&duration), "{duration:?}");
     }
 }
 
