@@ -19,9 +19,8 @@ with the std shells of the root workspace would pull std into it.
 
 | Module | What it does |
 | --- | --- |
-| `shell` | Owns the core. Routes each effect to a task as a `Command`, and gives each `Signal` from a task to the core. Keeps the connection ids of the streams, the timer tokens, the `WifiOn` tokens and the `FrontLight` tokens, and the `Write`, `Close`, `WifiOff`, `Sleep` and `FrontLight` requests until their tasks answer. Gives at most one `Render` for each batch of effects, with the last view. Sends each tap to the core as `Tapped`, with the control from `ui::hit_test`. While `Sleep` waits, a tap or a change of the power source answers it. The core does not publish service calls in a dry run. |
+| `shell` | Owns the core. Routes each effect to a task as a `Command`, and gives each `Signal` from a task to the core. Keeps the connection ids of the streams, the timer tokens, the radio tokens and the `FrontLight` tokens, and the `Write`, `Close`, `Radio`, `Sleep` and `FrontLight` requests until their tasks answer. Obeys the stop rule of the radio: a new `Job::Radio` stops each older radio request that still waits, and the shell answers each of them with `Stopped` (or with `()`) itself. The `stop` list of the job gives their tokens to the radio task. Gives at most one `Render` for each batch of effects, with the last view. Sends each tap to the core as `Tapped`, with the control from `ui::hit_test`. While `Sleep` waits, a tap or a change of the power source answers it. The core does not publish service calls in a dry run. |
 | `stream` | The bookkeeping of the stream task. The stream of each connection ends with exactly one `Closed` item. `supersede` removes the queued streams that a later job makes useless. `UpdateStats` counts the updates of the core and their time. |
-| `wifi` | A `WifiOff` during a join stops the join. A `WifiOn` during a join continues it with the newer token. `LinkHealth` decides when a `WifiOn` leaves and joins again, and when the Wi-Fi task restarts the chip. |
 | `backoff` | A wait that doubles from 1 s to 30 s after each failure, for the start of the touch controller. |
 | `timers` | The timers of the timer task, in milliseconds since the start. |
 | `touch` | Converts a GT911 point to a panel point, and touch samples to taps with a debounce. A sample is new with a finger, new with no finger (the finger lifted), or not new. Only a new sample with no finger ends a touch. |
@@ -41,7 +40,7 @@ cannot block each other. This is the pattern of the `cpb` example in Crux.
 | core (`main`) | Owns the shell. Sends `Start` with the power source `Stand`. | |
 | `timers` | Starts and cancels the timers of the core. | `Signal::Timer` |
 | `display` | Draws the newest view model with `ui::draw`, and refreshes the panel as `ui::Refresher` decides. Reads the touch controller every 30 ms between refreshes. Sets the front light. Runs the `Sleep` job. | `Signal::Tap`, `Signal::Event`, `Signal::Woke`, `Signal::Light` |
-| `wifi` | For `WifiOn`, turns the radio on, joins the network and waits for DHCP. For `WifiOff`, leaves the network and turns the radio off. Keeps the access point of the last good join, and joins it again with no scan of all the channels. After `WifiQuiet`, scans all the channels once, and changes to an access point that is at least 10 dB stronger. | `Signal::Wifi`, `Signal::RadioOff` |
+| `radio` | Does the radio jobs of the core (`Join`, `Address`, `Leave`, `Scan`, `StopScan` and `Off`) and the `Restart` job. Has no Wi-Fi policy. The core decides which access point to join, when to scan, when to leave and when to restart the chip. | `Signal::Radio` with the token of the job |
 | `stream` | Opens one TCP stream at a time. Writes the bytes of the core to it, gives the bytes that arrive to the core, and closes it. Knows nothing of MQTT. | `Signal::Stream`, `Signal::Written` |
 | `net` | Runs the network stack. | |
 
@@ -62,41 +61,71 @@ core finds a dead link with its own timers (refer to "Find a dead link" in
 `docs/mqtt.md`). The task has only these limits:
 
 - The DNS query has a limit of 5 s, and the TCP connect has a limit of 10 s. A newer
-  `Open`, a `Close` and a change of access point stop each of them.
+  `Open` and a `Close` stop each of them.
 - A `Write` that gets no space in the send buffer for 10 s (`WRITE_STALL`) ends the
   stream.
 - A `Close` sends a TCP FIN, waits up to 2 s (`CLOSE_FLUSH`) for the broker to
   acknowledge the bytes that wait, and then aborts the socket.
-- A change of access point closes the stream with the reason `access point changed`.
-  The core sends no DISCONNECT, so Home Assistant sees a short retained `offline`
-  and then `online`.
+- A change of access point (a roam) is the decision of the core. The core sends
+  DISCONNECT and a `Close` first, so the stream task sees an ordinary clean close.
+  Home Assistant sees no `offline` (refer to "Change the access point" in
+  `docs/mqtt.md`).
 
-The core then connects again, as after any other drop.
+The core connects again after a drop, with a backoff.
 
-### Recovery after a failed session
+### The radio and the Wi-Fi policy
 
-When a session ends with an error, the firmware records it in `HEALTH`
-(`logic::wifi::LinkHealth`) before the stream ends. The core task records a `Close`
-with `clean: false`. The stream task records a socket error and a reset from the
-broker. A stream that a new stream replaces, a change of access point and a clean
-close are not errors.
+The core decides each Wi-Fi step (`shared/src/features/wifi.rs` and
+`shared/src/features/wifi/rules.rs`). The radio task has no policy. It does one
+job at a time that the core asks for through the `radio` capability
+(`shared/src/capabilities/radio.rs`).
 
-- At the next `WifiOn`, if the driver is still connected, the Wi-Fi task leaves the
-  access point, waits for the stack to drop the address, and joins again. The log
-  shows `wifi: an MQTT session failed, so leave the access point and join again`.
-- The driver of `esp-radio` 1.0.0-beta.1 counts the frames that it did not send yet.
-  If the link goes down after the driver accepts a frame, the frame can stay in the
-  count. When the count is full, the stack can send and receive nothing. The join
-  still works, but DHCP gets no address. Only a restart clears the count.
-- After a failed session, each join that gets no new address counts. An address that
-  the stack kept from before the join also counts. After 3 (`RESTART_AFTER`), the
-  Wi-Fi task restarts the chip. The log shows
-  `wifi: 3 joins after an MQTT session failed got no new address`. A CONNACK clears
-  the count and the suspicion. A new address clears the count.
-- A join that fails before DHCP (the access point is off, or it blocks the device)
-  does not count. After a restart, the next restart needs a new address and a failed
-  session first. Thus a long outage of DHCP or of the broker cannot restart the chip
-  again and again.
+Each job is a `Job::Radio` with a token, a `stop` list and an operation. The task
+answers with `Signal::Radio` and the same token.
+
+The stop rule: a new radio request stops each older request that still waits. The
+shell answers each stopped request itself (`Stopped`, or `()` for a request with no
+result), and gives the tokens in the `stop` list. The radio task drops a job that
+the new job stops, and sends no answer for it. A `Restart` stops all jobs. The shell
+drops a late answer with a token that it does not know.
+
+How the core uses the stream ends:
+
+- Only an end with `Timeout` or `Transport` fails the link. The core then marks the
+  link suspect, and the next join leaves the access point and joins again.
+- An end by the broker host (`End::ByHost`: a TCP reset or a FIN from the host)
+  proves that traffic crosses the link while the link is up. A reconnect during an
+  outage of the broker therefore keeps the association.
+- After a roam, the core ends the session with a clean DISCONNECT, so the end is not
+  a failure.
+
+The driver of `esp-radio` 1.0.0-beta.1 counts the frames that it did not send yet.
+If the link goes down after the driver accepts a frame, the frame can stay in the
+count. When the count is full, the stack can send and receive nothing. The join
+still works, but DHCP gets no address. Only a restart clears the count.
+
+The core restarts the chip (`Job::Restart`) only after 3 joins (`RESTART_AFTER`)
+that get no new address while the link is suspect. A new address, or traffic from
+the broker, clears the count. A UniFi block (the joins fail) and an outage of the
+broker never restart the chip.
+
+The scan for a roam runs when the link is quiet, after the subscribe. The radio
+task dwells 50 to 120 ms on each channel. Three access points took 1.4 s on the
+board. If an access point is at least 10 dB stronger, the core starts a roam.
+
+The log lines that an operator can search for:
+
+| Log line | Meaning |
+| --- | --- |
+| `wifi: radio job N: <operation>` | The task starts the radio job N, for example `join ... (keep true)`, `wait for an address` or `scan all the channels`. |
+| `wifi: radio job N stops for a newer request` | The stop rule dropped the job N. |
+| `wifi: keep <access point> on channel C, signal S dBm` | A join keeps the association that the device has. |
+| `wifi: joined <access point> on channel C with <target> in N ms, signal S dBm` | A join succeeded. |
+| `wifi: address <address>` | DHCP gave an address. |
+| `wifi: the scan found N access points in N ms. Current ..., signal S dBm` | A roam scan ended. |
+| `wifi: restart the chip: <reason>` | The core asked for a restart. |
+| `stream: N failed: <reason> (by the host)` | The broker host ended the stream. |
+| `core: N updates since the stream opened, ...` | The core task writes it at each close of the stream. |
 
 ### Light sleep
 
@@ -116,10 +145,10 @@ and each step waits for the answer of the firmware:
    and ends the stream. The shell then answers `Close`, and only then does the core
    report offline, so the last will does not replace `asleep`. If no connection is
    current, the shell answers at once.
-3. The core sends `WifiOff`. The Wi-Fi task disconnects, waits 100 ms for the frames
-   in the driver, and drops the `WifiController`. The drop stops the Wi-Fi driver and
-   the radio. `esp-radio` 1.0.0-beta.1 has no other public call to stop it. Then the
-   task sends `Signal::RadioOff`, and the shell answers `WifiOff`. `WifiOn` makes a
+3. The core sends an `Off` radio request. The radio task disconnects, waits 100 ms for
+   the frames in the driver, and drops the `WifiController`. The drop stops the Wi-Fi
+   driver and the radio. `esp-radio` 1.0.0-beta.1 has no other public call to stop it.
+   Then the task sends `Signal::Radio` with the answer `Done`. The next `Join` makes a
    new controller.
 4. The core draws the "Asleep" image and sends `Sleep`. The display task draws the
    image first, then puts the chip into light sleep. It does not wait for a blocker,
@@ -341,7 +370,7 @@ Do the steps in this order. Each step needs the steps before it.
 9. **Wi-Fi.** Find `step 7`. The log shows `joined` and an address.
 10. **MQTT and the retained states.** Set `read_only = true` in `cfg.toml`. Run
     `just flash`. The log shows `stream: N is open` and,
-    at `WifiQuiet`, the count and the time of the updates of the core. The tiles show the
+    at each close of the stream, the count and the time of the updates of the core. The tiles show the
     states from Home Assistant. The footer shows "Last changed
     HH:MM" in UK time: the latest `last_updated` time of the entities on the page. On the
     Pi, run
@@ -383,9 +412,9 @@ These items stay open:
 - VCOM is 1600 mV, the value of the vendor firmware (`src/panel/ed047tc1.rs`).
 - The core asks for a full refresh after 30 partial renders and after 30 minutes
   (`shared/src/features/refresh.rs`). Change the numbers if ghost images show.
-- Measure the time from the CONNACK to `WifiQuiet` with the 7 SUBSCRIBE packets in
-  one write. At `WifiQuiet`, the log shows the count and the time of the updates of the
-  core since the stream opened. A warning shows for an update of more than 50 ms.
+- Measure the time from the CONNACK to the end of the subscribe with the 7 SUBSCRIBE
+  packets in one write. At each close of the stream, the log shows the count and the
+  time of the updates of the core since the stream opened. A warning shows for an update of more than 50 ms.
 
 ## Power check (phase 6)
 
