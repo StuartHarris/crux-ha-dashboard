@@ -574,6 +574,21 @@ mod tests {
     }
 
     #[test]
+    fn a_session_that_fails_while_the_link_is_suspect_keeps_the_count() {
+        // A rejoin gets a stale address, so it counts, and the link goes up.
+        // Then the next session fails too.
+        let mut health = Health::default();
+        health.failed();
+        assert_eq!(health.stale(), Recovery::Continue);
+        health.failed();
+        assert_eq!(health.joins_with_no_lease(), 1);
+        for _ in 2..RESTART_AFTER {
+            assert_eq!(health.no_lease(), Recovery::Continue);
+        }
+        assert_eq!(health.no_lease(), Recovery::Restart);
+    }
+
+    #[test]
     fn only_a_timeout_or_a_transport_end_fails_the_link() {
         let failures = [
             End::Timeout(TimerKind::PingResp),

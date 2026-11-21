@@ -1503,3 +1503,124 @@ fn a_chip_restart_during_a_sleep_leaves_the_core_asleep_with_no_step_that_waits(
     assert!(shell.sleep.is_none());
     assert_eq!(shell.view().status, "Asleep");
 }
+
+/// Wakes the device from [`asleep`] while the shell holds the radio
+/// requests, and answers each one until the scan waits. The other access
+/// point is stronger by less than the margin, so the scan finds no better
+/// access point.
+fn scanning_with_no_better_access_point() -> Shell {
+    let mut shell = asleep();
+    shell.radio.access_points[1].rssi = -46;
+    shell.hold_radio = true;
+    shell.wake(Wake::Timer);
+    shell.answer_radio();
+    shell.answer_radio();
+    assert!(matches!(shell.model.wifi.phase, Phase::Scanning(_)));
+    assert_eq!(shell.held_radio(), 1);
+    shell.take_log();
+    shell
+}
+
+#[test]
+fn a_scan_that_finds_no_better_access_point_keeps_the_link_ready() {
+    let mut shell = scanning_with_no_better_access_point();
+    shell.hold_radio = false;
+    shell.answer_radio();
+    assert!(matches!(shell.model.wifi.phase, Phase::Up(_)));
+    assert_eq!(shell.radio.associated, Some(HALL));
+    // The link is ready, so a link request connects with no radio request.
+    wifi::link(&mut shell.model).expect_no_effects();
+}
+
+#[test]
+fn a_session_that_fails_during_a_scan_makes_the_next_link_join_again() {
+    let mut shell = scanning_with_no_better_access_point();
+    fail_the_session(&mut shell);
+    // The scan completes before the reconnect.
+    shell.hold_radio = false;
+    shell.answer_radio();
+    assert!(matches!(shell.model.wifi.phase, Phase::Up(_)));
+    // The link is not ready, so a link request leaves and joins again.
+    let mut cmd = wifi::link(&mut shell.model);
+    assert!(
+        cmd.effects()
+            .any(|effect| matches!(effect, Effect::RadioJoin(_) | Effect::RadioLeave(_))),
+        "the core must join again"
+    );
+}
+
+#[test]
+fn a_wake_during_the_scan_stop_of_a_sleep_keeps_the_link_ready() {
+    let mut shell = scanning_with_no_better_access_point();
+    // The sleep stops the scan, and a tap wakes the device before the
+    // answer to `StopScan`.
+    shell.send(Event::SleepNow);
+    shell.send(Event::Tapped(None));
+    shell.hold_radio = false;
+    shell.answer_radio();
+    assert!(matches!(shell.model.wifi.phase, Phase::Up(_)));
+    assert_eq!(shell.radio.associated, Some(HALL));
+    // The link is ready, so a link request connects with no radio request.
+    wifi::link(&mut shell.model).expect_no_effects();
+}
+
+#[test]
+fn a_session_that_fails_again_after_a_stale_address_keeps_the_count_of_joins() {
+    let mut shell = online();
+    fail_the_session(&mut shell);
+    shell.hold_radio = true;
+    shell.advance(RECONNECT_MIN);
+    // The `Leave` waits.
+    shell.answer_radio();
+
+    // The network stack keeps its address through the join, so the join
+    // counts and the link goes up. The broker host does not answer the
+    // connect, so the session fails again while the link is suspect.
+    shell.radio.has_address = true;
+    shell.broker.unreachable = true;
+    shell.answer_radio();
+    shell.answer_radio();
+    assert!(matches!(shell.model.wifi.phase, Phase::Up(_)));
+    assert_eq!(
+        shell.take_logs(),
+        [
+            SUSPECT,
+            &connect_again(1),
+            LEAVE_HALL,
+            "warn wifi: the address is from before the join, so the network stack can be stuck",
+            &no_new_address(1),
+            &connect_again(2),
+        ]
+    );
+    shell.take_log();
+
+    // The driver is stuck now, so each join gets no address. The second
+    // failure keeps the count, so the second join of the next reconnect is
+    // the third that counts, and the core restarts the chip.
+    shell.hold_radio = false;
+    shell.radio.stuck = true;
+    shell.advance(RECONNECT_MIN * 2);
+    assert_eq!(
+        radio(&shell.take_log()),
+        [
+            "RadioLeave",
+            "RadioJoin Cached",
+            "RadioAddress",
+            "RadioLeave",
+            "RadioJoin Strongest",
+            "RadioAddress",
+            "RadioRestart",
+        ]
+    );
+    assert_eq!(shell.restarts, ["no address after 3 joins"]);
+    assert_eq!(
+        shell.take_logs(),
+        [
+            LEAVE_HALL,
+            &no_new_address(2),
+            "warn wifi: 02:00:00:00:00:01 on channel 6 gave no address, so leave it and join \
+             the strongest access point",
+            &no_new_address(3),
+        ]
+    );
+}
