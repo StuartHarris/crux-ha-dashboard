@@ -17,14 +17,14 @@ use crate::{
     capabilities::{
         log::Level,
         power::Wake,
-        radio::{Joined, Lease, Scanned, Seen, Target},
+        radio::{AccessPoint, Joined, Lease, Scanned, Seen, Target},
     },
     fake::radio::{HALL, LANDING},
     features::{
         connection::{RECONNECT_MAX, RECONNECT_MIN},
         power::{self, IDLE_TIMEOUT, SleepStep},
         wifi::{
-            ADDRESS_TIMEOUT, JOIN_TIMEOUT, LEAVE_TIMEOUT, OFF_TIMEOUT, Phase, SCAN_TIMEOUT,
+            ADDRESS_TIMEOUT, JOIN_TIMEOUT, LEAVE_TIMEOUT, Linked, OFF_TIMEOUT, Phase, SCAN_TIMEOUT,
             STOP_SCAN_TIMEOUT,
             rules::{Health, RESTART_AFTER, Recovery},
         },
@@ -79,6 +79,24 @@ fn place(log: &[String], entry: &str) -> usize {
         .unwrap_or_else(|| panic!("no {entry} in {log:?}"))
 }
 
+/// Returns a link to `access_point` that is ready, so a link request
+/// connects with no join.
+const fn ready(access_point: AccessPoint) -> Linked {
+    Linked {
+        access_point,
+        ready: true,
+    }
+}
+
+/// Returns a link to `access_point` that is not ready, so a link request
+/// joins again.
+const fn not_ready(access_point: AccessPoint) -> Linked {
+    Linked {
+        access_point,
+        ready: false,
+    }
+}
+
 /// Starts the house on the stand, connects, and clears the log.
 fn online() -> Shell {
     let mut shell = house();
@@ -116,7 +134,7 @@ fn scanning() -> Shell {
     shell.wake(Wake::Timer);
     shell.answer_radio();
     shell.answer_radio();
-    assert_eq!(shell.model.wifi.phase, Phase::Scanning(HALL));
+    assert_eq!(shell.model.wifi.phase, Phase::Scanning(ready(HALL)));
     assert_eq!(shell.held_radio(), 1);
     shell.take_log();
     shell
@@ -136,7 +154,7 @@ fn the_first_start_joins_the_strongest_access_point_and_does_not_scan() {
     assert!(address < place(&log, "MqttConnect"), "{log:?}");
 
     assert_eq!(shell.radio.associated, Some(HALL));
-    assert_eq!(shell.model.wifi.phase, Phase::Up(HALL));
+    assert_eq!(shell.model.wifi.phase, Phase::Up(ready(HALL)));
     // The join to the strongest access point found the best one, so no
     // scan is due.
     assert_eq!(shell.model.wifi.cache.plan(), Target::Cached(HALL));
@@ -222,7 +240,7 @@ fn a_wake_joins_the_cached_access_point_and_stays_if_the_scan_finds_less_than_th
         ]
     );
     assert_eq!(shell.radio.associated, Some(HALL));
-    assert_eq!(shell.model.wifi.phase, Phase::Up(HALL));
+    assert_eq!(shell.model.wifi.phase, Phase::Up(ready(HALL)));
     assert!(!shell.model.wifi.cache.scan_due());
     assert_eq!(shell.broker.connections, 2);
     assert_eq!(shell.view().connection, Connection::Online);
@@ -283,7 +301,7 @@ fn a_better_access_point_closes_cleanly_and_the_core_joins_it_once() {
     // scan after it.
     assert_eq!(shell.radio.associated, Some(LANDING));
     assert_eq!(shell.radio.joins, 3);
-    assert_eq!(shell.model.wifi.phase, Phase::Up(LANDING));
+    assert_eq!(shell.model.wifi.phase, Phase::Up(ready(LANDING)));
     assert_eq!(shell.model.wifi.cache.plan(), Target::Cached(LANDING));
     assert!(!shell.model.wifi.cache.scan_due());
 }
@@ -882,7 +900,7 @@ fn a_scan_with_no_answer_in_its_time_limit_is_complete_and_the_late_answer_is_ig
     let mut shell = scanning();
 
     shell.advance(SCAN_TIMEOUT);
-    assert_eq!(shell.model.wifi.phase, Phase::Up(HALL));
+    assert_eq!(shell.model.wifi.phase, Phase::Up(ready(HALL)));
     assert!(!shell.model.wifi.cache.scan_due());
     assert_eq!(
         shell.take_logs(),
@@ -970,7 +988,7 @@ fn a_time_limit_after_the_answer_does_nothing() {
         "{events:?}"
     );
     assert_eq!(radio(&shell.take_log()), Vec::<&str>::new());
-    assert_eq!(shell.model.wifi.phase, Phase::Up(HALL));
+    assert_eq!(shell.model.wifi.phase, Phase::Up(ready(HALL)));
     assert_eq!(shell.view().connection, Connection::Online);
 
     // The answer to `Off` cleared its time limit, so nothing happens while
@@ -1063,8 +1081,7 @@ fn an_association_after_the_sleep_started_is_up_but_not_ready() {
             &mut model,
         )
         .expect_no_effects();
-    assert_eq!(model.wifi.phase, Phase::Up(HALL));
-    assert!(!model.wifi.ready);
+    assert_eq!(model.wifi.phase, Phase::Up(not_ready(HALL)));
     // The core keeps nothing in the cache.
     assert_eq!(model.wifi.cache.plan(), Target::Strongest);
 
@@ -1166,7 +1183,7 @@ fn a_rejoin_that_keeps_the_association_and_its_address_writes_no_line() {
 
 #[test]
 fn a_better_access_point_found_during_a_sleep_is_for_the_next_wake() {
-    let mut model = sleeping_with(Phase::Scanning(HALL));
+    let mut model = sleeping_with(Phase::Scanning(not_ready(HALL)));
     model.wifi.cache.joined(Target::Cached(HALL), HALL);
     let scanned = Scanned::Found {
         seen: alloc::vec![
@@ -1256,7 +1273,7 @@ fn a_stale_address_on_a_link_that_is_not_suspect_writes_no_line() {
         .filter(|effect| matches!(effect, Effect::Log(_)))
         .collect();
     assert!(lines.is_empty(), "{lines:?}");
-    assert_eq!(model.wifi.phase, Phase::Up(HALL));
+    assert_eq!(model.wifi.phase, Phase::Up(ready(HALL)));
     assert_eq!(model.wifi.health, Health::default());
 }
 
@@ -1266,7 +1283,7 @@ fn a_scan_with_no_signal_for_the_current_access_point_stays() {
         startup: crate::Startup::Started(settings()),
         ..Model::default()
     };
-    model.wifi.phase = Phase::Scanning(HALL);
+    model.wifi.phase = Phase::Scanning(not_ready(HALL));
     model.wifi.radio = 9;
     model.wifi.cache.joined(Target::Cached(HALL), HALL);
     let scanned = Scanned::Found {
@@ -1288,7 +1305,7 @@ fn a_scan_with_no_signal_for_the_current_access_point_stays() {
                 "wifi: the signal of 02:00:00:00:00:01 on channel 6 is unknown, so stay"
             );
         });
-    assert_eq!(model.wifi.phase, Phase::Up(HALL));
+    assert_eq!(model.wifi.phase, Phase::Up(not_ready(HALL)));
     assert_eq!(model.wifi.cache.plan(), Target::Cached(HALL));
 }
 
@@ -1427,7 +1444,7 @@ fn a_wake_after_a_new_sleep_took_over_the_scan_stop_does_not_disconnect() {
     shell.answer_radio();
     let log = shell.take_log();
     assert!(!log.contains(&"MqttDisconnect".into()), "{log:?}");
-    assert_eq!(shell.model.wifi.phase, Phase::Up(HALL));
+    assert_eq!(shell.model.wifi.phase, Phase::Up(ready(HALL)));
     assert_eq!(
         shell.model.connection.link(),
         crate::features::connection::Link::Up

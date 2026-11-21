@@ -246,7 +246,7 @@ pub fn sleep_step(model: &Model) -> Option<SleepStep> {
         return Some(SleepStep::LightOff);
     }
     let step = match model.wifi.phase {
-        wifi::Phase::TurningOff { sleep } if sleep == id => SleepStep::RadioOff,
+        wifi::Phase::TurningOff { sleep, .. } if sleep == id => SleepStep::RadioOff,
         wifi::Phase::StoppingScan { sleep, .. } if sleep == id => SleepStep::StopScan,
         _ if model.connection.sleep_waiter() == Some(id) => SleepStep::Disconnect,
         wifi::Phase::Restarting => SleepStep::Stalled,
