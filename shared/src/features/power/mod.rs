@@ -92,8 +92,9 @@ pub struct State {
     pub battery: Option<u8>,
     /// The power phase. It also gives the power source.
     phase: Phase,
-    /// The id of the newest idle timer. The core takes a new id for each
-    /// idle timer, and ignores the expiry of an older one.
+    /// The last id that the core took for an idle timer. Each new idle timer
+    /// takes the next id. The `Slot` of the phase decides if an expiry is
+    /// stale.
     pub idle: u32,
     /// The id of the newest sleep. The core takes a new id for each sleep,
     /// and ignores the answers of an older one.
@@ -261,15 +262,18 @@ pub fn sleep_step(model: &Model) -> Option<SleepStep> {
 fn step_started(step: SleepStep, id: u32) -> Cmd {
     let line = |message: &str| format!("sleep {id} {message}");
     match step {
-        SleepStep::LightOff => log::info(Area::Power, line("turns the front light off")),
-        SleepStep::StopScan => log::info(Area::Power, line("waits for the end of the scan")),
-        SleepStep::Disconnect => log::info(Area::Power, line("closes the connection")),
-        SleepStep::RadioOff => log::info(Area::Power, line("turns the radio off")),
-        SleepStep::Sleep => log::info(Area::Power, line("draws the last image and sleeps")),
+        SleepStep::LightOff => log::info(Area::Power, line("turns the front light off")).build(),
+        SleepStep::StopScan => {
+            log::info(Area::Power, line("waits for the end of the scan")).build()
+        }
+        SleepStep::Disconnect => log::info(Area::Power, line("closes the connection")).build(),
+        SleepStep::RadioOff => log::info(Area::Power, line("turns the radio off")).build(),
+        SleepStep::Sleep => log::info(Area::Power, line("draws the last image and sleeps")).build(),
         SleepStep::Stalled => log::warn(
             Area::Power,
             line("stops before the radio turns off, because the chip restarts"),
-        ),
+        )
+        .build(),
     }
 }
 
@@ -362,8 +366,7 @@ pub fn source_changed(source: PowerSource, model: &mut Model) -> Cmd {
         PowerSource::Stand => {
             let was_asleep = model.power.is_asleep();
             // The device stays awake on the stand, so it needs no idle
-            // timer.
-            model.power.idle = model.power.idle.wrapping_add(1);
+            // timer. `enter` clears the idle timer that runs.
             model.power.enter(Phase::Stand);
             connection::restart(model);
             light::source_changed(model)
@@ -435,7 +438,6 @@ pub fn idle_timeout(id: u32, model: &mut Model) -> Cmd {
 /// nothing. Before `Start`, the device then stays `Awake` with no idle
 /// timer.
 pub fn sleep_now(model: &mut Model) -> Cmd {
-    model.power.idle = model.power.idle.wrapping_add(1);
     if let Phase::Awake { idle, .. } = &mut model.power.phase {
         idle.stop();
     }

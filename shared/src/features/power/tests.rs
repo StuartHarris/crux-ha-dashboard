@@ -568,9 +568,9 @@ fn an_idle_timer_that_expires_after_sleep_now_is_ignored() {
     let _ = app.update(Event::SleepNow, &mut model);
     let sleep = model.power.sleep;
 
-    // The core cleared the idle timer of the start. If its expiry still
-    // arrives, the core ignores it.
-    assert_ne!(model.power.idle, idle);
+    // The core cleared the idle timer of the start
+    // (`sleep_now_clears_the_idle_timer`). If its expiry still arrives, the
+    // core ignores it.
     app.update(Event::Power(power::Event::IdleTimeout(idle)), &mut model)
         .expect_no_effects();
     assert_eq!(model.power.sleep, sleep);

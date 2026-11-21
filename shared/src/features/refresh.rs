@@ -69,7 +69,7 @@
 
 use core::time::Duration;
 
-use crate::{Cmd, Model, ViewModel, features::timer::Slot, view::view};
+use crate::{Cmd, Model, ViewModel, features::timer::Slot};
 
 /// The internal events of the refresh policy. The core makes them from its
 /// timers.
@@ -122,13 +122,17 @@ pub const DRAW_DELAY: Duration = Duration::from_millis(200);
 pub struct State {
     /// The number of partial renders since the last full refresh.
     pub partials: u32,
-    /// The id of the newest full-refresh timer.
+    /// The last id that the core took for a full-refresh timer. Each new
+    /// timer takes the next id. The `Slot` `full` decides if an expiry is
+    /// stale.
     pub timer: u32,
     /// The full-refresh timer that runs.
     full: Slot,
     /// The view of the last render that the core asked for.
     last: Option<ViewModel>,
-    /// The id of the newest draw timer.
+    /// The last id that the core took for a draw timer. Each new draw timer
+    /// takes the next id. The `Slot` `draw_timer` decides if an expiry is
+    /// stale.
     pub draw: u32,
     /// The draw timer that waits. While it waits, a new change does not
     /// start another one.
@@ -152,7 +156,7 @@ impl State {
 /// [`PARTIALS_PER_FULL`] partial renders came before it. A full refresh
 /// always renders.
 pub fn redraw(model: &mut Model, full: bool) -> Cmd {
-    let mut next = view(model);
+    let mut next = ViewModel::from(&*model);
     let state = &mut model.refresh;
     if !full && state.last.as_ref() == Some(&next) {
         return Cmd::done();
@@ -165,10 +169,7 @@ pub fn redraw(model: &mut Model, full: bool) -> Cmd {
     state.partials = 0;
     // The full refresh draws the newest view, so the draw timer that waits
     // is stale.
-    if state.draw_timer.is_running() {
-        state.draw = state.draw.wrapping_add(1);
-        state.draw_timer.stop();
-    }
+    state.draw_timer.stop();
     model.full_refresh_seq = model.full_refresh_seq.wrapping_add(1);
     // The view is the same, except for the new number.
     next.full_refresh_seq = model.full_refresh_seq;

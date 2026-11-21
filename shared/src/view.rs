@@ -267,49 +267,50 @@ pub const fn rounded_level(level: u8) -> u8 {
 }
 
 /// Makes the view model from the model.
-#[must_use]
-pub fn view(model: &Model) -> ViewModel {
-    let index = model.page_index();
-    let page = model.pages.get(index);
+impl From<&Model> for ViewModel {
+    fn from(model: &Model) -> Self {
+        let index = model.page_index();
+        let page = model.pages.get(index);
 
-    let connection = if model.connection.link() == Link::Up {
-        Connection::Online
-    } else if model.wants_online() {
-        Connection::Connecting
-    } else {
-        Connection::Offline
-    };
-    let time = page_time(model);
-    let updated = time.map_or_else(String::new, |time| {
-        format!("Last changed {}", local_time(time))
-    });
+        let connection = if model.connection.link() == Link::Up {
+            Connection::Online
+        } else if model.wants_online() {
+            Connection::Connecting
+        } else {
+            Connection::Offline
+        };
+        let time = page_time(model);
+        let updated = time.map_or_else(String::new, |time| {
+            format!("Last changed {}", local_time(time))
+        });
 
-    let read_only = model.startup.read_only();
+        let read_only = model.startup.read_only();
 
-    ViewModel {
-        path: model.route.to_path(),
-        title: page.map(|page| page.title).unwrap_or_default().into(),
-        page_index: index,
-        page_count: model.pages.len(),
-        page_label: format!("{} / {}", index + 1, model.pages.len()),
-        page: page.map_or_else(
-            || {
-                PageView::Room(RoomView {
-                    tiles: Vec::new(),
-                    scenes: Vec::new(),
-                })
-            },
-            |page| page_view(page, model),
-        ),
-        connection,
-        power: model.power.source(),
-        battery: model.power.battery.map(rounded_level),
-        status: status(connection, model.power.is_asleep(), model.unsent, read_only),
-        last_sync: time.and_then(|time| u64::try_from(time.timestamp()).ok()),
-        asleep: model.power.is_asleep(),
-        read_only,
-        updated,
-        full_refresh_seq: model.full_refresh_seq,
+        Self {
+            path: model.route.to_path(),
+            title: page.map(|page| page.title).unwrap_or_default().into(),
+            page_index: index,
+            page_count: model.pages.len(),
+            page_label: format!("{} / {}", index + 1, model.pages.len()),
+            page: page.map_or_else(
+                || {
+                    PageView::Room(RoomView {
+                        tiles: Vec::new(),
+                        scenes: Vec::new(),
+                    })
+                },
+                |page| page_view(page, model),
+            ),
+            connection,
+            power: model.power.source(),
+            battery: model.power.battery.map(rounded_level),
+            status: status(connection, model.power.is_asleep(), model.unsent, read_only),
+            last_sync: time.and_then(|time| u64::try_from(time.timestamp()).ok()),
+            asleep: model.power.is_asleep(),
+            read_only,
+            updated,
+            full_refresh_seq: model.full_refresh_seq,
+        }
     }
 }
 

@@ -309,7 +309,8 @@ fn rejoin(current: AccessPoint, model: &mut Model) -> Cmd {
         let reason = log::warn(
             Area::Wifi,
             format!("the link is suspect, so leave {current} and join again"),
-        );
+        )
+        .build();
         reason.and(leave(Then::Join(target), model))
     } else if target != Target::Cached(current) {
         leave(Then::Join(target), model)
@@ -345,11 +346,13 @@ pub fn session_ended(end: &End, model: &mut Model) -> Cmd {
         (false, true) => log::warn(
             Area::Wifi,
             format!("the link is suspect, because the MQTT session failed: {end}"),
-        ),
+        )
+        .build(),
         (true, false) => log::info(
             Area::Wifi,
             "the broker host ended the session, so the link moves data and is not suspect",
-        ),
+        )
+        .build(),
         _ => Cmd::done(),
     }
 }
@@ -369,6 +372,7 @@ pub fn traffic(model: &mut Model) -> Cmd {
             Area::Wifi,
             "bytes from the broker arrived, so the link is not suspect",
         )
+        .build()
     } else {
         Cmd::done()
     }
@@ -491,7 +495,8 @@ pub fn leased(radio: u32, lease: Lease, model: &mut Model) -> Cmd {
             lines = log::warn(
                 Area::Wifi,
                 "the address is from before the join, so the network stack can be stuck",
-            );
+            )
+            .build();
         }
         let recovery = state.health.stale();
         lines = lines.and(counted(state.health));
@@ -524,6 +529,7 @@ fn counted(health: Health) -> Cmd {
         Area::Wifi,
         format!("{count} of {RESTART_AFTER} joins got no new address while the link is suspect"),
     )
+    .build()
 }
 
 /// Handles the answer to the `Leave` request `radio`.
@@ -574,6 +580,7 @@ pub fn timeout(radio: u32, model: &mut Model) -> Cmd {
             Area::Wifi,
             format!("the {request} request got no answer in its time limit"),
         )
+        .build()
     });
     if !model.wants_online()
         && matches!(model.wifi.phase, Phase::Joining(_) | Phase::Leasing { .. })
@@ -633,13 +640,14 @@ fn after_join(joined: &Joined, model: &mut Model) -> Cmd {
                     format!(
                         "the join to the cached access point {cached} failed, so join the strongest access point"
                     ),
-                );
+                ).build();
                 reason.and(join(Target::Strongest, false, model))
             }
             (AfterFailure::Fail, _) if model.wants_online() => log::warn(
                 Area::Wifi,
                 "the join to the strongest access point failed, so the link is down",
             )
+            .build()
             .and(connection::link_failed(model)),
             (AfterFailure::Rescan | AfterFailure::Fail, _) => connection::link_failed(model),
         };
@@ -687,7 +695,9 @@ fn no_address(target: Target, access_point: AccessPoint, model: &mut Model) -> C
             format!("the strongest access point {access_point} gave no address, so leave it"),
         ),
     };
-    log::warn(Area::Wifi, message).and(leave(then, model))
+    log::warn(Area::Wifi, message)
+        .build()
+        .and(leave(then, model))
 }
 
 /// Continues after the answer to a leave.
@@ -718,13 +728,14 @@ fn after_scan(scanned: &Scanned, model: &mut Model) -> Cmd {
     state.cache.scanned();
     state.phase = Phase::Up(linked);
     let Scanned::Found { seen, rssi } = scanned else {
-        return log::warn(Area::Wifi, format!("the scan failed, so stay on {current}"));
+        return log::warn(Area::Wifi, format!("the scan failed, so stay on {current}")).build();
     };
     let Some(rssi_now) = current_signal(current, *rssi, seen) else {
         return log::info(
             Area::Wifi,
             format!("the signal of {current} is unknown, so stay"),
-        );
+        )
+        .build();
     };
     let now = signal(Some(rssi_now));
     let Some(best) = better_access_point(current, *rssi, seen) else {
@@ -733,7 +744,7 @@ fn after_scan(scanned: &Scanned, model: &mut Model) -> Cmd {
             format!(
                 "the scan found no access point that is {ROAM_MARGIN_DB} dB stronger than {current} ({now}), so stay"
             ),
-        );
+        ).build();
     };
     state.cache.roam_to(best.access_point);
     state.phase = Phase::Up(Linked {
@@ -750,13 +761,15 @@ fn after_scan(scanned: &Scanned, model: &mut Model) -> Cmd {
                 "change to {to} ({} dBm), because the signal of {current} is {now}",
                 best.rssi
             ),
-        );
+        )
+        .build();
         reason.and(connection::close_for_roam(model))
     } else {
         log::info(
             Area::Wifi,
             format!("change to {to} at the next wake, because the signal of {current} is {now}"),
         )
+        .build()
     }
 }
 
@@ -807,7 +820,7 @@ fn leave(then: Then, model: &mut Model) -> Cmd {
 /// Asks the shell to restart the chip, for `reason`.
 fn restart(reason: String, model: &mut Model) -> Cmd {
     model.wifi.phase = Phase::Restarting;
-    Radio::restart(reason)
+    Radio::restart(reason).build()
 }
 
 /// Takes a new id for a radio request, and clears the time limit of the

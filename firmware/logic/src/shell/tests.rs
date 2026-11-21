@@ -1480,7 +1480,8 @@ fn a_join_with_no_answer_is_stopped_by_the_next_join() {
 fn a_line_of_the_log_keeps_its_place_before_a_restart() {
     let mut shell = Shell::new();
     let mut cmd: Cmd = log::warn(Area::Wifi, "3 of 3 joins got no new address")
-        .and(Radio::restart("no address after 3 joins".into()));
+        .build()
+        .and(Radio::restart("no address after 3 joins".into()).build());
     let effects: Vec<Effect> = cmd.effects().collect();
 
     let jobs = shell.process(effects);

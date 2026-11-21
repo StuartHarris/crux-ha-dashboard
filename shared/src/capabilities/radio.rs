@@ -35,7 +35,11 @@
 use alloc::{format, string::String, vec::Vec};
 use core::fmt;
 
-use crux_core::{Command, Request, command::RequestBuilder, macros::Operation};
+use crux_core::{
+    Command, Request,
+    command::{NotificationBuilder, RequestBuilder},
+    macros::Operation,
+};
 
 /// An access point: its BSSID and its channel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -316,7 +320,10 @@ impl Radio {
 
     /// Restarts the chip, and gives `reason` to the log of the shell. Refer
     /// to [`Restart`].
-    pub fn restart<Effect, Event>(reason: String) -> Command<Effect, Event>
+    #[must_use]
+    pub fn restart<Effect, Event>(
+        reason: String,
+    ) -> NotificationBuilder<Effect, Event, impl Future<Output = ()>>
     where
         Effect: From<Request<Restart>> + Send + 'static,
         Event: Send + 'static,
@@ -509,7 +516,7 @@ mod tests {
     #[test]
     fn restart_is_a_notification_with_its_reason() {
         let mut command: Command<Effect, Event> =
-            Radio::restart(String::from("no address after 3 joins"));
+            Radio::restart(String::from("no address after 3 joins")).build();
         let Effect::Restart(request) = effect(&mut command) else {
             panic!("a Restart notification");
         };
