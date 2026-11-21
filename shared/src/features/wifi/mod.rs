@@ -10,9 +10,11 @@
 //! [`connection::link_failed`] when the join failed. The steps:
 //!
 //! - From `Off` or `Idle`, the core joins the target of [`ApCache::plan`].
-//! - From `Up`, the core joins again and keeps the association. If the link
-//!   is suspect, or the cache has another access point, the core leaves
-//!   first. Refer to [`Health`].
+//! - From `Up` with a link that is ready ([`Linked::ready`]), the core
+//!   connects with no join.
+//! - From another linked phase, the core joins again and keeps the
+//!   association. If the link is suspect, or the cache has another access
+//!   point, the core leaves first. Refer to [`Health`].
 //! - After the association, the core waits for an address. A lease that is
 //!   not new can count toward a restart. A join with no lease leaves, and
 //!   then joins the strongest access point or fails.
@@ -163,18 +165,17 @@ pub enum Phase {
     },
     /// A `Leave` request waits for its answer. Then the core does this.
     Leaving(Then),
-    /// The device has an address, from this access point.
-    Up(AccessPoint),
-    /// A `Scan` request waits for its answer. The link to this access point
-    /// stays up.
-    Scanning(AccessPoint),
+    /// The device has an address.
+    Up(Linked),
+    /// A `Scan` request waits for its answer. The link stays up.
+    Scanning(Linked),
     /// A `StopScan` request for a sleep waits for its answer. The answer
     /// starts the next step of the sleep. If the device wakes and a new
     /// sleep starts before the answer, the new sleep takes the request
     /// ([`stop_scan`]).
     StoppingScan {
-        /// The access point of the link.
-        access_point: AccessPoint,
+        /// The link, which stays up.
+        linked: Linked,
         /// The id of the sleep.
         sleep: u32,
     },
@@ -183,10 +184,48 @@ pub enum Phase {
     TurningOff {
         /// The id of the sleep.
         sleep: u32,
+        /// The core wants the link after the answer, because the device
+        /// woke while the radio turned off.
+        wanted: bool,
     },
     /// The core asked the shell to restart the chip. The core does no more
     /// radio work.
     Restarting,
+}
+
+impl Phase {
+    /// Returns the link of the device with an address, or `None` if the
+    /// phase has no link.
+    ///
+    /// A scan keeps the link to the access point, so `Scanning` and
+    /// `StoppingScan` have a link too.
+    #[must_use]
+    pub const fn linked(mut self) -> Option<Linked> {
+        self.linked_mut().copied()
+    }
+
+    /// Returns the link of the device with an address, for a change, or
+    /// `None` if the phase has no link. This function is the only list of
+    /// the phases with a link. Refer to [`Phase::linked`].
+    pub const fn linked_mut(&mut self) -> Option<&mut Linked> {
+        match self {
+            Self::Up(linked) | Self::Scanning(linked) | Self::StoppingScan { linked, .. } => {
+                Some(linked)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// The link of the device with an address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Linked {
+    /// The access point of the link.
+    pub access_point: AccessPoint,
+    /// The core can connect on this link with no new join. It is `false`
+    /// after an MQTT session that did not end cleanly, after a decision to
+    /// change access point, and after an association during a sleep.
+    pub ready: bool,
 }
 
 /// What the core does after a `Leave` request.
@@ -216,11 +255,6 @@ pub struct State {
     pub cache: ApCache,
     /// The health of the link. A start makes a new one.
     pub health: Health,
-    /// The core wants the link after the `Off` request that waits.
-    pub wanted: bool,
-    /// The link is up, and no MQTT session ended after the join. While this
-    /// is `true`, [`link`] connects with no new join.
-    pub ready: bool,
 }
 
 /// Forgets the radio after the shell starts, as after a restart of the
@@ -232,8 +266,6 @@ pub fn reset(model: &mut Model) {
     state.radio = state.radio.wrapping_add(1);
     state.limit.stop();
     state.health = Health::default();
-    state.wanted = false;
-    state.ready = false;
 }
 
 /// Gets a link for the connection. Refer to the module documentation.
@@ -244,20 +276,19 @@ pub fn reset(model: &mut Model) {
 pub fn link(model: &mut Model) -> Cmd {
     let state = &mut model.wifi;
     match state.phase {
-        Phase::Up(_) if state.ready => connection::link_up(model),
+        Phase::Up(Linked { ready: true, .. }) => connection::link_up(model),
         // A new request stops the scan.
-        Phase::Up(current)
-        | Phase::Scanning(current)
-        | Phase::StoppingScan {
-            access_point: current,
-            ..
-        } => rejoin(current, model),
+        Phase::Up(linked) | Phase::Scanning(linked) | Phase::StoppingScan { linked, .. } => {
+            rejoin(linked.access_point, model)
+        }
         Phase::Off | Phase::Idle => {
             let target = state.cache.plan();
             join(target, false, model)
         }
         Phase::TurningOff { .. } => {
-            state.wanted = true;
+            if let Phase::TurningOff { wanted, .. } = &mut state.phase {
+                *wanted = true;
+            }
             Cmd::done()
         }
         Phase::Joining(_) | Phase::Leasing { .. } | Phase::Leaving(_) | Phase::Restarting => {
@@ -291,7 +322,7 @@ fn rejoin(current: AccessPoint, model: &mut Model) -> Cmd {
 ///
 /// A failure of the link makes it suspect. An end by the broker host proves
 /// traffic, but only while the device has a link with an address. Refer to
-/// [`Health::ended`] and [`linked`].
+/// [`Health::ended`] and [`Phase::linked`].
 ///
 /// After an end that is not clean, the link can be the cause, so the next
 /// [`link`] joins again. A clean end comes from the core, so the link stays
@@ -300,13 +331,15 @@ fn rejoin(current: AccessPoint, model: &mut Model) -> Cmd {
 /// The command writes a line to the log only when the link becomes suspect
 /// or stops being suspect.
 pub fn session_ended(end: &End, model: &mut Model) -> Cmd {
-    let linked = linked(model.wifi.phase);
+    let has_link = model.wifi.phase.linked().is_some();
     let health = &mut model.wifi.health;
     let was_suspect = health.suspect();
-    health.ended(end, linked);
+    health.ended(end, has_link);
     let is_suspect = health.suspect();
-    if *end != End::Clean {
-        model.wifi.ready = false;
+    if *end != End::Clean
+        && let Some(link) = model.wifi.phase.linked_mut()
+    {
+        link.ready = false;
     }
     match (was_suspect, is_suspect) {
         (false, true) => log::warn(
@@ -319,17 +352,6 @@ pub fn session_ended(end: &End, model: &mut Model) -> Cmd {
         ),
         _ => Cmd::done(),
     }
-}
-
-/// Returns `true` if the device has a link with an address in `phase`.
-///
-/// A scan keeps the link to the access point, so `Scanning` and
-/// `StoppingScan` have a link too.
-const fn linked(phase: Phase) -> bool {
-    matches!(
-        phase,
-        Phase::Up(_) | Phase::Scanning(_) | Phase::StoppingScan { .. }
-    )
 }
 
 /// Records bytes from the broker, which prove that the link moves data. An
@@ -356,13 +378,13 @@ pub fn traffic(model: &mut Model) -> Cmd {
 /// better access point is due, the core scans now.
 pub fn quiet(model: &mut Model) -> Cmd {
     let state = &mut model.wifi;
-    let Phase::Up(current) = state.phase else {
+    let Phase::Up(linked) = state.phase else {
         return Cmd::done();
     };
     if !state.cache.scan_due() || !model.wants_online() {
         return Cmd::done();
     }
-    model.wifi.phase = Phase::Scanning(current);
+    model.wifi.phase = Phase::Scanning(linked);
     let radio = next_id(model);
     Radio::scan(radio)
         .then_send(move |scanned| Event::Scanned { radio, scanned }.into())
@@ -378,18 +400,15 @@ pub fn quiet(model: &mut Model) -> Cmd {
 /// the old request stays. The answer then starts the next step of the new
 /// sleep.
 pub fn stop_scan(sleep: u32, model: &mut Model) -> Option<Cmd> {
-    let access_point = match &mut model.wifi.phase {
-        Phase::Scanning(access_point) => *access_point,
+    let linked = match &mut model.wifi.phase {
+        Phase::Scanning(linked) => *linked,
         Phase::StoppingScan { sleep: waiter, .. } => {
             *waiter = sleep;
             return Some(Cmd::done());
         }
         _ => return None,
     };
-    model.wifi.phase = Phase::StoppingScan {
-        access_point,
-        sleep,
-    };
+    model.wifi.phase = Phase::StoppingScan { linked, sleep };
     let radio = next_id(model);
     let stop = Radio::stop_scan(radio).then_send(move |()| Event::ScanStopped(radio).into());
     Some(stop.and(limit(radio, STOP_SCAN_TIMEOUT, model)))
@@ -408,9 +427,10 @@ pub fn off(sleep: u32, model: &mut Model) -> Cmd {
         return Cmd::done();
     }
     state.cache.stopped();
-    state.phase = Phase::TurningOff { sleep };
-    state.wanted = false;
-    state.ready = false;
+    state.phase = Phase::TurningOff {
+        sleep,
+        wanted: false,
+    };
     let radio = next_id(model);
     Radio::off(radio)
         .then_send(move |()| Event::RadioOff(radio).into())
@@ -485,8 +505,10 @@ pub fn leased(radio: u32, lease: Lease, model: &mut Model) -> Cmd {
     if !kept {
         state.cache.joined(target, access_point);
     }
-    state.phase = Phase::Up(access_point);
-    state.ready = true;
+    state.phase = Phase::Up(Linked {
+        access_point,
+        ready: true,
+    });
     lines.and(connection::link_up(model))
 }
 
@@ -642,8 +664,10 @@ fn after_join(joined: &Joined, model: &mut Model) -> Cmd {
 /// sleep turn the radio off. If the device wakes before that, [`link`]
 /// joins again from `Up`.
 fn associated_during_sleep(access_point: AccessPoint, model: &mut Model) -> Cmd {
-    model.wifi.phase = Phase::Up(access_point);
-    model.wifi.ready = false;
+    model.wifi.phase = Phase::Up(Linked {
+        access_point,
+        ready: false,
+    });
     Cmd::done()
 }
 
@@ -687,11 +711,12 @@ fn after_leave(model: &mut Model) -> Cmd {
 /// access point.
 fn after_scan(scanned: &Scanned, model: &mut Model) -> Cmd {
     let state = &mut model.wifi;
-    let Phase::Scanning(current) = state.phase else {
+    let Phase::Scanning(linked) = state.phase else {
         return Cmd::done();
     };
+    let current = linked.access_point;
     state.cache.scanned();
-    state.phase = Phase::Up(current);
+    state.phase = Phase::Up(linked);
     let Scanned::Found { seen, rssi } = scanned else {
         return log::warn(Area::Wifi, format!("the scan failed, so stay on {current}"));
     };
@@ -711,7 +736,10 @@ fn after_scan(scanned: &Scanned, model: &mut Model) -> Cmd {
         );
     };
     state.cache.roam_to(best.access_point);
-    state.ready = false;
+    state.phase = Phase::Up(Linked {
+        access_point: current,
+        ready: false,
+    });
     let to = best.access_point;
     // During the steps of a sleep, the sleep closes the session. The next
     // wake joins the better access point.
@@ -735,14 +763,10 @@ fn after_scan(scanned: &Scanned, model: &mut Model) -> Cmd {
 /// Continues after the answer to a stop of a scan, with the next step of
 /// the sleep.
 fn after_stop_scan(model: &mut Model) -> Cmd {
-    let Phase::StoppingScan {
-        access_point,
-        sleep,
-    } = model.wifi.phase
-    else {
+    let Phase::StoppingScan { linked, sleep } = model.wifi.phase else {
         return Cmd::done();
     };
-    model.wifi.phase = Phase::Up(access_point);
+    model.wifi.phase = Phase::Up(linked);
     power::scan_stopped(sleep, model)
 }
 
@@ -750,11 +774,10 @@ fn after_stop_scan(model: &mut Model) -> Cmd {
 /// If the device woke while the radio turned off, the core joins now.
 fn after_off(model: &mut Model) -> Cmd {
     let state = &mut model.wifi;
-    let Phase::TurningOff { sleep } = state.phase else {
+    let Phase::TurningOff { sleep, wanted } = state.phase else {
         return Cmd::done();
     };
     state.phase = Phase::Off;
-    let wanted = core::mem::take(&mut state.wanted);
     let next = power::radio_off(sleep, model);
     if wanted {
         next.and(connection::go_online(model))
@@ -784,7 +807,6 @@ fn leave(then: Then, model: &mut Model) -> Cmd {
 /// Asks the shell to restart the chip, for `reason`.
 fn restart(reason: String, model: &mut Model) -> Cmd {
     model.wifi.phase = Phase::Restarting;
-    model.wifi.ready = false;
     Radio::restart(reason)
 }
 

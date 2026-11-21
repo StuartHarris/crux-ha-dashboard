@@ -29,8 +29,12 @@ pub enum AfterFailure {
     Fail,
 }
 
-/// The access point of the last good join, and if a scan for a better one is
+/// The access point for the next join, and if a scan for a better one is
 /// due.
+///
+/// The access point is the access point of the last good join. While a
+/// change of access point waits, it is the better access point that the
+/// next join goes to ([`ApCache::roam_to`]).
 ///
 /// The core keeps the cache in its model, which light sleep keeps. The
 /// rules:
@@ -46,23 +50,44 @@ pub enum AfterFailure {
 ///   is due after it. No scan is due after a change of access point
 ///   ([`ApCache::roam_to`]) either.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ApCache {
-    access_point: Option<AccessPoint>,
-    scan_due: bool,
-    roaming: bool,
+pub struct ApCache(Entry);
+
+/// What the cache holds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Entry {
+    /// No join worked yet, or the last join failed.
+    #[default]
+    Empty,
+    /// The access point of the last good join.
+    Cached {
+        /// The access point of the join.
+        access_point: AccessPoint,
+        /// A scan for a better access point is due.
+        scan_due: bool,
+    },
+    /// A scan found this better access point. The next join goes there, and
+    /// no scan is due after that join.
+    Roaming(AccessPoint),
 }
 
 impl ApCache {
-    /// Returns the target of the next join.
+    /// Returns the target of the next join: the access point of
+    /// [`ApCache::current`], or the strongest access point if the cache is
+    /// empty.
     #[must_use]
     pub fn plan(&self) -> Target {
-        self.access_point.map_or(Target::Strongest, Target::Cached)
+        self.current().map_or(Target::Strongest, Target::Cached)
     }
 
-    /// Returns the access point of the last good join.
+    /// Returns the access point of the last good join. While a change of
+    /// access point waits, returns the better access point that the next
+    /// join goes to.
     #[must_use]
     pub const fn current(&self) -> Option<AccessPoint> {
-        self.access_point
+        match self.0 {
+            Entry::Empty => None,
+            Entry::Cached { access_point, .. } | Entry::Roaming(access_point) => Some(access_point),
+        }
     }
 
     /// Records a join to `target` that worked, to `access_point`.
@@ -70,17 +95,17 @@ impl ApCache {
     /// After a join with the cached access point, a scan is due. After the
     /// join of a change of access point, no scan is due.
     pub const fn joined(&mut self, target: Target, access_point: AccessPoint) {
-        self.access_point = Some(access_point);
-        self.scan_due = matches!(target, Target::Cached(_)) && !self.roaming;
-        self.roaming = false;
+        let roaming = matches!(self.0, Entry::Roaming(_));
+        self.0 = Entry::Cached {
+            access_point,
+            scan_due: matches!(target, Target::Cached(_)) && !roaming,
+        };
     }
 
     /// Records a join to `target` that failed, and returns what the core does
     /// next.
     pub const fn failed(&mut self, target: Target) -> AfterFailure {
-        self.access_point = None;
-        self.scan_due = false;
-        self.roaming = false;
+        self.0 = Entry::Empty;
         match target {
             Target::Cached(_) => AfterFailure::Rescan,
             Target::Strongest => AfterFailure::Fail,
@@ -91,16 +116,19 @@ impl ApCache {
     /// next join goes to `best`, and no scan is due after that join, because
     /// the core just scanned.
     pub const fn roam_to(&mut self, best: AccessPoint) {
-        self.access_point = Some(best);
-        self.scan_due = false;
-        self.roaming = true;
+        self.0 = Entry::Roaming(best);
     }
 
     /// Records a join that a request stopped (`Joined::Stopped`). The next
     /// join is not the join of a change of access point, so a scan is due
     /// after it as usual.
     pub const fn stopped(&mut self) {
-        self.roaming = false;
+        if let Entry::Roaming(access_point) = self.0 {
+            self.0 = Entry::Cached {
+                access_point,
+                scan_due: false,
+            };
+        }
     }
 
     /// Returns `true` if a scan for a better access point is due: after a
@@ -108,12 +136,14 @@ impl ApCache {
     /// A scan that a request stops does not count, so the scan stays due.
     #[must_use]
     pub const fn scan_due(&self) -> bool {
-        self.scan_due
+        matches!(self.0, Entry::Cached { scan_due: true, .. })
     }
 
     /// Records a scan for a better access point that completed or failed.
     pub const fn scanned(&mut self) {
-        self.scan_due = false;
+        if let Entry::Cached { scan_due, .. } = &mut self.0 {
+            *scan_due = false;
+        }
     }
 }
 
@@ -249,15 +279,29 @@ pub const fn proves_traffic(end: &End, linked: bool) -> bool {
 /// address. Thus the chip cannot restart again and again while DHCP or the
 /// access point is down.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Health {
-    suspect: bool,
-    no_lease: u32,
+pub struct Health(Trust);
+
+/// How much the core trusts the link.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Trust {
+    /// No MQTT session failed after the last proof of traffic.
+    #[default]
+    Trusted,
+    /// An MQTT session failed after the last proof of traffic.
+    Suspect {
+        /// The number of joins with no new address after the last new
+        /// address.
+        no_lease: u32,
+    },
 }
 
 impl Health {
-    /// Records an MQTT session that failed.
+    /// Records an MQTT session that failed. If the link is already suspect,
+    /// the count of joins with no new address stays.
     pub const fn failed(&mut self) {
-        self.suspect = true;
+        if matches!(self.0, Trust::Trusted) {
+            self.0 = Trust::Suspect { no_lease: 0 };
+        }
     }
 
     /// Records an MQTT session that ended with `end`. `linked` is `true` if
@@ -275,37 +319,38 @@ impl Health {
     /// Records a proof of traffic: the first bytes from the broker on a
     /// stream, or an end of the stream by the broker host.
     pub const fn traffic(&mut self) {
-        self.suspect = false;
-        self.no_lease = 0;
+        self.0 = Trust::Trusted;
     }
 
     /// Records a new address from DHCP after a join.
     pub const fn leased(&mut self) {
-        self.no_lease = 0;
+        if let Trust::Suspect { no_lease } = &mut self.0 {
+            *no_lease = 0;
+        }
     }
 
     /// Returns `true` if an MQTT session failed after the last proof of
     /// traffic.
     #[must_use]
     pub const fn suspect(&self) -> bool {
-        self.suspect
+        matches!(self.0, Trust::Suspect { .. })
     }
 
     /// Returns `true` if a join keeps an association that the device has.
     /// While the link is suspect, the join leaves and joins again.
     #[must_use]
     pub const fn keep(&self) -> bool {
-        !self.suspect
+        !self.suspect()
     }
 
     /// Records a join to an access point that got no address from DHCP, and
     /// returns what the core does next.
     pub const fn no_lease(&mut self) -> Recovery {
-        if !self.suspect {
+        let Trust::Suspect { no_lease } = &mut self.0 else {
             return Recovery::Continue;
-        }
-        self.no_lease += 1;
-        if self.no_lease >= RESTART_AFTER {
+        };
+        *no_lease += 1;
+        if *no_lease >= RESTART_AFTER {
             Recovery::Restart
         } else {
             Recovery::Continue
@@ -322,7 +367,10 @@ impl Health {
     /// Returns the number of joins with no address that counted.
     #[must_use]
     pub const fn joins_with_no_lease(&self) -> u32 {
-        self.no_lease
+        match self.0 {
+            Trust::Trusted => 0,
+            Trust::Suspect { no_lease } => no_lease,
+        }
     }
 }
 
@@ -571,6 +619,21 @@ mod tests {
         }
         health.failed();
         assert_eq!(health.stale(), Recovery::Restart);
+    }
+
+    #[test]
+    fn a_session_that_fails_while_the_link_is_suspect_keeps_the_count() {
+        // A rejoin gets a stale address, so it counts, and the link goes up.
+        // Then the next session fails too.
+        let mut health = Health::default();
+        health.failed();
+        assert_eq!(health.stale(), Recovery::Continue);
+        health.failed();
+        assert_eq!(health.joins_with_no_lease(), 1);
+        for _ in 2..RESTART_AFTER {
+            assert_eq!(health.no_lease(), Recovery::Continue);
+        }
+        assert_eq!(health.no_lease(), Recovery::Restart);
     }
 
     #[test]
