@@ -853,7 +853,7 @@ fn a_service_call_that_is_too_long_for_a_packet_is_dropped_with_a_line() {
         },
         entity_id: "light.all_lights",
     };
-    let mut cmd = connection::send(call, &mut model);
+    let mut cmd = connection::send(call, None, &mut model);
     cmd.expect_log_with(|log| {
         assert_eq!(
             log.to_string(),
@@ -876,7 +876,7 @@ fn a_service_call_that_is_too_long_in_the_outbox_is_dropped_with_a_line_when_the
         },
         entity_id: "light.all_lights",
     };
-    let _ = connection::send(call, &mut model);
+    let _ = connection::send(call, None, &mut model);
     assert_eq!(model.connection.outbox.len(), 1);
 
     // The CONNACK drains the outbox. The call cannot go, so the core drops

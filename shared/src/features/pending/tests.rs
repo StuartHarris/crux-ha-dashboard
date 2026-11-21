@@ -21,9 +21,9 @@ use crate::{
         light::STAND_LEVEL,
         pending::{PENDING_TIMEOUT, QUEUED_TIMEOUT, SCENE_TIMEOUT},
         power::IDLE_TIMEOUT,
-        refresh::DRAW_DELAY,
+        refresh::{DRAW_DELAY, redraw},
     },
-    mqtt::codec::server::Packet,
+    mqtt::{MAX_IN_FLIGHT, codec::server::Packet},
 };
 
 /// The rocket lamp: tile 1 on the page of the living room.
@@ -699,4 +699,301 @@ fn a_second_call_clears_the_timeout_of_the_first_and_only_the_new_timeout_fires(
         .count();
     assert_eq!(timeouts, 1, "{events:?}");
     assert_eq!(shell.view().tiles()[1].state, TileState::On);
+}
+
+/// Returns the number of queued timers that `cmd` starts.
+fn queued_timers(cmd: &mut Cmd) -> usize {
+    cmd.effects()
+        .filter(|effect| match effect {
+            crate::Effect::TimeNotifyAfter(request) => {
+                Duration::from(request.operation.duration) == QUEUED_TIMEOUT
+            }
+            _ => false,
+        })
+        .count()
+}
+
+#[test]
+fn a_sleep_keeps_the_mark_of_a_call_that_went_out_through_the_queued_timeout() {
+    let app = Dashboard;
+    let (mut model, mut wire) = lamp_on();
+
+    // The first call goes out, then the connection closes, and the second
+    // call waits in the outbox.
+    wire.settle(app.update(tap_tile(1), &mut model), &mut model);
+    let closed = wire.drop_connection(&mut model, "connection lost");
+    wire.settle(closed, &mut model);
+    wire.settle(app.update(tap_tile(1), &mut model), &mut model);
+    let queued = model.pending.timer;
+
+    // The device sleeps, and the sleep drops the call that waits.
+    let _ = app.update(Event::PowerSourceChanged(PowerSource::Battery), &mut model);
+    let _ = app.update(Event::SleepNow, &mut model);
+    let mut sleep = app.update(Event::SleepNow, &mut model);
+    assert!(model.power.is_asleep());
+    let light_off = sleep
+        .expect_step("sleep 1 turns the front light off")
+        .resolve_front_light(|_| ())
+        .expect_one_event();
+    let _ = app.update(light_off, &mut model);
+    assert!(model.connection.outbox.is_empty());
+
+    // The first call went out, so its mark stays.
+    assert_eq!(tile_state(&model, 1), TileState::Pending);
+
+    // No call waits, so the queued timeout does not remove the mark.
+    app.update(Event::Pending(pending::Event::Timeout(queued)), &mut model)
+        .expect_no_effects();
+    assert_eq!(tile_state(&model, 1), TileState::Pending);
+}
+
+#[test]
+fn a_call_that_goes_out_ends_the_queued_timer() {
+    let app = Dashboard;
+    let (mut model, mut wire) = drive_to_connecting(PowerSource::Stand);
+    model.route = Route::room("living_room");
+    set_state(&mut model, LAMP, "on");
+    assert_eq!(queued_timers(&mut app.update(tap_tile(1), &mut model)), 1);
+
+    // The connection opens, and the call goes out.
+    let connected = wire.connect(&mut model);
+    wire.settle(connected, &mut model);
+    assert!(model.connection.outbox.is_empty());
+
+    // The connection closes. The next call that waits gets a new queued
+    // timer, because the old one stopped when the first call went out.
+    let closed = wire.drop_connection(&mut model, "connection lost");
+    wire.settle(closed, &mut model);
+    assert_eq!(queued_timers(&mut app.update(tap_tile(1), &mut model)), 1);
+}
+
+#[test]
+fn a_second_call_that_waits_keeps_the_first_queued_timer() {
+    let app = Dashboard;
+    let (mut model, _wire) = drive_to_connecting(PowerSource::Stand);
+    model.route = Route::room("living_room");
+    set_state(&mut model, LAMP, "on");
+
+    assert_eq!(queued_timers(&mut app.update(tap_tile(1), &mut model)), 1);
+    // The first queued timer still runs, so the second call starts no timer.
+    assert_eq!(queued_timers(&mut app.update(tap_tile(1), &mut model)), 0);
+}
+
+#[test]
+fn an_issued_call_keeps_the_queued_timer_while_another_call_waits() {
+    let mut shell = crate::tests::flows::house();
+    // Home Assistant does not answer, so no state confirms a call.
+    shell.broker.ignore_calls = true;
+    shell.send(start_at(PowerSource::Stand, Some("/room/living_room")));
+
+    // The broker holds each PUBACK. The calls for the standard lamp (tile 2)
+    // fill the session, so the session refuses the next publish as full.
+    shell.broker.hold_puback = true;
+    for _ in 0..MAX_IN_FLIGHT {
+        shell.send(tap_tile(2));
+    }
+    assert!(shell.model.connection.outbox.is_empty());
+
+    // Two calls for the rocket lamp wait in the outbox.
+    shell.send(tap_tile(1));
+    shell.send(tap_tile(1));
+    assert_eq!(shell.model.connection.outbox.len(), 2);
+
+    // One PUBACK arrives. The drain issues one call, and the session refuses
+    // the other call, which stays in the outbox.
+    let held = shell.broker.held_pubacks.split_off(1);
+    shell.broker.release_pubacks();
+    shell.broker.held_pubacks = held;
+    shell.broker.flush();
+    shell.run();
+    assert_eq!(shell.broker.service_calls.len(), MAX_IN_FLIGHT + 1);
+    assert_eq!(shell.model.connection.outbox.len(), 1);
+    assert_eq!(shell.view().tiles()[1].state, TileState::Pending);
+
+    // The timeout of the issued call does not remove the mark, because a
+    // call waits and its queued timer runs.
+    shell.advance(PENDING_TIMEOUT);
+    assert_eq!(shell.view().tiles()[1].state, TileState::Pending);
+
+    // A call still waits, so the queued timeout removes the mark. The
+    // call stays in the outbox. In this flow, the issued timer and the
+    // queued timer start at the same time on the clock of the shell.
+    let rest = QUEUED_TIMEOUT
+        .checked_sub(PENDING_TIMEOUT)
+        .expect("the queued timeout is longer than the pending timeout");
+    shell.advance(rest);
+    assert_ne!(shell.view().tiles()[1].state, TileState::Pending);
+    assert_eq!(shell.model.connection.outbox.len(), 1);
+}
+
+#[test]
+fn a_sleep_clears_the_queued_timer_of_a_mark_whose_call_went_out() {
+    let app = Dashboard;
+    let (mut model, mut wire) = lamp_on();
+
+    // The first call goes out, then the connection closes, and the second
+    // call waits in the outbox. The wire keeps the command of the queued
+    // timer.
+    wire.settle(app.update(tap_tile(1), &mut model), &mut model);
+    let closed = wire.drop_connection(&mut model, "connection lost");
+    wire.settle(closed, &mut model);
+    wire.effects.clear();
+    wire.settle(app.update(tap_tile(1), &mut model), &mut model);
+    let queued = wire
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            crate::Effect::TimeNotifyAfter(request)
+                if Duration::from(request.operation.duration) == QUEUED_TIMEOUT =>
+            {
+                Some(request.operation.id)
+            }
+            _ => None,
+        })
+        .expect("the queued timer");
+    wire.effects.clear();
+
+    // The device sleeps, and the sleep drops the call that waits.
+    let _ = app.update(Event::PowerSourceChanged(PowerSource::Battery), &mut model);
+    let _ = app.update(Event::SleepNow, &mut model);
+    let mut sleep = app.update(Event::SleepNow, &mut model);
+    let light_off = sleep
+        .expect_step("sleep 1 turns the front light off")
+        .resolve_front_light(|_| ())
+        .expect_one_event();
+    let _ = app.update(light_off, &mut model);
+    assert!(model.connection.outbox.is_empty());
+
+    // The first call went out, so the mark stays. No call waits, so the
+    // core clears the queued timer.
+    assert_eq!(tile_state(&model, 1), TileState::Pending);
+    wire.run(&mut model);
+    assert!(
+        wire.effects.iter().any(|effect| matches!(
+            effect,
+            crate::Effect::TimeClear(request) if request.operation.id == queued
+        )),
+        "{:?}",
+        wire.effects
+    );
+}
+
+/// No flow of events reaches this state: the drain fills each place in the
+/// session before a new tap can use it. Thus the test makes the state with
+/// the functions of the feature.
+#[test]
+fn an_issued_timeout_removes_a_mark_that_has_no_queued_timer_while_an_old_call_waits() {
+    let app = Dashboard;
+    let (mut model, _wire) = drive_to_connecting(PowerSource::Stand);
+    model.route = Route::room("living_room");
+    set_state(&mut model, LAMP, "on");
+
+    // The queued timeout removes the mark, and the call stays in the outbox.
+    let _ = app.update(tap_tile(1), &mut model);
+    let _ = app.update(
+        Event::Pending(pending::Event::Timeout(model.pending.timer)),
+        &mut model,
+    );
+    assert!(model.pending.marks.is_empty());
+    assert_eq!(model.connection.outbox.len(), 1);
+
+    // A new call for the lamp goes out while the old call waits. Its mark has
+    // only the timeout of the issued call. The draw shows the mark, as after
+    // a tap.
+    let tap = pending::tap(&model, LAMP, pending::Confirm::Toggle);
+    let _ = pending::issued(LAMP, Some(tap), &mut model);
+    redraw(&mut model, false).expect_only_render();
+    assert_eq!(tile_state(&model, 1), TileState::Pending);
+
+    // No timer stays after the timeout, so the core removes the mark.
+    app.update(
+        Event::Pending(pending::Event::Timeout(model.pending.timer)),
+        &mut model,
+    )
+    .expect_only_render();
+    assert_eq!(tile_state(&model, 1), TileState::On);
+    assert_eq!(model.connection.outbox.len(), 1);
+}
+
+#[test]
+fn a_sleep_keeps_the_mark_of_a_call_that_went_out_until_its_timeout() {
+    let app = Dashboard;
+    let (mut model, mut wire) = lamp_on();
+
+    // The call goes out, and no other call waits.
+    wire.settle(app.update(tap_tile(1), &mut model), &mut model);
+    let issued = model.pending.timer;
+    assert!(model.connection.outbox.is_empty());
+
+    // The device sleeps. The sleep drops the outbox, which is empty.
+    let _ = app.update(Event::PowerSourceChanged(PowerSource::Battery), &mut model);
+    let mut sleep = app.update(Event::SleepNow, &mut model);
+    assert!(model.power.is_asleep());
+    let light_off = sleep
+        .expect_step("sleep 1 turns the front light off")
+        .resolve_front_light(|_| ())
+        .expect_one_event();
+    let _ = app.update(light_off, &mut model);
+
+    // The call went out, so the mark stays until its timeout.
+    assert!(pending::is_pending(&model, LAMP));
+    app.update(Event::Pending(pending::Event::Timeout(issued)), &mut model)
+        .expect_no_effects();
+    assert!(!pending::is_pending(&model, LAMP));
+}
+
+#[test]
+fn a_full_outbox_clears_the_queued_timer_of_a_mark_whose_call_went_out() {
+    let app = Dashboard;
+    let (mut model, mut wire) = lamp_on();
+    set_state(&mut model, "light.living_room_lights", "off");
+
+    // The first call goes out, then the connection closes, and the second
+    // call waits in the outbox. The wire keeps the command of the queued
+    // timer.
+    wire.settle(app.update(tap_tile(1), &mut model), &mut model);
+    let closed = wire.drop_connection(&mut model, "connection lost");
+    wire.settle(closed, &mut model);
+    wire.effects.clear();
+    wire.settle(app.update(tap_tile(1), &mut model), &mut model);
+    let queued = wire
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            crate::Effect::TimeNotifyAfter(request)
+                if Duration::from(request.operation.duration) == QUEUED_TIMEOUT =>
+            {
+                Some(request.operation.id)
+            }
+            _ => None,
+        })
+        .expect("the queued timer");
+    wire.effects.clear();
+
+    // The calls for the lights fill the outbox, and the last one drops the
+    // call for the lamp.
+    for _ in 0..OUTBOX_LIMIT {
+        wire.settle(app.update(tap_tile(0), &mut model), &mut model);
+    }
+    assert_eq!(model.connection.outbox.len(), OUTBOX_LIMIT);
+    assert!(
+        model
+            .connection
+            .outbox
+            .iter()
+            .all(|call| call.entity_id != LAMP)
+    );
+
+    // The first call went out, so the mark stays. No call waits, so the
+    // core clears the queued timer.
+    assert_eq!(tile_state(&model, 1), TileState::Pending);
+    wire.run(&mut model);
+    assert!(
+        wire.effects.iter().any(|effect| matches!(
+            effect,
+            crate::Effect::TimeClear(request) if request.operation.id == queued
+        )),
+        "{:?}",
+        wire.effects
+    );
 }
