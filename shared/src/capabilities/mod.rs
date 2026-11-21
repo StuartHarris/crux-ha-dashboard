@@ -9,14 +9,19 @@ pub mod power;
 pub mod radio;
 pub mod stream;
 
-use crux_core::{Command, Request, capability::Operation};
+use core::future::Future;
 
-/// Makes a command that sends a notification to the shell.
-pub(crate) fn notify<Op, Effect, Event>(operation: Op) -> Command<Effect, Event>
+use crux_core::{Command, Request, capability::Operation, command::NotificationBuilder};
+
+/// Makes a builder for a command that sends a notification to the shell.
+#[must_use]
+pub(crate) fn notify<Op, Effect, Event>(
+    operation: Op,
+) -> NotificationBuilder<Effect, Event, impl Future<Output = ()>>
 where
     Op: Operation,
     Effect: From<Request<Op>> + Send + 'static,
     Event: Send + 'static,
 {
-    Command::notify_shell(operation).build()
+    Command::notify_shell(operation)
 }

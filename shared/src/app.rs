@@ -25,7 +25,7 @@ use crate::{
     mqtt::Credentials,
     pages::PAGES,
     route::Route,
-    view::{self, ViewModel},
+    view::ViewModel,
 };
 
 /// The broker and device settings, which the shell supplies.
@@ -253,37 +253,42 @@ pub enum Control {
 #[effect]
 #[derive(Debug)]
 pub enum Effect {
-    /// Draw the view model.
+    /// Draw the view model: a partial render, or a full refresh of the panel.
     Render(RenderOperation),
-    /// Open a byte stream to the broker.
+    /// Open the TCP byte stream to the MQTT broker for a new session.
     StreamOpen(Open),
-    /// Send bytes on the stream.
+    /// Send the bytes of an MQTT packet (connect, subscribe, publish, ping)
+    /// on the stream.
     StreamWrite(Write),
-    /// Close the stream.
+    /// Close the stream, for example at a sleep, at a failed session or
+    /// before a new connection.
     StreamClose(Close),
-    /// Join an access point.
+    /// Join an access point, at a start, at a roam and after a lost link.
     RadioJoin(Join),
-    /// Wait for an IP address.
+    /// Wait for an IP address after a join.
     RadioAddress(Address),
-    /// Leave the access point.
+    /// Leave the access point, before a new join or a sleep.
     RadioLeave(Leave),
-    /// Scan for access points.
+    /// Scan for access points, to find the best one for a roam.
     RadioScan(Scan),
-    /// Stop a scan.
+    /// Stop a scan that runs, for example at a sleep.
     RadioStopScan(StopScan),
-    /// Turn the radio off.
+    /// Turn the radio off before a sleep.
     RadioOff(Off),
-    /// Restart the chip.
+    /// Restart the chip, if many joins in a row give no new address.
     RadioRestart(Restart),
-    /// Put the device to sleep.
+    /// Put the device to sleep on battery, until a touch or a timer wakes it.
     Sleep(Sleep),
-    /// Set the brightness of the front light.
+    /// Set the brightness of the front light: on at a touch, off at the
+    /// light timer, a reset or a sleep.
     FrontLight(FrontLight),
-    /// Write a line to the log.
+    /// Write a line of the core to the log of the shell: a decision of the
+    /// Wi-Fi policy, a failure or a step of a sleep.
     Log(Log),
-    /// Start a timer.
+    /// Start a timer: the idle, light, draw, refresh, mark, radio-limit,
+    /// reconnect, close and session timers.
     TimeNotifyAfter(time::NotifyAfter),
-    /// Clear a timer.
+    /// Clear a timer that the core does not need any more.
     TimeClear(time::ClearTimer),
 }
 
@@ -376,6 +381,27 @@ impl Model {
     pub const fn wants_online(&self) -> bool {
         self.startup.is_started() && !self.power.is_asleep()
     }
+
+    /// Handles `event`, and returns the command with its effects.
+    pub fn update(&mut self, event: Event) -> Cmd {
+        match event {
+            Event::Start(start) => on_start(start, self),
+            Event::PowerSourceChanged(source) => power::source_changed(source, self),
+            Event::BatteryChanged(level) => power::battery_changed(level, self),
+            Event::Tapped(control) => rooms::tapped(control, self),
+            Event::NextPage => rooms::turn_page(self, true),
+            Event::PreviousPage => rooms::turn_page(self, false),
+            Event::Navigate(route) => rooms::navigate(route, self),
+            Event::SetReadOnly(read_only) => rooms::set_read_only(read_only, self),
+            Event::SleepNow => power::sleep_now(self),
+            Event::Wifi(event) => wifi::update(event, self),
+            Event::Connection(event) => connection::update(event, self),
+            Event::Power(event) => power::update(event, self),
+            Event::Refresh(event) => refresh::update(event, self),
+            Event::Pending(event) => pending::update(event, self),
+            Event::Light(event) => light::update(event, self),
+        }
+    }
 }
 
 /// The Home Assistant dashboard app.
@@ -392,27 +418,11 @@ impl App for Dashboard {
     type Effect = Effect;
 
     fn update(&self, event: Event, model: &mut Model) -> Cmd {
-        match event {
-            Event::Start(start) => on_start(start, model),
-            Event::PowerSourceChanged(source) => power::source_changed(source, model),
-            Event::BatteryChanged(level) => power::battery_changed(level, model),
-            Event::Tapped(control) => rooms::tapped(control, model),
-            Event::NextPage => rooms::turn_page(model, true),
-            Event::PreviousPage => rooms::turn_page(model, false),
-            Event::Navigate(route) => rooms::navigate(route, model),
-            Event::SetReadOnly(read_only) => rooms::set_read_only(read_only, model),
-            Event::SleepNow => power::sleep_now(model),
-            Event::Wifi(event) => wifi::update(event, model),
-            Event::Connection(event) => connection::update(event, model),
-            Event::Power(event) => power::update(event, model),
-            Event::Refresh(event) => refresh::update(event, model),
-            Event::Pending(event) => pending::update(event, model),
-            Event::Light(event) => light::update(event, model),
-        }
+        model.update(event)
     }
 
     fn view(&self, model: &Model) -> ViewModel {
-        view::view(model)
+        model.into()
     }
 }
 

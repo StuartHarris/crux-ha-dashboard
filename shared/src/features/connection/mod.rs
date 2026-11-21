@@ -184,7 +184,9 @@ pub struct State {
     /// The number of messages that the session skipped, because they were
     /// too long.
     pub skipped: usize,
-    /// The id of the newest reconnect timer.
+    /// The last id that the core took for a reconnect timer. Each new timer
+    /// takes the next id. The `Slot` `retry` of the phase decides if an
+    /// expiry is stale.
     pub reconnect: u32,
     /// The wait before the next reconnect.
     pub backoff: Duration,
@@ -417,7 +419,6 @@ pub fn reset(model: &mut Model) {
     let state = &mut model.connection;
     mem::take(&mut state.phase).clear_timers();
     state.id = state.id.wrapping_add(1);
-    state.reconnect = state.reconnect.wrapping_add(1);
     state.backoff = RECONNECT_MIN;
 }
 
@@ -540,8 +541,6 @@ pub fn go_offline(sleep: u32, model: &mut Model) -> Cmd {
         retain: true,
     });
     let state = &mut model.connection;
-    // The core ignores the answers to earlier requests.
-    state.reconnect = state.reconnect.wrapping_add(1);
     let after = After {
         sleep: Some(sleep),
         connect: false,
@@ -641,7 +640,8 @@ fn issue(call: Call, tap: Option<Tap>, model: &mut Model) -> Result<Cmd, (Call, 
                     "the service call for {} is too long for a packet, so the core dropped it",
                     call.entity_id
                 ),
-            );
+            )
+            .build();
             if let Some(tap) = tap {
                 pending::retap(call.entity_id, tap, model);
             }
@@ -721,8 +721,6 @@ fn connect(model: &mut Model) -> Cmd {
     };
     let (host, port) = (request.host.clone(), request.port);
     state.id = state.id.wrapping_add(1);
-    // The core clears a reconnect timer that runs now.
-    state.reconnect = state.reconnect.wrapping_add(1);
     mem::replace(
         &mut state.phase,
         Phase::Starting(Live::new(Session::new(&request, Limits::default()))),
@@ -939,7 +937,7 @@ pub fn pump(model: &mut Model) -> Cmd {
                             format!(
                                 "a message of {length} bytes is too long, so the core skipped it"
                             ),
-                        ));
+                        ).build());
                     }
                 }
                 Action::Subscribed { id, outcome } => rest.push(subscribed(id, outcome, model)),
@@ -1055,7 +1053,8 @@ fn subscribed(id: SubscribeId, outcome: SubscribeOutcome, model: &mut Model) -> 
         let reason = log::warn(
             Area::Mqtt,
             "the broker refused one or more topic filters, so some entities get no state",
-        );
+        )
+        .build();
         return reason.and(wifi::quiet(model));
     }
     wifi::quiet(model)
@@ -1166,7 +1165,7 @@ fn schedule_reconnect(model: &mut Model) -> Cmd {
     let wait = state.backoff;
     state.backoff = (wait * 2).min(RECONNECT_MAX);
     let timer = retry.start(id, wait, Event::Reconnect(id).into());
-    let reason = log::info(Area::Mqtt, format!("connect again in {} s", wait.as_secs()));
+    let reason = log::info(Area::Mqtt, format!("connect again in {} s", wait.as_secs())).build();
     reason.and(timer)
 }
 

@@ -366,9 +366,14 @@ fn a_move_to_the_stand_cancels_the_idle_timeout() {
     // The move clears the idle timer of the start.
     shell.take_log();
     shell.send(Event::PowerSourceChanged(PowerSource::Stand));
-    assert_ne!(shell.model.power.idle, idle);
     let log = shell.take_log();
     assert!(log.contains(&"TimeClear".into()), "{log:?}");
+
+    // An expiry of that timer that still arrives does nothing.
+    shell.take_log();
+    shell.send(Event::Power(power::Event::IdleTimeout(idle)));
+    assert_eq!(shell.take_log(), Vec::<String>::new());
+    assert_eq!(shell.sleep, None);
 
     // The timer does not fire.
     let events = shell.advance(IDLE_TIMEOUT);

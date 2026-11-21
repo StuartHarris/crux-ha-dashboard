@@ -66,7 +66,9 @@ pub const LIGHT_TIMEOUT: Duration = Duration::from_secs(20);
 /// The state of the front light.
 #[derive(Debug, Default)]
 pub struct State {
-    /// The id of the newest light timer.
+    /// The last id that the core took for a light timer. Each new light timer
+    /// takes the next id. The `Running` timer in `light` decides if an
+    /// expiry is stale.
     pub timer: u32,
     /// The light, as the core last sent it to the shell.
     light: Light,
@@ -168,7 +170,6 @@ pub fn timeout(id: u32, model: &mut Model) -> Cmd {
 ///
 /// If the light is already off, the command has no effect.
 pub fn off(model: &mut Model) -> Cmd {
-    model.light.timer = model.light.timer.wrapping_add(1);
     let old = core::mem::take(&mut model.light.light);
     let was_on = matches!(old, Light::On { .. });
     old.clear();
@@ -183,7 +184,6 @@ pub fn off(model: &mut Model) -> Cmd {
 /// the light after a reset, so it always sends `FrontLight`. The core
 /// clears the light timer that runs.
 pub fn reset(model: &mut Model) -> Cmd {
-    model.light.timer = model.light.timer.wrapping_add(1);
     core::mem::take(&mut model.light.light).clear();
     FrontLight::set(0).build()
 }

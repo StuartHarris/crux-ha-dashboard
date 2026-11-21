@@ -12,7 +12,7 @@
 use alloc::string::String;
 use core::fmt;
 
-use crux_core::{Command, Request, macros::Operation};
+use crux_core::{Request, command::NotificationBuilder, macros::Operation};
 
 /// How important a line of the log is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,7 +76,11 @@ impl fmt::Display for Log {
 }
 
 /// Writes `message` to the log of the shell at the level `Info`.
-pub fn info<Effect, Event>(area: Area, message: impl Into<String>) -> Command<Effect, Event>
+#[must_use]
+pub fn info<Effect, Event>(
+    area: Area,
+    message: impl Into<String>,
+) -> NotificationBuilder<Effect, Event, impl Future<Output = ()>>
 where
     Effect: From<Request<Log>> + Send + 'static,
     Event: Send + 'static,
@@ -85,7 +89,11 @@ where
 }
 
 /// Writes `message` to the log of the shell at the level `Warn`.
-pub fn warn<Effect, Event>(area: Area, message: impl Into<String>) -> Command<Effect, Event>
+#[must_use]
+pub fn warn<Effect, Event>(
+    area: Area,
+    message: impl Into<String>,
+) -> NotificationBuilder<Effect, Event, impl Future<Output = ()>>
 where
     Effect: From<Request<Log>> + Send + 'static,
     Event: Send + 'static,
@@ -93,7 +101,12 @@ where
     line(Level::Warn, area, message.into())
 }
 
-fn line<Effect, Event>(level: Level, area: Area, message: String) -> Command<Effect, Event>
+#[must_use]
+fn line<Effect, Event>(
+    level: Level,
+    area: Area,
+    message: String,
+) -> NotificationBuilder<Effect, Event, impl Future<Output = ()>>
 where
     Effect: From<Request<Log>> + Send + 'static,
     Event: Send + 'static,
@@ -135,7 +148,7 @@ mod tests {
     #[test]
     fn info_and_warn_are_notifications_with_their_level() {
         assert_eq!(
-            logged(info(Area::Wifi, "stay")),
+            logged(info(Area::Wifi, "stay").build()),
             Log {
                 level: Level::Info,
                 area: Area::Wifi,
@@ -143,7 +156,7 @@ mod tests {
             }
         );
         assert_eq!(
-            logged(warn(Area::Mqtt, "refused")),
+            logged(warn(Area::Mqtt, "refused").build()),
             Log {
                 level: Level::Warn,
                 area: Area::Mqtt,
