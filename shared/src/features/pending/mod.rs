@@ -59,13 +59,23 @@
 //!   after the core issued the service call, Home Assistant did not confirm
 //!   it. The core removes the mark, and the tile
 //!   shows the last state that the core has. If a newer call for the entity
-//!   waits in the outbox, the mark stays for that call.
+//!   waits in the outbox, the mark stays for that call while its timeout of
+//!   the outbox runs. If an old call waits with no timeout of the outbox
+//!   (its mark ended at the queued timeout), the core removes the mark. The
+//!   flow of the core does not reach that case now.
 //! - [`SCENE_TIMEOUT`] after the core issued the call of a scene, the core
 //!   removes its mark.
 //! - [`QUEUED_TIMEOUT`] after the first call of a mark went into the
 //!   outbox, the connection did not open. The core removes the mark, but the
 //!   call stays in the outbox. If the connection opens later, the core sends
 //!   it.
+//!
+//! A mark always has a timer. It has the timeout of the call that the core
+//! issued last, the timeout of the outbox, or both. When a timer expires,
+//! the mark stays only for its other timer, and only if that timer still
+//! applies. The timeout of the outbox applies while a call waits. The
+//! timeout of an issued call applies while no call waits. In all other
+//! cases, the core removes the mark.
 //!
 //! The timeout of a call starts when the core issues the call: at once while
 //! the connection is open, or when the outbox drains after the connect. Thus
@@ -78,7 +88,9 @@
 //!
 //! If the outbox drops a service call, because it is full or the device goes
 //! to sleep, the core removes the mark. It keeps the mark if another call for
-//! the entity waits in the outbox, or if a call for the entity went out.
+//! the entity waits in the outbox, or if a call for the entity went out. If
+//! the mark stays and no call for the entity waits, the core clears the
+//! timeout of the outbox.
 //!
 //! A mark stays through a sleep. A tap that wakes the device shows the mark
 //! during the reconnect.
@@ -157,11 +169,10 @@ pub enum Confirm {
     Scene,
 }
 
-/// The mark of one entity.
+/// The tap that gave a mark: how Home Assistant confirms the call, and the
+/// state and the time of the entity at the tap.
 #[derive(Debug)]
-pub struct Mark {
-    /// The entity of the service call.
-    pub entity_id: &'static str,
+pub struct Tap {
     /// How Home Assistant confirms the call.
     pub confirm: Confirm,
     /// The state of the entity at the tap, or `None` if the core had no
@@ -170,52 +181,184 @@ pub struct Mark {
     /// The exact `last_updated` time of the entity at the tap, or `None` if
     /// the core had no time.
     pub since: Option<DateTime<Utc>>,
-    /// The timeout of the call that the core issued last, or `None` if no
-    /// timeout runs.
-    timeout: Option<Running>,
-    /// The timeout of the calls that wait in the outbox, or `None` if no
-    /// timeout runs.
-    queued: Option<Running>,
 }
 
-impl Mark {
-    /// Returns `true` if the timer `id` is a timer of the mark.
-    fn has_timer(&self, id: u32) -> bool {
-        [&self.timeout, &self.queued]
-            .into_iter()
-            .flatten()
-            .any(|timer| timer.id() == id)
+/// Returns the tap for a service call for `entity_id`, with the state and
+/// the time that the core has now. Make the tap before the core sends the
+/// call.
+#[must_use]
+pub fn tap(model: &Model, entity_id: &str, confirm: Confirm) -> Tap {
+    let entity = model.entities.get(entity_id);
+    Tap {
+        confirm,
+        state: entity.and_then(|entity| entity.state.clone()),
+        since: entity.and_then(|entity| entity.last_updated),
     }
+}
 
-    /// Clears the timers of the mark.
-    fn clear_timers(&mut self) {
-        for timer in [self.timeout.take(), self.queued.take()]
-            .into_iter()
-            .flatten()
-        {
-            timer.clear();
+/// The timers of a mark. A mark always has at least one timer.
+#[derive(Debug)]
+enum Timers {
+    /// The core issued a call, and no other call for the entity waits in the
+    /// outbox. The timer is the timeout of the call that the core issued
+    /// last.
+    ///
+    /// In one corner case, an old call for the entity waits with no timeout
+    /// of the outbox. A queued timeout removed the old mark, and its call
+    /// stayed in the outbox. Then a new call went out while the old call
+    /// waited. The flow of the core does not reach this case now, because
+    /// the drain uses each free place in the session before a new call can.
+    /// If the case occurs, the core removes the mark at the issued timeout.
+    Issued(Running),
+    /// Calls for the entity wait in the outbox, and the core issued none.
+    /// The timer is the timeout of the outbox.
+    Queued(Running),
+    /// The core issued a call, and another call for the entity waits in the
+    /// outbox.
+    Both {
+        /// The timeout of the call that the core issued last.
+        issued: Running,
+        /// The timeout of the outbox.
+        queued: Running,
+    },
+}
+
+impl Timers {
+    /// Returns `true` if the timer `id` is one of the timers.
+    const fn has(&self, id: u32) -> bool {
+        match self {
+            Self::Issued(timer) | Self::Queued(timer) => timer.id() == id,
+            Self::Both { issued, queued } => issued.id() == id || queued.id() == id,
         }
     }
 
+    /// Clears all the timers.
+    fn clear(self) {
+        match self {
+            Self::Issued(timer) | Self::Queued(timer) => timer.clear(),
+            Self::Both { issued, queued } => {
+                issued.clear();
+                queued.clear();
+            }
+        }
+    }
+
+    /// The core issued a call, with the new timeout `timer`. The new timeout
+    /// replaces the timeout before it. If no other call for the entity
+    /// waits (`waits` is `false`), the timeout of the outbox stops.
+    fn issued(self, timer: Running, waits: bool) -> Self {
+        let queued = match self {
+            Self::Issued(old) => {
+                old.clear();
+                None
+            }
+            Self::Queued(queued) => Some(queued),
+            Self::Both { issued, queued } => {
+                issued.clear();
+                Some(queued)
+            }
+        };
+        match queued {
+            Some(queued) if waits => Self::Both {
+                issued: timer,
+                queued,
+            },
+            Some(queued) => {
+                queued.clear();
+                Self::Issued(timer)
+            }
+            None => Self::Issued(timer),
+        }
+    }
+
+    /// A call for the entity went into the outbox. If the timeout of the
+    /// outbox does not run, start it. Returns the command of the new timer.
+    fn queued(self, state: &mut State) -> (Cmd, Self) {
+        match self {
+            Self::Issued(issued) => {
+                let (command, queued) = state.start(QUEUED_TIMEOUT);
+                (command, Self::Both { issued, queued })
+            }
+            timers @ (Self::Queued(_) | Self::Both { .. }) => (Cmd::done(), timers),
+        }
+    }
+
+    /// The outbox dropped calls. If a call for the entity still waits
+    /// (`waits` is `true`), the timers stay. If not, the timeout of the
+    /// outbox stops. Returns `None` if no timer stays.
+    fn dropped(self, waits: bool) -> Option<Self> {
+        match self {
+            timers @ (Self::Queued(_) | Self::Both { .. }) if waits => Some(timers),
+            timers @ Self::Issued(_) => Some(timers),
+            Self::Queued(queued) => {
+                queued.clear();
+                None
+            }
+            Self::Both { issued, queued } => {
+                queued.clear();
+                Some(Self::Issued(issued))
+            }
+        }
+    }
+
+    /// The timer `id` expired. The timer of the outbox does not matter if no
+    /// call waits, and the timeout of the issued call does not matter if a
+    /// call waits. Returns the timers that stay, or `None` if no timer
+    /// stays. The function clears the timers that do not stay.
+    fn expired(self, id: u32, waits: bool) -> Option<Self> {
+        match self {
+            // The last timer expired.
+            Self::Issued(_) | Self::Queued(_) => None,
+            Self::Both { issued, queued } if issued.id() == id => {
+                if waits {
+                    Some(Self::Queued(queued))
+                } else {
+                    queued.clear();
+                    None
+                }
+            }
+            Self::Both { issued, queued: _ } => {
+                if waits {
+                    issued.clear();
+                    None
+                } else {
+                    Some(Self::Issued(issued))
+                }
+            }
+        }
+    }
+}
+
+/// The mark of one entity.
+#[derive(Debug)]
+pub struct Mark {
+    /// The entity of the service call.
+    pub entity_id: &'static str,
+    /// The newest tap on the entity.
+    pub tap: Tap,
+    /// The timers of the mark.
+    timers: Timers,
+}
+
+impl Mark {
     /// Returns `true` if `entity` confirms the call. Refer to the module
     /// documentation.
     fn confirmed_by(&self, entity: Option<&EntityState>) -> bool {
+        let tap = &self.tap;
         let state = entity.and_then(|entity| entity.state.as_deref());
         let updated = entity.and_then(|entity| entity.last_updated);
-        let newer = match (self.since, updated) {
+        let newer = match (tap.since, updated) {
             (Some(since), Some(updated)) => updated > since,
             (Some(_), None) => false,
             (None, _) => true,
         };
-        match self.confirm {
+        match tap.confirm {
             Confirm::Toggle => {
-                self.state.is_some() && state.is_some() && state != self.state.as_deref() && newer
+                tap.state.is_some() && state.is_some() && state != tap.state.as_deref() && newer
             }
-            Confirm::Step => self.since.is_some() && newer,
+            Confirm::Step => tap.since.is_some() && newer,
             Confirm::Target(target) => {
-                self.since.is_some()
-                    && newer
-                    && entity.and_then(temperature::target) == Some(target)
+                tap.since.is_some() && newer && entity.and_then(temperature::target) == Some(target)
             }
             Confirm::Scene => false,
         }
@@ -237,6 +380,15 @@ impl State {
         self.marks
             .iter_mut()
             .find(|mark| mark.entity_id == entity_id)
+    }
+
+    /// Removes the mark of `entity_id` and returns it.
+    fn take(&mut self, entity_id: &str) -> Option<Mark> {
+        let index = self
+            .marks
+            .iter()
+            .position(|mark| mark.entity_id == entity_id)?;
+        Some(self.marks.swap_remove(index))
     }
 
     /// Starts a timer of `wait`, and returns its command and the timer.
@@ -269,101 +421,139 @@ pub fn requested_target(model: &Model, entity_id: &str) -> Option<Centi> {
         .marks
         .iter()
         .find(|mark| mark.entity_id == entity_id)
-        .and_then(|mark| match mark.confirm {
+        .and_then(|mark| match mark.tap.confirm {
             Confirm::Target(target) => Some(target),
             Confirm::Toggle | Confirm::Step | Confirm::Scene => None,
         })
 }
 
-/// Gives the entity `entity_id` a mark, before the core sends its service
-/// call. The mark keeps the state and the time that the core has now.
+/// Gives the mark of `entity_id` the new tap `tap`, if the entity has a
+/// mark. The timers of the mark stay.
 ///
-/// If the entity already has a mark, the core keeps its timers, and the
-/// new tap gives the mark its state, its time and `confirm`.
-pub fn mark(model: &mut Model, entity_id: &'static str, confirm: Confirm) {
-    let entity = model.entities.get(entity_id);
-    let state = entity.and_then(|entity| entity.state.clone());
-    let since = entity.and_then(|entity| entity.last_updated);
+/// The core uses this function for a call that it drops before the call
+/// goes into the outbox or out. A new tap with no mark gives no mark there.
+pub fn retap(entity_id: &str, tap: Tap, model: &mut Model) {
     if let Some(mark) = model.pending.get_mut(entity_id) {
-        mark.confirm = confirm;
-        mark.state = state;
-        mark.since = since;
-        return;
+        mark.tap = tap;
     }
-    model.pending.marks.push(Mark {
-        entity_id,
-        confirm,
-        state,
-        since,
-        timeout: None,
-        queued: None,
-    });
 }
 
 /// A service call for `entity_id` went into the outbox. If no timeout of
 /// the outbox runs for its mark, start [`QUEUED_TIMEOUT`].
-pub fn queued(entity_id: &str, model: &mut Model) -> Cmd {
+///
+/// `tap` is the tap that asks for the call, or `None` for a call with no
+/// tap. A tap gives the entity a mark, or replaces the tap of its mark. The
+/// timers of a mark stay.
+pub fn queued(entity_id: &'static str, tap: Option<Tap>, model: &mut Model) -> Cmd {
     let state = &mut model.pending;
-    if state
-        .get_mut(entity_id)
-        .is_none_or(|mark| mark.queued.is_some())
-    {
-        return Cmd::done();
-    }
-    let (command, timer) = state.start(QUEUED_TIMEOUT);
-    if let Some(mark) = state.get_mut(entity_id) {
-        mark.queued = Some(timer);
-    }
+    let (command, mark) = match (state.take(entity_id), tap) {
+        (
+            Some(Mark {
+                tap: old, timers, ..
+            }),
+            tap,
+        ) => {
+            let (command, timers) = timers.queued(state);
+            (
+                command,
+                Mark {
+                    entity_id,
+                    tap: tap.unwrap_or(old),
+                    timers,
+                },
+            )
+        }
+        (None, Some(tap)) => {
+            let (command, timer) = state.start(QUEUED_TIMEOUT);
+            (
+                command,
+                Mark {
+                    entity_id,
+                    tap,
+                    timers: Timers::Queued(timer),
+                },
+            )
+        }
+        (None, None) => return Cmd::done(),
+    };
+    // Each path between `take` and `push` must put the mark back.
+    debug_assert!(state.marks.iter().all(|mark| mark.entity_id != entity_id));
+    state.marks.push(mark);
     command
 }
 
 /// The core issued the service call for `entity_id`: start the timeout of
 /// its mark.
 ///
+/// `tap` is the tap of a new call, or `None` for a call from the outbox. A
+/// new tap gives the entity a mark, or replaces the tap of its mark.
+///
 /// The new timeout replaces the timeout before it. If no other call for the
 /// entity waits in the outbox, the timeout of the outbox stops.
-pub fn issued(entity_id: &str, model: &mut Model) -> Cmd {
+pub fn issued(entity_id: &'static str, tap: Option<Tap>, model: &mut Model) -> Cmd {
     let waits = model
         .connection
         .outbox
         .iter()
         .any(|call| call.entity_id == entity_id);
     let state = &mut model.pending;
-    let Some(confirm) = state.get_mut(entity_id).map(|mark| mark.confirm) else {
-        return Cmd::done();
+    let (tap, timers) = match (state.take(entity_id), tap) {
+        (
+            Some(Mark {
+                tap: old, timers, ..
+            }),
+            tap,
+        ) => (tap.unwrap_or(old), Some(timers)),
+        (None, Some(tap)) => (tap, None),
+        (None, None) => return Cmd::done(),
     };
-    let wait = match confirm {
+    let wait = match tap.confirm {
         Confirm::Scene => SCENE_TIMEOUT,
         Confirm::Target(_) => TARGET_TIMEOUT,
-        _ => PENDING_TIMEOUT,
+        Confirm::Toggle | Confirm::Step => PENDING_TIMEOUT,
     };
     let (command, timer) = state.start(wait);
-    if let Some(mark) = state.get_mut(entity_id) {
-        if let Some(old) = mark.timeout.replace(timer) {
-            old.clear();
-        }
-        if !waits && let Some(queued) = mark.queued.take() {
-            queued.clear();
-        }
-    }
+    let timers = match timers {
+        Some(timers) => timers.issued(timer, waits),
+        None => Timers::Issued(timer),
+    };
+    // Each path between `take` and `push` must put the mark back.
+    debug_assert!(state.marks.iter().all(|mark| mark.entity_id != entity_id));
+    state.marks.push(Mark {
+        entity_id,
+        tap,
+        timers,
+    });
     command
 }
 
-/// The outbox dropped one or more service calls. Removes each mark that has
-/// no timeout of an issued call and no call in the outbox. Returns `true` if
-/// the core removed a mark.
+/// The outbox dropped one or more service calls. Returns `true` if the core
+/// removed a mark.
+///
+/// The core removes each mark that has no timeout of an issued call and no
+/// call in the outbox. A mark that stays with no call in the outbox loses
+/// its timeout of the outbox.
 pub fn forget_dropped(model: &mut Model) -> bool {
     let outbox = &model.connection.outbox;
     let marks = &mut model.pending.marks;
     let before = marks.len();
-    marks.retain_mut(|mark| {
-        let keep =
-            mark.timeout.is_some() || outbox.iter().any(|call| call.entity_id == mark.entity_id);
-        if !keep {
-            mark.clear_timers();
-        }
-        keep
-    });
+    *marks = core::mem::take(marks)
+        .into_iter()
+        .filter_map(
+            |Mark {
+                 entity_id,
+                 tap,
+                 timers,
+             }| {
+                let waits = outbox.iter().any(|call| call.entity_id == entity_id);
+                timers.dropped(waits).map(|timers| Mark {
+                    entity_id,
+                    tap,
+                    timers,
+                })
+            },
+        )
+        .collect();
     marks.len() != before
 }
 
@@ -383,7 +573,7 @@ pub fn confirm(entity_id: &str, model: &mut Model) -> Cmd {
     else {
         return Cmd::done();
     };
-    marks.swap_remove(index).clear_timers();
+    marks.swap_remove(index).timers.clear();
     redraw_soon(model)
 }
 
@@ -391,34 +581,36 @@ pub fn confirm(entity_id: &str, model: &mut Model) -> Cmd {
 /// timer of a mark now.
 ///
 /// - The timeout of an issued call: if a newer call for the entity waits in
-///   the outbox, the mark stays for that call. Otherwise the core removes the
-///   mark.
-/// - The timeout of the outbox: if a call for the entity still waits in the
-///   outbox, the core removes the mark. The call stays in the outbox.
+///   the outbox and its timeout of the outbox runs, the mark stays for that
+///   call. Otherwise the core removes the mark.
+/// - The timeout of the outbox: if no call for the entity waits in the
+///   outbox and the timeout of an issued call runs, the mark stays for that
+///   call. Otherwise the core removes the mark. A call that waits stays in
+///   the outbox.
 ///
 /// The tile then shows the last state that the core has. While the device
 /// sleeps, the core removes the mark but does not draw. The wake draws the
 /// page.
 pub fn timeout(id: u32, model: &mut Model) -> Cmd {
     let outbox = &model.connection.outbox;
-    let marks = &mut model.pending.marks;
-    let Some(index) = marks.iter().position(|mark| mark.has_timer(id)) else {
+    let state = &mut model.pending;
+    let Some(index) = state.marks.iter().position(|mark| mark.timers.has(id)) else {
         return Cmd::done();
     };
-    let mark = &mut marks[index];
-    let waits = outbox.iter().any(|call| call.entity_id == mark.entity_id);
-    if mark.timeout.as_ref().is_some_and(|timer| timer.id() == id) {
-        mark.timeout = None;
-        if waits {
-            return Cmd::done();
-        }
-    } else {
-        mark.queued = None;
-        if !waits {
-            return Cmd::done();
-        }
+    let Mark {
+        entity_id,
+        tap,
+        timers,
+    } = state.marks.swap_remove(index);
+    let waits = outbox.iter().any(|call| call.entity_id == entity_id);
+    if let Some(timers) = timers.expired(id, waits) {
+        state.marks.push(Mark {
+            entity_id,
+            tap,
+            timers,
+        });
+        return Cmd::done();
     }
-    marks.swap_remove(index).clear_timers();
     if model.power.is_asleep() {
         return Cmd::done();
     }

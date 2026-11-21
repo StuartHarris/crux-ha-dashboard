@@ -306,12 +306,12 @@ fn call_service(model: &mut Model, call: &ServiceCall<'_>, confirm: Confirm) -> 
         qos: Qos::AtLeastOnce,
         retain: false,
     };
-    pending::mark(model, call.entity_id, confirm);
+    let tap = pending::tap(model, call.entity_id, confirm);
     let call = Call {
         publish,
         entity_id: call.entity_id,
     };
-    connection::send(call, model).and(redraw(model, false))
+    connection::send(call, Some(tap), model).and(redraw(model, false))
 }
 
 #[cfg(test)]

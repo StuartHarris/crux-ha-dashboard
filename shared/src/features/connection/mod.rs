@@ -56,7 +56,8 @@ use crate::{
     },
     entities,
     features::{
-        pending, power,
+        pending::{self, Tap},
+        power,
         refresh::{redraw, redraw_soon},
         timer::{self, Running, Slot},
         wifi,
@@ -527,7 +528,8 @@ pub fn close_for_roam(model: &mut Model) -> Cmd {
 /// timer, and does not connect again after the close.
 ///
 /// The core drops the service calls in the outbox and removes their marks.
-/// The device sleeps, so the core does not draw.
+/// The mark of a call that went out stays, but its timeout of the outbox
+/// stops. The device sleeps, so the core does not draw.
 pub fn go_offline(sleep: u32, model: &mut Model) -> Cmd {
     model.connection.outbox.clear();
     pending::forget_dropped(model);
@@ -578,21 +580,23 @@ pub fn go_offline(sleep: u32, model: &mut Model) -> Cmd {
 
 /// Publishes a service call now, or keeps it until the core connects.
 ///
-/// When the core issues the call, the timeout of the mark of its entity
-/// starts. While the call waits in the outbox, the timeout of the outbox
-/// runs. If the outbox is full, the core drops the oldest call and removes
-/// its mark. Refer to [`pending`].
+/// `tap` is the tap that asks for the call, or `None` for a call with no
+/// mark. The tap gives the entity of the call a mark, or replaces the tap of
+/// its mark. When the core issues the call, the timeout of the mark starts.
+/// While the call waits in the outbox, the timeout of the outbox runs. If
+/// the outbox is full, the core drops the oldest call and removes its mark.
+/// Refer to [`pending`].
 ///
 /// If the session cannot take the call now, the call goes first in the
 /// outbox. The outbox drains at the end of each [`pump`].
-pub fn send(call: Call, model: &mut Model) -> Cmd {
+pub fn send(call: Call, tap: Option<Tap>, model: &mut Model) -> Cmd {
     if model.connection.link() == Link::Up {
-        return match issue(call, model) {
+        return match issue(call, tap, model) {
             Ok(mark) => pump(model).and(mark),
-            Err(call) => {
+            Err((call, tap)) => {
                 let entity_id = call.entity_id;
                 model.connection.outbox.insert(0, call);
-                pending::queued(entity_id, model)
+                pending::queued(entity_id, tap, model)
             }
         };
     }
@@ -606,25 +610,30 @@ pub fn send(call: Call, model: &mut Model) -> Cmd {
     if full {
         pending::forget_dropped(model);
     }
-    pending::queued(entity_id, model).and(go_online(model))
+    pending::queued(entity_id, tap, model).and(go_online(model))
 }
 
 /// Gives a service call to the session and starts the timer of its mark.
 /// Returns the command of the timer.
 ///
+/// `tap` is the tap that asks for the call, or `None` for a call from the
+/// outbox. Refer to [`send`].
+///
 /// A call that is too long for a packet can never go. The core drops it,
 /// removes its mark, and writes a line to the log. The command that the
-/// function returns holds that line.
+/// function returns holds that line. If the entity has a mark, the tap
+/// replaces the tap of the mark before the core removes the mark. The mark
+/// then stays if it has a timeout of an issued call or a call in the outbox.
 ///
 /// # Errors
 ///
-/// Returns the call if the session cannot take it now.
-fn issue(call: Call, model: &mut Model) -> Result<Cmd, Call> {
+/// Returns the call and the tap if the session cannot take the call now.
+fn issue(call: Call, tap: Option<Tap>, model: &mut Model) -> Result<Cmd, (Call, Option<Tap>)> {
     let Some(live) = model.connection.phase.live_mut() else {
-        return Err(call);
+        return Err((call, tap));
     };
     match live.session.publish(call.publish.clone()) {
-        Ok(()) => Ok(pending::issued(call.entity_id, model)),
+        Ok(()) => Ok(pending::issued(call.entity_id, tap, model)),
         Err(Refused::TooLong) => {
             let reason = log::warn(
                 Area::Mqtt,
@@ -633,10 +642,13 @@ fn issue(call: Call, model: &mut Model) -> Result<Cmd, Call> {
                     call.entity_id
                 ),
             );
+            if let Some(tap) = tap {
+                pending::retap(call.entity_id, tap, model);
+            }
             pending::forget_dropped(model);
             Ok(reason)
         }
-        Err(Refused::Full | Refused::NotConnected) => Err(call),
+        Err(Refused::Full | Refused::NotConnected) => Err((call, tap)),
     }
 }
 
@@ -646,9 +658,9 @@ fn drain_outbox(model: &mut Model) -> Cmd {
     let mut commands = Vec::new();
     while !model.connection.outbox.is_empty() {
         let call = model.connection.outbox.remove(0);
-        match issue(call, model) {
+        match issue(call, None, model) {
             Ok(command) => commands.push(command),
-            Err(call) => {
+            Err((call, _)) => {
                 model.connection.outbox.insert(0, call);
                 break;
             }
