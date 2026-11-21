@@ -243,7 +243,7 @@ fn a_message_for_another_page_changes_the_state_but_does_not_draw() {
     second.expect_no_effects();
     let loft = model.entities.get("light.loft_loft_1").unwrap();
     assert_eq!(loft.state.as_deref(), Some("on"));
-    assert_eq!(loft.last_updated, Some(at(crate::tests::NOW)));
+    assert_eq!(loft.last_updated_minute(), Some(at(crate::tests::NOW)));
 }
 
 #[test]
@@ -786,7 +786,7 @@ fn a_last_updated_that_is_not_valid_is_ignored() {
         .expect_no_effects();
     }
     assert_eq!(
-        model.entities.get(VISIBLE).unwrap().last_updated,
+        model.entities.get(VISIBLE).unwrap().last_updated_minute(),
         Some(at(crate::tests::NOW))
     );
     assert_eq!(app.view(&model).updated, "Last changed 09:41");
@@ -814,7 +814,7 @@ fn after_start_the_footer_shows_the_kept_time_until_a_change_on_the_page() {
     });
     let _effects: Vec<_> = app.update(start, &mut model).effects().collect();
     // No entity has a `last_updated` time, so the footer shows the kept time.
-    assert_eq!(model.entities.last_updated().count(), 0);
+    assert_eq!(model.entities.last_updated_minutes().count(), 0);
     assert_eq!(app.view(&model).updated, "Last changed 09:41");
     assert_eq!(app.view(&model).last_sync, Some(crate::tests::NOW));
 }

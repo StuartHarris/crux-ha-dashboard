@@ -44,16 +44,14 @@ pub struct EntityState {
     pub state: Option<String>,
     /// The attributes that the tile shows, as text.
     pub attributes: BTreeMap<String, String>,
-    /// The time at which Home Assistant last updated the state or an
-    /// attribute, at the start of the minute. Only the minute shows on the
-    /// screen. Refer to the module documentation for the reason that the core
-    /// uses `last_updated` and not `last_changed`.
-    pub last_updated: Option<DateTime<Utc>>,
     /// The exact time at which Home Assistant last updated the state or an
-    /// attribute. The panel does not show it. The core compares it with the
-    /// time at a tap, to see that Home Assistant confirmed the tap. Refer to
-    /// [`pending`](crate::features::pending).
-    pub last_updated_exact: Option<DateTime<Utc>>,
+    /// attribute. The core compares it with the time at a tap, to see that
+    /// Home Assistant confirmed the tap. Refer to
+    /// [`pending`](crate::features::pending). Only the minute shows on the
+    /// screen ([`EntityState::last_updated_minute`]). Refer to the module
+    /// documentation for the reason that the core uses `last_updated` and not
+    /// `last_changed`.
+    pub last_updated: Option<DateTime<Utc>>,
 }
 
 impl EntityState {
@@ -61,6 +59,13 @@ impl EntityState {
     #[must_use]
     pub fn attribute(&self, name: &str) -> Option<&str> {
         self.attributes.get(name).map(String::as_str)
+    }
+
+    /// Returns the time of the last update at the start of its minute. Only
+    /// the minute shows on the screen.
+    #[must_use]
+    pub fn last_updated_minute(&self) -> Option<DateTime<Utc>> {
+        self.last_updated.map(start_of_minute)
     }
 }
 
@@ -84,12 +89,12 @@ impl Entities {
         self.get(entity_id)?.state.as_deref()
     }
 
-    /// Returns each entity id with the time of its last update, for the
-    /// entities that have one.
-    pub fn last_updated(&self) -> impl Iterator<Item = (&str, DateTime<Utc>)> {
-        self.states
-            .iter()
-            .filter_map(|(entity_id, entity)| Some((entity_id.as_str(), entity.last_updated?)))
+    /// Returns each entity id with the time of its last update at the start
+    /// of its minute, for the entities that have one.
+    pub fn last_updated_minutes(&self) -> impl Iterator<Item = (&str, DateTime<Utc>)> {
+        self.states.iter().filter_map(|(entity_id, entity)| {
+            Some((entity_id.as_str(), entity.last_updated_minute()?))
+        })
     }
 
     /// Applies a state-stream message to the states.
@@ -114,11 +119,9 @@ impl Entities {
 
         if key == LAST_UPDATED {
             let exact = DateTime::parse_from_rfc3339(text).ok()?.to_utc();
-            let time = start_of_minute(exact);
             let entity = self.states.entry(entity_id.clone()).or_default();
-            entity.last_updated_exact = Some(exact);
-            let changed = entity.last_updated != Some(time);
-            entity.last_updated = Some(time);
+            let changed = entity.last_updated_minute() != Some(start_of_minute(exact));
+            entity.last_updated = Some(exact);
             return changed.then_some(entity_id);
         }
 
@@ -477,7 +480,7 @@ mod tests {
     fn lamp_updated(entities: &Entities) -> Option<String> {
         entities
             .get("light.lamp")?
-            .last_updated
+            .last_updated_minute()
             .map(|time| time.to_rfc3339())
     }
 
@@ -499,7 +502,7 @@ mod tests {
             entities.apply(PAGES, topic, b"2026-11-08T14:03:59+00:00"),
             None
         );
-        let exact = entities.get("light.lamp").unwrap().last_updated_exact;
+        let exact = entities.get("light.lamp").unwrap().last_updated;
         assert_eq!(
             exact.map(|time| time.to_rfc3339()).as_deref(),
             Some("2026-11-08T14:03:59+00:00")
@@ -549,6 +552,6 @@ mod tests {
             let changed = entities.apply(PAGES, &topic, b"2026-11-08T14:03:21+00:00");
             assert_eq!(changed.as_deref(), Some(entity_id));
         }
-        assert_eq!(entities.last_updated().count(), 4);
+        assert_eq!(entities.last_updated_minutes().count(), 4);
     }
 }
