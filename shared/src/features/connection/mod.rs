@@ -1133,7 +1133,7 @@ pub(crate) fn shows(model: &Model, entity_id: &str) -> bool {
 pub fn page_time(model: &Model) -> Option<DateTime<Utc>> {
     model
         .entities
-        .last_updated()
+        .last_updated_minutes()
         .filter(|(entity_id, _)| shows(model, entity_id))
         .map(|(_, time)| time)
         .max()

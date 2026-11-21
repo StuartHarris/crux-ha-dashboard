@@ -201,7 +201,7 @@ impl Mark {
     /// documentation.
     fn confirmed_by(&self, entity: Option<&EntityState>) -> bool {
         let state = entity.and_then(|entity| entity.state.as_deref());
-        let updated = entity.and_then(|entity| entity.last_updated_exact);
+        let updated = entity.and_then(|entity| entity.last_updated);
         let newer = match (self.since, updated) {
             (Some(since), Some(updated)) => updated > since,
             (Some(_), None) => false,
@@ -283,7 +283,7 @@ pub fn requested_target(model: &Model, entity_id: &str) -> Option<Centi> {
 pub fn mark(model: &mut Model, entity_id: &'static str, confirm: Confirm) {
     let entity = model.entities.get(entity_id);
     let state = entity.and_then(|entity| entity.state.clone());
-    let since = entity.and_then(|entity| entity.last_updated_exact);
+    let since = entity.and_then(|entity| entity.last_updated);
     if let Some(mark) = model.pending.get_mut(entity_id) {
         mark.confirm = confirm;
         mark.state = state;

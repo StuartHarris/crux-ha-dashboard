@@ -18,8 +18,8 @@ use core::time::Duration;
 
 use crate::{
     Cmd, Model,
-    capabilities::{light::Light, power::PowerSource},
-    features::timer::Slot,
+    capabilities::{light::Light as FrontLight, power::PowerSource},
+    features::timer::Running,
 };
 
 /// The internal events of the front light. The core makes them from its
@@ -51,6 +51,9 @@ pub const STAND_LEVEL: u8 = 60;
 /// [`STAND_LEVEL`], so the light uses less of the battery.
 pub const BATTERY_LEVEL: u8 = 25;
 
+// The level of `Light::On` must be more than 0.
+const _: () = assert!(STAND_LEVEL > 0 && BATTERY_LEVEL > 0);
+
 /// The time without a touch after which the front light goes off.
 ///
 /// This time is shorter than
@@ -63,13 +66,51 @@ pub const LIGHT_TIMEOUT: Duration = Duration::from_secs(20);
 /// The state of the front light.
 #[derive(Debug, Default)]
 pub struct State {
-    /// The level that the core last sent to the shell, in percent. The
-    /// value 0 means that the light is off.
-    pub level: u8,
     /// The id of the newest light timer.
     pub timer: u32,
-    /// The light timer that runs.
-    running: Slot,
+    /// The light, as the core last sent it to the shell.
+    light: Light,
+}
+
+impl State {
+    /// Returns the level that the core last sent to the shell, in percent.
+    /// The value 0 means that the light is off.
+    #[must_use]
+    pub const fn level(&self) -> u8 {
+        self.light.level()
+    }
+}
+
+/// The front light, as the core last sent it to the shell.
+#[derive(Debug, Default)]
+enum Light {
+    /// The light is off, and no light timer runs.
+    #[default]
+    Off,
+    /// The light is on, and the light timer runs.
+    On {
+        /// The level, in percent. It is more than 0.
+        level: u8,
+        /// The light timer. When it expires, the light goes off.
+        timer: Running,
+    },
+}
+
+impl Light {
+    /// Returns the level in percent, or 0 if the light is off.
+    const fn level(&self) -> u8 {
+        match self {
+            Self::Off => 0,
+            Self::On { level, .. } => *level,
+        }
+    }
+
+    /// Clears the light timer, if it runs.
+    fn clear(self) {
+        if let Self::On { timer, .. } = self {
+            timer.clear();
+        }
+    }
 }
 
 /// Returns the level of the front light for the power source `source`.
@@ -84,31 +125,43 @@ pub const fn level_for(source: PowerSource) -> u8 {
 /// Returns `true` if the front light is on.
 #[must_use]
 pub const fn is_on(model: &Model) -> bool {
-    model.light.level > 0
+    matches!(model.light.light, Light::On { .. })
 }
 
 /// The user touched the panel: turns the light on at the level of the power
 /// source, and starts the light timer again.
 ///
-/// If the light is already on at that level, the core sends no `FrontLight`.
-/// The core then only starts a new timer.
+/// The new light timer replaces the timer that runs, and the core clears
+/// the old timer. If the light is already on at that level, the core sends
+/// no `FrontLight`. The core then only starts a new timer.
 pub fn touched(model: &mut Model) -> Cmd {
     model.light.timer = model.light.timer.wrapping_add(1);
     let id = model.light.timer;
-    let timer = model
-        .light
-        .running
-        .start(id, LIGHT_TIMEOUT, Event::Timeout(id).into());
-    set(level_for(model.power.source()), model).and(timer)
+    let (start, timer) = Running::start(id, LIGHT_TIMEOUT, Event::Timeout(id).into());
+    let level = level_for(model.power.source());
+    let old = core::mem::replace(&mut model.light.light, Light::On { level, timer });
+    let changed = old.level() != level;
+    old.clear();
+    let light = if changed {
+        FrontLight::set(level).build()
+    } else {
+        Cmd::done()
+    };
+    light.and(start)
 }
 
 /// The light timer with the id `id` expired. If it is the newest timer,
 /// turns the light off.
+///
+/// The timer already expired, so the core does not clear it.
 pub fn timeout(id: u32, model: &mut Model) -> Cmd {
-    if !model.light.running.expired(id) {
-        return Cmd::done();
+    match &model.light.light {
+        Light::On { timer, .. } if timer.id() == id => {
+            model.light.light = Light::Off;
+            FrontLight::set(0).build()
+        }
+        Light::Off | Light::On { .. } => Cmd::done(),
     }
-    set(0, model)
 }
 
 /// Turns the light off, and clears the light timer that runs.
@@ -116,8 +169,14 @@ pub fn timeout(id: u32, model: &mut Model) -> Cmd {
 /// If the light is already off, the command has no effect.
 pub fn off(model: &mut Model) -> Cmd {
     model.light.timer = model.light.timer.wrapping_add(1);
-    model.light.running.stop();
-    set(0, model)
+    let old = core::mem::take(&mut model.light.light);
+    let was_on = matches!(old, Light::On { .. });
+    old.clear();
+    if was_on {
+        FrontLight::set(0).build()
+    } else {
+        Cmd::done()
+    }
 }
 
 /// Turns the light off after a start. The core does not know the state of
@@ -125,28 +184,21 @@ pub fn off(model: &mut Model) -> Cmd {
 /// clears the light timer that runs.
 pub fn reset(model: &mut Model) -> Cmd {
     model.light.timer = model.light.timer.wrapping_add(1);
-    model.light.running.stop();
-    model.light.level = 0;
-    Light::set(0).build()
+    core::mem::take(&mut model.light.light).clear();
+    FrontLight::set(0).build()
 }
 
 /// The power source changed. If the light is on, sets the level of the new
-/// source.
+/// source. The light timer continues to run.
 pub fn source_changed(model: &mut Model) -> Cmd {
-    if !is_on(model) {
-        return Cmd::done();
+    let new = level_for(model.power.source());
+    match &mut model.light.light {
+        Light::On { level, .. } if *level != new => {
+            *level = new;
+            FrontLight::set(new).build()
+        }
+        Light::Off | Light::On { .. } => Cmd::done(),
     }
-    set(level_for(model.power.source()), model)
-}
-
-/// Sets the light to `level`. If the light already has that level, the
-/// command has no effect.
-fn set(level: u8, model: &mut Model) -> Cmd {
-    if model.light.level == level {
-        return Cmd::done();
-    }
-    model.light.level = level;
-    Light::set(level).build()
 }
 
 #[cfg(test)]
@@ -178,7 +230,7 @@ mod tests {
         // sends the level 0 also when its model has the light off.
         let mut cmd = app.update(start(PowerSource::Stand), &mut model);
         cmd.expect_light(0);
-        assert_eq!(model.light.level, 0);
+        assert_eq!(model.light.level(), 0);
     }
 
     #[test]
@@ -193,7 +245,7 @@ mod tests {
             app.update(Event::Tapped(None), &mut model)
                 .expect_touch_light(level)
                 .expect_no_effects();
-            assert_eq!(model.light.level, level, "{source:?}");
+            assert_eq!(model.light.level(), level, "{source:?}");
         }
     }
 
@@ -209,7 +261,7 @@ mod tests {
         )
         .expect_light(0)
         .expect_no_effects();
-        assert_eq!(model.light.level, 0);
+        assert_eq!(model.light.level(), 0);
     }
 
     #[test]
@@ -226,7 +278,7 @@ mod tests {
 
         app.update(Event::Light(light::Event::Timeout(old)), &mut model)
             .expect_no_effects();
-        assert_eq!(model.light.level, STAND_LEVEL);
+        assert_eq!(model.light.level(), STAND_LEVEL);
     }
 
     #[test]
@@ -239,12 +291,12 @@ mod tests {
             .expect_light(BATTERY_LEVEL)
             .expect_render()
             .expect_only_time_notify_after();
-        assert_eq!(model.light.level, BATTERY_LEVEL);
+        assert_eq!(model.light.level(), BATTERY_LEVEL);
 
         app.update(Event::PowerSourceChanged(PowerSource::Stand), &mut model)
             .expect_light(STAND_LEVEL)
             .expect_only_render();
-        assert_eq!(model.light.level, STAND_LEVEL);
+        assert_eq!(model.light.level(), STAND_LEVEL);
     }
 
     #[test]
@@ -255,7 +307,7 @@ mod tests {
         app.update(Event::PowerSourceChanged(PowerSource::Battery), &mut model)
             .expect_render()
             .expect_only_time_notify_after();
-        assert_eq!(model.light.level, 0);
+        assert_eq!(model.light.level(), 0);
     }
 
     #[test]
@@ -275,7 +327,7 @@ mod tests {
             .expect_front_light();
         assert_eq!(light.operation.level, 0);
         assert!(model.power.is_asleep());
-        assert_eq!(model.light.level, 0);
+        assert_eq!(model.light.level(), 0);
 
         light.resolve(()).unwrap();
         let light_off = sleep.expect_one_event();
@@ -312,7 +364,7 @@ mod tests {
         // turns the light on again.
         let _ = app.update(Event::Tapped(None), &mut model);
         assert!(!model.power.is_asleep());
-        assert_eq!(model.light.level, BATTERY_LEVEL);
+        assert_eq!(model.light.level(), BATTERY_LEVEL);
 
         // The answer of the sleep comes late. The core does not continue the
         // sleep.
@@ -352,7 +404,7 @@ mod tests {
             .expect_disconnect(&mut wire, &mut model)
             .expect_session_clear(&wire)
             .expect_no_effects();
-        assert_eq!(model.light.level, 0);
+        assert_eq!(model.light.level(), 0);
     }
 
     #[test]
