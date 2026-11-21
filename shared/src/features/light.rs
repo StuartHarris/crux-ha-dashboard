@@ -476,4 +476,36 @@ mod tests {
         assert_eq!(timeouts, 1, "{events:?}");
         assert_eq!(shell.light, 0);
     }
+
+    #[test]
+    fn a_change_of_the_power_source_while_the_light_is_on_keeps_the_light_timer() {
+        let mut shell = Shell::new();
+        shell.send(start(PowerSource::Stand));
+        shell.send(Event::Tapped(None));
+        shell.send(Event::PowerSourceChanged(PowerSource::Battery));
+        assert_eq!(shell.light, BATTERY_LEVEL);
+
+        // The timer of the tap still runs, so the light goes off at the
+        // light timeout.
+        shell.advance(LIGHT_TIMEOUT);
+        assert_eq!(shell.light, 0);
+    }
+
+    #[test]
+    fn a_start_while_the_light_is_on_clears_the_light_timer() {
+        let mut shell = Shell::new();
+        shell.send(start(PowerSource::Stand));
+        shell.send(Event::Tapped(None));
+        shell.send(start(PowerSource::Stand));
+        assert_eq!(shell.light, 0);
+
+        // The start cleared the timer of the tap, so no light timeout fires.
+        let events = shell.advance(LIGHT_TIMEOUT);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::Light(light::Event::Timeout(_)))),
+            "{events:?}"
+        );
+    }
 }
