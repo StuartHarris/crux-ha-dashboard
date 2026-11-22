@@ -7,7 +7,9 @@
 //! from the test. The wire sends the events of the stream to the core at once. It
 //! keeps the other effects and events for the test, in
 //! [`Wire::effects`] and [`Wire::events`]. It ignores the timers of the MQTT
-//! session. It keeps each `Log` notification in [`Wire::logs`].
+//! session. It keeps each `Log` request in [`Wire::logs`]. The wire has no
+//! clock, so it answers each `Log` request with [`Wire::UPTIME`], and it
+//! sends the event of the answer to the core at once.
 //!
 //! A test checks a `Write` in a command with the [`ExpectWrite`] helpers.
 //! They skip the timers of the session, take the `Write`, answer it, and
@@ -23,7 +25,10 @@ use crux_time::{TimerId, operation::NotifyAfter};
 use super::{broker::client_packets, broker::publish_of, shell::session_timers};
 use crate::{
     Cmd, Dashboard, Effect, Event, Model,
-    capabilities::stream::{Open, StreamItem, Write, Written},
+    capabilities::{
+        log::Uptime,
+        stream::{Open, StreamItem, Write, Written},
+    },
     fake,
     mqtt::{
         Publish, Qos,
@@ -50,11 +55,15 @@ pub struct Wire {
     pub events: VecDeque<Event>,
     /// The packets that the core wrote, in order.
     pub packets: Vec<Packet>,
-    /// Each `Log` notification as `{level} {area}: {message}`, in order.
+    /// Each `Log` request as `{level} {area}: {message}`, in order.
     pub logs: Vec<String>,
 }
 
 impl Wire {
+    /// The time with which the wire answers each `Log` request. The wire has
+    /// no clock.
+    pub const UPTIME: Uptime = Uptime(0);
+
     /// Takes the command `cmd` that opens the stream. The command must have
     /// only the `Open` request and timers of the session.
     #[track_caller]
@@ -210,8 +219,8 @@ impl Wire {
         }
     }
 
-    /// Sends an event of the stream to the core, and keeps the command.
-    /// Keeps another event for the test.
+    /// Sends an event of the stream, or the event of a line of the log, to
+    /// the core, and keeps the command. Keeps another event for the test.
     fn dispatch(&mut self, event: Event, model: &mut Model) {
         match event {
             Event::Connection(
@@ -219,7 +228,8 @@ impl Wire {
                 | connection::Event::Written { .. }
                 | connection::Event::StreamClosed { .. }
                 | connection::Event::SessionTimer { .. },
-            ) => {
+            )
+            | Event::Logs(_) => {
                 let command = Dashboard.update(event, model);
                 self.commands.push(command);
             }
@@ -240,9 +250,10 @@ impl Wire {
             Effect::TimeNotifyAfter(request) if is_session_timer(&request) => {
                 self.session_timers.push(request.operation.id);
             }
-            Effect::Log(request) => {
-                let log = request.operation;
+            Effect::Log(mut request) => {
+                let log = &request.operation;
                 self.logs.push(format!("{} {log}", log.level));
+                request.resolve(Self::UPTIME).unwrap();
             }
             Effect::TimeClear(mut request)
                 if self.session_timers.contains(&request.operation.id) =>

@@ -51,11 +51,12 @@ use futures::StreamExt;
 use crate::{
     Cmd, Model,
     capabilities::{
-        log::{self, Area},
+        log::Area,
         stream::{Stream, StreamItem, Written},
     },
     entities,
     features::{
+        logs,
         pending::{self, Tap},
         power,
         refresh::{redraw, redraw_soon},
@@ -634,14 +635,13 @@ fn issue(call: Call, tap: Option<Tap>, model: &mut Model) -> Result<Cmd, (Call, 
     match live.session.publish(call.publish.clone()) {
         Ok(_) => Ok(pending::issued(call.entity_id, tap, model)),
         Err(Refused::TooLong) => {
-            let reason = log::warn(
+            let reason = logs::warn(
                 Area::Mqtt,
                 format!(
                     "the service call for {} is too long for a packet, so the core dropped it",
                     call.entity_id
                 ),
-            )
-            .build();
+            );
             if let Some(tap) = tap {
                 pending::retap(call.entity_id, tap, model);
             }
@@ -933,12 +933,12 @@ pub fn pump(model: &mut Model) -> Cmd {
                         .live_mut()
                         .is_some_and(|live| !mem::replace(&mut live.skip_logged, true));
                     if first {
-                        rest.push(log::warn(
+                        rest.push(logs::warn(
                             Area::Mqtt,
                             format!(
                                 "a message of {length} bytes is too long, so the core skipped it"
                             ),
-                        ).build());
+                        ));
                     }
                 }
                 Action::Subscribed { id, outcome } => rest.push(subscribed(id, outcome, model)),
@@ -1051,11 +1051,10 @@ fn subscribed(id: SubscribeId, outcome: SubscribeOutcome, model: &mut Model) -> 
         return Cmd::done();
     }
     if outcome == SubscribeOutcome::Refused {
-        let reason = log::warn(
+        let reason = logs::warn(
             Area::Mqtt,
             "the broker refused one or more topic filters, so some entities get no state",
-        )
-        .build();
+        );
         return reason.and(wifi::quiet(model));
     }
     wifi::quiet(model)
@@ -1166,7 +1165,7 @@ fn schedule_reconnect(model: &mut Model) -> Cmd {
     let wait = state.backoff;
     state.backoff = (wait * 2).min(RECONNECT_MAX);
     let timer = retry.start(id, wait, Event::Reconnect(id).into());
-    let reason = log::info(Area::Mqtt, format!("connect again in {} s", wait.as_secs())).build();
+    let reason = logs::info(Area::Mqtt, format!("connect again in {} s", wait.as_secs()));
     reason.and(timer)
 }
 

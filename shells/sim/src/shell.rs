@@ -34,6 +34,8 @@
 //!
 //! The shell prints each line of the log of the core to stderr as
 //! `{area}: {message}`, with `warning: ` first for a warning.
+//! Then it answers the `Log` request at once with the time since the shell
+//! started, in milliseconds.
 //!
 //! The shell writes each effect to an [`Inspector`], which the window shows.
 //! The inspector also finds the MQTT packets in a copy of the bytes of each
@@ -42,7 +44,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     sync::{Arc, mpsc},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use embedded_graphics::prelude::Point;
@@ -52,7 +54,7 @@ use crux_time::{TimerId, operation::NotifyAfter};
 use shared::{
     Core, Dashboard, Effect, Event, PowerSource, Settings, Start, ViewModel,
     capabilities::{
-        log::Level,
+        log::{Level, Uptime},
         power::{Sleep, Wake},
         radio::AccessPoint,
         stream::{Close, Open, StreamItem, Write, Written},
@@ -173,6 +175,9 @@ pub struct Shell {
     /// The level of the front light, in percent. The window shows the
     /// light as a tint over the panel.
     light: u8,
+    /// The time at which the shell started. The answer to a `Log` request is
+    /// the time since then. A restart of the core does not change it.
+    started: Instant,
 }
 
 impl Drop for Shell {
@@ -212,7 +217,15 @@ impl Shell {
             restarting: false,
             sleep: None,
             light: 0,
+            started: Instant::now(),
         }
+    }
+
+    /// Returns the time since the shell started, in milliseconds, for the
+    /// answer to a `Log` request. The clock of the host counts while the
+    /// simulated device sleeps.
+    fn uptime(&self) -> Uptime {
+        Uptime(u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX))
     }
 
     /// Sends `Start` to the core, as the device does after a cold start.
@@ -670,8 +683,8 @@ impl Shell {
             | Effect::RadioStopScan(_)
             | Effect::RadioOff(_)
             | Effect::RadioRestart(_) => self.radio(effect),
-            Effect::Log(request) => {
-                let line = request.operation;
+            Effect::Log(mut request) => {
+                let line = &request.operation;
                 let outcome = match line.level {
                     Level::Info => {
                         eprintln!("{line}");
@@ -683,7 +696,7 @@ impl Shell {
                     }
                 };
                 self.inspector.effect("Log", line.to_string(), outcome);
-                Vec::new()
+                resolve(&self.core, &mut request, self.uptime())
             }
             Effect::Sleep(request) => {
                 eprintln!("power: asleep. Click the panel or press W to wake it.");

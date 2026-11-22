@@ -43,10 +43,10 @@ use core::time::Duration;
 use crate::{
     Cmd, Model,
     capabilities::{
-        log::{self, Area},
+        log::Area,
         radio::{AccessPoint, Joined, Lease, Radio, Scanned, Target, signal},
     },
-    features::{connection, power, timer::Slot},
+    features::{connection, logs, power, timer::Slot},
     mqtt::End,
 };
 
@@ -306,11 +306,10 @@ fn rejoin(current: AccessPoint, model: &mut Model) -> Cmd {
     let state = &model.wifi;
     let target = state.cache.plan();
     if state.health.suspect() {
-        let reason = log::warn(
+        let reason = logs::warn(
             Area::Wifi,
             format!("the link is suspect, so leave {current} and join again"),
-        )
-        .build();
+        );
         reason.and(leave(Then::Join(target), model))
     } else if target != Target::Cached(current) {
         leave(Then::Join(target), model)
@@ -343,16 +342,14 @@ pub fn session_ended(end: &End, model: &mut Model) -> Cmd {
         link.ready = false;
     }
     match (was_suspect, is_suspect) {
-        (false, true) => log::warn(
+        (false, true) => logs::warn(
             Area::Wifi,
             format!("the link is suspect, because the MQTT session failed: {end}"),
-        )
-        .build(),
-        (true, false) => log::info(
+        ),
+        (true, false) => logs::info(
             Area::Wifi,
             "the broker host ended the session, so the link moves data and is not suspect",
-        )
-        .build(),
+        ),
         _ => Cmd::done(),
     }
 }
@@ -368,11 +365,10 @@ pub fn traffic(model: &mut Model) -> Cmd {
     let was_suspect = health.suspect();
     health.traffic();
     if was_suspect {
-        log::info(
+        logs::info(
             Area::Wifi,
             "bytes from the broker arrived, so the link is not suspect",
         )
-        .build()
     } else {
         Cmd::done()
     }
@@ -492,11 +488,10 @@ pub fn leased(radio: u32, lease: Lease, model: &mut Model) -> Cmd {
         // a new join while the link is suspect. A join that keeps the
         // association keeps the address too.
         if !kept && state.health.suspect() {
-            lines = log::warn(
+            lines = logs::warn(
                 Area::Wifi,
                 "the address is from before the join, so the network stack can be stuck",
-            )
-            .build();
+            );
         }
         let recovery = state.health.stale();
         lines = lines.and(counted(state.health));
@@ -525,11 +520,10 @@ fn counted(health: Health) -> Cmd {
         return Cmd::done();
     }
     let count = health.joins_with_no_lease();
-    log::warn(
+    logs::warn(
         Area::Wifi,
         format!("{count} of {RESTART_AFTER} joins got no new address while the link is suspect"),
     )
-    .build()
 }
 
 /// Handles the answer to the `Leave` request `radio`.
@@ -576,11 +570,10 @@ pub fn timeout(radio: u32, model: &mut Model) -> Cmd {
         return Cmd::done();
     }
     let reason = request_name(model.wifi.phase).map_or_else(Cmd::done, |request| {
-        log::warn(
+        logs::warn(
             Area::Wifi,
             format!("the {request} request got no answer in its time limit"),
         )
-        .build()
     });
     if !model.wants_online()
         && matches!(model.wifi.phase, Phase::Joining(_) | Phase::Leasing { .. })
@@ -635,19 +628,18 @@ fn after_join(joined: &Joined, model: &mut Model) -> Cmd {
         model.wifi.phase = Phase::Idle;
         return match (model.wifi.cache.failed(target), target) {
             (AfterFailure::Rescan, Target::Cached(cached)) if model.wants_online() => {
-                let reason = log::warn(
+                let reason = logs::warn(
                     Area::Wifi,
                     format!(
                         "the join to the cached access point {cached} failed, so join the strongest access point"
                     ),
-                ).build();
+                );
                 reason.and(join(Target::Strongest, false, model))
             }
-            (AfterFailure::Fail, _) if model.wants_online() => log::warn(
+            (AfterFailure::Fail, _) if model.wants_online() => logs::warn(
                 Area::Wifi,
                 "the join to the strongest access point failed, so the link is down",
             )
-            .build()
             .and(connection::link_failed(model)),
             (AfterFailure::Rescan | AfterFailure::Fail, _) => connection::link_failed(model),
         };
@@ -695,9 +687,7 @@ fn no_address(target: Target, access_point: AccessPoint, model: &mut Model) -> C
             format!("the strongest access point {access_point} gave no address, so leave it"),
         ),
     };
-    log::warn(Area::Wifi, message)
-        .build()
-        .and(leave(then, model))
+    logs::warn(Area::Wifi, message).and(leave(then, model))
 }
 
 /// Continues after the answer to a leave.
@@ -728,23 +718,22 @@ fn after_scan(scanned: &Scanned, model: &mut Model) -> Cmd {
     state.cache.scanned();
     state.phase = Phase::Up(linked);
     let Scanned::Found { seen, rssi } = scanned else {
-        return log::warn(Area::Wifi, format!("the scan failed, so stay on {current}")).build();
+        return logs::warn(Area::Wifi, format!("the scan failed, so stay on {current}"));
     };
     let Some(rssi_now) = current_signal(current, *rssi, seen) else {
-        return log::info(
+        return logs::info(
             Area::Wifi,
             format!("the signal of {current} is unknown, so stay"),
-        )
-        .build();
+        );
     };
     let now = signal(Some(rssi_now));
     let Some(best) = better_access_point(current, *rssi, seen) else {
-        return log::info(
+        return logs::info(
             Area::Wifi,
             format!(
                 "the scan found no access point that is {ROAM_MARGIN_DB} dB stronger than {current} ({now}), so stay"
             ),
-        ).build();
+        );
     };
     state.cache.roam_to(best.access_point);
     state.phase = Phase::Up(Linked {
@@ -755,21 +744,19 @@ fn after_scan(scanned: &Scanned, model: &mut Model) -> Cmd {
     // During the steps of a sleep, the sleep closes the session. The next
     // wake joins the better access point.
     if model.wants_online() {
-        let reason = log::info(
+        let reason = logs::info(
             Area::Wifi,
             format!(
                 "change to {to} ({} dBm), because the signal of {current} is {now}",
                 best.rssi
             ),
-        )
-        .build();
+        );
         reason.and(connection::close_for_roam(model))
     } else {
-        log::info(
+        logs::info(
             Area::Wifi,
             format!("change to {to} at the next wake, because the signal of {current} is {now}"),
         )
-        .build()
     }
 }
 
