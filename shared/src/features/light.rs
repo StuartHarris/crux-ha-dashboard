@@ -210,7 +210,7 @@ mod tests {
     use crux_core::App;
 
     use crate::tests::{
-        ExpectLight, ExpectStep, drive_to_connected, shell::Shell, start, wire::ExpectWrite,
+        ExpectLight, ExpectStep, drive_to_connected, shell::Shell, start, state, wire::ExpectWrite,
     };
     use crate::{
         Dashboard, EffectTestExt, Event, Model, PowerSource,
@@ -291,14 +291,14 @@ mod tests {
             .expect_light(BATTERY_LEVEL)
             .expect_render()
             .expect_time_notify_after()
-            .expect_state(&mut wire, &mut model, r#"{"battery":null,"stand":"OFF"}"#)
+            .expect_state(&mut wire, &mut model, &state("null", "OFF"))
             .expect_only_session_clear(&wire);
         assert_eq!(model.light.level(), BATTERY_LEVEL);
 
         app.update(Event::PowerSourceChanged(PowerSource::Stand), &mut model)
             .expect_light(STAND_LEVEL)
             .expect_render()
-            .expect_state(&mut wire, &mut model, r#"{"battery":null,"stand":"ON"}"#)
+            .expect_state(&mut wire, &mut model, &state("null", "ON"))
             .expect_only_session_clear(&wire);
         assert_eq!(model.light.level(), STAND_LEVEL);
     }
@@ -311,7 +311,7 @@ mod tests {
         app.update(Event::PowerSourceChanged(PowerSource::Battery), &mut model)
             .expect_render()
             .expect_time_notify_after()
-            .expect_state(&mut wire, &mut model, r#"{"battery":null,"stand":"OFF"}"#)
+            .expect_state(&mut wire, &mut model, &state("null", "OFF"))
             .expect_only_session_clear(&wire);
         assert_eq!(model.light.level(), 0);
     }

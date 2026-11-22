@@ -62,7 +62,7 @@
 //! A wake (touch, tap, stand or `Start`) after more than one wake with no
 //! cause writes one Info line with the count. The core ignores the answer
 //! or the timer of an older sleep, and an answer in `Steps` or `Held`.
-//! `BatteryChanged` and `SleepNow` do not change the sleep.
+//! `BatteryChanged`, `PowerRead` and `SleepNow` do not change the sleep.
 //!
 //! # Lines of the log
 //!
@@ -81,7 +81,7 @@ use crate::{
     Cmd, Model,
     capabilities::{
         log::Area,
-        power::{Power, PowerSource, Wake, WakeSource},
+        power::{Power, PowerSource, Reading, Wake, WakeSource},
     },
     features::{
         connection, device, light, logs,
@@ -152,12 +152,24 @@ pub const CHECK_PERIOD: Duration = Duration::from_secs(60);
 /// it sleeps again.
 pub const STRAY_HOLD: Duration = Duration::from_secs(3);
 
+/// A reading with no values, before the shell reads the diagnostics.
+#[cfg(test)]
+const NO_READING: Reading = Reading {
+    charge: None,
+    voltage_mv: None,
+    current_ma: None,
+    tenth_celsius: None,
+};
+
 /// The power source and the sleep state.
 #[derive(Debug, Default)]
 pub struct State {
     /// The exact charge of the battery in percent, or `None` if the shell
     /// did not read it yet.
     pub battery: Option<u8>,
+    /// The last reading of the power diagnostics. Each value is `None`
+    /// until the shell reads it.
+    pub reading: Reading,
     /// The power phase. It also gives the power source.
     phase: Phase,
     /// The last id that the core took for an idle timer. Each new idle timer
@@ -281,6 +293,7 @@ impl State {
     pub(crate) const fn asleep_in(sleep: u32) -> Self {
         Self {
             battery: None,
+            reading: NO_READING,
             phase: Phase::Asleep {
                 id: sleep,
                 rest: Rest::Steps,
@@ -296,6 +309,7 @@ impl State {
     pub(crate) const fn sleeping_in(sleep: u32) -> Self {
         Self {
             battery: None,
+            reading: NO_READING,
             phase: Phase::Asleep {
                 id: sleep,
                 rest: Rest::Sleeping { strays: 0 },
@@ -648,9 +662,12 @@ pub fn source_changed(source: PowerSource, model: &mut Model) -> Cmd {
 /// wake draws the level.
 ///
 /// The core publishes each change of the exact level in the state message,
-/// while the device is awake. Refer to [`device::changed`]. A reading with
-/// the same level does nothing. While the device sleeps, the next connect
-/// publishes the level.
+/// while the device is awake. A move of more than
+/// [`BATTERY_FLAP`](device::BATTERY_FLAP) goes at once, and a smaller move
+/// goes at most once in
+/// [`STATE_MIN_INTERVAL`](device::STATE_MIN_INTERVAL). Refer to
+/// [`device::changed`]. A reading with the same level does nothing. While
+/// the device sleeps, the next connect publishes the level.
 pub fn battery_changed(level: Option<u8>, model: &mut Model) -> Cmd {
     let before = model.power.battery;
     model.power.battery = level;
@@ -662,6 +679,26 @@ pub fn battery_changed(level: Option<u8>, model: &mut Model) -> Cmd {
         return publish;
     }
     redraw(model, false).and(publish)
+}
+
+/// The shell read the power diagnostics. The core keeps the reading.
+///
+/// The view does not show the reading, so the core does not draw. The
+/// reading is a fact, not a touch, so it does not wake the device and it
+/// does not start the idle timer again. While the device sleeps, the core
+/// only keeps the reading, and the next connection publishes it.
+///
+/// While the device is awake, the core publishes the reading in the state
+/// message. Refer to [`device::changed`]. A change of the phase of the
+/// charge that starts or ends a charge goes at once. A change of only the
+/// other values goes at most once in
+/// [`STATE_MIN_INTERVAL`](device::STATE_MIN_INTERVAL).
+pub fn read(reading: Reading, model: &mut Model) -> Cmd {
+    let before = mem::replace(&mut model.power.reading, reading);
+    if reading == before || model.power.is_asleep() {
+        return Cmd::done();
+    }
+    device::changed(model)
 }
 
 /// Clears the idle timer that runs, and starts a new one if the device is

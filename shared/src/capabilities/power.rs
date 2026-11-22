@@ -16,6 +16,48 @@ pub enum PowerSource {
     Battery,
 }
 
+/// The phase of the charge of the battery, from the charger.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Charge {
+    /// The charger does not charge the battery.
+    NotCharging,
+    /// The charger charges a battery that is below its low voltage, with a
+    /// small current.
+    PreCharging,
+    /// The charger charges the battery with a constant current, then with a
+    /// constant voltage.
+    FastCharging,
+    /// The charge is complete.
+    Done,
+}
+
+impl Charge {
+    /// Returns `true` if the charger charges the battery now: pre-charge or
+    /// fast charge.
+    #[must_use]
+    pub const fn is_charging(self) -> bool {
+        matches!(self, Self::PreCharging | Self::FastCharging)
+    }
+}
+
+/// One reading of the power diagnostics, from the charger and the fuel
+/// gauge.
+///
+/// The shell rounds each value, so a small change of a value gives the same
+/// reading. Each value is `None` if the shell did not read it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Reading {
+    /// The phase of the charge.
+    pub charge: Option<Charge>,
+    /// The voltage of the battery, in mV.
+    pub voltage_mv: Option<u16>,
+    /// The average current of the battery, in mA. A positive current
+    /// charges the battery, and a negative current discharges it.
+    pub current_ma: Option<i16>,
+    /// The temperature of the fuel gauge, in tenths of a degree Celsius.
+    pub tenth_celsius: Option<i16>,
+}
+
 /// A thing that wakes the device from sleep.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WakeSource {

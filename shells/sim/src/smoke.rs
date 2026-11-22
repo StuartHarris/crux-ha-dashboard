@@ -19,7 +19,7 @@ use crate::{
     inspector::Direction,
     panel::Panel,
     settings::Options,
-    shell::{Notifier, Shell, Signal},
+    shell::{Notifier, Shell, Signal, reading},
     stream,
 };
 
@@ -47,6 +47,7 @@ pub fn run(options: Options, out: &Path) -> Result<(), String> {
     };
     shell.start(settings, options.power, options.path);
     shell.send(Event::BatteryChanged(Some(options.level)));
+    shell.send(Event::PowerRead(reading(options.power)));
 
     let started = Instant::now();
     // The time of the last bytes from the broker, or of the SUBACK packet if

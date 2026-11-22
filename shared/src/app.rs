@@ -11,7 +11,7 @@ use crate::{
     capabilities::{
         light::FrontLight,
         log::{Log, LogClock, Uptime},
-        power::{PowerSource, Sleep},
+        power::{PowerSource, Reading, Sleep},
         radio::{Address, Join, Leave, Off, Restart, Scan, StopScan},
         stream::{Close, Open, Write},
     },
@@ -234,6 +234,15 @@ pub enum Event {
     /// more idle period if service calls wait in the outbox. On the stand,
     /// or while the device sleeps, the event does nothing.
     SleepNow,
+    /// The shell read the power diagnostics: the phase of the charge, and
+    /// the voltage, the current and the temperature of the battery. Refer
+    /// to [`Reading`].
+    ///
+    /// The shell sends a reading only when a rounded value changes. The core
+    /// keeps the reading and publishes it to Home Assistant in the state
+    /// message. Refer to [`device`]. The event does not draw and does not
+    /// wake the device. While the device sleeps, the core only keeps it.
+    PowerRead(Reading),
     /// The shell wrote a line of its own log, for example the failure of a
     /// stream. The core keeps the line in its ring, and publishes it to Home
     /// Assistant as it publishes its own lines. Refer to [`logs`].
@@ -280,6 +289,9 @@ pub enum Event {
     /// answers to its `Log` and `LogClock` requests. The shell never sends
     /// them.
     Logs(logs::Event),
+    /// The internal events of the device feature. The core makes them from
+    /// its timers. The shell never sends them.
+    Device(device::Event),
 }
 
 /// A control on the panel.
@@ -483,6 +495,7 @@ impl Model {
             Event::Navigate(route) => rooms::navigate(route, self),
             Event::SetReadOnly(read_only) => rooms::set_read_only(read_only, self),
             Event::SleepNow => power::sleep_now(self),
+            Event::PowerRead(reading) => power::read(reading, self),
             Event::ShellLogged {
                 at,
                 level,
@@ -497,6 +510,7 @@ impl Model {
             Event::Pending(event) => pending::update(event, self),
             Event::Light(event) => light::update(event, self),
             Event::Logs(event) => logs::update(event, self),
+            Event::Device(event) => device::update(event, self),
         }
     }
 }

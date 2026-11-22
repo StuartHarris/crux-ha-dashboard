@@ -50,6 +50,19 @@ pub fn settings() -> Settings {
     }
 }
 
+/// Returns the state message with the battery `battery` (a number or
+/// `null`), the stand `stand` (`ON` or `OFF`) and no power diagnostics.
+pub fn state(battery: &str, stand: &str) -> String {
+    alloc::format!(
+        concat!(
+            r#"{{"battery":{},"stand":"{}","charging":null,"charge":null,"#,
+            r#""voltage":null,"current":null,"temperature":null}}"#
+        ),
+        battery,
+        stand
+    )
+}
+
 /// The facts about the firmware in the tests.
 pub fn firmware() -> Firmware {
     Firmware {

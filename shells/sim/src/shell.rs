@@ -59,7 +59,8 @@ use embedded_graphics::prelude::Point;
 use crux_core::{Request, capability::Operation};
 use crux_time::{TimerId, operation::NotifyAfter};
 use shared::{
-    Core, Dashboard, Effect, Event, Firmware, PowerSource, Settings, Start, ViewModel,
+    Charge, Core, Dashboard, Effect, Event, Firmware, PowerSource, Reading, Settings, Start,
+    ViewModel,
     capabilities::{
         log::{Level, Uptime},
         power::{Sleep, Wake, WakeSource},
@@ -85,6 +86,29 @@ fn firmware() -> Firmware {
     Firmware {
         version: concat!(env!("CARGO_PKG_VERSION"), "+sim").into(),
         mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+    }
+}
+
+/// Returns the fixed power diagnostics of the simulator for the power
+/// source `power`. The simulator has no charger and no fuel gauge, so it
+/// gives plausible values: a fast charge on the stand, and a small
+/// discharge on battery. The shell sends them at the start and after each
+/// change of the power source, so the device of the simulator has the
+/// entities in Home Assistant.
+pub const fn reading(power: PowerSource) -> Reading {
+    match power {
+        PowerSource::Stand => Reading {
+            charge: Some(Charge::FastCharging),
+            voltage_mv: Some(4150),
+            current_ma: Some(450),
+            tenth_celsius: Some(260),
+        },
+        PowerSource::Battery => Reading {
+            charge: Some(Charge::NotCharging),
+            voltage_mv: Some(3870),
+            current_ma: Some(-40),
+            tenth_celsius: Some(245),
+        },
     }
 }
 
@@ -320,6 +344,7 @@ impl Shell {
         if view.battery.is_some() {
             self.send(Event::BatteryChanged(view.battery));
         }
+        self.send(Event::PowerRead(reading(view.power)));
         true
     }
 
@@ -372,6 +397,10 @@ impl Shell {
         if view.battery.is_some() {
             effects.extend(self.core.process_event(Event::BatteryChanged(view.battery)));
         }
+        effects.extend(
+            self.core
+                .process_event(Event::PowerRead(reading(view.power))),
+        );
         effects
     }
 
@@ -491,10 +520,12 @@ impl Shell {
         }
     }
 
-    /// Sends the change of the power source to the core. If a `Sleep`
+    /// Sends the change of the power source to the core, and the fixed
+    /// power diagnostics of the new source ([`reading`]). If a `Sleep`
     /// request waits, then answers it with `Wake::PowerSource`.
     pub fn set_power_source(&mut self, power: PowerSource) {
         self.send(Event::PowerSourceChanged(power));
+        self.send(Event::PowerRead(reading(power)));
         self.answer_sleep(Wake::PowerSource);
     }
 

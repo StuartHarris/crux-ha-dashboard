@@ -437,9 +437,10 @@ The automation `dashboard_log` writes the lines to the Home Assistant log.
 ### Home Assistant device
 
 The dashboard tells Home Assistant about itself with MQTT discovery. Home Assistant
-then shows the dashboard as a device with three entities: the status, the charge of
-the battery, and whether the dashboard is on the stand. Refer to
-`shared/src/features/device/`.
+then shows the dashboard as a device with eight entities: the status, the charge of
+the battery, whether the dashboard is on the stand, and five power diagnostics
+(charging, the charge state, and the voltage, the current and the temperature of the
+battery). Refer to `shared/src/features/device/`.
 
 | Topic | Direction | QoS | Retained |
 | --- | --- | --- | --- |
@@ -451,8 +452,8 @@ the battery, and whether the dashboard is on the stand. Refer to
 #### The discovery message
 
 The discovery message is one device-based discovery config of Home Assistant
-(2024.11 and later), with abbreviated keys. It has about 940 bytes. For example, for
-the device id `hall`:
+(2024.11 and later), with abbreviated keys. It has about 2.9 KB (the limit in the
+tests is 4 KiB). For example, for the device id `hall`:
 
 ```json
 {
@@ -468,7 +469,8 @@ the device id `hall`:
   "cmps": {
     "status": {
       "p": "sensor", "name": "Status", "uniq_id": "dashboard_hall_status",
-      "dev_cla": "enum", "ops": ["online", "asleep", "offline"],
+      "dev_cla": "enum", "ic": "mdi:tablet-dashboard",
+      "ops": ["online", "asleep", "offline"],
       "stat_t": "dashboard/hall/status"
     },
     "battery": {
@@ -484,6 +486,50 @@ the device id `hall`:
       "stat_t": "dashboard/hall/state", "val_tpl": "{{ value_json.stand }}",
       "avty_t": "dashboard/hall/status",
       "avty_tpl": "{{ 'offline' if value == 'offline' else 'online' }}"
+    },
+    "charging": {
+      "p": "binary_sensor", "name": "Charging", "uniq_id": "dashboard_hall_charging",
+      "dev_cla": "battery_charging",
+      "stat_t": "dashboard/hall/state", "val_tpl": "{{ value_json.charging }}",
+      "avty_t": "dashboard/hall/status",
+      "avty_tpl": "{{ 'offline' if value == 'offline' else 'online' }}",
+      "ent_cat": "diagnostic"
+    },
+    "charge": {
+      "p": "sensor", "name": "Charge state", "uniq_id": "dashboard_hall_charge",
+      "dev_cla": "enum", "ic": "mdi:battery-charging-outline",
+      "ops": ["Not charging", "Pre-charging", "Fast charging", "Done"],
+      "stat_t": "dashboard/hall/state",
+      "val_tpl": "{{ {'not_charging': 'Not charging', 'pre_charging': 'Pre-charging', 'fast_charging': 'Fast charging', 'done': 'Done'}[value_json.charge] | default(None) }}",
+      "avty_t": "dashboard/hall/status",
+      "avty_tpl": "{{ 'offline' if value == 'offline' else 'online' }}",
+      "ent_cat": "diagnostic"
+    },
+    "voltage": {
+      "p": "sensor", "name": "Battery voltage", "uniq_id": "dashboard_hall_voltage",
+      "dev_cla": "voltage", "ic": "mdi:flash-triangle-outline",
+      "unit_of_meas": "mV", "stat_cla": "measurement",
+      "stat_t": "dashboard/hall/state", "val_tpl": "{{ value_json.voltage }}",
+      "avty_t": "dashboard/hall/status",
+      "avty_tpl": "{{ 'offline' if value == 'offline' else 'online' }}",
+      "ent_cat": "diagnostic"
+    },
+    "current": {
+      "p": "sensor", "name": "Battery current", "uniq_id": "dashboard_hall_current",
+      "dev_cla": "current", "ic": "mdi:current-dc",
+      "unit_of_meas": "mA", "stat_cla": "measurement",
+      "stat_t": "dashboard/hall/state", "val_tpl": "{{ value_json.current }}",
+      "avty_t": "dashboard/hall/status",
+      "avty_tpl": "{{ 'offline' if value == 'offline' else 'online' }}",
+      "ent_cat": "diagnostic"
+    },
+    "temperature": {
+      "p": "sensor", "name": "Gauge temperature", "uniq_id": "dashboard_hall_temperature",
+      "dev_cla": "temperature", "unit_of_meas": "°C", "stat_cla": "measurement",
+      "stat_t": "dashboard/hall/state", "val_tpl": "{{ value_json.temperature }}",
+      "avty_t": "dashboard/hall/status",
+      "avty_tpl": "{{ 'offline' if value == 'offline' else 'online' }}",
+      "ent_cat": "diagnostic"
     }
   }
 }
@@ -499,6 +545,19 @@ The message on the broker has no spaces or new lines.
   `02:00:00:00:00:01`.
 - The config has no shared options at its root. Each component has its own state topic
   and availability, because a shared availability would apply to the status sensor too.
+- The status, charge, voltage and current components set an icon with `ic`. The
+  battery, stand, charging and temperature components keep the default icon of their
+  device class.
+- The state message keeps the snake_case values of `charge` (`not_charging`,
+  `pre_charging`, `fast_charging`, `done`). The `charge` component has the options
+  `Not charging`, `Pre-charging`, `Fast charging` and `Done`. Its value template maps
+  each wire value to its label. If `charge` is null or unknown, the template gives
+  `None`, and Home Assistant shows the state as unknown.
+- The five power diagnostics have the entity category `diagnostic`, so Home Assistant
+  shows them in the "Diagnostic" part of the device page.
+- The voltage is in mV, not in V. The dashboard then sends a whole number, so the
+  payload is exact. Home Assistant converts the units of a voltage sensor, so you can
+  set the display unit to V in the settings of the entity.
 
 The dashboard publishes the discovery message at these times:
 
@@ -520,32 +579,52 @@ publishes the discovery message (if it did not send it yet) and the state.
 
 #### The state message
 
-The state message has the values of the battery and the stand sensors as one JSON
+The state message has the values of all the sensors except the status as one JSON
 object:
 
 ```json
-{"battery":95,"stand":"OFF"}
+{"battery":95,"stand":"OFF","charging":"OFF","charge":"not_charging","voltage":3870,"current":-40,"temperature":24.5}
 ```
 
 | Key | Value |
 | --- | --- |
-| `battery` | The charge of the battery in percent, from 0 to 100. `null` if the shell did not read it. Home Assistant then shows the sensor as unknown. |
+| `battery` | The charge of the battery in percent, from 0 to 100. |
 | `stand` | `ON` if the dashboard is on the stand, `OFF` if it is on battery. These are the default payloads of a binary sensor. |
+| `charging` | `ON` during a pre-charge or a fast charge, else `OFF`. |
+| `charge` | The phase of the charge from the charger: `not_charging`, `pre_charging`, `fast_charging` or `done`. |
+| `voltage` | The voltage of the battery in mV, rounded to 10 mV. |
+| `current` | The average current of the battery in mA, rounded to 10 mA. A positive current charges the battery, and a negative current discharges it. A check on the board is still to do. |
+| `temperature` | The temperature of the fuel gauge in °C, rounded to 0.5 °C. |
 
-The message has about 30 bytes. The dashboard publishes it at these times:
+A value is `null` if the shell did not read it. Home Assistant then shows the entity as
+unknown. The shell keeps the last good value of each diagnostic after a read that fails,
+so a value is `null` only until its first good read. The simulator gives fixed values
+for each power source.
+
+The message has about 120 bytes. The dashboard publishes it at these times:
 
 - Once on each connection.
-- After each change of a value, while the connection is up. A change of 1% of the
-  battery is a change, also if the panel shows the same rounded level.
+- At once after an urgent change, while the connection is up. An urgent change is a
+  move on or off the stand, a start or an end of a charge (`charging`), the first level
+  of the battery, or a level of the battery that moves by more than 1%.
+- At most once in 60 seconds for each other change: the voltage, the current, the
+  temperature, the charge state while `charging` stays the same, and a level of the
+  battery that moves by 1%. The gauge can flap between two levels, so a move of 1% is
+  not urgent. The first of these changes goes at once and starts a timer of 60 seconds.
+  The changes in that time wait. At the end of the time, the dashboard publishes the
+  values of that time, if they changed, and starts a new timer. An urgent change in that
+  time goes at once with the values that wait.
 - At most one state message waits for a PUBACK. If a value changes while one waits,
   the dashboard publishes the new values after the PUBACK.
+- The timer ends with the connection. Each sleep closes the connection first, so the
+  timer never waits during a sleep. The next connection publishes the state at once.
 
 #### Availability
 
 | Entity | Available |
 | --- | --- |
 | Status | Always. It shows `online`, `asleep` or `offline` from the status topic. |
-| Battery, On stand | Unless the status is `offline`. While the dashboard is asleep, they keep their last value. |
+| Battery, On stand, and the power diagnostics | Unless the status is `offline`. While the dashboard is asleep, they keep their last value. |
 
 #### When the dashboard publishes
 
