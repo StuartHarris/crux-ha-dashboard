@@ -328,6 +328,17 @@ pub trait ExpectWrite {
         self.expect_publish_with(wire, model, |_| {})
     }
 
+    /// Expects a `Write` with the retained state message `json` of the test
+    /// settings. Refer to [`crate::features::device`].
+    #[track_caller]
+    fn expect_state(&mut self, wire: &mut Wire, model: &mut Model, json: &str) -> &mut Self {
+        self.expect_publish_with(wire, model, |publish| {
+            assert_eq!(publish.topic, "dashboard/hall/state");
+            assert_eq!(String::from_utf8_lossy(&publish.payload), json);
+            assert!(publish.retain);
+        })
+    }
+
     /// Expects the `Write` of a sleep: the retained `asleep` status and then
     /// a DISCONNECT packet. After the write, the core closes the stream, and
     /// the wire keeps [`power::Event::Offline`] for the test.

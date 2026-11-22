@@ -59,7 +59,7 @@ use embedded_graphics::prelude::Point;
 use crux_core::{Request, capability::Operation};
 use crux_time::{TimerId, operation::NotifyAfter};
 use shared::{
-    Core, Dashboard, Effect, Event, PowerSource, Settings, Start, ViewModel,
+    Core, Dashboard, Effect, Event, Firmware, PowerSource, Settings, Start, ViewModel,
     capabilities::{
         log::{Level, Uptime},
         power::{Sleep, Wake, WakeSource},
@@ -78,6 +78,15 @@ use crate::{
 /// The reason in the answer to a `Write` request for a stream that is not
 /// open.
 const NOT_OPEN: &str = "the stream is not open";
+
+/// The facts about the firmware that the simulator gives in `Start`. The
+/// MAC address is a fixed, locally administered address.
+fn firmware() -> Firmware {
+    Firmware {
+        version: concat!(env!("CARGO_PKG_VERSION"), "+sim").into(),
+        mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+    }
+}
 
 /// An answer from a task on the runtime.
 #[derive(Debug)]
@@ -257,6 +266,7 @@ impl Shell {
         self.settings = Some(settings.clone());
         self.send(Event::Start(Start {
             settings,
+            firmware: firmware(),
             power,
             path,
             last_sync: None,
@@ -302,6 +312,7 @@ impl Shell {
         self.stop_all();
         self.send(Event::Start(Start {
             settings,
+            firmware: firmware(),
             power: view.power,
             path: Some(view.path),
             last_sync: view.last_sync,
@@ -353,6 +364,7 @@ impl Shell {
         self.radio.blocked = blocked;
         let mut effects = self.core.process_event(Event::Start(Start {
             settings,
+            firmware: firmware(),
             power: view.power,
             path: None,
             last_sync: None,
@@ -1399,10 +1411,28 @@ mod tests {
         }
 
         /// Waits until the core gets the SUBACK packet of the next
-        /// connection, after the broker sent the retained messages.
+        /// connection, after the broker sent the retained messages. Then
+        /// waits for the state message, which the core publishes in a
+        /// later write on each connection. A dry run publishes no state
+        /// message, so then the fixture does not wait for it.
         fn connect(&mut self) {
             let subacks = self.shell().suback_count();
+            let states = self.state_publishes();
             self.until("SUBACK", |fixture| fixture.shell().suback_count() > subacks);
+            if !self.shell().view().read_only {
+                self.until("the state message", |fixture| {
+                    fixture.state_publishes() > states
+                });
+            }
+        }
+
+        /// Returns the number of state messages in the log.
+        fn state_publishes(&self) -> usize {
+            self.net()
+                .log
+                .iter()
+                .filter(|line| line.starts_with("publish dashboard/test/state "))
+                .count()
         }
 
         /// Waits until the core reaches the `Sleep` effect.
@@ -1559,7 +1589,10 @@ mod tests {
                 "open 1",
                 "connect 1",
                 "publish dashboard/test/status 1",
-                "subscribe 1"
+                "subscribe 1",
+                // The device publishes go in the next write.
+                "publish homeassistant/device/dashboard_test/config 1",
+                "publish dashboard/test/state 1",
             ]
         );
         assert!(fixture.shell().current_connection().is_some());
@@ -1600,6 +1633,8 @@ mod tests {
                 // The steps of the sleep write `Debug` lines, so no line
                 // goes to Home Assistant.
                 "subscribe 2",
+                // A wake is not a start, so only the state goes.
+                "publish dashboard/test/state 2",
             ]
         );
         assert_eq!(fixture.net().closed, [1]);
@@ -1848,7 +1883,15 @@ mod tests {
         fixture.settle();
         assert_eq!(fixture.take_log(), Vec::<String>::new());
 
+        // The end of the dry run publishes the discovery and the state.
         fixture.shell().send(Event::SetReadOnly(false));
+        assert_eq!(
+            fixture.wait_log(2),
+            [
+                "publish homeassistant/device/dashboard_test/config 1",
+                "publish dashboard/test/state 1",
+            ]
+        );
         fixture.shell().tap(tile);
         assert_eq!(fixture.wait_log(1), ["publish dashboard/test/cmd 1"]);
     }

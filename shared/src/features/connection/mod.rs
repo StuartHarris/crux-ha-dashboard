@@ -56,7 +56,7 @@ use crate::{
     },
     entities,
     features::{
-        logs,
+        device, logs,
         pending::{self, Tap},
         power,
         refresh::{redraw, redraw_soon},
@@ -360,6 +360,29 @@ pub struct Live {
     /// so its packet ids never go to the next session. Refer to
     /// [`logs::Flight`].
     pub log: logs::Flight,
+    /// The publish of the state message on this session. Each session
+    /// publishes the state once, and then each change. Refer to
+    /// [`device::StateSync`].
+    pub state: device::StateSync,
+    /// The write of the CONNACK: the outbox, `online` and the SUBSCRIBE
+    /// packets. Refer to [`ConnackWrite`].
+    connack_write: ConnackWrite,
+}
+
+/// The write of the CONNACK on a session.
+///
+/// If the CONNACK arrives before the `Sent` of the CONNECT write, the bytes
+/// of the CONNACK write wait in the session. While they wait, the device
+/// publish queue does not drain, so no device publish joins that write.
+/// Refer to [`device::drain`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ConnackWrite {
+    /// The CONNACK write is not in the session: the CONNACK did not come,
+    /// or the write went to the shell.
+    #[default]
+    NotWaiting,
+    /// The bytes of the CONNACK write wait for the next `Send`.
+    Waits,
 }
 
 impl Live {
@@ -370,7 +393,16 @@ impl Live {
             skip_logged: false,
             timers: Default::default(),
             log: logs::Flight::Idle,
+            state: device::StateSync::Unsent,
+            connack_write: ConnackWrite::NotWaiting,
         }
+    }
+
+    /// Returns `true` while the bytes of the CONNACK write wait for the next
+    /// `Send`. Refer to [`ConnackWrite`].
+    #[must_use]
+    pub fn connack_write_waits(&self) -> bool {
+        self.connack_write == ConnackWrite::Waits
     }
 
     /// Keeps the handle of the timer of `kind` that the session started.
@@ -916,11 +948,18 @@ fn handle(id: u32, input: Input, model: &mut Model) -> Cmd {
 ///   connection. The new stream opens after the answer to the `Close`
 ///   request.
 ///
-/// - `Acked` goes to the logs feature ([`logs::acked`]).
+/// - `Acked` goes to the publisher that owns the packet id
+///   ([`device::acked`]).
 ///
 /// While the connection is up, the outbox drains after the actions, and
-/// then the lines of the log go ([`logs::drain`]). The command has the
-/// timers first, then the `Write`, then the other effects.
+/// then the device publish queue drains ([`device::drain`]): the discovery
+/// message, the state message and the lines of the log. The command has
+/// the timers first, then the `Write`, then the other effects.
+///
+/// The write of the CONNACK has only the outbox, `online` and the
+/// SUBSCRIBE packets. If the CONNACK arrives before the `Sent` of the
+/// CONNECT write, that write waits, and the queue does not drain until the
+/// next `Send`. Refer to [`ConnackWrite`].
 pub fn pump(model: &mut Model) -> Cmd {
     let mut timers = Vec::new();
     let mut writes = Vec::new();
@@ -935,6 +974,9 @@ pub fn pump(model: &mut Model) -> Cmd {
             let id = model.connection.id;
             match action {
                 Action::Send(bytes) => {
+                    if let Some(live) = model.connection.phase.live_mut() {
+                        live.connack_write = ConnackWrite::NotWaiting;
+                    }
                     writes.push(Stream::write(id, bytes).then_send(move |outcome| {
                         Event::Written {
                             connection: id,
@@ -957,7 +999,7 @@ pub fn pump(model: &mut Model) -> Cmd {
                 }
                 // The core closes the stream when the session ends.
                 Action::Close => {}
-                Action::Acked(packet) => logs::acked(packet, model),
+                Action::Acked(packet) => device::acked(packet, model),
                 Action::Connected => rest.push(connected(model)),
                 Action::Message(message) => rest.push(on_message(&message, model)),
                 Action::Skipped { length } => {
@@ -989,8 +1031,8 @@ pub fn pump(model: &mut Model) -> Cmd {
         if before > 0 {
             rest.push(drain_outbox(model));
         }
-        let (log, published) = logs::drain(model);
-        rest.push(log);
+        let (waits, published) = device::drain(model);
+        rest.push(waits);
         if model.connection.outbox.len() == before && !published {
             break;
         }
@@ -1014,6 +1056,10 @@ fn start_timer(id: u32, timer: Timer, after: Duration) -> (Cmd, TimerHandle) {
 /// The broker accepted the connection: publish the outbox and `online`,
 /// subscribe to all the topics, and draw.
 ///
+/// The topics are the topics of the entities, and then the birth message
+/// of Home Assistant ([`device::BIRTH_TOPIC`]). The device publishes go in
+/// later writes. Refer to [`device::drain`].
+///
 /// The service calls of the outbox go first, so a tap that waits for the
 /// connection does not wait behind the subscribe. The subscribe after the
 /// status is safe: the state messages are retained, so the broker sends the
@@ -1036,7 +1082,8 @@ fn connected(model: &mut Model) -> Cmd {
     model.connection.backoff = RECONNECT_MIN;
     model.unsent = 0;
     let marks = drain_outbox(model);
-    let topics = entities::topics(model.pages);
+    let mut topics = entities::topics(model.pages);
+    topics.push(device::BIRTH_TOPIC.into());
     let state = &mut model.connection;
     match mem::take(&mut state.phase) {
         Phase::Starting(mut live) => {
@@ -1044,6 +1091,8 @@ fn connected(model: &mut Model) -> Cmd {
             // status.
             let _ = live.session.publish(status);
             let subscribe = live.session.subscribe(&topics);
+            // The next `Send` of the session takes the bytes.
+            live.connack_write = ConnackWrite::Waits;
             state.phase = Phase::Up { live, subscribe };
         }
         phase => state.phase = phase,
@@ -1051,9 +1100,14 @@ fn connected(model: &mut Model) -> Cmd {
     marks.and(redraw(model, false))
 }
 
-/// Handles a message from the broker on a subscribed topic.
+/// Handles a message from the broker on a subscribed topic. A birth
+/// message of Home Assistant goes to the device feature
+/// ([`device::route`]), and each other message to the entities.
 fn on_message(message: &Message, model: &mut Model) -> Cmd {
     if model.connection.link() != Link::Up {
+        return Cmd::done();
+    }
+    if device::route(message, model) {
         return Cmd::done();
     }
     let Some(topic_entity) = entities::entity_of(&message.topic) else {
@@ -1114,7 +1168,9 @@ fn subscribed(id: SubscribeId, outcome: SubscribeOutcome, model: &mut Model) -> 
 /// [`connect`]. A sleep that waits for the close of the session waits for
 /// the answer too. During a sleep, the core does not draw.
 ///
-/// The Wi-Fi feature records the end. Refer to [`wifi::session_ended`].
+/// The Wi-Fi feature records the end. Refer to [`wifi::session_ended`]. A
+/// discovery message in flight becomes due again. Refer to
+/// [`device::session_ended`].
 fn ended(end: &End, model: &mut Model) -> Cmd {
     let health = wifi::session_ended(end, model);
     let wants_online = model.wants_online();
@@ -1134,6 +1190,8 @@ fn ended(end: &End, model: &mut Model) -> Cmd {
         }
     };
     live.clear_timers();
+    device::session_ended(model);
+    let state = &mut model.connection;
     let clean = *end == End::Clean;
     let id = state.id;
     let (close, timer) = close_stream(id, clean, end.to_string());

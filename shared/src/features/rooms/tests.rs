@@ -565,7 +565,7 @@ fn a_tap_before_the_connection_opens_waits_in_the_outbox_and_goes_first() {
 /// Drives the core to an open connection on the stand, in a dry run.
 fn connected_in_a_dry_run() -> Model {
     let (mut model, _wire) = drive_to_connected(PowerSource::Stand);
-    if let crate::Startup::Started(settings) = &mut model.startup {
+    if let crate::Startup::Started { settings, .. } = &mut model.startup {
         settings.read_only = true;
     }
     model

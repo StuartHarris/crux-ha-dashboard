@@ -13,7 +13,10 @@
 use core::time::Duration;
 
 use crux_time::operation::NotifyAfter;
-use dashboard_firmware::{board::uptime, logger};
+use dashboard_firmware::{
+    board::{self, uptime},
+    logger,
+};
 use embassy_futures::select::{Either, select};
 use embassy_time::Instant;
 use logic::{
@@ -55,7 +58,7 @@ pub async fn run(source: PowerSource, display: bool) -> ! {
     // does not start the core again.
     // TODO: if the firmware uses deep sleep in the future, give the path and
     // the time of the last update that it kept in RTC memory.
-    let start = shell::start(&CONFIG, source, None, None);
+    let start = shell::start(&CONFIG, board::firmware(), source, None, None);
     let mut stats = Stats::default();
     let started = Instant::now();
     let jobs = shell.send(Event::Start(start));

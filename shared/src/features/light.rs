@@ -284,29 +284,35 @@ mod tests {
     #[test]
     fn a_change_of_the_power_source_while_the_light_is_on_sets_the_new_level() {
         let app = Dashboard;
-        let (mut model, _wire) = drive_to_connected(PowerSource::Stand);
+        let (mut model, mut wire) = drive_to_connected(PowerSource::Stand);
         let _ = app.update(Event::Tapped(None), &mut model);
 
         app.update(Event::PowerSourceChanged(PowerSource::Battery), &mut model)
             .expect_light(BATTERY_LEVEL)
             .expect_render()
-            .expect_only_time_notify_after();
+            .expect_time_notify_after()
+            .expect_state(&mut wire, &mut model, r#"{"battery":null,"stand":"OFF"}"#)
+            .expect_only_session_clear(&wire);
         assert_eq!(model.light.level(), BATTERY_LEVEL);
 
         app.update(Event::PowerSourceChanged(PowerSource::Stand), &mut model)
             .expect_light(STAND_LEVEL)
-            .expect_only_render();
+            .expect_render()
+            .expect_state(&mut wire, &mut model, r#"{"battery":null,"stand":"ON"}"#)
+            .expect_only_session_clear(&wire);
         assert_eq!(model.light.level(), STAND_LEVEL);
     }
 
     #[test]
     fn a_change_of_the_power_source_while_the_light_is_off_does_not_set_it() {
         let app = Dashboard;
-        let (mut model, _wire) = drive_to_connected(PowerSource::Stand);
+        let (mut model, mut wire) = drive_to_connected(PowerSource::Stand);
 
         app.update(Event::PowerSourceChanged(PowerSource::Battery), &mut model)
             .expect_render()
-            .expect_only_time_notify_after();
+            .expect_time_notify_after()
+            .expect_state(&mut wire, &mut model, r#"{"battery":null,"stand":"OFF"}"#)
+            .expect_only_session_clear(&wire);
         assert_eq!(model.light.level(), 0);
     }
 

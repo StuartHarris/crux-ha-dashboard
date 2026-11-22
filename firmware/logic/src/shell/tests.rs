@@ -7,7 +7,7 @@ use core::{
 
 use embedded_graphics::prelude::Point;
 use shared::{
-    Cmd, Connection, Effect, Event, PowerSource,
+    Cmd, Connection, Effect, Event, Firmware, PowerSource,
     capabilities::{
         log::{self, Area, Level, Log, Uptime},
         power::Wake,
@@ -47,6 +47,14 @@ const CONFIG: Config<'static> = Config {
     read_only: true,
     force_battery: false,
 };
+
+/// The facts about the firmware in the tests.
+fn firmware() -> Firmware {
+    Firmware {
+        version: "0.1.0+test".into(),
+        mac: [0x02, 0, 0, 0, 0, 0x01],
+    }
+}
 
 /// The connection id of the first stream of the core after the start.
 const FIRST: u32 = 2;
@@ -215,6 +223,23 @@ impl Device {
         next
     }
 
+    /// Delivers the writes in `jobs` as [`Device::deliver`] does, and then
+    /// each write that follows, until no write waits. Returns the other
+    /// jobs, in order.
+    ///
+    /// After the CONNACK write, the device publishes (the discovery and the
+    /// state messages) go in the next write. A dry run publishes neither.
+    fn deliver_all(&mut self, jobs: &[Job]) -> Vec<Job> {
+        let mut rest = Vec::new();
+        let mut next = self.deliver(jobs);
+        while next.iter().any(is_write) {
+            rest.extend(next.iter().filter(|job| !is_write(job)).cloned());
+            next = self.deliver(&next);
+        }
+        rest.extend(next);
+        rest
+    }
+
     /// Gives `bytes` from the broker to the shell, if there are any.
     /// Returns the jobs.
     fn received(&mut self, connection: u32, bytes: Vec<u8>) -> Vec<Job> {
@@ -242,6 +267,17 @@ impl Device {
             item: StreamItem::closed(reason),
         })
     }
+}
+
+/// Returns `true` if `job` is a `Write` job of a stream.
+const fn is_write(job: &Job) -> bool {
+    matches!(
+        job,
+        Job::Stream {
+            op: StreamOp::Write(_),
+            ..
+        }
+    )
 }
 
 /// Returns the packets from the client in `bytes`.
@@ -383,7 +419,13 @@ fn started(power: PowerSource, read_only: bool) -> (Device, Vec<Job>) {
         read_only,
         ..CONFIG
     };
-    let start = start(&config, power, Some("/room/living_room".into()), None);
+    let start = start(
+        &config,
+        firmware(),
+        power,
+        Some("/room/living_room".into()),
+        None,
+    );
     let mut device = Device {
         shell,
         broker: Broker::default(),
@@ -402,7 +444,7 @@ fn online(read_only: bool) -> Device {
     let (mut device, _) = started(PowerSource::Stand, read_only);
     device.link();
     let jobs = device.connect(FIRST);
-    device.deliver(&jobs);
+    device.deliver_all(&jobs);
     device
 }
 
@@ -546,7 +588,7 @@ fn the_subscribe_answer_makes_the_link_quiet() {
     let (mut device, _) = started(PowerSource::Stand, true);
     device.link();
     let jobs = device.connect(FIRST);
-    assert_eq!(names(&device.deliver(&jobs)), Vec::<String>::new());
+    assert_eq!(names(&device.deliver_all(&jobs)), Vec::<String>::new());
 
     // The reconnect joins the cached access point. The SUBACK makes the
     // link quiet, and the core scans for a better access point.
@@ -814,7 +856,7 @@ fn on_battery_the_sleep_waits_for_the_light_before_it_disconnects() {
     device.handle(Signal::Light { token: 1 });
     device.link();
     let jobs = device.connect(FIRST);
-    device.deliver(&jobs);
+    device.deliver_all(&jobs);
     let jobs = device.handle(Signal::Tap(Point::new(100, 20)));
     assert!(names(&jobs).contains(&"light 25 2".into()));
     device.handle(Signal::Light { token: 2 });
@@ -920,6 +962,9 @@ fn on_battery_the_idle_timer_sleeps_and_a_tap_wakes() {
     assert_eq!(timers.len(), 1, "{:?}", names(&jobs));
     let (id, token, duration) = timers[0];
     assert_eq!(duration, IDLE_TIMEOUT);
+    // Without a dry run, the core publishes the new power source in the
+    // state message. Each write goes now.
+    device.deliver_all(&jobs);
 
     let jobs = device.handle(Signal::Timer { id, token });
     // The first step of the sleep. The core waits for the close.
@@ -1013,7 +1058,7 @@ fn a_timer_that_the_core_clears_cancels_its_task_and_the_count_does_not_grow() {
 
 #[test]
 fn start_has_the_settings_of_the_config() {
-    let start = start(&CONFIG, PowerSource::Stand, None, Some(5));
+    let start = start(&CONFIG, firmware(), PowerSource::Stand, None, Some(5));
     assert_eq!(start.settings.host, "broker");
     assert_eq!(start.settings.port, 1883);
     assert_eq!(start.settings.device_id, "test");
@@ -1021,12 +1066,13 @@ fn start_has_the_settings_of_the_config() {
     assert_eq!(credentials.username, "dashboard");
     assert_eq!(start.last_sync, Some(5));
     assert!(start.settings.read_only);
+    assert_eq!(start.firmware, firmware());
 
     let anonymous = Config {
         mqtt_username: "",
         ..CONFIG
     };
-    let start = super::start(&anonymous, PowerSource::Stand, None, None);
+    let start = super::start(&anonymous, firmware(), PowerSource::Stand, None, None);
     assert_eq!(start.settings.credentials, None);
 }
 
@@ -1150,7 +1196,7 @@ fn idle_timeout_with(read_only: bool) -> (Device, Vec<Job>) {
     let (mut device, _) = started(PowerSource::Battery, read_only);
     device.link();
     let jobs = device.connect(FIRST);
-    device.deliver(&jobs);
+    device.deliver_all(&jobs);
     let jobs = device.handle(sleep_now());
     (device, jobs)
 }

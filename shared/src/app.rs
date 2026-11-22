@@ -17,7 +17,7 @@ use crate::{
     },
     entities::Entities,
     features::{
-        connection, light, logs, pending, power,
+        connection, device, light, logs, pending, power,
         refresh::{self, redraw},
         rooms, wifi,
     },
@@ -65,6 +65,20 @@ impl Settings {
         format!("dashboard/{}/log", self.device_id)
     }
 
+    /// Returns the retained topic on which the dashboard publishes the
+    /// state of its sensors as one JSON object. Refer to [`device`].
+    #[must_use]
+    pub fn state_topic(&self) -> String {
+        format!("dashboard/{}/state", self.device_id)
+    }
+
+    /// Returns the id of the dashboard as a device of Home Assistant, for
+    /// example `dashboard_hall`. Refer to [`device`].
+    #[must_use]
+    pub fn unique_id(&self) -> String {
+        format!("dashboard_{}", self.device_id)
+    }
+
     /// Returns the MQTT client id.
     #[must_use]
     pub fn client_id(&self) -> String {
@@ -72,8 +86,20 @@ impl Settings {
     }
 }
 
+/// The facts about the firmware of the shell, which the shell gives in
+/// [`Start`]. The core tells them to Home Assistant in the discovery
+/// message. Refer to [`device`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Firmware {
+    /// The version of the firmware, for example `0.1.0+1b073946` or
+    /// `0.1.0+1b073946.dirty`.
+    pub version: String,
+    /// The MAC address of the Wi-Fi station interface.
+    pub mac: [u8; 6],
+}
+
 /// The start of the app: before the first `Start`, or after it with the
-/// settings.
+/// settings and the facts about the firmware.
 #[derive(Debug)]
 pub enum Startup {
     /// The core waits for the first `Start`. It has no settings, and it
@@ -88,9 +114,14 @@ pub enum Startup {
         read_only: bool,
     },
     /// The core has the settings from `Start`, with the dry run of the
-    /// user. A later `Start` replaces the settings and uses only the dry
-    /// run of the shell.
-    Started(Settings),
+    /// user, and the facts about the firmware. A later `Start` replaces both
+    /// and uses only the dry run of the shell.
+    Started {
+        /// The broker and device settings.
+        settings: Settings,
+        /// The facts about the firmware.
+        firmware: Firmware,
+    },
 }
 
 impl Default for Startup {
@@ -105,14 +136,23 @@ impl Startup {
     pub const fn settings(&self) -> Option<&Settings> {
         match self {
             Self::Waiting { .. } => None,
-            Self::Started(settings) => Some(settings),
+            Self::Started { settings, .. } => Some(settings),
+        }
+    }
+
+    /// Returns the facts about the firmware, or `None` before `Start`.
+    #[must_use]
+    pub const fn firmware(&self) -> Option<&Firmware> {
+        match self {
+            Self::Waiting { .. } => None,
+            Self::Started { firmware, .. } => Some(firmware),
         }
     }
 
     /// Returns `true` after `Start`.
     #[must_use]
     pub const fn is_started(&self) -> bool {
-        matches!(self, Self::Started(_))
+        matches!(self, Self::Started { .. })
     }
 
     /// Returns `true` if the dashboard does a dry run. Before `Start`, this
@@ -121,7 +161,7 @@ impl Startup {
     pub const fn read_only(&self) -> bool {
         match self {
             Self::Waiting { read_only } => *read_only,
-            Self::Started(settings) => settings.read_only,
+            Self::Started { settings, .. } => settings.read_only,
         }
     }
 }
@@ -131,6 +171,8 @@ impl Startup {
 pub struct Start {
     /// The broker and device settings.
     pub settings: Settings,
+    /// The facts about the firmware.
+    pub firmware: Firmware,
     /// The power source now.
     pub power: PowerSource,
     /// The path of the page to show, from [`ViewModel::path`]. After a deep
@@ -371,6 +413,9 @@ pub struct Model {
     /// The lines of the log of the core, with their times. Refer to
     /// [`logs`].
     pub logs: logs::State,
+    /// The discovery of the dashboard as a device of Home Assistant. Refer
+    /// to [`device`].
+    pub device: device::State,
 }
 
 impl Default for Model {
@@ -390,6 +435,7 @@ impl Default for Model {
             refresh: refresh::State::default(),
             pending: pending::State::default(),
             logs: logs::State::default(),
+            device: device::State::default(),
         }
     }
 }
@@ -480,6 +526,7 @@ impl App for Dashboard {
 fn on_start(start: Start, model: &mut Model) -> Cmd {
     let Start {
         settings,
+        firmware,
         power: source,
         path,
         last_sync,
@@ -487,12 +534,15 @@ fn on_start(start: Start, model: &mut Model) -> Cmd {
     // A second `Start` uses only the dry run of the shell.
     let requested = match model.startup {
         Startup::Waiting { read_only } => read_only,
-        Startup::Started(_) => false,
+        Startup::Started { .. } => false,
     };
-    model.startup = Startup::Started(Settings {
-        read_only: settings.read_only || requested,
-        ..settings
-    });
+    model.startup = Startup::Started {
+        settings: Settings {
+            read_only: settings.read_only || requested,
+            ..settings
+        },
+        firmware,
+    };
     let kept = last_sync
         .and_then(|seconds| i64::try_from(seconds).ok())
         .and_then(|seconds| DateTime::from_timestamp(seconds, 0));
@@ -505,6 +555,7 @@ fn on_start(start: Start, model: &mut Model) -> Cmd {
         .unwrap_or_default();
     let summary = power::reset(source, model);
     connection::reset(model);
+    device::start(model);
 
     // The state of the light after a reset is not known, so the core turns
     // it off.

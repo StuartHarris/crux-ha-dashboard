@@ -2,6 +2,7 @@
 //! its part of the model.
 
 pub mod connection;
+pub mod device;
 pub mod light;
 pub mod logs;
 pub mod pending;
