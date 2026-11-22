@@ -509,11 +509,13 @@ fn the_write_after_the_connack_keeps_its_packets_and_their_ids() {
         assert_eq!(*id, expected_id);
         filters.extend(more.iter().cloned());
     }
-    // The filters of the entities, and then the birth message of Home
-    // Assistant. The write has nothing else.
+    // The filters of the entities, then the birth message of Home
+    // Assistant, and then the `set` topics of the device. The write has
+    // nothing else.
     let mut expected: Vec<(String, u8)> =
         topics(PAGES).into_iter().map(|topic| (topic, 0)).collect();
     expected.push((BIRTH_TOPIC.into(), 0));
+    expected.push(("dashboard/hall/set/+".into(), 0));
     assert_eq!(filters, expected);
 }
 

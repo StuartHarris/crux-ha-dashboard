@@ -248,7 +248,7 @@ The log lines that an operator can search for:
 | `wifi: address <address>` | DHCP gave an address. The core gets it in the lease and publishes it as the `ip` sensor. |
 | `wifi: the network stack is up with no IPv4 address` | Not expected: the address request answers `NoLease`. |
 | `wifi: the scan found N access points in N ms. Current ..., signal S dBm` | A roam scan ended. |
-| `wifi: restart the chip: <reason>` | The core asked for a restart. |
+| `<area>: restart the chip: <reason>` | The core asked for a restart. The area is `wifi` for a restart after 3 joins with no address, and `device` for a restart that Home Assistant asked for (`device: restart the chip: Home Assistant asked`). |
 | `wifi: the link is suspect, because the MQTT session failed: <end>` | The core thinks the link is bad, so the next rejoin leaves first. |
 | `wifi: the link is suspect, so leave <access point> and join again` | The core leaves before the join, because the link is suspect. |
 | `wifi: N of 3 joins got no new address while the link is suspect` | The count toward a restart of the chip. |

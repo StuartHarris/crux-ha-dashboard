@@ -64,7 +64,7 @@ use shared::{
     capabilities::{
         log::{Level, Uptime},
         power::{Sleep, Wake, WakeSource},
-        radio::AccessPoint,
+        radio::{AccessPoint, Restart},
         stream::{Close, Open, StreamItem, Write, Written},
     },
     fake::FakeRadio,
@@ -912,8 +912,9 @@ impl Shell {
                 ("RadioOff", String::new(), "resolved".into(), effects)
             }
             Effect::RadioRestart(request) => {
-                let reason = request.operation.reason;
-                eprintln!("radio: the core asks for a restart: {reason}");
+                let Restart { area, reason } = request.operation;
+                eprintln!("warning: {area}: restart the chip: {reason}");
+                let reason = format!("{area}: {reason}");
                 self.restarting = true;
                 (
                     "RadioRestart",

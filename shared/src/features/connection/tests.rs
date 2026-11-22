@@ -16,11 +16,13 @@ use crate::tests::{
 use crate::{
     Cmd, Connection, Dashboard, Effect, EffectTestExt, Event, Model, PowerSource, Route, TileState,
     capabilities::{
-        radio::{Joined, Target},
+        log::Area,
+        radio::{Joined, Restart, Target},
         stream::{StreamItem, Written},
     },
     features::{
         connection::{self, CLOSE_TIMEOUT, Call, Link, RECONNECT_MAX, RECONNECT_MIN},
+        device::{self, Button},
         light, power,
         refresh::DRAW_DELAY,
         wifi::{JOIN_TIMEOUT, Phase},
@@ -1100,6 +1102,72 @@ fn a_sleep_during_the_close_for_a_roam_goes_on_at_the_answer_to_the_close() {
         "{:?}",
         wire.effects
     );
+}
+
+/// Returns the `Restart` notifications in `effects`.
+fn restarts<'a>(effects: impl Iterator<Item = &'a Effect>) -> Vec<Restart> {
+    effects
+        .filter_map(|effect| match effect {
+            Effect::RadioRestart(request) => Some(request.operation.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The restart that Home Assistant asks for.
+fn home_assistant_restart() -> Restart {
+    Restart {
+        area: Area::Device,
+        reason: connection::RESTART_REASON.into(),
+    }
+}
+
+/// A restart during the close for a change of access point replaces the
+/// reconnect. The chip restarts at the answer to the `Close` request, and
+/// the core does not connect again.
+#[test]
+fn a_restart_during_a_roam_close_restarts_and_does_not_connect() {
+    let (mut model, mut wire) = drive_to_connected(PowerSource::Stand);
+    let roam = connection::close_for_roam(&mut model);
+    let restart = Dashboard.update(
+        Event::Device(device::Event::Pressed(Button::Restart)),
+        &mut model,
+    );
+    assert!(model.connection.restart_waits());
+
+    wire.settle(roam, &mut model);
+    wire.settle(restart, &mut model);
+    assert_eq!(restarts(wire.effects.iter()), [home_assistant_restart()]);
+    assert!(
+        !wire
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::StreamOpen(_))
+                || (is_radio(effect) && !matches!(effect, Effect::RadioRestart(_)))),
+        "{:?}",
+        wire.effects
+    );
+    assert_eq!(model.wifi.phase, Phase::Restarting);
+}
+
+/// A restart while the old stream drains after a failure stops the
+/// reconnect timer. The chip restarts at the answer to the `Close` request.
+#[test]
+fn a_restart_while_the_stream_drains_after_a_failure_restarts_at_the_answer() {
+    let (mut model, mut dropped) = drive_to_a_drain_after_a_failure();
+    let mut restart = Dashboard.update(
+        Event::Device(device::Event::Pressed(Button::Restart)),
+        &mut model,
+    );
+    // The restart waits for the answer. The reconnect timer stops through
+    // its handle, so the command has no effects.
+    restart.expect_no_effects();
+    assert!(model.connection.restart_waits());
+
+    let mut answer = answer_the_close(&mut dropped, &mut model);
+    let effects: Vec<Effect> = answer.effects().collect();
+    assert_eq!(restarts(effects.iter()), [home_assistant_restart()]);
+    assert_eq!(effects.iter().filter(|effect| is_radio(effect)).count(), 1);
 }
 
 /// A state message after the stream opened and before the CONNACK

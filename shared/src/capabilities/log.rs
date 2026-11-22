@@ -71,6 +71,9 @@ pub enum Area {
     /// The power policy and the steps of a sleep. Refer to
     /// [`crate::features::power`].
     Power,
+    /// The dashboard as a device of Home Assistant, for example its
+    /// buttons. Refer to [`crate::features::device`].
+    Device,
 }
 
 impl Area {
@@ -81,6 +84,7 @@ impl Area {
             Self::Wifi => "wifi",
             Self::Mqtt => "mqtt",
             Self::Power => "power",
+            Self::Device => "device",
         }
     }
 }

@@ -123,10 +123,11 @@ parts, in this order:
 
 1. The service calls that wait (the outbox).
 2. The `online` status.
-3. The SUBSCRIBE packets for all the topic filters: the topics of the entities, and
-   then `homeassistant/status` (refer to "Home Assistant device" below).
+3. The SUBSCRIBE packets for all the topic filters: the topics of the entities, then
+   `homeassistant/status`, and then `dashboard/<device_id>/set/+` (refer to "Home
+   Assistant device" below).
 
-The session packs the filters into SUBSCRIBE packets of up to 1024 bytes. The 116
+The session packs the filters into SUBSCRIBE packets of up to 1024 bytes. The 117
 filters need about 7 packets, 7.9 KiB in all. The broker sends the retained state of
 each topic after it accepts the filter.
 
@@ -191,7 +192,30 @@ old stream. A new stream makes the shell abort the old stream, and an abort can 
 the broker lose the DISCONNECT. Thus a tap during the close for a sleep wakes the
 device, but the core connects only after the close.
 If the shell does not answer the `Close` request in 6 seconds (`CLOSE_TIMEOUT`), the
-core acts as if the answer arrived. Thus a shell cannot stop a reconnect or a sleep.
+core acts as if the answer arrived. Thus a shell cannot stop a reconnect, a sleep or a
+restart.
+
+A restart that Home Assistant asks for (the Restart button) closes the stream cleanly
+too. The core does these steps in order:
+
+1. The core publishes `restarting` (retained, QoS 1). If the session refuses the
+   publish, the restart goes on.
+2. The core sends DISCONNECT.
+3. The shell closes the stream.
+4. The core asks the shell to restart the chip.
+
+The broker keeps `restarting`, and it does not publish the last will. If the chip does
+not start again (for example, a panic at boot or a flat battery), Home Assistant shows
+`restarting`, not `online`. The core publishes `restarting` only if the connection is up.
+If the session waits for its CONNACK, or the stream already closes for a sleep or a
+roam, the core publishes nothing. The retained status then stays as it was. With no
+stream, the chip restarts at once.
+
+While the restart waits, it wins over a tap, a wake and a sleep. The core does not
+connect again, and a sleep stops before the radio turns off. The sleep keeps the calls
+in the outbox and the pending marks, because the restart clears them. The core draws
+nothing until the chip restarts, so the reset cannot stop a refresh with the panel half
+drawn. Refer to `close_for_restart` in `shared/src/features/connection/mod.rs`.
 
 ### Change the access point
 
@@ -295,7 +319,11 @@ has no state, so its button shows the pattern for 2 seconds. Refer to
 | --- | --- |
 | `online` | The dashboard publishes it after it connects. |
 | `asleep` | The dashboard publishes it before it sends DISCONNECT to sleep on battery. |
-| `offline` | The broker publishes it as the last will if the connection stops without a DISCONNECT, for example when the link fails or the power fails. A roam does not do this. |
+| `restarting` | The dashboard publishes it before it sends DISCONNECT to restart the chip, when Home Assistant asks (the Restart button). The DISCONNECT is clean, so the broker keeps `restarting`. If the chip does not start again, Home Assistant shows `restarting`, not `online`. |
+| `offline` | The broker publishes it as the last will if the connection stops without a DISCONNECT, for example when the link fails or the power fails. A roam and a restart from Home Assistant do not do this. |
+
+The automation `dashboard_statestream_seed` starts only on `online` (refer to "Seed the
+state stream"). Thus `asleep` and `restarting` do not start it.
 
 ### Log
 
@@ -335,7 +363,7 @@ Each message is one line as JSON:
 | Key | Value |
 | --- | --- |
 | `level` | `info` or `warn` for a line of the core. `warn` or `error` for a line of the shell. Never `debug`. |
-| `source` | For a line of the core, the part of the core that wrote the line: `wifi`, `mqtt` or `power`. For a line of the shell, the source that the shell gives, with at most 32 bytes. The drop message has `log`. A line from before a restart has `boot`. |
+| `source` | For a line of the core, the part of the core that wrote the line: `wifi`, `mqtt`, `power` or `device`. For a line of the shell, the source that the shell gives, with at most 32 bytes. The drop message has `log`. A line from before a restart has `boot`. |
 | `age` | The age of the line in whole seconds when the dashboard publishes it. A line from before a restart has the age 0, because its time is not known. |
 | `msg` | The text of the line, with at most 200 bytes. A longer text ends with `…`. |
 
@@ -461,11 +489,12 @@ The automation `dashboard_log` writes the lines to the Home Assistant log.
 ### Home Assistant device
 
 The dashboard tells Home Assistant about itself with MQTT discovery. Home Assistant
-then shows the dashboard as a device with fifteen entities: the status, the charge of
+then shows the dashboard as a device with eighteen entities: the status, the charge of
 the battery, whether the dashboard is on the stand, five power diagnostics (charging,
 the charge state, and the voltage, the current and the temperature of the battery),
-and seven Wi-Fi and boot diagnostics (the signal, the access point, the IP address,
-the reconnects, the restarts, the last reset and the wake reason). Refer to
+seven Wi-Fi and boot diagnostics (the signal, the access point, the IP address,
+the reconnects, the restarts, the last reset and the wake reason), and three buttons
+(Sleep now, Restart and Full refresh). Refer to
 `shared/src/features/device/`. The core gets a new signal only at a join or a scan,
 so on the stand the Wi-Fi signal entity can show a value that is hours or days old.
 
@@ -475,13 +504,15 @@ so on the stand the Wi-Fi signal entity can show a value that is hours or days o
 | `dashboard/<device_id>/state` | Dashboard to Home Assistant | 1 | Yes |
 | `dashboard/<device_id>/status` | Dashboard to Home Assistant (refer to "Status") | 1 | Yes |
 | `homeassistant/status` | Home Assistant to the dashboard | 0 (subscribe) | No |
+| `dashboard/<device_id>/set/button` | Home Assistant to the dashboard (refer to "Buttons") | 0 | No |
 
 #### The discovery message
 
 The discovery message is one device-based discovery config of Home Assistant
-(2024.11 and later), with abbreviated keys. It has 5,365 bytes for the device id
-`hall` (the limit in the tests is 6 KiB). The discovery and the state message go in
-one write, which has about 5.6 KB of the 16 KiB that a write can have (`MAX_OUTGOING`).
+(2024.11 and later), with abbreviated keys. It has 6,283 bytes for the device id
+`hall` (the limit in the tests is 8 KiB, also for a device id of 16 characters). The
+discovery and the state message go in one write, which has about 6.5 KB of the 16 KiB
+that a write can have (`MAX_OUTGOING`).
 For example, for the device id `hall`:
 
 ```json
@@ -499,7 +530,7 @@ For example, for the device id `hall`:
     "status": {
       "p": "sensor", "name": "Status", "uniq_id": "dashboard_hall_status",
       "dev_cla": "enum", "ic": "mdi:tablet-dashboard",
-      "ops": ["online", "asleep", "offline"],
+      "ops": ["online", "asleep", "offline", "restarting"],
       "stat_t": "dashboard/hall/status"
     },
     "battery": {
@@ -618,6 +649,30 @@ For example, for the device id `hall`:
       "avty_t": "dashboard/hall/status",
       "avty_tpl": "{{ 'offline' if value == 'offline' else 'online' }}",
       "ent_cat": "diagnostic"
+    },
+    "sleep": {
+      "p": "button", "name": "Sleep now", "uniq_id": "dashboard_hall_sleep",
+      "ic": "mdi:sleep",
+      "cmd_t": "dashboard/hall/set/button", "pl_prs": "sleep",
+      "avty": [
+        {"t": "dashboard/hall/status", "val_tpl": "{{ 'online' if value == 'online' else 'offline' }}"},
+        {"t": "dashboard/hall/state", "val_tpl": "{{ 'online' if value_json.stand == 'OFF' else 'offline' }}"}
+      ],
+      "avty_mode": "all"
+    },
+    "restart": {
+      "p": "button", "name": "Restart", "uniq_id": "dashboard_hall_restart",
+      "dev_cla": "restart", "ent_cat": "config",
+      "cmd_t": "dashboard/hall/set/button", "pl_prs": "restart",
+      "avty_t": "dashboard/hall/status",
+      "avty_tpl": "{{ 'online' if value == 'online' else 'offline' }}"
+    },
+    "refresh": {
+      "p": "button", "name": "Full refresh", "uniq_id": "dashboard_hall_refresh",
+      "ic": "mdi:refresh", "ent_cat": "config",
+      "cmd_t": "dashboard/hall/set/button", "pl_prs": "refresh",
+      "avty_t": "dashboard/hall/status",
+      "avty_tpl": "{{ 'online' if value == 'online' else 'offline' }}"
     }
   }
 }
@@ -633,6 +688,10 @@ The message on the broker has no spaces or new lines.
   `02:00:00:00:00:01`.
 - The config has no shared options at its root. Each component has its own state topic
   and availability, because a shared availability would apply to the status sensor too.
+- A button has a command topic (`cmd_t`) and the payload of a press (`pl_prs`), and no
+  state. Restart has the device class `restart`. Restart and Full refresh have the
+  entity category `config`, so Home Assistant shows them in the "Configuration" part of
+  the device page. Sleep now has no category, so it is a control.
 - The battery, stand, charging, temperature and signal components keep the default
   icon of their device class. The other components set an icon with `ic`, because
   they have no device class or the icon of the class does not tell what they are.
@@ -724,8 +783,57 @@ The message has about 240 bytes. The dashboard publishes it at these times:
 
 | Entity | Available |
 | --- | --- |
-| Status | Always. It shows `online`, `asleep` or `offline` from the status topic. |
-| Battery, On stand, the power diagnostics, and the Wi-Fi and boot diagnostics | Unless the status is `offline`. While the dashboard is asleep, they keep their last value. |
+| Status | Always. It shows `online`, `asleep`, `offline` or `restarting` from the status topic. |
+| Battery, On stand, the power diagnostics, and the Wi-Fi and boot diagnostics | Unless the status is `offline`. While the dashboard is asleep or restarts, they keep their last value. |
+| Restart, Full refresh | Only while the status is `online`. |
+| Sleep now | Only while the status is `online` and the dashboard is on battery (`stand` is `OFF`). On the stand, a sleep does nothing. |
+
+Home Assistant compares the result of an availability template with `online` and
+`offline`, and it ignores each other result. So the template of a button must turn
+`asleep` and `restarting` into `offline`:
+`{{ 'online' if value == 'online' else 'offline' }}`. Each status gives these results:
+
+| Status | Sensor template | Button template |
+| --- | --- | --- |
+| `online` | `online` | `online` |
+| `asleep` | `online` | `offline` |
+| `offline` | `offline` | `offline` |
+| `restarting` | `online` | `offline` |
+ Sleep now
+has two availabilities (`avty`) with `avty_mode: all`, so both must give `online`.
+
+#### Buttons
+
+| Topic | Direction | QoS | Retained |
+| --- | --- | --- | --- |
+| `dashboard/<device_id>/set/button` | Home Assistant to the dashboard | 0 | No |
+
+A press publishes one of these payloads:
+
+| Payload | Button | What the dashboard does |
+| --- | --- | --- |
+| `sleep` | Sleep now | On battery, the dashboard sleeps at once, as at the end of the idle time. If pending marks are open, the sleep waits for them. If calls wait in the outbox, it first waits one more idle period. If a sleep already waits for the pending marks, it does nothing more. Each of these writes a `debug` line that tells what the dashboard did. On the stand, it stays awake and writes the `info` line `device: Home Assistant asked to sleep, but the device is on the stand, so it stays awake`. While a restart waits, it does nothing and writes a `debug` line. |
+| `restart` | Restart | The dashboard publishes `restarting`, closes the connection cleanly, and then restarts the chip (refer to "Close the stream"). The firmware writes the warning `device: restart the chip: Home Assistant asked`. That line goes to Home Assistant after the restart, with the source `boot`, and `restarts` goes up by 1. |
+| `refresh` | Full refresh | The dashboard does a full refresh of the panel, which clears ghost images. The panel flashes. While the dashboard sleeps, it does nothing, because the last image before a sleep is a full refresh. While a restart waits, it does nothing and writes a `debug` line. |
+
+- The dashboard subscribes to `dashboard/<device_id>/set/+`. It never publishes on a
+  `set` topic, so the filter brings back none of its own messages. It ignores a message
+  on another `set` topic.
+- The dashboard ignores a retained button message, because a retained `restart` would
+  restart the chip at each connect. It writes the `info` line `device: the button message
+  on dashboard/<device_id>/set/button is retained, so the core ignored it`. To clear
+  such a message, publish an empty retained message on the topic.
+- The dashboard ignores a payload that it does not know, and writes a `warn` line with
+  at most 32 bytes of the payload. The line escapes each control character, quote and
+  backslash of the payload (for example `\n` and `\u{1b}`), so a payload cannot add a
+  line to the log or send a terminal code.
+- A press is not a touch. It does not start the idle time again, and it does not turn
+  the front light on.
+- Each client with credentials on the broker can publish to
+  `dashboard/<device_id>/set/button`, so each one can press a button. The broker has
+  only two users, `dashboard` and `homeassistant` (refer to "Broker").
+- A press arrives only while the connection is up. During the close for a sleep or a
+  change of access point, the dashboard drops each message, also a button message.
 
 #### When the dashboard publishes
 
@@ -736,7 +844,8 @@ publishes. One queue sends them, in this order: the discovery, the state, the lo
   the CONNACK, nothing from the start of a sleep, and nothing during the close for a
   change of access point. The messages wait for the next connection after the wake.
 - At most 56 device publishes wait for a PUBACK at a time, all together. The session
-  takes 64, so 8 places stay free for the status (`asleep`) and the service calls.
+  takes 64, so 8 places stay free for the status (`asleep` or `restarting`) and the
+  service calls.
 - If the queue is at its limit, or the session takes no more bytes now, the queue
   continues after the next confirmed write or PUBACK.
 

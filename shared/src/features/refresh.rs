@@ -66,12 +66,23 @@
 //! refresh. The wake draws with a full refresh, which starts the timer
 //! again. A deep sleep loses the core and its timers, and the next `Start`
 //! draws with a full refresh.
+//!
+//! # No draw before a restart
+//!
+//! While the chip waits to restart, the core draws nothing. A refresh that
+//! starts just before the reset stops with the panel half drawn, and the
+//! panel keeps that image until the full refresh at `Start`. Thus
+//! [`redraw`] does nothing while a restart waits for the close of the
+//! connection
+//! ([`restart_waits`](crate::features::connection::State::restart_waits)),
+//! and after the core asked the shell to restart the chip
+//! ([`wifi::Phase::Restarting`]).
 
 use core::time::Duration;
 
 use crate::{
     Cmd, Model, ViewModel,
-    features::{power, timer::Slot},
+    features::{power, timer::Slot, wifi},
 };
 
 /// The internal events of the refresh policy. The core makes them from its
@@ -163,7 +174,13 @@ impl State {
 /// the pending marks and no mark is open, the full refresh then starts the
 /// sleep. Refer to [`power::sleep_if_settled`]. Thus a caller that cancels
 /// that sleep must do so before the full refresh.
+///
+/// While the chip waits to restart, the core asks for nothing, and the
+/// counts and timers do not change. Refer to the [module docs](self).
 pub fn redraw(model: &mut Model, full: bool) -> Cmd {
+    if chip_restarts(model) {
+        return Cmd::done();
+    }
     let mut next = ViewModel::from(&*model);
     let state = &mut model.refresh;
     if !full && state.last.as_ref() == Some(&next) {
@@ -187,6 +204,12 @@ pub fn redraw(model: &mut Model, full: bool) -> Cmd {
     render()
         .and(restart_timer(model))
         .and(power::sleep_if_settled(model))
+}
+
+/// Returns `true` if a restart waits for the close of the connection, or if
+/// the core asked the shell to restart the chip.
+fn chip_restarts(model: &Model) -> bool {
+    model.connection.restart_waits() || model.wifi.phase == wifi::Phase::Restarting
 }
 
 /// Draws after [`DRAW_DELAY`], for a change from the state stream that the
