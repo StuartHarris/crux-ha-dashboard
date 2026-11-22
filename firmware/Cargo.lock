@@ -1359,6 +1359,7 @@ dependencies = [
  "crux_core",
  "crux_time",
  "embedded-graphics",
+ "log",
  "shared",
  "ui",
 ]

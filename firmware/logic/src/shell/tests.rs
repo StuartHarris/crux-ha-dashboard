@@ -18,7 +18,7 @@ use shared::{
     features::{
         connection::{CLOSE_TIMEOUT, RECONNECT_MIN},
         light::{BATTERY_LEVEL, LIGHT_TIMEOUT, STAND_LEVEL},
-        logs::{self, Line, Message},
+        logs::{self, Line, Message, Source},
         power::IDLE_TIMEOUT,
         refresh::DRAW_DELAY,
         wifi::JOIN_TIMEOUT,
@@ -1572,7 +1572,7 @@ fn a_line_of_the_log_ends_at_its_answer_with_the_time_of_the_device() {
         [Event::Logs(logs::Event::Stamped(Line {
             at: Uptime(42_000),
             level: Level::Info,
-            area: Area::Power,
+            source: Source::Core(Area::Power),
             message: Message::new("sleep 1 closes the connection"),
         }))]
     );

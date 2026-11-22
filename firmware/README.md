@@ -25,6 +25,7 @@ with the std shells of the root workspace would pull std into it.
 | `timers` | The timers of the timer task, in milliseconds since the start. |
 | `touch` | Converts a GT911 point to a panel point, and touch samples to taps with a debounce. A sample is new with a finger, new with no finger (the finger lifted), or not new. Only a new sample with no finger ends a touch. |
 | `sleep` | Decides when the chip can go into light sleep for a `Sleep` job, which wake is a real wake, and when a blocker gets a warning. |
+| `forward` | Decides which lines of the log print and which go to the core (`warn` and `error`, not the target `core`, also if `ESP_LOG` does not print them), splits each line into its source and its message, and keeps at most 16 lines for the core task with a count of the lines that it dropped. Reads `ESP_LOG` with the rules of esp-println. |
 | `config` | Reads and checks `cfg.toml`. Its `Debug` output does not show the passwords. `build.rs` includes this file, so it uses only `core`. |
 
 ## The hardware binary
@@ -37,7 +38,7 @@ cannot block each other. This is the pattern of the `cpb` example in Crux.
 
 | Task | Work | Answers |
 | --- | --- | --- |
-| core (`main`) | Owns the shell. Sends `Start` with the power source `Stand`. | |
+| core (`main`) | Owns the shell. Sends `Start` with the power source `Stand`. Sends each warn and error line that the logger keeps as `Event::ShellLogged`. | |
 | `timers` | Starts and cancels the timers of the core. | `Signal::Timer` |
 | `display` | Draws the newest view model with `ui::draw`, and refreshes the panel as `ui::Refresher` decides. Reads the touch controller every 30 ms between refreshes. Sets the front light. Runs the `Sleep` job. | `Signal::Tap`, `Signal::Event`, `Signal::Woke`, `Signal::Light` |
 | `radio` | Does the radio jobs of the core (`Join`, `Address`, `Leave`, `Scan`, `StopScan` and `Off`) and the `Restart` job. Has no Wi-Fi policy. The core decides which access point to join, when to scan, when to leave and when to restart the chip. | `Signal::Radio` with the token of the job |
@@ -120,10 +121,33 @@ shows the reason, and the radio line shows the action. One `grep -a 'wifi:'` on 
 serial log shows both, in the order that they happened. The core writes nothing for
 the usual steps.
 
-The core lines have the log target `core`. esp-println does not print the target, so
-the serial log does not show it. The target matters only for a filter in `ESP_LOG`: a
-`dashboard=...` directive does not match the core lines. The next PR uses the target to
-keep the core lines out of the shell lines that the firmware sends to the core.
+The core lines have the log target `core`. The logger does not print the target, so
+the serial log does not show it. A filter in `ESP_LOG` uses the target: a
+`dashboard=...` directive does not match the core lines. The logger also uses the
+target: it does not send a core line back to the core.
+
+The logger of the firmware (`src/logger.rs`) prints each line as the logger of
+esp-println does, with the same colours and the same `ESP_LOG` rules. It also keeps
+each `warn` and `error` line of the firmware, also a line of esp-radio, for the core.
+The core task sends each kept line to the core as `Event::ShellLogged`. The core then
+publishes the line to Home Assistant with its own lines (refer to the "Log" section of
+`docs/mqtt.md`).
+
+- The forward does not depend on `ESP_LOG`. A `warn` or `error` line that `ESP_LOG`
+  does not print still goes to the core.
+- For a line of the firmware (the crates `dashboard` and `dashboard_firmware`), the
+  source is the first word of the line, if the line starts with a lowercase word and
+  `": "`, for example `stream` or `power`. Otherwise, and for each line of another
+  crate, the source is the crate of the log target, for example `esp_radio`, and the
+  message is the whole line. Refer to `logic::forward::split`.
+- The logger does not allocate, because a line can come from a thread of esp-rtos or
+  before the heap is ready. It keeps at most 16 lines that the core task did not take.
+  It drops the lines after that. The event of the last kept line tells the core how
+  many it dropped.
+- The logger keeps lines from just after `board::init()`, when `main` calls
+  `logger::forward()`. A line before that only prints. A line from an outage or a
+  sleep goes to Home Assistant after the next connect. The `bringup` binary has no
+  core, so its logger only prints.
 
 After the task prints a core line, it answers with the time since the chip started, in
 milliseconds. That time counts through a light sleep. The core keeps its last 64 lines

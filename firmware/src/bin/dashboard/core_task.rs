@@ -5,20 +5,24 @@
 //! an update. The task measures the time of each update. It logs a warning for
 //! a slow update (`logic::stream::SLOW_UPDATE`). At the `Close` of the
 //! stream that the core opened last, it logs the updates since that `Open`.
+//!
+//! The task also takes each warn and error line that the logger keeps
+//! (`dashboard_firmware::logger`), and sends it to the core as
+//! `Event::ShellLogged`.
 
 use core::time::Duration;
 
 use crux_time::operation::NotifyAfter;
+use dashboard_firmware::{board::uptime, logger};
+use embassy_futures::select::{Either, select};
 use embassy_time::Instant;
 use logic::{
+    forward::{CORE_TARGET, PENDING},
     shell::{self, Job, Shell, StreamOp, TimerOp},
     sleep::Plan,
     stream::UpdateStats,
 };
-use shared::{
-    Event, PowerSource,
-    capabilities::log::{Level, Uptime},
-};
+use shared::{Event, PowerSource, capabilities::log::Level};
 
 use crate::{LIGHT, RADIO, RENDER, SIGNALS, SLEEP, STREAM, TIMERS, config::CONFIG, radio, timers};
 
@@ -32,7 +36,11 @@ struct Stats {
 }
 
 /// Starts the core with the power source `source`, then gives it each
-/// signal from the other tasks.
+/// signal from the other tasks, and each line that the logger keeps.
+///
+/// The lines of the logger do not count in the update statistics. A slow
+/// update logs a warning, which the logger keeps, so a slow line would make
+/// one more line.
 ///
 /// If `display` is `false`, no display task runs. The core task then
 /// answers each `FrontLight` job itself, so the sleep steps continue.
@@ -52,20 +60,30 @@ pub async fn run(source: PowerSource, display: bool) -> ! {
     record(&mut stats.updates, started);
     dispatch(jobs, display, &mut stats);
     loop {
-        let signal = SIGNALS.pop().await;
-        let sleeping = shell.is_sleeping();
-        // The answer to a `Log` job is not real work, so it does not count.
-        let counts = signal.counts();
-        let started = Instant::now();
-        let jobs = shell.handle(signal);
-        if counts {
-            record(&mut stats.updates, started);
+        if let Either::First(signal) = select(SIGNALS.pop(), logger::wait()).await {
+            let sleeping = shell.is_sleeping();
+            // The answer to a `Log` job is not real work, so it does not count.
+            let counts = signal.counts();
+            let started = Instant::now();
+            let jobs = shell.handle(signal);
+            if counts {
+                record(&mut stats.updates, started);
+            }
+            dispatch(jobs, display, &mut stats);
+            // The shell answered the `Sleep` request, so the display task stops
+            // the sleep.
+            if sleeping && !shell.is_sleeping() {
+                SLEEP.signal(None);
+            }
         }
-        dispatch(jobs, display, &mut stats);
-        // The shell answered the `Sleep` request, so the display task stops
-        // the sleep.
-        if sleeping && !shell.is_sleeping() {
-            SLEEP.signal(None);
+        // At most one full queue. A line that the logger keeps after this
+        // wakes the task again. A line of the shell does not wake the core.
+        for _ in 0..PENDING {
+            let Some(event) = logger::take() else {
+                break;
+            };
+            let jobs = shell.handle(shell::Signal::Event(event));
+            dispatch(jobs, display, &mut stats);
         }
     }
 }
@@ -94,7 +112,9 @@ fn record(stats: &mut UpdateStats, started: Instant) {
 /// This task writes each line of the log of the core as `{area}: {message}`,
 /// with no prefix of its own. Thus a `wifi:` line comes between the lines of
 /// the radio task. The line has the log target `core`, which the printed
-/// line does not show. Then the task answers at once with
+/// line does not show. The logger does not keep a line with this target
+/// for the core, because the core keeps it already. Then the task answers
+/// at once with
 /// `Signal::Logged` and the time of the line ([`uptime`]).
 /// A `Clock` job gets the same answer at once as `Signal::Clock`.
 ///
@@ -140,8 +160,10 @@ fn dispatch(jobs: alloc::vec::Vec<Job>, display: bool, stats: &mut Stats) {
             Job::Restart(restart) => RADIO.push(radio::Request::Restart(restart)),
             Job::Log { token, line } => {
                 match line.level {
-                    Level::Info => log::info!(target: "core", "{line}"),
-                    Level::Warn => log::warn!(target: "core", "{line}"),
+                    Level::Info => log::info!(target: CORE_TARGET, "{line}"),
+                    Level::Warn => log::warn!(target: CORE_TARGET, "{line}"),
+                    // The core writes no line at this level.
+                    Level::Error => log::error!(target: CORE_TARGET, "{line}"),
                 }
                 SIGNALS.push(shell::Signal::Logged {
                     token,
@@ -172,17 +194,4 @@ fn dispatch(jobs: alloc::vec::Vec<Job>, display: bool, stats: &mut Stats) {
             } => TIMERS.push(timers::Request::Cancel { token }),
         }
     }
-}
-
-/// Returns the time since the chip started, in milliseconds.
-///
-/// The time comes from the system timer of esp-hal. At a wake from light
-/// sleep, esp-hal moves the system timer forward by the time asleep, so the
-/// time counts through a sleep.
-fn uptime() -> Uptime {
-    Uptime(
-        esp_hal::time::Instant::now()
-            .duration_since_epoch()
-            .as_millis(),
-    )
 }

@@ -694,6 +694,12 @@ impl Shell {
                         eprintln!("warning: {line}");
                         "printed as a warning"
                     }
+                    // The core writes no line at this level. Only a line of
+                    // the shell (`Event::ShellLogged`) has it.
+                    Level::Error => {
+                        eprintln!("error: {line}");
+                        "printed as an error"
+                    }
                 };
                 self.inspector.effect("Log", line.to_string(), outcome);
                 resolve(&self.core, &mut request, self.uptime())

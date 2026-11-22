@@ -1,14 +1,22 @@
-//! The logs feature: the core keeps its own lines of the log, each with the
-//! time from the shell, and publishes them to Home Assistant.
+//! The logs feature: the core keeps its own lines of the log and the warn
+//! and error lines of the shell, each with the time from the shell, and
+//! publishes them to Home Assistant.
 //!
-//! - Each line goes to the shell as a [`Log`](crate::capabilities::log::Log)
-//!   request. The shell writes the line and answers with its monotonic time
-//!   ([`Uptime`]). The core then keeps the line with that time.
+//! - Each line of the core goes to the shell as a
+//!   [`Log`](crate::capabilities::log::Log) request. The shell writes the
+//!   line and answers with its monotonic time ([`Uptime`]). The core then
+//!   keeps the line with that time.
+//! - The shell sends its own lines as
+//!   [`Event::ShellLogged`](crate::Event::ShellLogged), with the time on the
+//!   same clock. The core keeps each line as it comes, with
+//!   [`Source::Shell`]. The event does not render and does not wake the
+//!   device. Refer to [`shell_logged`].
 //! - The core keeps the lines in a ring of [`CAPACITY`] lines. If the ring
 //!   is full, a new line removes the oldest line, and the core counts the
 //!   removed lines ([`State::dropped`]).
-//! - The ring keeps at most [`MAX_MESSAGE`] bytes of each message. The shell
-//!   still writes the full message.
+//! - The ring keeps at most [`MAX_MESSAGE`] bytes of each message, and at
+//!   most [`MAX_SOURCE`] bytes of the source of a line of the shell. The
+//!   shell still writes the full message.
 //! - The ring is in the model, so it keeps its lines through a light sleep,
 //!   which keeps the RAM, and while the device is offline.
 //! - The ring is only in RAM, so a chip restart loses its lines. This
@@ -33,7 +41,7 @@
 //! | `Idle` | the connection is up, and a line or a drop count waits | `Clock` | sends a [`LogClock`](log::LogClock) request |
 //! | `Clock` | the answer for the same connection | `Sending` | publishes from the oldest line |
 //! | `Clock` | an answer for an older connection | `Clock` | nothing |
-//! | `Sending` | a new line | `Sending` | publishes the line, after the older lines that wait |
+//! | `Sending` | a new line of the core or of the shell | `Sending` | publishes the line, after the older lines that wait |
 //! | `Sending` | `Acked` for a line | `Sending` | removes the line from the ring, then publishes more |
 //! | `Sending` | `Acked` for the drop message | `Sending` | subtracts its count from the drop count |
 //! | any | the session ends | (none) | the lines with no PUBACK stay in the ring |
@@ -57,7 +65,9 @@
 //!   `Acked`. Refer to
 //!   [`connection::pump`].
 //! - The core writes no line about the publish of its own log, so the log
-//!   cannot make more log.
+//!   cannot make more log. The shell can write a line about a failed
+//!   write of the stream, also a write of the log. The session then ends,
+//!   so the line waits for the next connect.
 
 use alloc::{collections::VecDeque, format, string::String, vec::Vec};
 use core::fmt;
@@ -76,6 +86,9 @@ pub const CAPACITY: usize = 64;
 
 /// The maximum length of a message in the ring, in bytes.
 pub const MAX_MESSAGE: usize = 200;
+
+/// The maximum length of the source of a line of the shell, in bytes.
+pub const MAX_SOURCE: usize = 32;
 
 /// The mark at the end of a message that the ring cut.
 pub const CUT_MARK: &str = "…";
@@ -136,11 +149,49 @@ pub fn update(event: Event, model: &mut Model) -> Cmd {
 /// The line is newer than the time of the flight, so its age is 0.
 fn stamped(line: Line, model: &mut Model) -> Cmd {
     model.logs.push(line);
+    publish(model)
+}
+
+/// Starts to publish the lines that wait, if the connection is up.
+/// [`drain`] publishes nothing from the start of a sleep.
+fn publish(model: &mut Model) -> Cmd {
     if model.connection.link() == Link::Up {
         connection::pump(model)
     } else {
         Cmd::done()
     }
+}
+
+/// Keeps a line of the shell, and adds `dropped` to the drop count. Then
+/// publishes the line as a line of the core.
+///
+/// The ring keeps at most [`MAX_SOURCE`] bytes of the source and
+/// [`MAX_MESSAGE`] bytes of the message.
+///
+/// `dropped` is the number of lines that the shell itself lost since its
+/// last [`Event::ShellLogged`](crate::Event::ShellLogged). The drop
+/// message tells Home Assistant the sum of these lines and the lines that
+/// the ring removed.
+///
+/// The event does not render, because the view does not show the log. It
+/// does not wake the device. While the device sleeps, the line waits in the
+/// ring until the next connect after the wake.
+pub fn shell_logged(
+    at: Uptime,
+    level: Level,
+    source: &str,
+    message: &str,
+    dropped: u32,
+    model: &mut Model,
+) -> Cmd {
+    model.logs.push(Line {
+        at,
+        level,
+        source: Source::Shell(ShellSource::new(source)),
+        message: Message::new(message),
+    });
+    model.logs.dropped = model.logs.dropped.saturating_add(dropped);
+    publish(model)
 }
 
 /// Starts to publish with the time `now`, if the answer is for the
@@ -183,7 +234,7 @@ fn write(level: Level, area: Area, message: String) -> Cmd {
         Event::Stamped(Line {
             at,
             level,
-            area,
+            source: Source::Core(area),
             message: kept,
         })
         .into()
@@ -198,10 +249,54 @@ pub struct Line {
     pub at: Uptime,
     /// How important the line is.
     pub level: Level,
-    /// The part of the core that wrote the line.
-    pub area: Area,
+    /// The part of the core or the shell that wrote the line.
+    pub source: Source,
     /// The text of the line, with at most [`MAX_MESSAGE`] bytes.
     pub message: Message,
+}
+
+/// The part of the core or the shell that wrote a line. The payload has
+/// its [`name`](Source::name) as `source`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Source {
+    /// A part of the core.
+    Core(Area),
+    /// A part of the shell, as the shell names it.
+    Shell(ShellSource),
+}
+
+impl Source {
+    /// Returns the name of the source: the name of the area, or the text
+    /// from the shell.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Core(area) => area.name(),
+            Self::Shell(source) => source.as_str(),
+        }
+    }
+}
+
+/// The source of a line of the shell, with at most [`MAX_SOURCE`] bytes.
+///
+/// If a text is longer, [`ShellSource::new`] cuts it as [`Message::new`]
+/// cuts a message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShellSource(String);
+
+impl ShellSource {
+    /// Makes a source from `text`, and cuts it if it is longer than
+    /// [`MAX_SOURCE`] bytes.
+    #[must_use]
+    pub fn new(text: &str) -> Self {
+        Self(cut(text, MAX_SOURCE))
+    }
+
+    /// Returns the text of the source.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// The text of a line in the ring, with at most [`MAX_MESSAGE`] bytes.
@@ -217,14 +312,7 @@ impl Message {
     /// [`MAX_MESSAGE`] bytes.
     #[must_use]
     pub fn new(text: &str) -> Self {
-        if text.len() <= MAX_MESSAGE {
-            return Self(text.into());
-        }
-        let end = text.floor_char_boundary(MAX_MESSAGE - CUT_MARK.len());
-        let mut message = String::with_capacity(end + CUT_MARK.len());
-        message.push_str(&text[..end]);
-        message.push_str(CUT_MARK);
-        Self(message)
+        Self(cut(text, MAX_MESSAGE))
     }
 
     /// Returns the text of the message.
@@ -232,6 +320,19 @@ impl Message {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+/// Returns `text`, or if it is longer than `max` bytes, its start and
+/// [`CUT_MARK`] in `max` bytes. The cut is on a character boundary.
+fn cut(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.into();
+    }
+    let end = text.floor_char_boundary(max - CUT_MARK.len());
+    let mut kept = String::with_capacity(end + CUT_MARK.len());
+    kept.push_str(&text[..end]);
+    kept.push_str(CUT_MARK);
+    kept
 }
 
 impl fmt::Display for Message {
@@ -476,7 +577,7 @@ fn dropped_json(count: u32) -> Vec<u8> {
 #[derive(Serialize)]
 struct Payload<'a> {
     level: &'static str,
-    source: &'static str,
+    source: &'a str,
     /// The age of the line in whole seconds, when the core publishes it.
     age: u64,
     msg: &'a str,
@@ -488,7 +589,7 @@ impl<'a> Payload<'a> {
     fn of(line: &'a Line, now: Uptime) -> Self {
         Self {
             level: line.level.name(),
-            source: line.area.name(),
+            source: line.source.name(),
             age: now.0.saturating_sub(line.at.0) / 1000,
             msg: line.message.as_str(),
         }
