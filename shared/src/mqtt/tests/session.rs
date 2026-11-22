@@ -273,7 +273,7 @@ fn the_retained_flood_gives_each_message_in_order_and_starts_no_timer_for_each_p
 
     assert_eq!(message_topics(&wire.log), topics);
     for action in &wire.log {
-        if let Action::Message(Message { topic, payload }) = action {
+        if let Action::Message(Message { topic, payload, .. }) = action {
             assert_eq!(topic.as_bytes(), payload);
         }
     }
@@ -433,7 +433,7 @@ fn a_puback_frees_its_id_and_an_unknown_puback_is_ignored() {
     // A publish at QoS 0 has no id, so the window does not apply.
     let mut status = online();
     status.qos = Qos::AtMostOnce;
-    assert_eq!(wire.session.publish(status), Ok(()));
+    assert_eq!(wire.session.publish(status), Ok(None));
     wire.run();
 
     let mut acks = Vec::new();
@@ -444,8 +444,126 @@ fn a_puback_frees_its_id_and_an_unknown_puback_is_ignored() {
     let mut acks = Vec::new();
     codec::server::puback(&mut acks, 5);
     wire.deliver(&acks);
-    assert_eq!(wire.session.publish(command("x")), Ok(()));
+    assert!(matches!(wire.session.publish(command("x")), Ok(Some(_))));
     assert_eq!(wire.session.publish(command("x")), Err(Refused::Full));
+}
+
+#[test]
+fn a_puback_gives_acked_with_the_id_that_publish_returned() {
+    let mut wire = Wire::connected();
+    wire.broker.hold_puback = true;
+    let first = wire.session.publish(command("first")).unwrap().unwrap();
+    let second = wire.session.publish(command("second")).unwrap().unwrap();
+    assert_ne!(first, second);
+    wire.run();
+    assert!(wire.log.is_empty(), "{:?}", wire.log);
+
+    // The PUBACK packets arrive in the opposite order.
+    let mut acks = Vec::new();
+    codec::server::puback(&mut acks, 2);
+    codec::server::puback(&mut acks, 1);
+    wire.deliver(&acks);
+    wire.run();
+    assert_eq!(wire.log, [Action::Acked(second), Action::Acked(first)]);
+}
+
+#[test]
+fn a_publish_at_qos_0_returns_no_id_and_gives_no_acked() {
+    let mut wire = Wire::connected();
+    let mut status = online();
+    status.qos = Qos::AtMostOnce;
+    assert_eq!(wire.session.publish(status), Ok(None));
+    wire.run();
+    assert!(
+        matches!(wire.broker.packets[..], [Packet::Publish { id: None, .. }]),
+        "{:?}",
+        wire.broker.packets
+    );
+    assert!(wire.log.is_empty(), "{:?}", wire.log);
+}
+
+#[test]
+fn a_puback_for_an_id_that_does_not_wait_gives_no_acked() {
+    let mut wire = Wire::connected();
+    wire.broker.hold_puback = true;
+    wire.broker.hold_suback = true;
+    let one = wire.session.publish(command("one")).unwrap().unwrap();
+    let _ = wire.session.subscribe(&["a".to_string()]);
+    wire.run();
+    wire.log.clear();
+    // The SUBSCRIBE packet has the packet id 2.
+    assert!(
+        wire.broker
+            .packets
+            .iter()
+            .any(|packet| matches!(packet, Packet::Subscribe { id: 2, .. })),
+        "{:?}",
+        wire.broker.packets
+    );
+
+    // An id that is not in use, and the id of the SUBSCRIBE packet.
+    for id in [999, 2] {
+        let mut ack = Vec::new();
+        codec::server::puback(&mut ack, id);
+        wire.deliver(&ack);
+        wire.run();
+        assert!(wire.log.is_empty(), "id {id}: {:?}", wire.log);
+    }
+
+    // The PUBACK of the publish gives `Acked` once. A second copy gives
+    // nothing.
+    let mut ack = Vec::new();
+    codec::server::puback(&mut ack, 1);
+    wire.deliver(&ack);
+    wire.deliver(&ack);
+    wire.run();
+    assert_eq!(wire.log, [Action::Acked(one)]);
+}
+
+#[test]
+fn a_message_has_the_retain_flag_only_if_the_broker_kept_it() {
+    let mut wire = Wire::connected();
+    wire.broker.retain("a", b"kept");
+    let id = wire.session.subscribe(&["a".to_string(), "b".to_string()]);
+    wire.run();
+    // A message that the broker kept comes after the SUBACK.
+    assert_eq!(
+        wire.log,
+        [
+            Action::Subscribed {
+                id,
+                outcome: SubscribeOutcome::Done,
+            },
+            Action::Message(Message {
+                topic: "a".into(),
+                payload: b"kept".to_vec(),
+                retain: true,
+            }),
+        ]
+    );
+    wire.log.clear();
+
+    // A live message has no retain flag, also if its publisher set the flag.
+    wire.broker.publish("b", b"live", false);
+    wire.broker.publish("a", b"new", true);
+    let bytes = wire.broker.take();
+    wire.deliver(&bytes);
+    wire.run();
+    assert_eq!(
+        wire.log,
+        [
+            Action::Message(Message {
+                topic: "b".into(),
+                payload: b"live".to_vec(),
+                retain: false,
+            }),
+            Action::Message(Message {
+                topic: "a".into(),
+                payload: b"new".to_vec(),
+                retain: false,
+            }),
+        ]
+    );
 }
 
 #[test]
@@ -761,7 +879,8 @@ fn broken_framing_ends_the_session_after_the_messages_before_it() {
         [
             Action::Message(Message {
                 topic: topics[0].clone(),
-                payload: b"on".to_vec()
+                payload: b"on".to_vec(),
+                retain: false,
             }),
             Action::Close,
             Action::Ended(End::Malformed),
@@ -829,7 +948,8 @@ fn an_oversize_packet_is_skipped_and_the_session_stays_connected() {
             Action::Skipped { length: 505 },
             Action::Message(Message {
                 topic: "small".into(),
-                payload: b"ok".to_vec()
+                payload: b"ok".to_vec(),
+                retain: false,
             })
         ]
     );
@@ -866,7 +986,8 @@ fn an_inbound_publish_at_qos_1_gets_a_puback() {
         wire.log,
         [Action::Message(Message {
             topic: "a/b".into(),
-            payload: b"on".to_vec()
+            payload: b"on".to_vec(),
+            retain: false,
         })]
     );
     assert_eq!(wire.broker.packets, [Packet::PubAck(300)]);
@@ -1104,7 +1225,7 @@ fn a_disconnect_that_is_not_sent_in_time_ends_with_a_timeout() {
 fn a_lost_puback_ends_the_session() {
     let mut wire = Wire::connected();
     wire.broker.hold_puback = true;
-    wire.session.publish(command("one")).unwrap();
+    let one = wire.session.publish(command("one")).unwrap().unwrap();
     wire.session.publish(command("two")).unwrap();
     wire.run();
     assert_eq!(wire.broker.held_pubacks, [1, 2]);
@@ -1116,11 +1237,12 @@ fn a_lost_puback_ends_the_session() {
     let first = wire.timer(TimerKind::Ack);
     wire.timers.clear();
     wire.fire(first);
-    assert!(wire.log.is_empty(), "{:?}", wire.log);
+    assert_eq!(wire.log, [Action::Acked(one)]);
     assert_eq!(
         wire.timer_kinds(),
         [(TimerKind::Ack, Duration::from_secs(10))]
     );
+    wire.log.clear();
 
     // No PUBACK arrives in the second period.
     wire.fire(wire.timer(TimerKind::Ack));
@@ -1192,10 +1314,10 @@ fn subacks_that_each_arrive_in_time_do_not_end_the_session() {
 #[test]
 fn a_puback_of_the_last_publish_stops_the_ack_watch() {
     let mut wire = Wire::connected();
-    wire.session.publish(command("one")).unwrap();
+    let one = wire.session.publish(command("one")).unwrap().unwrap();
     wire.run();
     wire.fire(wire.timer(TimerKind::Ack));
-    assert!(wire.log.is_empty(), "{:?}", wire.log);
+    assert_eq!(wire.log, [Action::Acked(one)]);
     // The next publish starts the timer again.
     wire.timers.clear();
     wire.session.publish(command("two")).unwrap();
@@ -1276,7 +1398,7 @@ fn requests_above_the_outgoing_limit_are_refused() {
     // After the send, the bytes no longer wait.
     wire.session.handle(Input::Sent);
     publish.payload = b"again".to_vec();
-    assert_eq!(wire.session.publish(publish), Ok(()));
+    assert!(matches!(wire.session.publish(publish), Ok(Some(_))));
 }
 
 /// Returns the `Ack` timers in `actions`.
@@ -1330,5 +1452,5 @@ fn the_ack_watch_starts_when_the_publish_leaves_not_when_it_is_made() {
             .any(|action| matches!(action, Action::Ended(_))),
         "{actions:?}"
     );
-    assert_eq!(wire.session.publish(command("next")), Ok(()));
+    assert!(matches!(wire.session.publish(command("next")), Ok(Some(_))));
 }

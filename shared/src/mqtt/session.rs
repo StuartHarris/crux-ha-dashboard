@@ -165,6 +165,13 @@ pub enum Input {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SubscribeId(u32);
 
+/// The packet id of a publish at `QoS` 1. Refer to [`Session::publish`]
+/// and [`Action::Acked`].
+///
+/// Only the session makes a packet id, so the id is never 0.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PacketId(u16);
+
 /// A thing for the caller to do.
 #[derive(Clone, PartialEq, Eq)]
 pub enum Action {
@@ -194,6 +201,9 @@ pub enum Action {
         /// The length of the body.
         length: usize,
     },
+    /// The broker acknowledged the publish at `QoS` 1 with this packet id.
+    /// The id is the one that [`Session::publish`] returned.
+    Acked(PacketId),
     /// The answer to a subscribe job.
     Subscribed {
         /// The id that [`Session::subscribe`] returned.
@@ -224,6 +234,7 @@ impl fmt::Debug for Action {
             Self::Connected => f.write_str("Connected"),
             Self::Message(message) => f.debug_tuple("Message").field(message).finish(),
             Self::Skipped { length } => f.debug_struct("Skipped").field("length", length).finish(),
+            Self::Acked(id) => f.debug_tuple("Acked").field(id).finish(),
             Self::Subscribed { id, outcome } => f
                 .debug_struct("Subscribed")
                 .field("id", id)
@@ -384,10 +395,16 @@ impl From<Inbound<'_>> for Packet {
                 session_present,
                 code,
             },
-            Inbound::Publish { topic, payload, id } => Self::Publish {
+            Inbound::Publish {
+                topic,
+                payload,
+                id,
+                retain,
+            } => Self::Publish {
                 message: Message {
                     topic: topic.into(),
                     payload: payload.to_vec(),
+                    retain,
                 },
                 id,
             },
@@ -509,13 +526,18 @@ impl Session {
 
     /// Publishes a message. The bytes go in the next [`Action::Send`].
     ///
+    /// Returns the packet id of a publish at `QoS` 1, or `None` at `QoS` 0.
+    /// When the PUBACK for that id arrives, the session gives
+    /// [`Action::Acked`] with the same id. If the session ends first, no
+    /// `Acked` comes for the id.
+    ///
     /// # Errors
     ///
     /// Returns [`Refused`] if the broker did not accept the connection yet,
     /// after [`Session::disconnect`], if too many publishes at `QoS` 1 wait for
     /// a PUBACK, if the bytes that wait would go above
     /// [`Limits::max_outgoing`], or if the message is too long.
-    pub fn publish(&mut self, publish: Publish) -> Result<(), Refused> {
+    pub fn publish(&mut self, publish: Publish) -> Result<Option<PacketId>, Refused> {
         if self.state != State::Connected {
             return Err(Refused::NotConnected);
         }
@@ -546,7 +568,7 @@ impl Session {
             self.publishes.insert(id);
             self.unsent_acks = true;
         }
-        Ok(())
+        Ok(id.map(PacketId))
     }
 
     /// Subscribes to `topics` at `QoS` 0, and returns the id of the job.
@@ -866,9 +888,11 @@ impl Session {
                     codec::puback(&mut self.outgoing, id);
                 }
             }
+            // The session ignores a PUBACK for an id that does not wait.
             (_, Packet::PubAck(id)) => {
                 if self.publishes.remove(&id) {
                     self.acknowledged();
+                    self.actions.push_back(Action::Acked(PacketId(id)));
                 }
             }
             (_, Packet::SubAck { id, count, failed }) => self.suback(id, count, failed),

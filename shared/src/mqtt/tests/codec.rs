@@ -237,11 +237,12 @@ fn publish_decodes_with_and_without_a_packet_id() {
         Ok(Inbound::Publish {
             topic: "a/b",
             payload: b"hi",
-            id: None
+            id: None,
+            retain: false,
         })
     );
-    // The retain and DUP flags do not change the decode.
-    assert_eq!(decode(0x39, &body), decode(0x30, &body));
+    // The DUP flag does not change the decode.
+    assert_eq!(decode(0x38, &body), decode(0x30, &body));
 
     let body = [0x00, 0x03, b'a', b'/', b'b', 0x00, 0x0A, b'h', b'i'];
     assert_eq!(
@@ -249,7 +250,8 @@ fn publish_decodes_with_and_without_a_packet_id() {
         Ok(Inbound::Publish {
             topic: "a/b",
             payload: b"hi",
-            id: Some(10)
+            id: Some(10),
+            retain: false,
         })
     );
 }
@@ -266,9 +268,31 @@ fn publish_round_trips_through_the_codec() {
             Ok(Inbound::Publish {
                 topic: "home/°C",
                 payload: b"20.5",
-                id
+                id,
+                retain: true,
             })
         );
+    }
+}
+
+#[test]
+fn publish_decodes_the_retain_flag() {
+    let qos_0 = [0x00, 0x03, b'a', b'/', b'b', b'h', b'i'];
+    let qos_1 = [0x00, 0x03, b'a', b'/', b'b', 0x00, 0x0A, b'h', b'i'];
+    let cases: [(u8, &[u8], bool); 6] = [
+        (0x30, &qos_0, false),
+        (0x31, &qos_0, true),
+        (0x32, &qos_1, false),
+        (0x33, &qos_1, true),
+        // The DUP flag does not change the retain flag.
+        (0x38, &qos_0, false),
+        (0x39, &qos_0, true),
+    ];
+    for (first, body, expected) in cases {
+        let Ok(Inbound::Publish { retain, .. }) = decode(first, body) else {
+            panic!("a publish: {first:#x}");
+        };
+        assert_eq!(retain, expected, "{first:#x}");
     }
 }
 

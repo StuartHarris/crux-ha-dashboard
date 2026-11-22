@@ -97,4 +97,8 @@ pub struct Message {
     pub topic: String,
     /// The payload of the message.
     pub payload: Vec<u8>,
+    /// The retain flag that the broker set on the PUBLISH. In MQTT 3.1.1,
+    /// the broker sets it on a kept message that it sends because of a new
+    /// subscription, and clears it on a message that it forwards live.
+    pub retain: bool,
 }
