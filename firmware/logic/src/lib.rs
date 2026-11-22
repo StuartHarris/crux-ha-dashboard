@@ -16,6 +16,9 @@
 //! - [`backoff`] is a wait that doubles after each failure.
 //! - [`sleep`] decides when the chip can go into light sleep, and which
 //!   wake is a real wake.
+//! - [`forward`] decides which lines of the log of the firmware go to the
+//!   core, splits each line into its source and its message, and keeps the
+//!   lines that wait for the core task.
 //! - [`waveform`] builds the lines and the lookup table of the extra frames
 //!   of a clean refresh of the panel.
 
@@ -25,6 +28,7 @@ extern crate alloc;
 
 pub mod backoff;
 pub mod config;
+pub mod forward;
 pub mod power;
 pub mod shell;
 pub mod sleep;

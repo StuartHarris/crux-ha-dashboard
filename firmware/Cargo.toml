@@ -50,8 +50,9 @@ esp-alloc = { version = "0.11.0", features = ["esp32s3"] }
 allocator-api2 = { version = "0.3.0", default-features = false, features = ["alloc"] }
 esp-bootloader-esp-idf = { version = "0.6.0", features = ["esp32s3"] }
 # The log goes to the USB-Serial-JTAG port. UART0 (GPIO43 and GPIO44) goes to
-# the GPS header on this board.
-esp-println = { version = "0.18.0", default-features = false, features = ["esp32s3", "jtag-serial", "log-04", "critical-section", "colors"] }
+# the GPS header on this board. The logger of the firmware (`src/logger.rs`)
+# prints with `println!`, so the logger of esp-println is not used.
+esp-println = { version = "0.18.0", default-features = false, features = ["esp32s3", "jtag-serial", "critical-section"] }
 esp-backtrace = { version = "0.20.0", features = ["esp32s3", "panic-handler", "println"] }
 
 embassy-executor = "0.10.0"

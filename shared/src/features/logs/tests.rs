@@ -8,8 +8,8 @@ use crux_core::App;
 use serde_json::Value;
 
 use super::{
-    CAPACITY, CUT_MARK, LOG_IN_FLIGHT, Line, MAX_MESSAGE, Message, Payload, State, dropped_json,
-    info, warn,
+    CAPACITY, CUT_MARK, LOG_IN_FLIGHT, Line, MAX_MESSAGE, MAX_SOURCE, Message, Payload,
+    ShellSource, Source, State, dropped_json, info, warn,
 };
 use crate::{
     Dashboard, EffectTestExt, Event, Model, PowerSource,
@@ -35,7 +35,7 @@ fn line(at: u64, message: &str) -> Line {
     Line {
         at: Uptime(at),
         level: Level::Info,
-        area: Area::Wifi,
+        source: Source::Core(Area::Wifi),
         message: Message::new(message),
     }
 }
@@ -50,7 +50,7 @@ fn power_lines(model: &Model) -> Vec<(u64, String)> {
     model
         .logs
         .lines()
-        .filter(|line| line.area == Area::Power)
+        .filter(|line| line.source == Source::Core(Area::Power))
         .map(|line| (line.at.0, String::from(line.message.as_str())))
         .collect()
 }
@@ -86,13 +86,13 @@ fn a_line_has_the_time_of_the_answer_of_the_shell() {
     let lines: Vec<_> = model
         .logs
         .lines()
-        .map(|line| (line.at, line.level, line.area))
+        .map(|line| (line.at, line.level, line.source.clone()))
         .collect();
     assert_eq!(
         lines,
         [
-            (Uptime(1_000), Level::Info, Area::Wifi),
-            (Uptime(2_500), Level::Warn, Area::Mqtt),
+            (Uptime(1_000), Level::Info, Source::Core(Area::Wifi)),
+            (Uptime(2_500), Level::Warn, Source::Core(Area::Mqtt)),
         ]
     );
     assert_eq!(
@@ -188,7 +188,7 @@ fn an_info_line_has_its_age_in_whole_seconds() {
     let line = Line {
         at: Uptime(3_000),
         level: Level::Info,
-        area: Area::Wifi,
+        source: Source::Core(Area::Wifi),
         message: Message::new("the scan found no better access point, so stay"),
     };
 
@@ -205,7 +205,7 @@ fn a_warn_line_escapes_its_message() {
     let line = Line {
         at: Uptime(0),
         level: Level::Warn,
-        area: Area::Mqtt,
+        source: Source::Core(Area::Mqtt),
         message: Message::new("a \"quoted\" topic\nand a new line"),
     };
 
@@ -222,7 +222,7 @@ fn a_line_newer_than_the_clock_has_the_age_0() {
     let line = Line {
         at: Uptime(9_000),
         level: Level::Info,
-        area: Area::Power,
+        source: Source::Core(Area::Power),
         message: Message::new("sleep 1 closes the connection"),
     };
 
@@ -258,7 +258,7 @@ fn stamp(shell: &mut Shell, at_secs: u64, text: &str) {
     let line = Line {
         at: Uptime(at_secs * 1_000),
         level: Level::Info,
-        area: Area::Wifi,
+        source: Source::Core(Area::Wifi),
         message: Message::new(text),
     };
     shell.send(Event::Logs(super::Event::Stamped(line)));
@@ -730,4 +730,174 @@ fn a_line_while_the_core_sends_goes_at_once_with_the_age_0() {
     assert_eq!(payloads[1]["msg"], "a new line");
     assert_eq!(payloads[1]["age"], 0);
     assert_eq!(shell.model.logs.lines().len(), 0);
+}
+
+// The lines of the shell.
+
+/// Returns a `ShellLogged` event with no lost lines.
+fn shell_line(at: u64, level: Level, source: &str, message: &str) -> Event {
+    Event::ShellLogged {
+        at: Uptime(at),
+        level,
+        source: source.into(),
+        message: message.into(),
+        dropped: 0,
+    }
+}
+
+#[test]
+fn a_shell_line_goes_into_the_ring_with_its_source_and_level() {
+    let app = Dashboard;
+    let mut model = Model::default();
+
+    // The link is down, so the line only goes into the ring. The event does
+    // not render.
+    app.update(
+        shell_line(4_000, Level::Error, "panel", "power on failed: Timeout"),
+        &mut model,
+    )
+    .expect_done();
+
+    let lines: Vec<&Line> = model.logs.lines().collect();
+    assert_eq!(
+        lines,
+        [&Line {
+            at: Uptime(4_000),
+            level: Level::Error,
+            source: Source::Shell(ShellSource::new("panel")),
+            message: Message::new("power on failed: Timeout"),
+        }]
+    );
+    assert_eq!(model.logs.dropped(), 0);
+}
+
+#[test]
+fn a_shell_line_keeps_a_cut_source_and_a_cut_message() {
+    let app = Dashboard;
+    let mut model = Model::default();
+    let source = "s".repeat(MAX_SOURCE + 8);
+    let message = "m".repeat(MAX_MESSAGE + 8);
+
+    app.update(shell_line(0, Level::Warn, &source, &message), &mut model)
+        .expect_done();
+
+    let line = model.logs.lines().next().expect("a line");
+    let name = line.source.name();
+    assert_eq!(name.len(), MAX_SOURCE);
+    assert!(name.ends_with(CUT_MARK), "{name}");
+    assert_eq!(line.message.as_str().len(), MAX_MESSAGE);
+    assert!(line.message.as_str().ends_with(CUT_MARK));
+}
+
+#[test]
+fn a_shell_line_goes_out_with_its_source_and_level() {
+    let mut shell = online();
+    let frames = shell.frames.len();
+    let at = u64::try_from(shell.now().as_millis()).unwrap();
+    shell.send(shell_line(
+        at,
+        Level::Warn,
+        "stream",
+        "10 failed: TCP connect failed: ConnectionReset (by the host)",
+    ));
+    shell.send(shell_line(
+        at,
+        Level::Error,
+        "panel",
+        "refresh failed: Busy",
+    ));
+
+    let payloads: Vec<String> = shell
+        .broker
+        .published
+        .iter()
+        .filter(|publish| publish.topic == LOG_TOPIC)
+        .map(|publish| String::from_utf8(publish.payload.clone()).unwrap())
+        .collect();
+    assert_eq!(
+        payloads,
+        [
+            r#"{"level":"warn","source":"stream","age":0,"msg":"10 failed: TCP connect failed: ConnectionReset (by the host)"}"#,
+            r#"{"level":"error","source":"panel","age":0,"msg":"refresh failed: Busy"}"#,
+        ]
+    );
+    // The broker acknowledged both lines, so the ring is empty. The lines
+    // and their PUBACKs did not render.
+    assert_eq!(shell.model.logs.lines().len(), 0);
+    assert_eq!(shell.frames.len(), frames);
+}
+
+#[test]
+fn the_lines_that_the_shell_lost_add_to_the_drop_count() {
+    let mut shell = house();
+    for at in 0..CAPACITY as u64 {
+        stamp(&mut shell, at, &format!("line {at}"));
+    }
+    assert_eq!(shell.model.logs.dropped(), 0);
+
+    // The ring is full, so the line of the shell removes the oldest line.
+    // The shell also lost 5 lines of its own.
+    shell.send(Event::ShellLogged {
+        at: Uptime(70_000),
+        level: Level::Warn,
+        source: "touch".into(),
+        message: "read failed".into(),
+        dropped: 5,
+    });
+    assert_eq!(shell.model.logs.dropped(), 6);
+    assert_eq!(shell.model.logs.lines().len(), CAPACITY);
+
+    // The drop message tells the sum. Then the lines go from the oldest
+    // line that the ring kept, and the line of the shell is last.
+    shell.send(start(PowerSource::Stand));
+    let payloads = published(&shell);
+    assert_eq!(payloads[0]["msg"], "6 older lines were dropped");
+    assert_eq!(payloads[1]["msg"], "line 1");
+    let last = payloads.last().expect("a line");
+    assert_eq!(last["source"], "touch");
+    assert_eq!(last["msg"], "read failed");
+    assert_eq!(shell.model.logs.dropped(), 0);
+    assert_eq!(shell.model.logs.lines().len(), 0);
+}
+
+#[test]
+fn a_shell_line_during_a_sleep_waits_for_the_wake_and_does_not_wake() {
+    let mut shell = house();
+    shell.send(start(PowerSource::Battery));
+    shell.advance(IDLE_TIMEOUT);
+    assert!(shell.sleep.is_some());
+    let kept = shell.model.logs.lines().len();
+    let writes = shell.writes.len();
+
+    // The line goes into the ring. The core does not render, does not wake
+    // and does not answer the `Sleep` request.
+    let slept_at = u64::try_from(shell.now().as_millis()).unwrap();
+    Dashboard
+        .update(
+            shell_line(
+                slept_at,
+                Level::Warn,
+                "power",
+                "cannot read the BQ27220 (Nack)",
+            ),
+            &mut shell.model,
+        )
+        .expect_done();
+    assert!(shell.model.power.is_asleep());
+    assert!(shell.sleep.is_some());
+    assert_eq!(shell.model.logs.lines().len(), kept + 1);
+    assert_eq!(shell.writes.len(), writes);
+    assert_eq!(published(&shell), Vec::<Value>::new());
+
+    // A minute later, a touch wakes the device. After the connect, the line
+    // goes with its age.
+    shell.advance(Duration::from_secs(60));
+    shell.wake(Wake::Touch(None));
+    assert_eq!(shell.model.connection.link(), Link::Up);
+    let line = published(&shell)
+        .into_iter()
+        .find(|payload| payload["source"] == "power" && payload["level"] == "warn")
+        .expect("the line of the shell");
+    assert_eq!(line["msg"], "cannot read the BQ27220 (Nack)");
+    assert_eq!(line["age"], 60);
 }

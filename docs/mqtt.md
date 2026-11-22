@@ -293,8 +293,10 @@ has no state, so its button shows the pattern for 2 seconds. Refer to
 ### Log
 
 The core keeps its lines of the log in a ring of 64 lines, with the time of each line
-on the monotonic clock of the shell. Refer to `shared/src/features/logs/mod.rs`. The
-dashboard publishes each line to Home Assistant.
+on the monotonic clock of the shell. The ring also keeps the `warn` and `error` lines
+of the shell, which the shell sends as `Event::ShellLogged`. Refer to
+`shared/src/features/logs/mod.rs`. The dashboard publishes each line to Home
+Assistant.
 
 | Topic | QoS | Retained |
 | --- | --- | --- |
@@ -308,10 +310,31 @@ Each message is one line as JSON:
 
 | Key | Value |
 | --- | --- |
-| `level` | `info` or `warn` |
-| `source` | The part of the core that wrote the line: `wifi`, `mqtt` or `power`. The drop message has `log`. |
+| `level` | `info` or `warn` for a line of the core. `warn` or `error` for a line of the shell. |
+| `source` | For a line of the core, the part of the core that wrote the line: `wifi`, `mqtt` or `power`. For a line of the shell, the source that the shell gives, with at most 32 bytes. The drop message has `log`. |
 | `age` | The age of the line in whole seconds when the dashboard publishes it |
 | `msg` | The text of the line, with at most 200 bytes. A longer text ends with `…`. |
+
+The firmware sends its own `warn` and `error` lines to the core, also the lines of
+esp-radio. It sends them also if `ESP_LOG` does not print them. It does not send a
+line that it printed for the core. It starts to send lines just after
+`board::init()`, and a line before that only prints. The serial log does not
+change. A line of the firmware has the time when the firmware wrote it, so
+a line from an outage or a sleep goes after the next connect with its age:
+
+```json
+{"level":"warn","source":"stream","age":40,"msg":"10 failed: TCP connect failed: ConnectionReset (by the host)"}
+```
+
+- For a line of the firmware itself (the crates `dashboard` and
+  `dashboard_firmware`), if the line starts with a lowercase word and `": "`, the
+  word is the source and the rest is the message. For example,
+  `stream: 10 failed: ...` gives the source `stream`.
+- Otherwise, and for each line of another crate, the source is the crate of the
+  log target, for example `esp_radio`, and the message is the whole line.
+- The firmware keeps at most 16 lines for the core task. If more lines come before
+  the core task takes them, the firmware drops the new lines, and the drop message
+  counts them. Refer to `firmware/logic/src/forward.rs`.
 
 The dashboard has no wall clock. Home Assistant gets the time of the line as the time
 when the message arrives, minus `age`. The clock of the device counts through a light
@@ -356,7 +379,8 @@ removed lines. Before the next line, the dashboard then publishes the drop messa
 {"level":"warn","source":"log","age":0,"msg":"3 older lines were dropped"}
 ```
 
-For one line, the message is `1 older line was dropped`.
+For one line, the message is `1 older line was dropped`. The count also includes
+the lines that the shell lost before they came to the core.
 
 The core subtracts the count of the drop message when the broker acknowledges it. The
 core writes no line about the publish of its own log.
@@ -374,6 +398,8 @@ The automation `dashboard_log` writes the lines to the Home Assistant log.
   arrives, minus `age`, in local time.
 - A `warn` line calls `system_log.write` with the logger `dashboard.<device_id>` and
   the level `warning`.
+- An `error` line calls `system_log.write` with the logger `dashboard.<device_id>`
+  and the level `error`.
 - An `info` line also calls `system_log.write` with the logger
   `dashboard.<device_id>` and the level `warning`, with `[info] ` before the
   message. The Home Assistant log keeps only the level `warning` and higher. A later

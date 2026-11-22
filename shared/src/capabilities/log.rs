@@ -22,12 +22,18 @@ use core::fmt;
 use crux_core::{Command, Request, command::RequestBuilder, macros::Operation};
 
 /// How important a line of the log is.
+///
+/// The core writes its own lines at `Info` and `Warn` only. `Error` comes
+/// only from a line of the shell
+/// ([`Event::ShellLogged`](crate::Event::ShellLogged)).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Level {
     /// A decision of the core.
     Info,
     /// A failure, or a decision because of a failure.
     Warn,
+    /// A failure in the shell, for example a panel that does not start.
+    Error,
 }
 
 impl Level {
@@ -37,6 +43,7 @@ impl Level {
         match self {
             Self::Info => "info",
             Self::Warn => "warn",
+            Self::Error => "error",
         }
     }
 }
@@ -227,5 +234,6 @@ mod tests {
         assert_eq!(Area::Mqtt.to_string(), "mqtt");
         assert_eq!(Level::Info.to_string(), "info");
         assert_eq!(Level::Warn.to_string(), "warn");
+        assert_eq!(Level::Error.to_string(), "error");
     }
 }

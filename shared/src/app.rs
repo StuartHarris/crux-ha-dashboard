@@ -10,7 +10,7 @@ use crux_time::operation as time;
 use crate::{
     capabilities::{
         light::FrontLight,
-        log::{Log, LogClock},
+        log::{Level, Log, LogClock, Uptime},
         power::{PowerSource, Sleep},
         radio::{Address, Join, Leave, Off, Restart, Scan, StopScan},
         stream::{Close, Open, Write},
@@ -192,6 +192,29 @@ pub enum Event {
     /// more idle period if service calls wait in the outbox. On the stand,
     /// or while the device sleeps, the event does nothing.
     SleepNow,
+    /// The shell wrote a line of its own log, for example the failure of a
+    /// stream. The core keeps the line in its ring, and publishes it to Home
+    /// Assistant as it publishes its own lines. Refer to [`logs`].
+    ///
+    /// The shell sends its warn and error lines only, and never a line that
+    /// it wrote for a `Log` request of the core. The event does not render
+    /// and does not wake the device.
+    ShellLogged {
+        /// The time of the line, on the clock of the `Log` answers.
+        at: Uptime,
+        /// How important the line is: `Warn` or `Error`.
+        level: Level,
+        /// The part of the shell that wrote the line, for example `stream`.
+        /// The core keeps at most [`logs::MAX_SOURCE`] bytes.
+        source: String,
+        /// The text of the line. The core keeps at most
+        /// [`logs::MAX_MESSAGE`] bytes.
+        message: String,
+        /// The number of lines that the shell lost since its last
+        /// `ShellLogged`, for example because its own queue was full. The
+        /// core adds them to its drop count.
+        dropped: u32,
+    },
 
     /// The internal events of the Wi-Fi feature. The core makes them from the
     /// answers to its effects. The shell never sends them.
@@ -414,6 +437,13 @@ impl Model {
             Event::Navigate(route) => rooms::navigate(route, self),
             Event::SetReadOnly(read_only) => rooms::set_read_only(read_only, self),
             Event::SleepNow => power::sleep_now(self),
+            Event::ShellLogged {
+                at,
+                level,
+                source,
+                message,
+                dropped,
+            } => logs::shell_logged(at, level, &source, &message, dropped, self),
             Event::Wifi(event) => wifi::update(event, self),
             Event::Connection(event) => connection::update(event, self),
             Event::Power(event) => power::update(event, self),

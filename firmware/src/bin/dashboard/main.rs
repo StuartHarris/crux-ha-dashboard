@@ -6,7 +6,7 @@
 //!
 //! | Task | Work | Answers |
 //! | --- | --- | --- |
-//! | `core` | owns the shell and routes each job | |
+//! | `core` | owns the shell, routes each job, and gives the warn and error lines of the logger to the core | |
 //! | `timers` | `StartTimer`, `CancelTimer` | `Signal::Timer` |
 //! | `display` | draws the latest view model, reads the touch controller, the charger and the fuel gauge, sets the front light, and runs the `Sleep` job | `Signal::Tap`, `Signal::Event`, `Signal::Woke`, `Signal::Light` |
 //! | `radio` | the radio jobs (`Join`, `Address`, `Leave`, `Scan`, `StopScan`, `Off`) and `Restart`, with no Wi-Fi policy | `Signal::Radio` |
@@ -30,7 +30,7 @@ mod radio;
 mod stream;
 mod timers;
 
-use dashboard_firmware::{board, lane::Lane, light::FrontLight, panel::Panel, panel_pins};
+use dashboard_firmware::{board, lane::Lane, light::FrontLight, logger, panel::Panel, panel_pins};
 use embassy_executor::Spawner;
 use embassy_net::StackResources;
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal as Latest};
@@ -81,6 +81,9 @@ const SOCKETS: usize = 4;
 #[esp_hal::main]
 async fn main(spawner: Spawner) -> ! {
     let peripherals = board::init();
+    // From now, the warn and error lines wait for the core, also the lines
+    // before the core starts.
+    logger::forward();
     board::start(
         peripherals.PSRAM,
         peripherals.TIMG0,

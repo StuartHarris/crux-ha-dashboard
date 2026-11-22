@@ -7,6 +7,7 @@ use esp_hal::{
     psram::{PsramConfig, PsramMode},
     timer::timg::TimerGroup,
 };
+use shared::capabilities::log::Uptime;
 
 /// The size of the heap in internal RAM. The Wi-Fi driver needs internal RAM
 /// for its buffers. With Wi-Fi and MQTT connected, about 29 KiB of it is free
@@ -15,11 +16,29 @@ pub const INTERNAL_HEAP: usize = 72 * 1024;
 
 /// Starts the log and the clocks, and returns the peripherals.
 ///
+/// The log only prints. The dashboard then calls [`crate::logger::forward`]
+/// to send its warn and error lines to the core.
+///
 /// Give `PSRAM`, `TIMG0` and `FROM_CPU_INTR0` to [`start`] next.
 #[must_use]
 pub fn init() -> Peripherals {
-    esp_println::logger::init_logger_from_env();
+    crate::logger::init();
     esp_hal::init(esp_hal::Config::default().with_cpu_clock(CpuClock::max()))
+}
+
+/// Returns the time since the chip started, in milliseconds.
+///
+/// The time comes from the system timer of esp-hal. At a wake from light
+/// sleep, esp-hal moves the system timer forward by the time asleep, so the
+/// time counts through a sleep. Before `esp_hal::init` sets the scale of
+/// the timer, the time is not correct.
+#[must_use]
+pub fn uptime() -> Uptime {
+    Uptime(
+        esp_hal::time::Instant::now()
+            .duration_since_epoch()
+            .as_millis(),
+    )
 }
 
 /// Starts the heap and the scheduler.

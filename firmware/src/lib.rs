@@ -9,6 +9,8 @@
 //! - [`panel`] drives the panel and reads the touch controller.
 //! - [`lane`] is a queue between two tasks.
 //! - [`light`] drives the front light.
+//! - [`logger`] prints the log, and keeps the warn and error lines for the
+//!   core.
 //! - [`network`] makes the configuration of the Wi-Fi driver.
 //!
 //! Each binary includes the build-time configuration from `cfg.toml`
@@ -28,5 +30,6 @@ extern crate alloc;
 pub mod board;
 pub mod lane;
 pub mod light;
+pub mod logger;
 pub mod network;
 pub mod panel;
