@@ -17,7 +17,7 @@ use crate::{
     },
     entities::Entities,
     features::{
-        connection, light, pending, power,
+        connection, light, logs, pending, power,
         refresh::{self, redraw},
         rooms, wifi,
     },
@@ -204,6 +204,9 @@ pub enum Event {
     /// The internal events of the front light. The core makes them from the
     /// answers to its effects. The shell never sends them.
     Light(light::Event),
+    /// The internal events of the logs feature. The core makes them from the
+    /// answers to its `Log` requests. The shell never sends them.
+    Logs(logs::Event),
 }
 
 /// A control on the panel.
@@ -283,7 +286,8 @@ pub enum Effect {
     /// light timer, a reset or a sleep.
     FrontLight(FrontLight),
     /// Write a line of the core to the log of the shell: a decision of the
-    /// Wi-Fi policy, a failure or a step of a sleep.
+    /// Wi-Fi policy, a failure or a step of a sleep. The answer is the time
+    /// of the line, and the core keeps the line with it. Refer to [`logs`].
     Log(Log),
     /// Start a timer: the idle, light, draw, refresh, mark, radio-limit,
     /// reconnect, close and session timers.
@@ -329,6 +333,9 @@ pub struct Model {
     /// The entities with a service call that Home Assistant did not confirm
     /// yet. Refer to [`pending`].
     pub pending: pending::State,
+    /// The lines of the log of the core, with their times. Refer to
+    /// [`logs`].
+    pub logs: logs::State,
 }
 
 impl Default for Model {
@@ -347,6 +354,7 @@ impl Default for Model {
             full_refresh_seq: 0,
             refresh: refresh::State::default(),
             pending: pending::State::default(),
+            logs: logs::State::default(),
         }
     }
 }
@@ -400,6 +408,7 @@ impl Model {
             Event::Refresh(event) => refresh::update(event, self),
             Event::Pending(event) => pending::update(event, self),
             Event::Light(event) => light::update(event, self),
+            Event::Logs(event) => logs::update(event, self),
         }
     }
 }

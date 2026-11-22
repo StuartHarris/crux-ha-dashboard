@@ -33,10 +33,10 @@ use core::{mem, time::Duration};
 use crate::{
     Cmd, Model,
     capabilities::{
-        log::{self, Area},
+        log::Area,
         power::{Power, PowerSource, Wake, WakeSource},
     },
-    features::{connection, light, refresh::redraw, rooms, timer::Slot, wifi},
+    features::{connection, light, logs, refresh::redraw, rooms, timer::Slot, wifi},
     view::rounded_level,
 };
 
@@ -262,18 +262,15 @@ pub fn sleep_step(model: &Model) -> Option<SleepStep> {
 fn step_started(step: SleepStep, id: u32) -> Cmd {
     let line = |message: &str| format!("sleep {id} {message}");
     match step {
-        SleepStep::LightOff => log::info(Area::Power, line("turns the front light off")).build(),
-        SleepStep::StopScan => {
-            log::info(Area::Power, line("waits for the end of the scan")).build()
-        }
-        SleepStep::Disconnect => log::info(Area::Power, line("closes the connection")).build(),
-        SleepStep::RadioOff => log::info(Area::Power, line("turns the radio off")).build(),
-        SleepStep::Sleep => log::info(Area::Power, line("draws the last image and sleeps")).build(),
-        SleepStep::Stalled => log::warn(
+        SleepStep::LightOff => logs::info(Area::Power, line("turns the front light off")),
+        SleepStep::StopScan => logs::info(Area::Power, line("waits for the end of the scan")),
+        SleepStep::Disconnect => logs::info(Area::Power, line("closes the connection")),
+        SleepStep::RadioOff => logs::info(Area::Power, line("turns the radio off")),
+        SleepStep::Sleep => logs::info(Area::Power, line("draws the last image and sleeps")),
+        SleepStep::Stalled => logs::warn(
             Area::Power,
             line("stops before the radio turns off, because the chip restarts"),
-        )
-        .build(),
+        ),
     }
 }
 

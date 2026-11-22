@@ -224,6 +224,9 @@ impl ExpectRadioLimit for Cmd {
 pub trait ExpectStep {
     /// Expects the next effect to write `message` with the area `power` at
     /// the level `Info`. Refer to [`crate::features::power::sleep_step`].
+    ///
+    /// The helper drops the `Log` request with no answer. The core then
+    /// keeps no line, and the command ends as if the line was not there.
     fn expect_step(&mut self, message: &str) -> &mut Self;
 }
 
@@ -261,7 +264,8 @@ pub fn link_up(cmd: &mut Cmd, model: &mut Model) -> Cmd {
 /// answer.
 ///
 /// The function skips the lines of the log before the request, for example
-/// the line of a leave for a suspect link. A test that checks a line uses
+/// the line of a leave for a suspect link. It drops each `Log` request with
+/// no answer, so the core keeps no line. A test that checks a line uses
 /// `expect_log_with` before it calls this function.
 #[track_caller]
 pub fn answer_radio(cmd: &mut Cmd, radio: &mut FakeRadio) -> Event {

@@ -3,6 +3,7 @@
 
 pub mod connection;
 pub mod light;
+pub mod logs;
 pub mod pending;
 pub mod power;
 pub mod refresh;

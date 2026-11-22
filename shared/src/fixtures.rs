@@ -22,7 +22,10 @@ use crux_time::operation::NotifyAfter;
 
 use crate::{
     Core, Dashboard, Effect, Event, PowerSource, Settings, Start, TileKind, ViewModel,
-    capabilities::stream::{Open, StreamItem, Written},
+    capabilities::{
+        log::Uptime,
+        stream::{Open, StreamItem, Written},
+    },
     fake,
     pages::PAGES,
 };
@@ -166,9 +169,9 @@ impl FixedShell {
                     self.timers.retain(|timer| timer.operation.id != id);
                     self.resolve(&mut request, id)
                 }
-                Effect::Render(_) | Effect::Sleep(_) | Effect::RadioRestart(_) | Effect::Log(_) => {
-                    Vec::new()
-                }
+                // The shell has no clock, so each line has the time 0.
+                Effect::Log(mut request) => self.resolve(&mut request, Uptime(0)),
+                Effect::Render(_) | Effect::Sleep(_) | Effect::RadioRestart(_) => Vec::new(),
             };
             queue.extend(more);
         }

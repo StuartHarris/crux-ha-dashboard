@@ -38,9 +38,10 @@
 //! capability: a new request stops each request that waits.
 //! [`Shell::answer_radio`] answers the requests that wait.
 //!
-//! The shell keeps each `Log` notification in [`Shell::logs`], not in
+//! The shell keeps each `Log` request in [`Shell::logs`], not in
 //! [`Shell::log`], so a line of the log does not change the effects that a
-//! test checks.
+//! test checks. It answers the request at once with the time on its clock
+//! in milliseconds, so the core keeps each line with that time.
 
 use alloc::{format, string::String, vec::Vec};
 use core::time::Duration;
@@ -52,6 +53,7 @@ use super::broker::{Broker, publish_of};
 use crate::{
     Cmd, Dashboard, Effect, Event, Model, ViewModel,
     capabilities::{
+        log::Uptime,
         power::{Sleep, Wake},
         radio::{Address, Join, Joined, Lease, Leave, Off, Scan, Scanned, StopScan, Target},
         stream::Close,
@@ -112,7 +114,7 @@ pub struct Shell {
     held: Vec<Held>,
     /// The reason of each `Restart` notification, in order.
     pub restarts: Vec<String>,
-    /// Each `Log` notification as `{level} {area}: {message}`, in order. For
+    /// Each `Log` request as `{level} {area}: {message}`, in order. For
     /// example `warn wifi: the scan failed, so stay on ...`.
     pub logs: Vec<String>,
     /// The timers that wait, in the order in which the core started them.
@@ -463,9 +465,13 @@ impl Shell {
                 self.log.push("RadioRestart".into());
                 self.restarts.push(request.operation.reason);
             }
-            Effect::Log(request) => {
-                let log = request.operation;
+            Effect::Log(mut request) => {
+                let log = &request.operation;
                 self.logs.push(format!("{} {log}", log.level));
+                let at = Uptime(u64::try_from(self.now.as_millis()).expect("a short test"));
+                request
+                    .resolve(at)
+                    .expect("the core waits for the time of the line");
             }
             Effect::Sleep(request) => {
                 self.log.push("Sleep".into());

@@ -120,6 +120,18 @@ shows the reason, and the radio line shows the action. One `grep -a 'wifi:'` on 
 serial log shows both, in the order that they happened. The core writes nothing for
 the usual steps.
 
+The core lines have the log target `core`. esp-println does not print the target, so
+the serial log does not show it. The target matters only for a filter in `ESP_LOG`: a
+`dashboard=...` directive does not match the core lines. The next PR uses the target to
+keep the core lines out of the shell lines that the firmware sends to the core.
+
+After the task prints a core line, it answers with the time since the chip started, in
+milliseconds. That time counts through a light sleep. The core keeps its last 64 lines
+in RAM with these times, also while the board sleeps or is offline. A chip restart
+loses the lines. For example, the restart of the Wi-Fi policy after 3 joins with no new
+address loses the lines that tell why the chip restarts. A later PR can keep the lines
+through a restart.
+
 The log lines that an operator can search for:
 
 | Log line | Meaning |

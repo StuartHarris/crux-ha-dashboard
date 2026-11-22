@@ -9,7 +9,7 @@ use embedded_graphics::prelude::Point;
 use shared::{
     Cmd, Connection, Effect, Event, PowerSource,
     capabilities::{
-        log::{self, Area, Level, Log},
+        log::{Area, Level, Log, Uptime},
         power::Wake,
         radio::{Joined, Lease, Radio, Restart, Scanned},
         stream::{StreamItem, Written},
@@ -18,6 +18,7 @@ use shared::{
     features::{
         connection::{CLOSE_TIMEOUT, RECONNECT_MIN},
         light::{BATTERY_LEVEL, LIGHT_TIMEOUT, STAND_LEVEL},
+        logs::{self, Line, Message},
         power::IDLE_TIMEOUT,
         refresh::DRAW_DELAY,
         wifi::JOIN_TIMEOUT,
@@ -63,6 +64,9 @@ struct Device {
     radio_jobs: Vec<(u32, RadioOp)>,
     /// The token of the last timer of a feature that the core started.
     last_timer: u32,
+    /// The time on the clock of the device, with which the device answers
+    /// each `Log` job.
+    uptime: Uptime,
 }
 
 impl Deref for Device {
@@ -84,7 +88,8 @@ impl Device {
     /// radio jobs for [`Device::link`] and the token of the last timer of a
     /// feature.
     fn send(&mut self, event: Event) -> Vec<Job> {
-        let jobs = self.shell.send(event);
+        let mut jobs = self.shell.send(event);
+        self.answer_logs(&mut jobs);
         self.keep_radio_jobs(&jobs);
         self.keep_last_timer(&jobs);
         keep_stream_timers(&jobs);
@@ -95,11 +100,26 @@ impl Device {
     /// radio jobs for [`Device::link`] and the token of the last timer of a
     /// feature.
     fn handle(&mut self, signal: Signal) -> Vec<Job> {
-        let jobs = self.shell.handle(signal);
+        let mut jobs = self.shell.handle(signal);
+        self.answer_logs(&mut jobs);
         self.keep_radio_jobs(&jobs);
         self.keep_last_timer(&jobs);
         keep_stream_timers(&jobs);
         jobs
+    }
+
+    /// Answers each `Log` job in `jobs` at once with [`Device::uptime`], as
+    /// the core task does after it writes the line. Adds the jobs of the
+    /// answers to `jobs`.
+    fn answer_logs(&mut self, jobs: &mut Vec<Job>) {
+        let mut index = 0;
+        while let Some(job) = jobs.get(index) {
+            if let Job::Log { token, .. } = *job {
+                let at = self.uptime;
+                jobs.extend(self.shell.handle(Signal::Logged { token, at }));
+            }
+            index += 1;
+        }
     }
 
     /// Keeps the token of the last timer of a feature that `jobs` starts.
@@ -311,7 +331,7 @@ fn names(jobs: &[Job]) -> Vec<String> {
                 RadioOp::Off(_) => "wifi off".into(),
             }],
             Job::Restart(_) => vec!["restart".into()],
-            Job::Log(_) => Vec::new(),
+            Job::Log { .. } => Vec::new(),
             Job::Sleep(_) => vec!["sleep".into()],
             Job::FrontLight { token, level } => vec![format!("light {level} {token}")],
             Job::Timer {
@@ -339,7 +359,7 @@ fn names(jobs: &[Job]) -> Vec<String> {
 fn logs(jobs: &[Job]) -> Vec<String> {
     jobs.iter()
         .filter_map(|job| match job {
-            Job::Log(log) => Some(format!("{} {log}", log.level)),
+            Job::Log { line, .. } => Some(format!("{} {line}", line.level)),
             _ => None,
         })
         .collect()
@@ -360,6 +380,7 @@ fn started(power: PowerSource, read_only: bool) -> (Device, Vec<Job>) {
         radio: FakeRadio::default(),
         radio_jobs: Vec::new(),
         last_timer: 0,
+        uptime: Uptime(0),
     };
     let jobs = device.send(Event::Start(start));
     (device, jobs)
@@ -1409,7 +1430,7 @@ fn a_change_of_access_point_leaves_only_after_the_end_of_the_stream() {
     );
     // The clear of the time limit comes first. The line comes before the
     // effects of the decision.
-    assert!(matches!(jobs[1], Job::Log(_)), "{jobs:?}");
+    assert!(matches!(jobs[1], Job::Log { .. }), "{jobs:?}");
     // The session ended, so the view shows `Connecting`.
     let jobs = device.deliver(&jobs);
     assert_eq!(names(&jobs), [format!("close {SECOND}"), "render".into()]);
@@ -1479,8 +1500,7 @@ fn a_join_with_no_answer_is_stopped_by_the_next_join() {
 #[test]
 fn a_line_of_the_log_keeps_its_place_before_a_restart() {
     let mut shell = Shell::new();
-    let mut cmd: Cmd = log::warn(Area::Wifi, "3 of 3 joins got no new address")
-        .build()
+    let mut cmd: Cmd = logs::warn(Area::Wifi, "3 of 3 joins got no new address")
         .and(Radio::restart("no address after 3 joins".into()).build());
     let effects: Vec<Effect> = cmd.effects().collect();
 
@@ -1489,11 +1509,14 @@ fn a_line_of_the_log_keeps_its_place_before_a_restart() {
     assert_eq!(
         jobs,
         [
-            Job::Log(Log {
-                level: Level::Warn,
-                area: Area::Wifi,
-                message: "3 of 3 joins got no new address".into(),
-            }),
+            Job::Log {
+                token: 1,
+                line: Log {
+                    level: Level::Warn,
+                    area: Area::Wifi,
+                    message: "3 of 3 joins got no new address".into(),
+                },
+            },
             Job::Restart(Restart {
                 reason: "no address after 3 joins".into(),
             }),
@@ -1501,4 +1524,58 @@ fn a_line_of_the_log_keeps_its_place_before_a_restart() {
     );
     assert_eq!(names(&jobs), ["restart"]);
     assert_eq!(logs(&jobs), ["warn wifi: 3 of 3 joins got no new address"]);
+}
+
+#[test]
+fn a_line_of_the_log_ends_at_its_answer_with_the_time_of_the_device() {
+    let mut shell = Shell::new();
+    let mut cmd: Cmd = logs::info(Area::Power, "sleep 1 closes the connection");
+    let effects: Vec<Effect> = cmd.effects().collect();
+    let jobs = shell.process(effects);
+    let [Job::Log { token, .. }] = jobs[..] else {
+        panic!("not one Log job: {jobs:?}");
+    };
+
+    // An answer with a token that no request waits for is dropped.
+    let stale = Signal::Logged {
+        token: token + 1,
+        at: Uptime(1),
+    };
+    assert_eq!(shell.handle(stale), Vec::new());
+    assert_eq!(cmd.events().next(), None);
+
+    // The answer gives the time of the line to the core.
+    let answer = Signal::Logged {
+        token,
+        at: Uptime(42_000),
+    };
+    assert_eq!(shell.handle(answer), Vec::new());
+    assert_eq!(
+        cmd.events().collect::<Vec<_>>(),
+        [Event::Logs(logs::Event::Stamped(Line {
+            at: Uptime(42_000),
+            level: Level::Info,
+            area: Area::Power,
+            message: Message::new("sleep 1 closes the connection"),
+        }))]
+    );
+    assert!(cmd.is_done());
+}
+
+#[test]
+fn only_the_answer_to_a_log_job_does_not_count_as_an_update() {
+    let logged = Signal::Logged {
+        token: 1,
+        at: Uptime(5),
+    };
+    assert!(!logged.counts());
+    assert!(Signal::Tap(Point::new(10, 10)).counts());
+    assert!(Signal::Woke(Wake::Timer).counts());
+    assert!(
+        Signal::Stream {
+            connection: FIRST,
+            item: StreamItem::Opened,
+        }
+        .counts()
+    );
 }

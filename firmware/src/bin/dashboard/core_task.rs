@@ -15,7 +15,10 @@ use logic::{
     sleep::Plan,
     stream::UpdateStats,
 };
-use shared::{Event, PowerSource, capabilities::log::Level};
+use shared::{
+    Event, PowerSource,
+    capabilities::log::{Level, Uptime},
+};
 
 use crate::{LIGHT, RADIO, RENDER, SIGNALS, SLEEP, STREAM, TIMERS, config::CONFIG, radio, timers};
 
@@ -51,9 +54,13 @@ pub async fn run(source: PowerSource, display: bool) -> ! {
     loop {
         let signal = SIGNALS.pop().await;
         let sleeping = shell.is_sleeping();
+        // The answer to a `Log` job is not real work, so it does not count.
+        let counts = signal.counts();
         let started = Instant::now();
         let jobs = shell.handle(signal);
-        record(&mut stats.updates, started);
+        if counts {
+            record(&mut stats.updates, started);
+        }
         dispatch(jobs, display, &mut stats);
         // The shell answered the `Sleep` request, so the display task stops
         // the sleep.
@@ -86,7 +93,9 @@ fn record(stats: &mut UpdateStats, started: Instant) {
 ///
 /// This task writes each line of the log of the core as `{area}: {message}`,
 /// with no prefix of its own. Thus a `wifi:` line comes between the lines of
-/// the radio task.
+/// the radio task. The line has the log target `core`, which the printed
+/// line does not show. Then the task answers at once with
+/// `Signal::Logged` and the time of the line ([`uptime`]).
 ///
 /// An `Open` starts new update statistics. The first `Close` of the same
 /// connection logs them. A `Close` of an older connection, or a second
@@ -128,10 +137,16 @@ fn dispatch(jobs: alloc::vec::Vec<Job>, display: bool, stats: &mut Stats) {
             }
             Job::Radio { token, stop, op } => RADIO.push(radio::Request::Job { token, stop, op }),
             Job::Restart(restart) => RADIO.push(radio::Request::Restart(restart)),
-            Job::Log(line) => match line.level {
-                Level::Info => log::info!("{line}"),
-                Level::Warn => log::warn!("{line}"),
-            },
+            Job::Log { token, line } => {
+                match line.level {
+                    Level::Info => log::info!(target: "core", "{line}"),
+                    Level::Warn => log::warn!(target: "core", "{line}"),
+                }
+                SIGNALS.push(shell::Signal::Logged {
+                    token,
+                    at: uptime(),
+                });
+            }
             Job::FrontLight { token, level } if display => LIGHT.push((token, level)),
             Job::FrontLight { token, .. } => SIGNALS.push(shell::Signal::Light { token }),
             Job::Sleep(sleep) => {
@@ -152,4 +167,17 @@ fn dispatch(jobs: alloc::vec::Vec<Job>, display: bool, stats: &mut Stats) {
             } => TIMERS.push(timers::Request::Cancel { token }),
         }
     }
+}
+
+/// Returns the time since the chip started, in milliseconds.
+///
+/// The time comes from the system timer of esp-hal. At a wake from light
+/// sleep, esp-hal moves the system timer forward by the time asleep, so the
+/// time counts through a sleep.
+fn uptime() -> Uptime {
+    Uptime(
+        esp_hal::time::Instant::now()
+            .duration_since_epoch()
+            .as_millis(),
+    )
 }

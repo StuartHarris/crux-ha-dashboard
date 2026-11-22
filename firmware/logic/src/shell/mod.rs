@@ -30,9 +30,11 @@
 //!   drops the late answers of those jobs.
 //! - `Restart` is a notification. The shell gives it to a task as
 //!   [`Job::Restart`].
-//! - `Log` is a notification. The shell gives it to a task as [`Job::Log`],
-//!   in the order of the effects. Thus a line of the log comes before the
-//!   job of the next effect, for example before a `Restart`.
+//! - Each `Log` request has a token. The shell gives it to a task as
+//!   [`Job::Log`], in the order of the effects. Thus a line of the log comes
+//!   before the job of the next effect, for example before a `Restart`. The
+//!   task writes the line, then answers at once with [`Signal::Logged`], the
+//!   token and its monotonic time.
 //! - `Sleep` ends at [`Signal::Woke`]. While it waits, a tap is the wake
 //!   (`Wake::Touch` with the control at the point), and a change of the
 //!   power source also ends it (`Wake::PowerSource`). [`Shell::is_sleeping`] tells
@@ -60,7 +62,7 @@ use shared::{
     Core, Dashboard, Effect, Event, PowerSource, Settings, Start, ViewModel,
     capabilities::{
         light::FrontLight,
-        log::Log,
+        log::{Log, Uptime},
         power::{Sleep, Wake},
         radio::{Address, Join, Joined, Lease, Leave, Off, Restart, Scan, Scanned, StopScan},
         stream::{Close, Open, StreamItem, Write, Written},
@@ -116,8 +118,26 @@ pub enum Signal {
         /// The token of the newest job that the answer is for.
         token: u32,
     },
+    /// The task wrote the line of the `Log` job with this token, at this
+    /// time on the monotonic clock of the device.
+    Logged {
+        /// The token of the job.
+        token: u32,
+        /// The time of the line.
+        at: Uptime,
+    },
     /// An event for the core, for example `PowerSourceChanged`.
     Event(Event),
+}
+
+impl Signal {
+    /// Returns `true` if the update for this signal is real work of the core
+    /// (MQTT, a tap, a timer and so on), so it counts in the update
+    /// statistics of a stream. The answer to a `Log` job does not count.
+    #[must_use]
+    pub const fn counts(&self) -> bool {
+        !matches!(self, Self::Logged { .. })
+    }
 }
 
 /// A stream operation of the core, for the connection with the id in the
@@ -193,8 +213,8 @@ pub enum TimerOp {
 }
 
 /// Work for a task. A job holds the operations of the core unchanged, and
-/// adds only what the shell owns: the radio token, the light token and the
-/// timer token.
+/// adds only what the shell owns: the radio token, the log token, the light
+/// token and the timer token.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Job {
     /// Draw the view model on the panel. The shell decides this job, so no
@@ -224,9 +244,15 @@ pub enum Job {
     /// Write the reason to the log, wait for the log to go, and restart the
     /// chip. No answer.
     Restart(Restart),
-    /// Write the line to the log as `{area}: {message}`, at its level. No
-    /// answer.
-    Log(Log),
+    /// Write the line to the log as `{area}: {message}`, at its level. Then
+    /// answer at once with [`Signal::Logged`], the token and the monotonic
+    /// time in milliseconds. The time must count through a light sleep.
+    Log {
+        /// The token of the request.
+        token: u32,
+        /// The line.
+        line: Log,
+    },
     /// Draw the view model that waits, then put the device to sleep. Answer
     /// with [`Signal::Woke`] at the first real wake. After another wake,
     /// sleep again.
@@ -279,6 +305,10 @@ pub struct Shell {
     /// The `FrontLight` requests that wait for an answer, with their tokens.
     lights: Vec<(u32, Request<FrontLight>)>,
     last_light_token: u32,
+    /// The `Log` requests that wait for an answer, with their tokens, from
+    /// the oldest.
+    logs: Vec<(u32, Request<Log>)>,
+    last_log_token: u32,
 }
 
 impl Default for Shell {
@@ -303,6 +333,8 @@ impl Shell {
             sleep: None,
             lights: Vec::new(),
             last_light_token: 0,
+            logs: Vec::new(),
+            last_log_token: 0,
         }
     }
 
@@ -374,6 +406,14 @@ impl Shell {
                 jobs
             }
             Signal::Woke(wake) => self.wake(wake),
+            Signal::Logged { token, at } => {
+                let Some(index) = self.logs.iter().position(|(log, _)| *log == token) else {
+                    return Vec::new();
+                };
+                let (_, mut request) = self.logs.remove(index);
+                let effects = resolve(&self.core, &mut request, at);
+                self.process(effects)
+            }
             Signal::Light { token } => {
                 let (answered, waiting) = core::mem::take(&mut self.lights)
                     .into_iter()
@@ -509,6 +549,26 @@ impl Shell {
         effects
     }
 
+    /// Takes a token for the `Log` request `request`, and adds its job to
+    /// `jobs`. The request waits for [`Signal::Logged`], so it gives no new
+    /// effects now.
+    ///
+    /// The job takes the message, so the shell does not copy it. The request
+    /// needs only its answer.
+    fn log(&mut self, mut request: Request<Log>, jobs: &mut Vec<Job>) -> Vec<Effect> {
+        self.last_log_token = self.last_log_token.wrapping_add(1);
+        let token = self.last_log_token;
+        let operation = &mut request.operation;
+        let line = Log {
+            level: operation.level,
+            area: operation.area,
+            message: core::mem::take(&mut operation.message),
+        };
+        jobs.push(Job::Log { token, line });
+        self.logs.push((token, request));
+        Vec::new()
+    }
+
     fn process(&mut self, effects: Vec<Effect>) -> Vec<Job> {
         let mut queue: alloc::collections::VecDeque<Effect> = effects.into();
         let mut jobs = Vec::new();
@@ -591,7 +651,7 @@ impl Shell {
                 self.radio(RadioRequest::Off(request), op, jobs)
             }
             Effect::RadioRestart(request) => notification(Job::Restart(request.operation), jobs),
-            Effect::Log(request) => notification(Job::Log(request.operation), jobs),
+            Effect::Log(request) => self.log(request, jobs),
             Effect::Sleep(request) => {
                 jobs.push(Job::Sleep(request.operation.clone()));
                 self.sleep = Some(request);
