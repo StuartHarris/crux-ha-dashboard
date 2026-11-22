@@ -171,6 +171,7 @@ impl FixedShell {
                 }
                 // The shell has no clock, so each line has the time 0.
                 Effect::Log(mut request) => self.resolve(&mut request, Uptime(0)),
+                Effect::LogClock(mut request) => self.resolve(&mut request, Uptime(0)),
                 Effect::Render(_) | Effect::Sleep(_) | Effect::RadioRestart(_) => Vec::new(),
             };
             queue.extend(more);

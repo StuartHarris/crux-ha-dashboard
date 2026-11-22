@@ -28,7 +28,8 @@
 //! [`Shell::auto_draw`] to `false`.
 //!
 //! The shell answers `FrontLight` at once and keeps the level in
-//! [`Shell::light`].
+//! [`Shell::light`]. A test of a light that does not answer sets
+//! [`Shell::hold_light`].
 //!
 //! The shell answers each radio request at once with the fake radio
 //! ([`Shell::radio`]). It logs `Off` as `WifiOff`, and each other radio
@@ -41,7 +42,11 @@
 //! The shell keeps each `Log` request in [`Shell::logs`], not in
 //! [`Shell::log`], so a line of the log does not change the effects that a
 //! test checks. It answers the request at once with the time on its clock
-//! in milliseconds, so the core keeps each line with that time.
+//! in milliseconds, so the core keeps each line with that time. It answers
+//! each `LogClock` request at once with the same time, and does not log it.
+//! It counts the `LogClock` requests in [`Shell::clocks`]. A test of a late
+//! answer sets [`Shell::hold_clock`], and then answers the requests that
+//! wait with [`Shell::answer_clock`].
 
 use alloc::{format, string::String, vec::Vec};
 use core::time::Duration;
@@ -53,7 +58,8 @@ use super::broker::{Broker, publish_of};
 use crate::{
     Cmd, Dashboard, Effect, Event, Model, ViewModel,
     capabilities::{
-        log::Uptime,
+        light::FrontLight,
+        log::{Log, LogClock, Uptime},
         power::{Sleep, Wake},
         radio::{Address, Join, Joined, Lease, Leave, Off, Scan, Scanned, StopScan, Target},
         stream::Close,
@@ -99,6 +105,10 @@ pub struct Frame {
 ///
 /// Like an e-paper shell, it draws once at the end of [`Shell::run`], for all
 /// the `Render` requests of the run.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag is a separate rule of the test shell"
+)]
 pub struct Shell {
     app: Dashboard,
     pub model: Model,
@@ -117,6 +127,19 @@ pub struct Shell {
     /// Each `Log` request as `{level} {area}: {message}`, in order. For
     /// example `warn wifi: the scan failed, so stay on ...`.
     pub logs: Vec<String>,
+    /// The number of `LogClock` requests.
+    pub clocks: usize,
+    /// If `true`, the shell keeps each `LogClock` request until
+    /// [`Shell::answer_clock`].
+    pub hold_clock: bool,
+    /// If `true`, the shell sets the level of each `FrontLight` request, but
+    /// keeps the request until [`Shell::answer_lights`], so the core waits
+    /// for the light.
+    pub hold_light: bool,
+    /// The `FrontLight` requests that the shell did not answer.
+    held_lights: Vec<Request<FrontLight>>,
+    /// The `LogClock` requests that wait, from the oldest.
+    held_clocks: Vec<Request<LogClock>>,
     /// The timers that wait, in the order in which the core started them.
     timers: Vec<Timer>,
     /// The time on the clock of the shell.
@@ -145,6 +168,8 @@ pub struct Shell {
     pub closes: Vec<Close>,
     /// The packets of each `Write` request, in order.
     pub writes: Vec<Vec<Packet>>,
+    /// The number of bytes of each `Write` request, in order.
+    pub write_bytes: Vec<usize>,
 }
 
 impl Shell {
@@ -161,6 +186,11 @@ impl Shell {
             held: Vec::new(),
             restarts: Vec::new(),
             logs: Vec::new(),
+            clocks: 0,
+            hold_clock: false,
+            hold_light: false,
+            held_lights: Vec::new(),
+            held_clocks: Vec::new(),
             timers: Vec::new(),
             now: Duration::ZERO,
             light: 0,
@@ -174,6 +204,7 @@ impl Shell {
             cleared: Vec::new(),
             closes: Vec::new(),
             writes: Vec::new(),
+            write_bytes: Vec::new(),
         }
     }
 
@@ -405,6 +436,60 @@ impl Shell {
         core::mem::take(&mut self.cleared)
     }
 
+    /// Returns the time on the clock of the shell in milliseconds, as the
+    /// shell answers `Log` and `LogClock`.
+    fn uptime(&self) -> Uptime {
+        Uptime(u64::try_from(self.now.as_millis()).expect("a short test"))
+    }
+
+    /// Keeps the line of a `Log` request in [`Shell::logs`], and answers it
+    /// at once with the time on the clock.
+    fn log_line(&mut self, mut request: Request<Log>) {
+        let log = &request.operation;
+        self.logs.push(format!("{} {log}", log.level));
+        request
+            .resolve(self.uptime())
+            .expect("the core waits for the time of the line");
+    }
+
+    /// Answers a `LogClock` request at once, or keeps it if
+    /// [`Shell::hold_clock`] is `true`.
+    fn clock(&mut self, mut request: Request<LogClock>) {
+        self.clocks += 1;
+        if self.hold_clock {
+            self.held_clocks.push(request);
+        } else {
+            request
+                .resolve(self.uptime())
+                .expect("the core waits for the time");
+        }
+    }
+
+    /// Answers the `LogClock` request at `index` in the requests that wait,
+    /// with the time on the clock, and answers the effects until the core
+    /// waits. Refer to [`Shell::hold_clock`].
+    pub fn answer_clock(&mut self, index: usize) {
+        let mut request = self.held_clocks.remove(index);
+        request
+            .resolve(self.uptime())
+            .expect("the core waits for the time");
+        self.run();
+    }
+
+    /// Answers the `FrontLight` requests that wait, in order, and answers
+    /// the effects until the core waits. Refer to [`Shell::hold_light`].
+    pub fn answer_lights(&mut self) {
+        for mut request in core::mem::take(&mut self.held_lights) {
+            request.resolve(()).expect("the core waits for the light");
+        }
+        self.run();
+    }
+
+    /// Returns the number of `LogClock` requests that wait.
+    pub const fn held_clocks(&self) -> usize {
+        self.held_clocks.len()
+    }
+
     /// Returns the lines of the log of the core and clears them. Refer to
     /// [`Shell::logs`].
     pub fn take_logs(&mut self) -> Vec<String> {
@@ -422,6 +507,7 @@ impl Shell {
                 self.broker.open(request);
             }
             Effect::StreamWrite(request) => {
+                self.write_bytes.push(request.operation.bytes.len());
                 let packets = self.broker.write(request);
                 self.log_packets(&packets);
                 self.writes.push(packets);
@@ -465,14 +551,8 @@ impl Shell {
                 self.log.push("RadioRestart".into());
                 self.restarts.push(request.operation.reason);
             }
-            Effect::Log(mut request) => {
-                let log = &request.operation;
-                self.logs.push(format!("{} {log}", log.level));
-                let at = Uptime(u64::try_from(self.now.as_millis()).expect("a short test"));
-                request
-                    .resolve(at)
-                    .expect("the core waits for the time of the line");
-            }
+            Effect::Log(request) => self.log_line(request),
+            Effect::LogClock(request) => self.clock(request),
             Effect::Sleep(request) => {
                 self.log.push("Sleep".into());
                 self.sleep = Some(request.operation.clone());
@@ -482,7 +562,11 @@ impl Shell {
                 let level = request.operation.level;
                 self.log.push(format!("FrontLight {level}"));
                 self.light = level;
-                request.resolve(()).expect("the core waits for the light");
+                if self.hold_light {
+                    self.held_lights.push(request);
+                } else {
+                    request.resolve(()).expect("the core waits for the light");
+                }
             }
             Effect::TimeNotifyAfter(request) => {
                 let duration = Duration::from(request.operation.duration);

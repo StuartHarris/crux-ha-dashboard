@@ -10,7 +10,7 @@ use crux_time::operation as time;
 use crate::{
     capabilities::{
         light::FrontLight,
-        log::Log,
+        log::{Log, LogClock},
         power::{PowerSource, Sleep},
         radio::{Address, Join, Leave, Off, Restart, Scan, StopScan},
         stream::{Close, Open, Write},
@@ -56,6 +56,13 @@ impl Settings {
     #[must_use]
     pub fn status_topic(&self) -> String {
         format!("dashboard/{}/status", self.device_id)
+    }
+
+    /// Returns the topic on which the dashboard publishes the lines of its
+    /// log. Refer to [`logs`].
+    #[must_use]
+    pub fn log_topic(&self) -> String {
+        format!("dashboard/{}/log", self.device_id)
     }
 
     /// Returns the MQTT client id.
@@ -205,7 +212,8 @@ pub enum Event {
     /// answers to its effects. The shell never sends them.
     Light(light::Event),
     /// The internal events of the logs feature. The core makes them from the
-    /// answers to its `Log` requests. The shell never sends them.
+    /// answers to its `Log` and `LogClock` requests. The shell never sends
+    /// them.
     Logs(logs::Event),
 }
 
@@ -289,6 +297,10 @@ pub enum Effect {
     /// Wi-Fi policy, a failure or a step of a sleep. The answer is the time
     /// of the line, and the core keeps the line with it. Refer to [`logs`].
     Log(Log),
+    /// Ask for the time on the clock of the `Log` answers, before the core
+    /// sends its kept lines to Home Assistant with their ages. Refer to
+    /// [`logs`].
+    LogClock(LogClock),
     /// Start a timer: the idle, light, draw, refresh, mark, radio-limit,
     /// reconnect, close and session timers.
     TimeNotifyAfter(time::NotifyAfter),
