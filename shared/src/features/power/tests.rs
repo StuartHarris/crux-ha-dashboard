@@ -918,3 +918,78 @@ fn the_sleep_step_follows_each_step_of_a_sleep_and_each_step_writes_one_line() {
     );
     assert_eq!(power::sleep_step(&model), None);
 }
+
+/// Starts the house on battery, sleeps at the idle timeout, and clears the
+/// logs. The `Sleep` request waits.
+fn at_the_sleep_step() -> Shell {
+    let mut shell = crate::tests::flows::house();
+    shell.send(start(PowerSource::Battery));
+    shell.advance(IDLE_TIMEOUT);
+    assert!(shell.sleep.is_some());
+    assert_eq!(power::sleep_step(&shell.model), Some(SleepStep::Sleep));
+    shell.take_log();
+    shell.take_logs();
+    shell
+}
+
+/// Returns the lines of `logs` with the area `power`. Each line is
+/// `{level} {area}: {message}`.
+fn power_lines(logs: &[alloc::string::String]) -> Vec<&str> {
+    logs.iter()
+        .map(alloc::string::String::as_str)
+        .filter(|line| {
+            line.split_once(' ')
+                .is_some_and(|(_, rest)| rest.starts_with("power:"))
+        })
+        .collect()
+}
+
+#[test]
+fn a_tap_at_the_sleep_step_wakes_connects_and_acts_on_its_control() {
+    let mut shell = at_the_sleep_step();
+
+    // The tap comes to the core as `Tapped`, not as the answer to `Sleep`.
+    // It wakes the device, connects, starts the idle timer and acts on its
+    // control.
+    shell.queue(crate::tests::tap_all_lights());
+    shell.run();
+    let log = shell.take_log();
+    assert!(!asleep(&shell.model));
+    assert_eq!(power::sleep_step(&shell.model), None);
+    assert!(
+        log.iter().any(|entry| entry.starts_with("RadioJoin")),
+        "{log:?}"
+    );
+    let idle = alloc::format!("TimeNotifyAfter {}ms", IDLE_TIMEOUT.as_millis());
+    assert!(log.contains(&idle), "{log:?}");
+    assert_eq!(shell.view().connection, Connection::Online);
+    let call = shell.broker.service_calls.last().expect("a service call");
+    assert_eq!(call.entity_id, "light.all_lights");
+    assert_eq!(shell.broker.service_calls.len(), 1);
+}
+
+#[test]
+fn a_touch_wake_writes_no_power_line() {
+    let mut shell = at_the_sleep_step();
+
+    // The shell answers `Sleep` with `Wake::Touch(None)`. A usual wake
+    // writes no line with the area `power`.
+    shell.send(Event::Tapped(None));
+    assert!(!asleep(&shell.model));
+    let logs = shell.take_logs();
+    assert_eq!(power_lines(&logs), Vec::<&str>::new(), "{logs:?}");
+}
+
+#[test]
+fn a_battery_level_at_the_sleep_step_sends_nothing() {
+    let mut shell = at_the_sleep_step();
+
+    // The core keeps the level, but it sends no effect, and the `Sleep`
+    // request still waits.
+    shell.send(Event::BatteryChanged(Some(41)));
+    assert_eq!(shell.take_log(), Vec::<alloc::string::String>::new());
+    assert_eq!(shell.take_logs(), Vec::<alloc::string::String>::new());
+    assert!(shell.sleep.is_some());
+    assert_eq!(power::sleep_step(&shell.model), Some(SleepStep::Sleep));
+    assert_eq!(shell.view().battery, Some(40));
+}

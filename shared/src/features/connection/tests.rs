@@ -1105,3 +1105,80 @@ fn a_close_for_a_roam_shows_connecting_and_drops_the_messages() {
     send(&mut model, &mut wire, &topic(VISIBLE, "state"), "on").expect_no_effects();
     assert_eq!(model.entities.get(VISIBLE), None);
 }
+
+#[test]
+fn a_stream_failure_waits_1_2_4_s_before_each_retry() {
+    let app = Dashboard;
+    let (mut model, _wire) = drive_to_connecting(PowerSource::Stand);
+
+    for expected in [1, 2, 4] {
+        let connection = model.connection.id;
+        let mut cmd = app.update(
+            Event::Connection(connection::Event::Stream {
+                connection,
+                item: StreamItem::by_host("connection refused"),
+            }),
+            &mut model,
+        );
+        // The retry timer is the timer that is not the time limit of the
+        // close.
+        let mut retry = cmd
+            .effects()
+            .find_map(|effect| match effect {
+                Effect::TimeNotifyAfter(request)
+                    if Duration::from(request.operation.duration) != CLOSE_TIMEOUT =>
+                {
+                    Some(request)
+                }
+                _ => None,
+            })
+            .expect("a retry timer");
+        assert_eq!(
+            Duration::from(retry.operation.duration),
+            Duration::from_secs(expected)
+        );
+        let id = retry.operation.id;
+        retry.resolve(id).expect("the core waits for the timer");
+        let reconnect = cmd.expect_event();
+        let _ = app.update(
+            Event::Connection(connection::Event::StreamClosed { connection }),
+            &mut model,
+        );
+        let mut cmd = app.update(reconnect, &mut model);
+        let _ = link_up(&mut cmd, &mut model);
+    }
+}
+
+#[test]
+fn a_clean_end_connects_again_at_once_with_no_wait() {
+    let mut shell = house();
+    shell.send(start(PowerSource::Battery));
+    assert_eq!(shell.view().connection, Connection::Online);
+    shell.broker.hold_writes = true;
+    shell.broker.hold_closes = true;
+    shell.advance(crate::features::power::IDLE_TIMEOUT);
+    // A tap wakes the device while the DISCONNECT of the sleep waits.
+    shell.send(Event::Tapped(None));
+    assert!(!shell.model.power.is_asleep());
+    shell.take_log();
+
+    // The DISCONNECT leaves, so the session ends clean. The core starts no
+    // retry timer.
+    shell.broker.release_writes();
+    shell.run();
+    assert!(shell.closes.last().expect("a Close request").clean);
+    shell.broker.release_closes();
+    shell.run();
+    let log = shell.take_log();
+    let retry = format!("TimeNotifyAfter {}ms", RECONNECT_MIN.as_millis());
+    assert!(!log.contains(&retry), "{log:?}");
+    assert!(log.contains(&"MqttConnect".into()), "{log:?}");
+    assert_eq!(shell.view().connection, Connection::Online);
+    let events = shell.advance(RECONNECT_MAX);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, Event::Connection(connection::Event::Reconnect(_)))),
+        "{events:?}"
+    );
+}

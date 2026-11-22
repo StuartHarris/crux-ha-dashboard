@@ -386,12 +386,16 @@ mod tests {
     }
 
     #[test]
-    fn a_tap_holds_the_sleep_and_does_not_shorten_a_hold() {
+    fn a_tap_holds_the_sleep_for_the_tap_guard() {
         let mut sleeper = Sleeper::default();
         sleeper.tapped(1000);
         assert!(!sleeper.can_sleep(1000 + TAP_HOLD_MS - 1));
         assert!(sleeper.can_sleep(1000 + TAP_HOLD_MS));
+    }
 
+    #[test]
+    fn a_tap_does_not_shorten_a_hold() {
+        let mut sleeper = Sleeper::default();
         sleeper.woke(5000);
         sleeper.tapped(5000);
         assert!(!sleeper.can_sleep(5000 + TAP_HOLD_MS));

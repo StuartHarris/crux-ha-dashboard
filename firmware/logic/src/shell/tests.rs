@@ -1262,6 +1262,17 @@ fn a_tap_while_sleep_waits_is_the_wake_and_acts_on_its_control() {
 }
 
 #[test]
+fn a_tap_from_the_wake_answers_sleep_once() {
+    let mut device = asleep();
+    let _ = device.handle(Signal::Tap(ui::layout::next().center()));
+    assert!(!device.is_sleeping());
+
+    // The tap answered the `Sleep` request. A late wake finds no request,
+    // so it gives no jobs.
+    assert_eq!(device.handle(Signal::Woke(Wake::Touch(None))), Vec::new());
+}
+
+#[test]
 fn a_tap_on_a_light_while_sleep_waits_is_sent_after_the_reconnect() {
     let mut device = asleep_with(false);
     let jobs = device.handle(Signal::Tap(ui::layout::tile(0).unwrap().center()));

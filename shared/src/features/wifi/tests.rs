@@ -1641,3 +1641,76 @@ fn a_session_that_fails_again_after_a_stale_address_keeps_the_count_of_joins() {
         ]
     );
 }
+
+/// Starts the house on battery, sleeps at the idle timeout, and clears the
+/// logs. Unlike [`asleep`], it does not check the lines of the sleep.
+fn at_the_sleep_step() -> Shell {
+    let mut shell = house();
+    shell.send(start(PowerSource::Battery));
+    shell.advance(IDLE_TIMEOUT);
+    assert!(shell.sleep.is_some());
+    shell.take_log();
+    shell.take_logs();
+    shell
+}
+
+/// Returns the level and the message of each line on the log topic that
+/// the broker got, in order.
+fn published_lines(shell: &Shell) -> Vec<(String, String)> {
+    shell
+        .broker
+        .published
+        .iter()
+        .filter(|publish| publish.topic == "dashboard/hall/log")
+        .map(|publish| {
+            let payload: serde_json::Value =
+                serde_json::from_slice(&publish.payload).expect("JSON");
+            (
+                payload["level"].as_str().expect("a level").into(),
+                payload["msg"].as_str().expect("a msg").into(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn a_roam_after_the_wake_scan_keeps_its_line() {
+    let mut shell = at_the_sleep_step();
+    assert_eq!(shell.radio.move_strongest(), Some(LANDING));
+
+    // A tap wakes the device. The scan finds a better access point, and
+    // the core changes to it.
+    shell.send(Event::Tapped(None));
+    let change = "change to 02:00:00:00:00:02 on channel 11 (-45 dBm), because the \
+                  signal of 02:00:00:00:00:01 on channel 6 is -75 dBm";
+    let logs = shell.take_logs();
+    assert!(logs.contains(&format!("info wifi: {change}")), "{logs:?}");
+    assert_eq!(shell.radio.associated, Some(LANDING));
+
+    // The ring kept the line, and it went to Home Assistant at Info.
+    let lines = published_lines(&shell);
+    assert!(lines.contains(&("info".into(), change.into())), "{lines:?}");
+}
+
+#[test]
+fn a_failed_wake_scan_keeps_its_warning() {
+    let mut shell = at_the_sleep_step();
+    shell.hold_radio = true;
+
+    // A tap wakes the device. The join and the address answer, and the scan
+    // gets no answer in its time limit.
+    shell.send(Event::Tapped(None));
+    shell.answer_radio();
+    shell.answer_radio();
+    assert_eq!(shell.model.wifi.phase, Phase::Scanning(ready(HALL)));
+    shell.advance(SCAN_TIMEOUT);
+    let failed = "the scan failed, so stay on 02:00:00:00:00:01 on channel 6";
+    let logs = shell.take_logs();
+    assert!(logs.contains(&format!("warn wifi: {failed}")), "{logs:?}");
+
+    // The ring kept the line, and it went to Home Assistant as a warning.
+    shell.hold_radio = false;
+    shell.answer_radio();
+    let lines = published_lines(&shell);
+    assert!(lines.contains(&("warn".into(), failed.into())), "{lines:?}");
+}
