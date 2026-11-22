@@ -487,7 +487,8 @@ pub fn link_up(model: &mut Model) -> Cmd {
 /// the failure.
 pub fn link_failed(model: &mut Model) -> Cmd {
     if model.wants_online() {
-        schedule_reconnect(model)
+        // The Wi-Fi feature already wrote a warning with the reason.
+        schedule_reconnect("the link is down", logs::info, model)
     } else {
         Cmd::done()
     }
@@ -543,12 +544,12 @@ pub fn close_for_roam(model: &mut Model) -> Cmd {
 /// A new sleep replaces the sleep that waits. The core stops the reconnect
 /// timer, and does not connect again after the close.
 ///
-/// The core drops the service calls in the outbox and removes their marks.
-/// The mark of a call that went out stays, but its timeout of the outbox
-/// stops. The device sleeps, so the core does not draw.
+/// The core drops the service calls in the outbox and removes each mark,
+/// also the mark of a call that went out. Refer to
+/// [`pending::end_for_sleep`]. The device sleeps, so the core does not draw.
 pub fn go_offline(sleep: u32, model: &mut Model) -> Cmd {
     model.connection.outbox.clear();
-    pending::forget_dropped(model);
+    pending::end_for_sleep(model);
     let status = model.startup.settings().map(|settings| Publish {
         topic: settings.status_topic(),
         payload: STATUS_ASLEEP.into(),
@@ -841,8 +842,27 @@ pub fn stream_closed(id: u32, model: &mut Model) -> Cmd {
 /// If the answer did not arrive, the core acts as if it
 /// arrived now. The answer clears the timer. If the timer expires first,
 /// the core ignores the answer. Refer to [`CLOSE_TIMEOUT`].
+///
+/// If the timer acts, the core writes a warning. During the steps of a
+/// sleep, the close is the disconnect step, so the warning tells that the
+/// step was stuck.
 pub fn close_timeout(id: u32, model: &mut Model) -> Cmd {
-    stream_closed(id, model)
+    let waits = matches!(
+        &model.connection.phase,
+        Phase::Draining { close, .. } if close.id() == id
+    );
+    let closed = stream_closed(id, model);
+    if !waits {
+        return closed;
+    }
+    logs::warn(
+        Area::Mqtt,
+        format!(
+            "the close of connection {id} got no answer in {} s",
+            CLOSE_TIMEOUT.as_secs()
+        ),
+    )
+    .and(closed)
 }
 
 /// Sends the `Close` request for the stream of the connection `id`, and
@@ -1128,12 +1148,19 @@ fn ended(end: &End, model: &mut Model) -> Cmd {
         },
     };
     if model.power.is_asleep() {
-        return health.and(close);
+        // The sleep does not connect again. A failed end is the only line
+        // of the disconnect step.
+        let failure = if clean {
+            Cmd::done()
+        } else {
+            logs::warn(Area::Mqtt, format!("{end}, during the sleep"))
+        };
+        return health.and(close).and(failure);
     }
     let retry = if !wants_online || clean {
         Cmd::done()
     } else {
-        schedule_reconnect(model)
+        schedule_reconnect(&end.to_string(), logs::warn, model)
     };
     health.and(close).and(redraw(model, false)).and(retry)
 }
@@ -1173,10 +1200,13 @@ pub fn page_time(model: &Model) -> Option<DateTime<Utc>> {
 }
 
 /// Waits, then tries to connect again. Each wait is double the wait before
-/// it, up to [`RECONNECT_MAX`]. The command writes the wait to the log, in
-/// whole seconds, before the timer starts. Both limits are whole seconds,
-/// so each wait is. With a stream, the core does nothing.
-fn schedule_reconnect(model: &mut Model) -> Cmd {
+/// it, up to [`RECONNECT_MAX`]. With a stream, the core does nothing.
+///
+/// The command writes one line with `write` before the timer starts: `cause`,
+/// then the wait in whole seconds, for example `the stream closed:
+/// connection lost, so connect again in 4 s`. Both limits are whole
+/// seconds, so each wait is.
+fn schedule_reconnect(cause: &str, write: fn(Area, String) -> Cmd, model: &mut Model) -> Cmd {
     let state = &mut model.connection;
     let Some(retry) = state.phase.retry_mut() else {
         return Cmd::done();
@@ -1186,8 +1216,8 @@ fn schedule_reconnect(model: &mut Model) -> Cmd {
     let wait = state.backoff;
     state.backoff = (wait * 2).min(RECONNECT_MAX);
     let timer = retry.start(id, wait, Event::Reconnect(id).into());
-    let reason = logs::info(Area::Mqtt, format!("connect again in {} s", wait.as_secs()));
-    reason.and(timer)
+    let message = format!("{cause}, so connect again in {} s", wait.as_secs());
+    write(Area::Mqtt, message).and(timer)
 }
 
 #[cfg(test)]

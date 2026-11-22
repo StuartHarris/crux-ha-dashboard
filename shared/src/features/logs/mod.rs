@@ -6,6 +6,10 @@
 //!   [`Log`](crate::capabilities::log::Log) request. The shell writes the
 //!   line and answers with its monotonic time ([`Uptime`]). The core then
 //!   keeps the line with that time.
+//! - The core does not keep a line at [`Level::Debug`] ([`debug`]). The
+//!   shell writes it, but the line never goes into the ring, so it never
+//!   goes to Home Assistant. A [`Line`] has the level type [`Kept`], which
+//!   has no `Debug` variant.
 //! - The shell sends its own lines as
 //!   [`Event::ShellLogged`](crate::Event::ShellLogged), with the time on the
 //!   same clock. The core keeps each line as it comes, with
@@ -178,7 +182,7 @@ fn publish(model: &mut Model) -> Cmd {
 /// ring until the next connect after the wake.
 pub fn shell_logged(
     at: Uptime,
-    level: Level,
+    level: Kept,
     source: &str,
     message: &str,
     dropped: u32,
@@ -216,21 +220,34 @@ fn clock(connection: u32, now: Uptime, model: &mut Model) -> Cmd {
     connection::pump(model)
 }
 
+/// Writes `message` to the log of the shell at the level `Debug`. The core
+/// does not keep the line, so it does not go to Home Assistant.
+///
+/// The line is a `Log` request as the other lines are, so the order of the
+/// lines and the effects is the same at each level. The command ignores the
+/// answer, and sends no event.
+pub fn debug(area: Area, message: impl Into<String>) -> Cmd {
+    let request = log::write(Level::Debug, area, message.into());
+    Cmd::new(|ctx| async move {
+        let _: Uptime = request.into_future(ctx).await;
+    })
+}
+
 /// Writes `message` to the log of the shell at the level `Info`, and keeps
 /// the line with its time.
 pub fn info(area: Area, message: impl Into<String>) -> Cmd {
-    write(Level::Info, area, message.into())
+    write(Kept::Info, area, message.into())
 }
 
 /// Writes `message` to the log of the shell at the level `Warn`, and keeps
 /// the line with its time.
 pub fn warn(area: Area, message: impl Into<String>) -> Cmd {
-    write(Level::Warn, area, message.into())
+    write(Kept::Warn, area, message.into())
 }
 
-fn write(level: Level, area: Area, message: String) -> Cmd {
+fn write(level: Kept, area: Area, message: String) -> Cmd {
     let kept = Message::new(&message);
-    log::write(level, area, message).then_send(move |at| {
+    log::write(level.into(), area, message).then_send(move |at| {
         Event::Stamped(Line {
             at,
             level,
@@ -248,11 +265,50 @@ pub struct Line {
     /// the line.
     pub at: Uptime,
     /// How important the line is.
-    pub level: Level,
+    pub level: Kept,
     /// The part of the core or the shell that wrote the line.
     pub source: Source,
     /// The text of the line, with at most [`MAX_MESSAGE`] bytes.
     pub message: Message,
+}
+
+/// How important a line in the ring is: a [`Level`] with no `Debug`.
+///
+/// The core does not keep a `Debug` line, so a line in the ring cannot have
+/// that level. The payload has its [`name`](Kept::name) as `level`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kept {
+    /// A decision of the core.
+    Info,
+    /// A failure, or a decision because of a failure.
+    Warn,
+    /// A failure in the shell.
+    Error,
+}
+
+impl Kept {
+    /// Returns the name of the level, for example `info`.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        Level::from_kept(self).name()
+    }
+}
+
+impl From<Kept> for Level {
+    fn from(level: Kept) -> Self {
+        Self::from_kept(level)
+    }
+}
+
+impl Level {
+    /// Returns the level of a line in the ring.
+    const fn from_kept(level: Kept) -> Self {
+        match level {
+            Kept::Info => Self::Info,
+            Kept::Warn => Self::Warn,
+            Kept::Error => Self::Error,
+        }
+    }
 }
 
 /// The part of the core or the shell that wrote a line. The payload has
@@ -565,7 +621,7 @@ fn dropped_json(count: u32) -> Vec<u8> {
         format!("{count} older lines were dropped")
     };
     Payload {
-        level: Level::Warn.name(),
+        level: Kept::Warn.name(),
         source: DROP_SOURCE,
         age: 0,
         msg: &message,

@@ -47,6 +47,12 @@
 //! It counts the `LogClock` requests in [`Shell::clocks`]. A test of a late
 //! answer sets [`Shell::hold_clock`], and then answers the requests that
 //! wait with [`Shell::answer_clock`].
+//!
+//! At each `Sleep` request, the shell keeps the durations of the timers
+//! that wait when the core then waits ([`Shell::timers_at_sleep`]). A timer
+//! of the core cannot wake the chip, and light sleep stops it, so the shell
+//! panics if a timer waits. Each test that reaches a `Sleep` request thus
+//! checks this rule.
 
 use alloc::{format, string::String, vec::Vec};
 use core::time::Duration;
@@ -158,6 +164,12 @@ pub struct Shell {
     /// The `Sleep` request that waits for its answer. A start or a wake
     /// clears it.
     pub sleep: Option<Sleep>,
+    /// For each `Sleep` request, the durations of the timers that wait when
+    /// the core waits after the request, the timers of the session
+    /// included.
+    pub timers_at_sleep: Vec<Vec<Duration>>,
+    /// The core sent a `Sleep` request in the current run.
+    sleep_sent: bool,
     sleep_request: Option<Request<Sleep>>,
     /// A short name for each effect, in order.
     pub log: Vec<String>,
@@ -199,6 +211,8 @@ impl Shell {
             drawn_seq: 0,
             render_requested: false,
             sleep: None,
+            timers_at_sleep: Vec::new(),
+            sleep_sent: false,
             sleep_request: None,
             log: Vec::new(),
             cleared: Vec::new(),
@@ -242,6 +256,18 @@ impl Shell {
             request.resolve(wake).expect("the core waits for the wake");
             self.run();
         }
+    }
+
+    /// Answers the `Sleep` request that waits with `Wake::Timer`, as the
+    /// shell does at the check of the power source.
+    pub fn check(&mut self) {
+        self.wake(Wake::Timer);
+    }
+
+    /// Answers the `Sleep` request that waits with `Wake::Other`, as the
+    /// shell does after a wake with no cause.
+    pub fn stray(&mut self) {
+        self.wake(Wake::Other);
     }
 
     /// Sends an event to the core, but does not answer the effects yet.
@@ -301,6 +327,18 @@ impl Shell {
             }
         }
         self.commands.retain_mut(|command| !command.is_done());
+        if core::mem::take(&mut self.sleep_sent) {
+            let timers = self
+                .timers
+                .iter()
+                .map(|timer| Duration::from(timer.request.operation.duration))
+                .collect::<Vec<_>>();
+            assert!(
+                timers.is_empty(),
+                "timers of the core wait at a Sleep request: {timers:?}"
+            );
+            self.timers_at_sleep.push(timers);
+        }
         if core::mem::take(&mut self.render_requested) {
             let view = self.app.view(&self.model);
             let full = view.full_refresh_seq != self.drawn_seq;
@@ -555,6 +593,7 @@ impl Shell {
             Effect::LogClock(request) => self.clock(request),
             Effect::Sleep(request) => {
                 self.log.push("Sleep".into());
+                self.sleep_sent = true;
                 self.sleep = Some(request.operation.clone());
                 self.sleep_request = Some(request);
             }

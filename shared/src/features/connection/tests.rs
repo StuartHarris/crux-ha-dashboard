@@ -347,7 +347,7 @@ fn a_lost_connection_shows_the_time_of_the_last_message_and_retries_after_a_back
         })
         .expect_render()
         .expect_log_with(|log| {
-            assert_eq!(log.to_string(), "mqtt: connect again in 1 s");
+            assert_eq!(log.to_string(), "mqtt: the stream closed: connection lost, so connect again in 1 s");
         })
         .resolve_time_notify_after(|notify| {
             assert_eq!(Duration::from(notify.duration), RECONNECT_MIN);
@@ -402,7 +402,10 @@ fn the_backoff_doubles_up_to_a_limit_and_resets_on_connect() {
             .expect_log_with(|log| {
                 assert_eq!(
                     log.to_string(),
-                    format!("mqtt: connect again in {} s", expected.as_secs())
+                    format!(
+                        "mqtt: the broker host ended the stream: connection refused, so connect again in {} s",
+                        expected.as_secs()
+                    )
                 );
             })
             .resolve_time_notify_after(|notify| {
@@ -477,7 +480,10 @@ fn a_join_that_fails_is_tried_again_after_a_backoff() {
             );
         })
         .expect_log_with(|log| {
-            assert_eq!(log.to_string(), "mqtt: connect again in 1 s");
+            assert_eq!(
+                log.to_string(),
+                "mqtt: the link is down, so connect again in 1 s"
+            );
         })
         .resolve_time_notify_after(|notify| {
             assert_eq!(Duration::from(notify.duration), RECONNECT_MIN);
@@ -1104,4 +1110,189 @@ fn a_close_for_a_roam_shows_connecting_and_drops_the_messages() {
 
     send(&mut model, &mut wire, &topic(VISIBLE, "state"), "on").expect_no_effects();
     assert_eq!(model.entities.get(VISIBLE), None);
+}
+
+#[test]
+fn a_stream_failure_waits_1_2_4_s_before_each_retry() {
+    let app = Dashboard;
+    let (mut model, _wire) = drive_to_connecting(PowerSource::Stand);
+
+    for expected in [1, 2, 4] {
+        let connection = model.connection.id;
+        let mut cmd = app.update(
+            Event::Connection(connection::Event::Stream {
+                connection,
+                item: StreamItem::by_host("connection refused"),
+            }),
+            &mut model,
+        );
+        // The retry timer is the timer that is not the time limit of the
+        // close.
+        let mut retry = cmd
+            .effects()
+            .find_map(|effect| match effect {
+                Effect::TimeNotifyAfter(request)
+                    if Duration::from(request.operation.duration) != CLOSE_TIMEOUT =>
+                {
+                    Some(request)
+                }
+                _ => None,
+            })
+            .expect("a retry timer");
+        assert_eq!(
+            Duration::from(retry.operation.duration),
+            Duration::from_secs(expected)
+        );
+        let id = retry.operation.id;
+        retry.resolve(id).expect("the core waits for the timer");
+        let reconnect = cmd.expect_event();
+        let _ = app.update(
+            Event::Connection(connection::Event::StreamClosed { connection }),
+            &mut model,
+        );
+        let mut cmd = app.update(reconnect, &mut model);
+        let _ = link_up(&mut cmd, &mut model);
+    }
+}
+
+#[test]
+fn a_clean_end_connects_again_at_once_with_no_wait() {
+    let mut shell = house();
+    shell.send(start(PowerSource::Battery));
+    assert_eq!(shell.view().connection, Connection::Online);
+    shell.broker.hold_writes = true;
+    shell.broker.hold_closes = true;
+    shell.advance(crate::features::power::IDLE_TIMEOUT);
+    // A tap wakes the device while the DISCONNECT of the sleep waits.
+    shell.send(Event::Tapped(None));
+    assert!(!shell.model.power.is_asleep());
+    shell.take_log();
+
+    // The DISCONNECT leaves, so the session ends clean. The core starts no
+    // retry timer.
+    shell.broker.release_writes();
+    shell.run();
+    assert!(shell.closes.last().expect("a Close request").clean);
+    shell.broker.release_closes();
+    shell.run();
+    let log = shell.take_log();
+    let retry = format!("TimeNotifyAfter {}ms", RECONNECT_MIN.as_millis());
+    assert!(!log.contains(&retry), "{log:?}");
+    assert!(log.contains(&"MqttConnect".into()), "{log:?}");
+    assert_eq!(shell.view().connection, Connection::Online);
+    let events = shell.advance(RECONNECT_MAX);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, Event::Connection(connection::Event::Reconnect(_)))),
+        "{events:?}"
+    );
+}
+
+/// Returns the lines of `logs` with the area `mqtt`.
+fn mqtt_lines(logs: &[alloc::string::String]) -> Vec<&str> {
+    logs.iter()
+        .map(alloc::string::String::as_str)
+        .filter(|line| {
+            line.split_once(' ')
+                .is_some_and(|(_, rest)| rest.starts_with("mqtt:"))
+        })
+        .collect()
+}
+
+#[test]
+fn a_stream_that_the_host_ends_writes_one_line_with_the_reason_and_the_wait() {
+    let mut shell = house();
+    shell.send(start(PowerSource::Stand));
+    assert_eq!(shell.view().connection, Connection::Online);
+    shell.take_logs();
+
+    // The broker stops: the host ends the stream, and the next connect is
+    // refused.
+    shell.broker.stop();
+    shell.run();
+    let logs = shell.take_logs();
+    assert_eq!(
+        mqtt_lines(&logs),
+        [
+            "warn mqtt: the broker host ended the stream: the broker closed the stream, so connect again in 1 s"
+        ],
+        "{logs:?}"
+    );
+    shell.advance(RECONNECT_MIN);
+    let logs = shell.take_logs();
+    assert_eq!(
+        mqtt_lines(&logs),
+        [
+            "warn mqtt: the broker host ended the stream: connection refused, so connect again in 2 s"
+        ],
+        "{logs:?}"
+    );
+    // The ring keeps each line as a warning.
+    assert!(
+        shell
+            .model
+            .logs
+            .lines()
+            .all(|line| line.level == crate::features::logs::Kept::Warn),
+    );
+}
+
+#[test]
+fn a_stream_failure_in_the_steps_of_a_sleep_writes_one_line_and_does_not_retry() {
+    let mut shell = house();
+    shell.send(start(PowerSource::Battery));
+    shell.take_logs();
+    // The write of `asleep` and the DISCONNECT does not end, so the send
+    // timer of the session ends it.
+    shell.broker.hold_writes = true;
+    shell.advance(crate::features::power::IDLE_TIMEOUT);
+    shell.advance_session(crate::mqtt::SEND_TIMEOUT);
+    assert!(shell.sleep.is_some());
+    let logs = shell.take_logs();
+    assert_eq!(
+        mqtt_lines(&logs),
+        ["warn mqtt: the shell did not send the bytes in time, during the sleep"],
+        "{logs:?}"
+    );
+    let events = shell.advance(RECONNECT_MAX);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, Event::Connection(connection::Event::Reconnect(_)))),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn a_close_with_no_answer_in_the_steps_of_a_sleep_writes_a_warning() {
+    let mut shell = house();
+    shell.send(start(PowerSource::Battery));
+    shell.take_logs();
+    shell.broker.hold_closes = true;
+    shell.advance(crate::features::power::IDLE_TIMEOUT);
+    assert!(shell.sleep.is_none());
+
+    // After the time limit, the sleep continues, and the core writes a
+    // warning.
+    shell.advance(CLOSE_TIMEOUT);
+    assert!(shell.sleep.is_some());
+    let logs = shell.take_logs();
+    assert_eq!(
+        mqtt_lines(&logs),
+        ["warn mqtt: the close of connection 2 got no answer in 6 s"],
+        "{logs:?}"
+    );
+}
+
+#[test]
+fn a_close_with_an_answer_in_time_writes_no_line() {
+    let mut shell = house();
+    shell.send(start(PowerSource::Battery));
+    shell.take_logs();
+    shell.advance(crate::features::power::IDLE_TIMEOUT);
+    assert!(shell.sleep.is_some());
+    let logs = shell.take_logs();
+    assert_eq!(mqtt_lines(&logs), Vec::<&str>::new(), "{logs:?}");
+    assert_eq!(shell.model.logs.lines().len(), 0);
 }

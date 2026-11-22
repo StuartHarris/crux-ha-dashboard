@@ -721,14 +721,14 @@ fn after_scan(scanned: &Scanned, model: &mut Model) -> Cmd {
         return logs::warn(Area::Wifi, format!("the scan failed, so stay on {current}"));
     };
     let Some(rssi_now) = current_signal(current, *rssi, seen) else {
-        return logs::info(
+        return logs::debug(
             Area::Wifi,
             format!("the signal of {current} is unknown, so stay"),
         );
     };
     let now = signal(Some(rssi_now));
     let Some(best) = better_access_point(current, *rssi, seen) else {
-        return logs::info(
+        return logs::debug(
             Area::Wifi,
             format!(
                 "the scan found no access point that is {ROAM_MARGIN_DB} dB stronger than {current} ({now}), so stay"

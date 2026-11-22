@@ -86,14 +86,33 @@
 //!
 //! # Drop
 //!
-//! If the outbox drops a service call, because it is full or the device goes
-//! to sleep, the core removes the mark. It keeps the mark if another call for
-//! the entity waits in the outbox, or if a call for the entity went out. If
-//! the mark stays and no call for the entity waits, the core clears the
-//! timeout of the outbox.
+//! If the outbox drops a service call because it is full, the core removes
+//! the mark. It keeps the mark if another call for the entity waits in the
+//! outbox, or if a call for the entity went out. If the mark stays and no
+//! call for the entity waits, the core clears the timeout of the outbox.
 //!
-//! A mark stays through a sleep. A tap that wakes the device shows the mark
-//! during the reconnect.
+//! # Sleep
+//!
+//! A sleep does not start while a mark is open and no service call waits in
+//! the outbox. The sleep waits until each mark ends, and the end of the last
+//! mark starts it. Refer to
+//! [`sleep_if_settled`](crate::features::power::sleep_if_settled). After a
+//! confirmation, the sleep starts when the draw timer expires. The last
+//! image of the sleep thus shows the state that Home Assistant confirmed,
+//! or the last state that the core has after a timeout. If a call still
+//! waits in the outbox, the sleep does not wait for the marks. It drops the
+//! calls and ends each mark, as the next paragraph tells.
+//!
+//! No mark stays through a sleep ([`end_for_sleep`]). A timer of the core
+//! cannot wake the chip, so no timer may wait at the `Sleep` request. At the
+//! disconnect step of a sleep, the core drops the outbox, so no call waits.
+//! The core then removes each mark and clears its timers, also the mark of
+//! a call that went out. The tile shows the last state that the core has,
+//! so the last image of the sleep shows no mark. After the wake, the
+//! retained messages show the true state.
+//!
+//! A tap that wakes the device gives a new mark. The mark shows during the
+//! reconnect, and its timeout starts when the core issues the call.
 
 use alloc::{string::String, vec::Vec};
 use core::time::Duration;
@@ -102,6 +121,7 @@ use crate::{
     Cmd, Model,
     entities::EntityState,
     features::{
+        power,
         refresh::{redraw, redraw_soon},
         timer::Running,
     },
@@ -141,8 +161,9 @@ pub const PENDING_TIMEOUT: Duration = Duration::from_secs(5);
 /// A thermostat can take much longer than a light to report its new target.
 /// A Nest thermostat reports it through the Google cloud, and on the board
 /// that took from 1.3 s to 14 s. The time is less than
-/// [`IDLE_TIMEOUT`](crate::features::power::IDLE_TIMEOUT), so the device does
-/// not sleep while the mark waits.
+/// [`IDLE_TIMEOUT`](crate::features::power::IDLE_TIMEOUT), so the idle
+/// timeout never ends the mark. A `SleepNow` waits for the end of the mark.
+/// Refer to [`sleep_if_settled`](crate::features::power::sleep_if_settled).
 pub const TARGET_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// The time after which the core removes the mark of a scene. A scene has no
@@ -530,6 +551,10 @@ pub fn issued(entity_id: &'static str, tap: Option<Tap>, model: &mut Model) -> C
 /// The outbox dropped one or more service calls. Returns `true` if the core
 /// removed a mark.
 ///
+/// This removal does not start a sleep that waits for the marks. Only a new
+/// call can make the outbox drop a call, and in that wait no call waits.
+/// The tap that asks for a new call cancels the sleep that waits first.
+///
 /// The core removes each mark that has no timeout of an issued call and no
 /// call in the outbox. A mark that stays with no call in the outbox loses
 /// its timeout of the outbox.
@@ -563,7 +588,8 @@ pub fn forget_dropped(model: &mut Model) -> bool {
 /// Refer to the module documentation for the rules. The draw waits for the
 /// other messages of the change, as for any change from the state stream.
 /// Home Assistant sends `last_updated` before the attributes, so a draw at
-/// once can show the old brightness.
+/// once can show the old brightness. If a sleep waits for the marks, the
+/// expiry of the draw timer starts it.
 pub fn confirm(entity_id: &str, model: &mut Model) -> Cmd {
     let entity = model.entities.get(entity_id);
     let marks = &mut model.pending.marks;
@@ -574,7 +600,26 @@ pub fn confirm(entity_id: &str, model: &mut Model) -> Cmd {
         return Cmd::done();
     };
     marks.swap_remove(index).timers.clear();
-    redraw_soon(model)
+    redraw_soon(model).and(power::sleep_if_settled(model))
+}
+
+/// The device starts to sleep, and the outbox is empty: remove each mark and
+/// clear its timers. Returns `true` if the core removed a mark. Refer to
+/// the [module documentation](self).
+///
+/// The caller drops the outbox first. The device sleeps, so the core does
+/// not draw. The last image of the sleep draws the tiles with no mark.
+pub fn end_for_sleep(model: &mut Model) -> bool {
+    debug_assert!(
+        model.connection.outbox.is_empty(),
+        "the sleep drops the outbox first"
+    );
+    let marks = core::mem::take(&mut model.pending.marks);
+    let ended = !marks.is_empty();
+    for mark in marks {
+        mark.timers.clear();
+    }
+    ended
 }
 
 /// The timer `id` of a mark expired. The core ignores a timer that is not a
@@ -590,7 +635,8 @@ pub fn confirm(entity_id: &str, model: &mut Model) -> Cmd {
 ///
 /// The tile then shows the last state that the core has. While the device
 /// sleeps, the core removes the mark but does not draw. The wake draws the
-/// page.
+/// page. If a sleep waits for the marks, and this mark was the last one,
+/// the sleep starts.
 pub fn timeout(id: u32, model: &mut Model) -> Cmd {
     let outbox = &model.connection.outbox;
     let state = &mut model.pending;
@@ -614,7 +660,7 @@ pub fn timeout(id: u32, model: &mut Model) -> Cmd {
     if model.power.is_asleep() {
         return Cmd::done();
     }
-    redraw(model, false)
+    redraw(model, false).and(power::sleep_if_settled(model))
 }
 
 #[cfg(test)]

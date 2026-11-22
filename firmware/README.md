@@ -24,7 +24,7 @@ with the std shells of the root workspace would pull std into it.
 | `backoff` | A wait that doubles from 1 s to 30 s after each failure, for the start of the touch controller. |
 | `timers` | The timers of the timer task, in milliseconds since the start. |
 | `touch` | Converts a GT911 point to a panel point, and touch samples to taps with a debounce. A sample is new with a finger, new with no finger (the finger lifted), or not new. Only a new sample with no finger ends a touch. |
-| `sleep` | Decides when the chip can go into light sleep for a `Sleep` job, which wake is a real wake, and when a blocker gets a warning. |
+| `sleep` | Decides when the chip can go into light sleep for a `Sleep` job (the blockers and the hold after a tap), and when a blocker gets a warning. The core decides what each wake means. |
 | `forward` | Decides which lines of the log print and which go to the core (`warn` and `error`, not the target `core`, also if `ESP_LOG` does not print them), splits each line into its source and its message, and keeps at most 16 lines for the core task with a count of the lines that it dropped. Reads `ESP_LOG` with the rules of esp-println. |
 | `config` | Reads and checks `cfg.toml`. Its `Debug` output does not show the passwords. `build.rs` includes this file, so it uses only `core`. |
 
@@ -118,8 +118,11 @@ The core writes its decisions through the log capability. The task prints each l
 as `wifi: <message>` or `mqtt: <message>`, at the level `info` or `warn`. The core
 lines show beside the radio lines `wifi: radio job N: <operation>`. The core line
 shows the reason, and the radio line shows the action. One `grep -a 'wifi:'` on the
-serial log shows both, in the order that they happened. The core writes nothing for
-the usual steps.
+serial log shows both, in the order that they happened. The core writes the usual
+steps at the level `debug`, for example each step of a sleep. `ESP_LOG` is
+`info,core=debug` (`.cargo/config.toml`), so these lines print on the serial port,
+and the `debug` lines of the other targets do not print. The core does not keep a
+`debug` line, so it does not go to Home Assistant.
 
 The core lines have the log target `core`. The logger does not print the target, so
 the serial log does not show it. A filter in `ESP_LOG` uses the target: a
@@ -171,12 +174,19 @@ The log lines that an operator can search for:
 | `wifi: the link is suspect, so leave <access point> and join again` | The core leaves before the join, because the link is suspect. |
 | `wifi: N of 3 joins got no new address while the link is suspect` | The count toward a restart of the chip. |
 | `wifi: the join to the cached access point <...> failed, so join the strongest access point` | The core changes the target after a failed join. |
-| `wifi: the scan found no access point that is 10 dB stronger than ..., so stay` | A roam scan ended with no roam. |
-| `mqtt: connect again in N s` | The core waits N seconds before the next connect. |
+| `wifi: the scan found no access point that is 10 dB stronger than ..., so stay` | A roam scan ended with no roam (`debug`). |
+| `mqtt: <end>, so connect again in N s` | The session failed for the reason `<end>`. The core waits N seconds before the next connect. |
+| `mqtt: <end>, during the sleep` | The session failed in the steps of a sleep. The sleep continues. |
+| `mqtt: the link is down, so connect again in N s` | A join failed (the `wifi:` warning before it gives the reason). The core waits N seconds. |
+| `mqtt: the close of connection N got no answer in 6 s` | The `Close` request got no answer in its time limit. |
+| `power: sleep N <step>` | The start of each step of the sleep N (`debug`). |
+| `power: sleep N woke with no cause, so it sleeps again after 3 s` | The first wake with no cause in the sleep N. |
+| `power: sleep N had K wakes with no cause` | The wake after more than one wake with no cause in the sleep N. |
+| `power: sleep N got a power source wake on battery, so it sleeps again` | Not expected: the shell answered `Wake::PowerSource`, but the core is still on battery. |
 | `mqtt: the broker refused one or more topic filters, so some entities get no state` | The broker refused a filter of the subscribe. |
 | `mqtt: a message of N bytes is too long, so the core skipped it` | The core skipped a message that is too long. |
 | `mqtt: the service call for <entity> is too long for a packet, so the core dropped it` | The core dropped a service call. |
-| `stream: N failed: <reason> (by the host)` | The broker host ended the stream. |
+| `stream: N failed: <reason> (by the host)` | The broker host ended the stream (`info`, serial only). |
 | `core: N updates since the stream opened, ...` | The core task writes it at each close of the stream. |
 
 ### Light sleep
@@ -207,25 +217,40 @@ and each step waits for the answer of the firmware:
    so the touch poll and the renders continue. If one blocker stops the sleep for
    5 seconds, the log shows a warning. If the blocker is a low INT, the task clears
    the GT911 status register, and starts the touch controller again if INT stays low.
-5. The wake sources are a low level on the GT911 INT pin (GPIO3) and, if the core
-   asks for it, the RTC timer. The GT911 stays on and in its normal mode. The panel
-   is off after each render.
-6. A touch wake, or a timer wake at the time that the core asked for, is a real
-   wake. After a touch wake, the display task reads the point (the GT911 holds it
-   while INT is low) and sends it as a tap. The shell answers `Sleep` with
-   `Wake::Touch` and the control at the point, and the core acts on the control. A
-   service call waits until MQTT connects again. If the task cannot read the point,
-   it answers `Wake::Touch(None)`. The touch then wakes the device and turns the
-   front light on, but it does not act on a control. A timer wake
-   sends `Signal::Woke`. After another wake
-   (for example a sleep that the hardware rejects), the chip sleeps again after
-   3 seconds. In that time, a tap or a change of the power source also answers
-   `Sleep`.
-7. The RTC timer also wakes the chip each 60 seconds for a check of the power source.
-   The display task reads only the charger, with no Wi-Fi. If the source is new, the
-   task reads it again after 1 second. If the second read agrees, the shell sends
-   `PowerSourceChanged` and answers `Sleep` with `Wake::PowerSource`. Otherwise the
-   chip sleeps again at once. The check writes only a debug line to the log.
+5. The wake sources are the sources of the `Sleep` request: a low level on the GT911
+   INT pin (GPIO3), and the RTC timer of 60 seconds for the check of the power
+   source. The GT911 stays on and in its normal mode. The panel is off after each
+   render.
+6. The display task answers each wake at once, and the core decides what to do. The
+   firmware keeps no schedule.
+   - After a touch wake, the display task reads the point (the GT911 holds it while
+     INT is low) and sends it as a tap. The shell answers `Sleep` with `Wake::Touch`
+     and the control at the point, and the core acts on the control. A service call
+     waits until MQTT connects again. If the task cannot read the point, it answers
+     `Wake::Touch(None)`. The touch then wakes the device and turns the front light
+     on, but it does not act on a control.
+   - After a timer wake, the display task reads only the charger, with no Wi-Fi, and
+     answers `Wake::Timer`. The core sends a new `Sleep` at once, with no image and
+     no line in Home Assistant. If the source is new, the task reads it again after
+     1 second, and the chip does not sleep before that read
+     (`Blocker::PowerConfirm`). If the second read agrees, the shell sends
+     `PowerSourceChanged`, and the core wakes on the stand.
+   - After another wake (for example a sleep that the hardware rejects), the task
+     answers `Wake::Other`. The core stays awake for 3 seconds, then sends a new
+     `Sleep`. In that time, a tap or a change of the power source wakes the device.
+     The first such wake of a sleep writes an `info` line to Home Assistant.
+7. The chip does not sleep while an event that the display task sent waits for the
+   core task (`Blocker::CoreBusy`). The display task sends a change of the power
+   source or the charge, and then tries to sleep in the same pass of its loop. An
+   exact handshake closes that gap (`logic::sleep::InFlight`):
+   - The display task adds 1 to the count before it sends the event.
+   - The core task subtracts 1 after the shell handled the event, and after it
+     signalled the end of the `Sleep` job.
+   - The display task takes a new value of the `Sleep` job before it tries to sleep.
+   Thus a confirmed stand never waits in the queue while the chip sleeps.
+8. After a tap, the chip does not sleep for 2 seconds (`TAP_HOLD_MS`). The display
+   task sends the tap and then tries to sleep in the same pass, before the core task
+   handles the tap. The hold closes that gap.
 
 Light sleep keeps the RAM and the PSRAM, so the core and the panel image stay, and a
 wake needs no full refresh.
@@ -471,16 +496,17 @@ These items stay open:
 ## Power check (phase 6)
 
 The display task reads the BQ25896 charger (REG0B) and the BQ27220 fuel gauge
-(`StateOfCharge()`) each 30 seconds. It only reads these chips. Do these steps with the
-board on USB power:
+(`StateOfCharge()`) each 5 seconds while the chip is awake. While the chip sleeps, the
+check of the power source reads the charger each 60 seconds. The display task only
+reads these chips. Do these steps with the board on USB power:
 
 1. Run `just flash`. The log shows `power: source Stand at the start`, then
    `power: battery N%`. The header shows the percent and a plug icon. Keep
    `force_battery = false` for this check.
-2. Disconnect USB. In about 30 seconds, the header shows the percent and a battery
+2. Disconnect USB. In about 6 seconds, the header shows the percent and a battery
    icon. The fill of the icon shows the charge. The serial log is on USB, so you cannot
    see the log line `power: source Battery` now.
-3. Connect USB again. In about 30 seconds, the header shows the plug icon. If the serial
+3. Connect USB again. In about 6 seconds, the header shows the plug icon. If the serial
    log connects again, it shows `power: source Stand`.
 
 If a read fails, the log shows one warning, and the header keeps the last values.
@@ -505,12 +531,14 @@ log.
    The status is `online`.
 4. Do not touch the panel for 30 seconds. The panel must show "Asleep", and the
    status must show `asleep`. The log can show `wifi: off, and the radio is off`,
-   then `power: sleep until [Touch]`. The last log lines before the sleep can be
-   lost.
+   then stops. The line `power: sleep until [Touch, Timer { seconds: 60 }]` is a
+   `DEBUG` line with the log target `dashboard::core_task`. It does not print with
+   the default `ESP_LOG` (`info,core=debug`). To print it, add `dashboard=debug` to
+   `ESP_LOG`. The last log lines before the sleep can be lost.
 5. Tap a room button on the panel. The panel must show that room, so the tap that
    wakes the device also acts. In a few seconds the status is `online` again. If the
    log continues, it shows
-   `power: woke by Touch after N ms, average current M mA (not verified)` and
+   `power: woke by a touch after N ms, average current M mA (not verified)` and
    `touch: wake tap at (x, y)`.
 6. Wait 30 seconds again. The panel must show "Asleep" again.
 7. Set `force_battery = false` in `cfg.toml` and run `just flash`.

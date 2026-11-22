@@ -18,7 +18,7 @@ use shared::{
     features::{
         connection::{CLOSE_TIMEOUT, RECONNECT_MIN},
         light::{BATTERY_LEVEL, LIGHT_TIMEOUT, STAND_LEVEL},
-        logs::{self, Line, Message, Source},
+        logs::{self, Kept, Line, Message, Source},
         power::IDLE_TIMEOUT,
         refresh::DRAW_DELAY,
         wifi::JOIN_TIMEOUT,
@@ -1262,6 +1262,64 @@ fn a_tap_while_sleep_waits_is_the_wake_and_acts_on_its_control() {
 }
 
 #[test]
+fn a_tap_from_the_wake_answers_sleep_once() {
+    let mut device = asleep();
+    let _ = device.handle(Signal::Tap(ui::layout::next().center()));
+    assert!(!device.is_sleeping());
+
+    // The tap answered the `Sleep` request. A late wake finds no request,
+    // so it gives no jobs.
+    assert_eq!(device.handle(Signal::Woke(Wake::Touch(None))), Vec::new());
+}
+
+/// Returns the wake sources of the `Sleep` job in `jobs`.
+fn sleep_job(jobs: &[Job]) -> Option<&shared::capabilities::power::Sleep> {
+    jobs.iter().find_map(|job| match job {
+        Job::Sleep(sleep) => Some(sleep),
+        _ => None,
+    })
+}
+
+#[test]
+fn a_check_gives_only_a_new_sleep_job() {
+    let mut device = asleep();
+    let jobs = device.handle(Signal::Woke(Wake::Timer));
+    // The `Sleep` job that went out last is the job of the steps of the
+    // sleep. The check gives a job with the same wake sources, and nothing
+    // more.
+    assert_eq!(jobs.len(), 1, "{:?}", names(&jobs));
+    let sleep = sleep_job(&jobs).expect("a Sleep job");
+    assert_eq!(
+        sleep.wake_on,
+        [
+            shared::capabilities::power::WakeSource::Touch,
+            shared::capabilities::power::WakeSource::Timer { seconds: 60 },
+        ]
+    );
+    assert!(device.is_sleeping());
+}
+
+#[test]
+fn a_stray_wake_gives_a_hold_timer_and_a_line_and_then_a_sleep_job() {
+    let mut device = asleep();
+    let jobs = device.handle(Signal::Woke(Wake::Other));
+    assert_eq!(names(&jobs), [format!("start timer {}", device.last_timer)]);
+    assert_eq!(
+        logs(&jobs),
+        ["info power: sleep 1 woke with no cause, so it sleeps again after 3 s"]
+    );
+    assert!(sleep_job(&jobs).is_none());
+    assert!(!device.is_sleeping());
+
+    // The hold timer expires: one `Sleep` job.
+    let (id, token, duration) = started_timers(&jobs)[0];
+    assert_eq!(duration, Duration::from_secs(3));
+    let jobs = device.handle(Signal::Timer { id, token });
+    assert_eq!(names(&jobs), ["sleep"]);
+    assert!(device.is_sleeping());
+}
+
+#[test]
 fn a_tap_on_a_light_while_sleep_waits_is_sent_after_the_reconnect() {
     let mut device = asleep_with(false);
     let jobs = device.handle(Signal::Tap(ui::layout::tile(0).unwrap().center()));
@@ -1571,7 +1629,7 @@ fn a_line_of_the_log_ends_at_its_answer_with_the_time_of_the_device() {
         cmd.events().collect::<Vec<_>>(),
         [Event::Logs(logs::Event::Stamped(Line {
             at: Uptime(42_000),
-            level: Level::Info,
+            level: Kept::Info,
             source: Source::Core(Area::Power),
             message: Message::new("sleep 1 closes the connection"),
         }))]
@@ -1634,4 +1692,13 @@ fn only_the_answer_to_a_log_job_does_not_count_as_an_update() {
         }
         .counts()
     );
+}
+
+#[test]
+fn only_an_event_from_a_task_needs_an_ack() {
+    assert!(Signal::Event(Event::PowerSourceChanged(PowerSource::Stand)).needs_ack());
+    assert!(Signal::Event(Event::BatteryChanged(Some(50))).needs_ack());
+    assert!(!Signal::Woke(Wake::Timer).needs_ack());
+    assert!(!Signal::Tap(ui::layout::next().center()).needs_ack());
+    assert!(!Signal::Light { token: 1 }.needs_ack());
 }

@@ -4,8 +4,15 @@
 //! The printed line is the same as the line of the logger of esp-println
 //! 0.18 with its `colors` feature: `<colour><LEVEL> - <message><reset>`.
 //! The logger reads the levels from `ESP_LOG` at build time, with the same
-//! rules (refer to [`logic::forward::Filter`]). Thus the serial log does not
-//! change, and `grep -a 'stream:'` still finds the same lines.
+//! rules (refer to [`logic::forward::Filter`]), with one change: a target
+//! matches only if it is equal, or if it ends at `::`. Thus the serial log
+//! does not change, and `grep -a 'stream:'` still finds the same lines.
+//!
+//! The filter reads `ESP_LOG` at compile time. The `core=debug` directive
+//! makes the `log` facade pass each `Debug` line, also of other crates, to
+//! the logger. The logger drops such a line at once, with no string
+//! parsing. The `log` macros call only [`log::Log::log`], so `log` makes
+//! the same check. [`log::Log::enabled`] makes it for code that asks.
 //!
 //! The dashboard calls [`forward`] just after `board::init`. From then, the
 //! logger also keeps each line that [`logic::forward::forwarded`] accepts,
@@ -48,8 +55,8 @@ use shared::Event;
 
 use crate::board::uptime;
 
-/// The levels from `ESP_LOG` at build time.
-const FILTER: Filter<'static> = Filter::new(option_env!("ESP_LOG"));
+/// The levels from `ESP_LOG`, read once at build time.
+static FILTER: Filter<'static> = Filter::new(option_env!("ESP_LOG"));
 
 /// The lines that wait for the core task.
 static PENDING: Mutex<RefCell<Pending>> = Mutex::new(RefCell::new(Pending::new()));
@@ -78,6 +85,11 @@ impl log::Log for Logger {
     }
 
     fn log(&self, record: &log::Record<'_>) {
+        // The macros of `log` do not call `enabled`, so this drops a line
+        // that neither prints nor goes to the core.
+        if !self.enabled(record.metadata()) {
+            return;
+        }
         let Route {
             print: prints,
             forward,
@@ -158,7 +170,7 @@ fn print(record: &log::Record<'_>) {
 /// Keeps `record` for the core at `level`, and wakes the core task.
 ///
 /// If the logger keeps another line now, it only counts the line as lost.
-fn keep(level: shared::capabilities::log::Level, record: &log::Record<'_>) {
+fn keep(level: shared::features::logs::Kept, record: &log::Record<'_>) {
     if BUSY.swap(true, Ordering::Acquire) {
         LOST.fetch_add(1, Ordering::Relaxed);
         return;

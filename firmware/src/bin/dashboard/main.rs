@@ -37,7 +37,7 @@ use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal 
 use esp_backtrace as _;
 use logic::{
     shell::{Signal, StreamOp},
-    sleep::Plan,
+    sleep::{InFlight, Plan},
 };
 use shared::{PowerSource, ViewModel};
 use static_cell::StaticCell;
@@ -54,6 +54,9 @@ static RESOURCES: StaticCell<StackResources<SOCKETS>> = StaticCell::new();
 
 /// The signals for the core task.
 pub static SIGNALS: Lane<Signal> = Lane::new();
+/// The events that the display task sent in [`SIGNALS`], and that the core
+/// task did not handle yet. The chip does not sleep while one waits.
+pub static IN_FLIGHT: InFlight = InFlight::new();
 /// The newest view model to draw.
 ///
 /// A newer view model replaces one that the display task did not draw yet.

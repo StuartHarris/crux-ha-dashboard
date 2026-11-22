@@ -8,8 +8,9 @@
 //! ([`Uptime`]). The core keeps the line with that time. Refer to
 //! [`crate::features::logs`].
 //!
-//! The core logs a decision of the Wi-Fi policy, a failure, and the start
-//! of each step of a sleep. A start, a join and a connect give no lines.
+//! The core logs a decision of the Wi-Fi policy and a failure at `Info` or
+//! `Warn`. It logs the usual steps, for example each step of a sleep, at
+//! `Debug`. A start, a join and a connect give no lines.
 //!
 //! Before the core sends the kept lines to Home Assistant, it sends a
 //! [`LogClock`] request. The shell answers with the time on the same clock,
@@ -23,11 +24,14 @@ use crux_core::{Command, Request, command::RequestBuilder, macros::Operation};
 
 /// How important a line of the log is.
 ///
-/// The core writes its own lines at `Info` and `Warn` only. `Error` comes
-/// only from a line of the shell
-/// ([`Event::ShellLogged`](crate::Event::ShellLogged)).
+/// The core writes its own lines at `Debug`, `Info` and `Warn` only. The
+/// core does not keep a `Debug` line, so a `Debug` line goes only to the
+/// log of the shell (for example the serial log), and never to Home
+/// Assistant. Refer to [`crate::features::logs`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Level {
+    /// A usual step, for the log of the shell only.
+    Debug,
     /// A decision of the core.
     Info,
     /// A failure, or a decision because of a failure.
@@ -41,6 +45,7 @@ impl Level {
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
+            Self::Debug => "debug",
             Self::Info => "info",
             Self::Warn => "warn",
             Self::Error => "error",
@@ -129,8 +134,9 @@ pub struct LogClock;
 /// Writes `message` to the log of the shell at `level`. The request ends
 /// with the time of the line.
 ///
-/// The app uses [`crate::features::logs::info`] and
-/// [`crate::features::logs::warn`], which also keep the line.
+/// The app uses [`crate::features::logs::debug`],
+/// [`crate::features::logs::info`] and [`crate::features::logs::warn`]. The
+/// last two also keep the line.
 #[must_use]
 pub fn write<Effect, Event>(
     level: Level,
@@ -232,6 +238,7 @@ mod tests {
         };
         assert_eq!(log.to_string(), "wifi: the scan failed, so stay");
         assert_eq!(Area::Mqtt.to_string(), "mqtt");
+        assert_eq!(Level::Debug.to_string(), "debug");
         assert_eq!(Level::Info.to_string(), "info");
         assert_eq!(Level::Warn.to_string(), "warn");
         assert_eq!(Level::Error.to_string(), "error");

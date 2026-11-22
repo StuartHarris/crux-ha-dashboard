@@ -69,7 +69,10 @@
 
 use core::time::Duration;
 
-use crate::{Cmd, Model, ViewModel, features::timer::Slot};
+use crate::{
+    Cmd, Model, ViewModel,
+    features::{power, timer::Slot},
+};
 
 /// The internal events of the refresh policy. The core makes them from its
 /// timers.
@@ -155,6 +158,11 @@ impl State {
 /// the render does not count. A partial render is a full refresh if
 /// [`PARTIALS_PER_FULL`] partial renders came before it. A full refresh
 /// always renders.
+///
+/// A full refresh clears the draw timer that waits. If a sleep waits for
+/// the pending marks and no mark is open, the full refresh then starts the
+/// sleep. Refer to [`power::sleep_if_settled`]. Thus a caller that cancels
+/// that sleep must do so before the full refresh.
 pub fn redraw(model: &mut Model, full: bool) -> Cmd {
     let mut next = ViewModel::from(&*model);
     let state = &mut model.refresh;
@@ -174,7 +182,11 @@ pub fn redraw(model: &mut Model, full: bool) -> Cmd {
     // The view is the same, except for the new number.
     next.full_refresh_seq = model.full_refresh_seq;
     model.refresh.last = Some(next);
-    render().and(restart_timer(model))
+    // The draw timer can no longer start a sleep that waits for the marks,
+    // so the full refresh starts it.
+    render()
+        .and(restart_timer(model))
+        .and(power::sleep_if_settled(model))
 }
 
 /// Draws after [`DRAW_DELAY`], for a change from the state stream that the
@@ -199,6 +211,9 @@ pub fn redraw_soon(model: &mut Model) -> Cmd {
 /// The draw is a partial render through [`redraw`]. If the view is the same
 /// as the last view, the core asks for nothing. An example is a change of
 /// `last_updated` in the same minute as the footer time.
+///
+/// If a sleep waits for the pending marks and no mark is open, the sleep
+/// then starts. Refer to [`power::sleep_if_settled`].
 pub fn draw_due(id: u32, model: &mut Model) -> Cmd {
     if !model.refresh.draw_timer.expired(id) {
         return Cmd::done();
@@ -206,7 +221,7 @@ pub fn draw_due(id: u32, model: &mut Model) -> Cmd {
     if model.power.is_asleep() {
         return Cmd::done();
     }
-    redraw(model, false)
+    redraw(model, false).and(power::sleep_if_settled(model))
 }
 
 /// The full-refresh timer `id` expired. The core ignores an older timer,
@@ -449,7 +464,7 @@ mod tests {
 
         // The wake draws with a full refresh and starts the timer again.
         shell.take_log();
-        shell.wake(Wake::Timer);
+        shell.wake(Wake::Touch(None));
         assert!(shell.frames.last().unwrap().full);
         let timer = alloc::format!("TimeNotifyAfter {}ms", FULL_REFRESH_INTERVAL.as_millis());
         assert!(shell.take_log().contains(&timer));

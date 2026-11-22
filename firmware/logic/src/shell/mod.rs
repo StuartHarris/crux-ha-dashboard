@@ -38,10 +38,13 @@
 //! - Each `LogClock` request has a token from the same count. The shell
 //!   gives it to a task as [`Job::Clock`]. The task answers at once with
 //!   [`Signal::Clock`], the token and the time on the same clock.
-//! - `Sleep` ends at [`Signal::Woke`]. While it waits, a tap is the wake
-//!   (`Wake::Touch` with the control at the point), and a change of the
-//!   power source also ends it (`Wake::PowerSource`). [`Shell::is_sleeping`] tells
-//!   the task that runs the sleep when the request ended.
+//! - `Sleep` ends at [`Signal::Woke`], which the task that runs the sleep
+//!   sends at each wake: `Wake::Timer` at the check of the power source, or
+//!   `Wake::Other` after a wake with no cause. While it waits, a tap is the
+//!   wake (`Wake::Touch` with the control at the point), and a change of
+//!   the power source also ends it (`Wake::PowerSource`). The core then
+//!   sends a new `Sleep`, or wakes. [`Shell::is_sleeping`] tells the task
+//!   that runs the sleep when the request ended.
 //! - Each `FrontLight` request has a token. The task that drives the light
 //!   answers with [`Signal::Light`] and the token when the light has the
 //!   level. The answer is also for the older requests that wait.
@@ -113,7 +116,7 @@ pub enum Signal {
     /// the tap answers it with `Wake::Touch` and the control, in place of a
     /// tap.
     Tap(Point),
-    /// The device woke from a real wake. The answer to the `Sleep` job.
+    /// The device woke, for this cause. The answer to the `Sleep` job.
     Woke(Wake),
     /// The front light has the level of the `FrontLight` job with this
     /// token. The answer is also for the older jobs that wait.
@@ -148,6 +151,15 @@ impl Signal {
     #[must_use]
     pub const fn counts(&self) -> bool {
         !matches!(self, Self::Logged { .. })
+    }
+
+    /// Returns `true` if the core task must acknowledge this signal after
+    /// the shell handled it. A task counts each [`Signal::Event`] that it
+    /// sends in an [`InFlight`](crate::sleep::InFlight), and the chip does
+    /// not sleep while one waits.
+    #[must_use]
+    pub const fn needs_ack(&self) -> bool {
+        matches!(self, Self::Event(_))
     }
 }
 
@@ -270,9 +282,10 @@ pub enum Job {
         /// The token of the request.
         token: u32,
     },
-    /// Draw the view model that waits, then put the device to sleep. Answer
-    /// with [`Signal::Woke`] at the first real wake. After another wake,
-    /// sleep again.
+    /// Draw the view model that waits, then put the device to sleep with the
+    /// wake sources of the job. Answer with [`Signal::Woke`] at the first
+    /// wake, also a wake with no cause. The core decides if the device
+    /// sleeps again.
     Sleep(Sleep),
     /// Set the front light to `level` percent. Answer with
     /// [`Signal::Light`] and the token when the light has the level.
