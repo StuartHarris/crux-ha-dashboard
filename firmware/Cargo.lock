@@ -359,9 +359,11 @@ dependencies = [
  "esp-rtos",
  "firmware-logic",
  "log",
+ "portable-atomic",
  "shared",
  "static_cell",
  "ui",
+ "xtensa-lx",
 ]
 
 [[package]]
@@ -1360,6 +1362,7 @@ dependencies = [
  "crux_time",
  "embedded-graphics",
  "log",
+ "portable-atomic",
  "shared",
  "ui",
 ]

@@ -155,9 +155,87 @@ publishes the line to Home Assistant with its own lines (refer to the "Log" sect
 After the task prints a core line, it answers with the time since the chip started, in
 milliseconds. That time counts through a light sleep. The core keeps its last 64 lines
 in RAM with these times, also while the board sleeps or is offline. A chip restart
-loses the lines. For example, the restart of the Wi-Fi policy after 3 joins with no new
-address loses the lines that tell why the chip restarts. A later PR can keep the lines
-through a restart.
+loses that RAM, so the firmware also keeps a few facts in RTC memory. Refer to "The
+restart facts" below.
+
+### The restart facts
+
+The firmware keeps these values in RTC fast memory
+(`#[ram(unstable(rtc_fast, persistent))]`, about 2 KB). esp-hal fills that memory with
+zeros at a power-on, and keeps it through each other reset (software, panic,
+watchdog, brownout, a reset from the USB port). `src/boot.rs` holds the statics, and
+`logic::boot` has the rules and their host tests.
+
+- **The reset reason.** `main` reads `esp_hal::system::reset_reason()` once, just
+  after `board::init()`, and maps it to the `ResetReason` of the core
+  (`logic::boot::reset_reason`): a power-on (also when the chip cannot tell), a
+  software reset, a watchdog (each of the 8 watchdog codes), a brownout of the digital
+  core, or another reset (the USB port, a glitch of the clock or of the power). On the
+  ESP32-S3, a brownout of the whole chip can also give the code of a power-on. The
+  core gets the reason in `Start`, writes `power: started after <reset>`, and publishes
+  it as the `reset` sensor.
+- **The restart count.** Each reset that is not a power-on adds 1. A power-on sets the
+  count to 0. The core publishes it as the `restarts` sensor, and adds `, restart N` to
+  the start line.
+- **The last warn and error lines.** The logger keeps each warn and error line, also
+  a line of the core (target `core`) and a line that `ESP_LOG` does not print, in a
+  ring of 8 lines. The
+  newest line replaces the oldest line. Each line has the caps of a forwarded line, in
+  fixed buffers with no allocation. A line of the core has its area as the source, for
+  example `wifi`. At the next start after a reset that is not a power-on, `main` takes
+  the lines and clears the ring before the first warn line of the new start. The core
+  then puts them first in its log, as `before the restart: <source>: <message>` with
+  the source `boot`. After a power-on, the ring is empty.
+- **The panic flag and the panic count.** A panic restarts the chip (refer to the next
+  part). The next start reports `Panic` in place of a software reset.
+
+The memory starts with a magic word with the version of the layout. A reset after a
+new firmware is flashed is not a power-on, so the new firmware can read the memory of
+the old one at other addresses. If the magic word is not there, the firmware clears
+the memory. The level byte of each line goes last, so a reset during a write leaves an
+empty place. The read drops a line with a level, a length or UTF-8 that is not valid.
+
+### A panic restarts the chip
+
+esp-backtrace prints the panic and its backtrace. Then, with its `custom-halt`
+feature, it calls `boot::custom_halt`. That function sets the panic flag, waits 200 ms
+for the serial port, and restarts the chip with `esp_hal::system::software_reset()`.
+`esp_hal::init` turns off each watchdog. Without this restart, a panic stops the
+board until a power-on.
+
+If a panic occurs at each start, each restart causes the next panic, and the restarts
+empty the battery. So the firmware counts the panic restarts in a row. The count goes
+back to 0 only at these times:
+
+- A power-on, because esp-hal fills the memory with zeros.
+- The uptime of one start reaches 10 minutes (`logic::boot::STABLE_AFTER` and
+  `logic::boot::Uptime`). The uptime counts through light sleep, so the rule works on
+  battery too, where the board is online for only about 30 s at each wake. The core
+  task checks the uptime after each signal: the MQTT pings while online, and the wake
+  for the check of the power source every 60 s while asleep. An MQTT connect alone
+  does not set the count to 0, because a panic can follow each connect.
+
+Each other reset keeps the count: a software reset, a watchdog reset, a brownout and
+a reset by hand. The third panic in a row (`logic::boot::PANIC_LIMIT`) stops the chip,
+and prints `panic: 3 panics in a row, so the chip stops`. The `restarts` sensor shows
+the restarts before that.
+
+The stop masks and disables each interrupt, and then waits in `waiti`, so the CPU
+clock stops (`boot::halt`). No watchdog resets the stopped chip, because
+`esp_hal::init` disables each one. The stop does not stop the Wi-Fi radio, because a
+call to the driver is not safe in a panic. A panic that stops the chip does not set
+the panic flag, so the start after a reset by hand does not report `Panic`. That reset
+keeps the count at the limit, so the next panic stops the chip at once. Only a power
+cycle, or 10 minutes of uptime with no panic, clears the count.
+
+The panic message is not in the ring of lines. The hooks of esp-backtrace 0.20
+(`custom-pre-backtrace`, `custom-halt`) get no `PanicInfo`, and a panic handler of our
+own would replace the backtrace of esp-backtrace. The serial log keeps the message and
+the backtrace.
+
+The `bringup` binary does not read the RTC memory, so the lines from before a restart
+stay for the dashboard. Its core gets the facts of a power-on, and a panic in it stops
+the chip as before.
 
 The log lines that an operator can search for:
 
@@ -167,7 +245,8 @@ The log lines that an operator can search for:
 | `wifi: radio job N stops for a newer request` | The stop rule dropped the job N. |
 | `wifi: keep <access point> on channel C, signal S dBm` | A join keeps the association that the device has. |
 | `wifi: joined <access point> on channel C with <target> in N ms, signal S dBm` | A join succeeded. |
-| `wifi: address <address>` | DHCP gave an address. |
+| `wifi: address <address>` | DHCP gave an address. The core gets it in the lease and publishes it as the `ip` sensor. |
+| `wifi: the network stack is up with no IPv4 address` | Not expected: the address request answers `NoLease`. |
 | `wifi: the scan found N access points in N ms. Current ..., signal S dBm` | A roam scan ended. |
 | `wifi: restart the chip: <reason>` | The core asked for a restart. |
 | `wifi: the link is suspect, because the MQTT session failed: <end>` | The core thinks the link is bad, so the next rejoin leaves first. |
@@ -179,7 +258,9 @@ The log lines that an operator can search for:
 | `mqtt: <end>, during the sleep` | The session failed in the steps of a sleep. The sleep continues. |
 | `mqtt: the link is down, so connect again in N s` | A join failed (the `wifi:` warning before it gives the reason). The core waits N seconds. |
 | `mqtt: the close of connection N got no answer in 6 s` | The `Close` request got no answer in its time limit. |
+| `power: started after <reset>[, restart N]` | The start of the core, with the reset reason and the restart count. A panic, a watchdog reset or a brownout gives `warn`. |
 | `power: sleep N <step>` | The start of each step of the sleep N (`debug`). |
+| `panic: restart the chip` | A panic restarts the chip (printed by `boot::custom_halt`). |
 | `power: sleep N woke with no cause, so it sleeps again after 3 s` | The first wake with no cause in the sleep N. |
 | `power: sleep N had K wakes with no cause` | The wake after more than one wake with no cause in the sleep N. |
 | `power: sleep N got a power source wake on battery, so it sleeps again` | Not expected: the shell answered `Wake::PowerSource`, but the core is still on battery. |

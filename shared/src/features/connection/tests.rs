@@ -98,8 +98,11 @@ fn start_on_the_stand_draws_and_joins_the_strongest_access_point() {
         .expect_radio_join_with(|join| {
             assert_eq!((join.target, join.keep), (Target::Strongest, false));
         })
-        .expect_only_time_notify_after_with(|notify| {
+        .expect_time_notify_after_with(|notify| {
             assert_eq!(Duration::from(notify.duration), JOIN_TIMEOUT);
+        })
+        .expect_only_log_with(|log| {
+            assert_eq!(log.to_string(), "power: started after a power-on");
         });
 
     let view = app.view(&model);

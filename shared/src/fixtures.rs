@@ -90,6 +90,11 @@ impl FixedShell {
                 version: "0.0.0+fixture".into(),
                 mac: [0x02, 0, 0, 0, 0, 0x01],
             },
+            boot: crate::Boot {
+                reset: crate::ResetReason::PowerOn,
+                restarts: 0,
+            },
+            before_restart: Vec::new(),
             power,
             path: Some(path.into()),
             last_sync: None,

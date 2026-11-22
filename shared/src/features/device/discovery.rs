@@ -1,7 +1,7 @@
 //! The discovery message: one device-based discovery config of Home
 //! Assistant (2024.11 and later), with abbreviated keys.
 //!
-//! The config has the device (`dev`), the origin (`o`) and eight
+//! The config has the device (`dev`), the origin (`o`) and fifteen
 //! components (`cmps`). Each component has the platform `p` and a
 //! `uniq_id` of `dashboard_<id>_<key>`. Refer to `docs/mqtt.md`.
 //!
@@ -15,15 +15,26 @@
 //! | `voltage` | `sensor` | `voltage`, in `mV`, icon `mdi:flash-triangle-outline`, diagnostic | the state topic, key `voltage` |
 //! | `current` | `sensor` | `current`, in `mA`, icon `mdi:current-dc`, diagnostic | the state topic, key `current` |
 //! | `temperature` | `sensor` | `temperature`, in `°C`, diagnostic | the state topic, key `temperature` |
+//! | `rssi` | `sensor` | `signal_strength`, in `dBm`, diagnostic | the state topic, key `rssi` |
+//! | `bssid` | `sensor` | none, icon `mdi:access-point`, diagnostic | the state topic, key `bssid` |
+//! | `ip` | `sensor` | none, icon `mdi:ip-network`, diagnostic | the state topic, key `ip` |
+//! | `reconnects` | `sensor` | none, `total_increasing`, icon `mdi:lan-connect`, diagnostic | the state topic, key `reconnects` |
+//! | `restarts` | `sensor` | none, `total_increasing`, icon `mdi:restart`, diagnostic | the state topic, key `restarts` |
+//! | `reset` | `sensor` | `enum`: [`RESET_LABELS`], icon `mdi:power-cycle`, diagnostic | the state topic, key `reset` |
+//! | `wake` | `sensor` | `enum`: [`WAKE_LABELS`], icon `mdi:sleep-off`, diagnostic | the state topic, key `wake` |
 //!
 //! The status sensor has no availability, so it shows `offline` too. The
 //! other components are available unless the status is `offline`. Thus
 //! they keep their last value while the device is asleep.
 //!
-//! The state message keeps the `snake_case` values of [`CHARGE_OPTIONS`](super::CHARGE_OPTIONS). The
-//! value template of the `charge` component maps them to the labels of
-//! [`CHARGE_LABELS`]. The other components use the default icon of their
-//! device class.
+//! The state message keeps the `snake_case` values of
+//! [`CHARGE_OPTIONS`](super::CHARGE_OPTIONS),
+//! [`RESET_OPTIONS`](super::RESET_OPTIONS) and
+//! [`WAKE_OPTIONS`](super::WAKE_OPTIONS). The value template of each enum
+//! component maps them to its labels. The battery, stand, charging,
+//! temperature and signal components use the default icon of their device
+//! class. The other components set an icon, because they have no device
+//! class or the icon of the class does not tell what they are.
 //!
 //! The voltage is in mV, not in V. The core then sends a whole number, so
 //! the payload is exact, and the snapshot can compare it. Home Assistant
@@ -39,6 +50,7 @@ use serde::Serialize;
 
 use crate::{
     Firmware, Settings,
+    capabilities::radio::mac_text,
     features::connection::{STATUS_ASLEEP, STATUS_OFFLINE, STATUS_ONLINE},
 };
 
@@ -62,7 +74,26 @@ const CHARGE_LABELS: [&str; 4] = ["Not charging", "Pre-charging", "Fast charging
 /// the state as unknown.
 const CHARGE_TEMPLATE: &str = "{{ {'not_charging': 'Not charging', 'pre_charging': 'Pre-charging', 'fast_charging': 'Fast charging', 'done': 'Done'}[value_json.charge] | default(None) }}";
 
-/// The entity category of the power diagnostics.
+/// The labels of the reset options that Home Assistant shows, in the order
+/// of [`RESET_OPTIONS`](super::RESET_OPTIONS).
+const RESET_LABELS: [&str; 6] = [
+    "Power on", "Software", "Panic", "Watchdog", "Brownout", "Other",
+];
+
+/// The value template of the reset component. It maps each wire value to
+/// its label, as [`CHARGE_TEMPLATE`] does.
+const RESET_TEMPLATE: &str = "{{ {'power_on': 'Power on', 'software': 'Software', 'panic': 'Panic', 'watchdog': 'Watchdog', 'brownout': 'Brownout', 'other': 'Other'}[value_json.reset] | default(None) }}";
+
+/// The labels of the wake options that Home Assistant shows, in the order
+/// of [`WAKE_OPTIONS`](super::WAKE_OPTIONS).
+const WAKE_LABELS: [&str; 3] = ["Boot", "Touch", "Stand"];
+
+/// The value template of the wake component. It maps each wire value to
+/// its label, as [`CHARGE_TEMPLATE`] does.
+const WAKE_TEMPLATE: &str =
+    "{{ {'boot': 'Boot', 'touch': 'Touch', 'stand': 'Stand'}[value_json.wake] | default(None) }}";
+
+/// The entity category of the diagnostics.
 const DIAGNOSTIC: Option<&str> = Some("diagnostic");
 
 /// Returns the discovery topic of the device, for example
@@ -98,108 +129,217 @@ pub fn payload(settings: &Settings, firmware: &Firmware) -> Vec<u8> {
 }
 
 /// Returns the components of the device with the unique id `id`.
-fn components<'a>(id: &str, status_topic: &'a str, state_topic: &'a str) -> Components<'a> {
-    let unique = |key: &str| format!("{id}_{key}");
-    let measurement = |key: &str, name, dev_cla, ic, unit_of_meas, val_tpl, ent_cat| Measurement {
-        p: "sensor",
-        name,
-        uniq_id: unique(key),
-        dev_cla,
-        ic,
-        unit_of_meas,
-        stat_cla: "measurement",
-        stat_t: state_topic,
-        val_tpl,
-        avty_t: status_topic,
-        avty_tpl: AVAILABLE_UNLESS_OFFLINE,
-        ent_cat,
-    };
-    let binary = |key: &str, name, dev_cla, val_tpl, ent_cat| Binary {
-        p: "binary_sensor",
-        name,
-        uniq_id: unique(key),
-        dev_cla,
-        stat_t: state_topic,
-        val_tpl,
-        avty_t: status_topic,
-        avty_tpl: AVAILABLE_UNLESS_OFFLINE,
-        ent_cat,
+fn components<'a>(id: &'a str, status_topic: &'a str, state_topic: &'a str) -> Components<'a> {
+    let make = Make {
+        id,
+        status_topic,
+        state_topic,
     };
     Components {
+        power: power_components(&make),
+        diagnostics: diagnostic_components(&make),
+    }
+}
+
+/// Returns the status, the battery, the stand and the power diagnostics.
+fn power_components<'a>(make: &Make<'a>) -> PowerComponents<'a> {
+    PowerComponents {
         status: Status {
             p: "sensor",
             name: "Status",
-            uniq_id: unique("status"),
+            uniq_id: make.unique("status"),
             dev_cla: "enum",
             ic: "mdi:tablet-dashboard",
             ops: [STATUS_ONLINE, STATUS_ASLEEP, STATUS_OFFLINE],
-            stat_t: status_topic,
+            stat_t: make.status_topic,
         },
-        battery: measurement(
-            "battery",
-            "Battery",
-            "battery",
-            None,
-            "%",
-            "{{ value_json.battery }}",
-            None,
+        battery: make.measurement(("battery", "Battery", "battery", None, "%"), None),
+        stand: make.binary("stand", "On stand", "plug", None),
+        charging: make.binary("charging", "Charging", "battery_charging", DIAGNOSTIC),
+        charge: make.choice(
+            ("charge", "Charge state", "mdi:battery-charging-outline"),
+            &CHARGE_LABELS,
+            CHARGE_TEMPLATE,
         ),
-        stand: binary("stand", "On stand", "plug", "{{ value_json.stand }}", None),
-        charging: binary(
-            "charging",
-            "Charging",
-            "battery_charging",
-            "{{ value_json.charging }}",
+        voltage: make.measurement(
+            (
+                "voltage",
+                "Battery voltage",
+                "voltage",
+                Some("mdi:flash-triangle-outline"),
+                "mV",
+            ),
             DIAGNOSTIC,
         ),
-        charge: Charge {
-            p: "sensor",
-            name: "Charge state",
-            uniq_id: unique("charge"),
-            dev_cla: "enum",
-            ic: "mdi:battery-charging-outline",
-            ops: CHARGE_LABELS,
-            stat_t: state_topic,
-            val_tpl: CHARGE_TEMPLATE,
-            avty_t: status_topic,
-            avty_tpl: AVAILABLE_UNLESS_OFFLINE,
-            ent_cat: "diagnostic",
-        },
-        voltage: measurement(
-            "voltage",
-            "Battery voltage",
-            "voltage",
-            Some("mdi:flash-triangle-outline"),
-            "mV",
-            "{{ value_json.voltage }}",
+        current: make.measurement(
+            (
+                "current",
+                "Battery current",
+                "current",
+                Some("mdi:current-dc"),
+                "mA",
+            ),
             DIAGNOSTIC,
         ),
-        current: measurement(
-            "current",
-            "Battery current",
-            "current",
-            Some("mdi:current-dc"),
-            "mA",
-            "{{ value_json.current }}",
-            DIAGNOSTIC,
-        ),
-        temperature: measurement(
-            "temperature",
-            "Gauge temperature",
-            "temperature",
-            None,
-            "°C",
-            "{{ value_json.temperature }}",
+        temperature: make.measurement(
+            (
+                "temperature",
+                "Gauge temperature",
+                "temperature",
+                None,
+                "°C",
+            ),
             DIAGNOSTIC,
         ),
     }
 }
 
-/// Returns the MAC address as lowercase hex with colons, for example
-/// `28:84:85:37:b8:a0`.
-fn mac_text(mac: [u8; 6]) -> String {
-    let bytes: Vec<String> = mac.iter().map(|byte| format!("{byte:02x}")).collect();
-    bytes.join(":")
+/// Returns the Wi-Fi and boot diagnostics.
+fn diagnostic_components<'a>(make: &Make<'a>) -> DiagnosticComponents<'a> {
+    DiagnosticComponents {
+        rssi: make.measurement(
+            ("rssi", "Wi-Fi signal", "signal_strength", None, "dBm"),
+            DIAGNOSTIC,
+        ),
+        bssid: make.plain(("bssid", "Access point", "mdi:access-point"), None),
+        ip: make.plain(("ip", "IP address", "mdi:ip-network"), None),
+        reconnects: make.plain(
+            ("reconnects", "Reconnects", "mdi:lan-connect"),
+            Some("total_increasing"),
+        ),
+        restarts: make.plain(
+            ("restarts", "Restarts", "mdi:restart"),
+            Some("total_increasing"),
+        ),
+        reset: make.choice(
+            ("reset", "Last reset", "mdi:power-cycle"),
+            &RESET_LABELS,
+            RESET_TEMPLATE,
+        ),
+        wake: make.choice(
+            ("wake", "Wake reason", "mdi:sleep-off"),
+            &WAKE_LABELS,
+            WAKE_TEMPLATE,
+        ),
+    }
+}
+
+/// Makes the components of one device. Each component except the status
+/// reads its key of the state topic, and is available unless the status
+/// is `offline`.
+struct Make<'a> {
+    /// The unique id of the device.
+    id: &'a str,
+    status_topic: &'a str,
+    state_topic: &'a str,
+}
+
+/// The key, the name, the device class, the icon and the unit of a
+/// measurement.
+type MeasurementId = (
+    &'static str,
+    &'static str,
+    &'static str,
+    Option<&'static str>,
+    &'static str,
+);
+
+/// The key, the name and the icon of a component.
+type Named = (&'static str, &'static str, &'static str);
+
+impl<'a> Make<'a> {
+    /// Returns the unique id of the component `key`.
+    fn unique(&self, key: &str) -> String {
+        format!("{}_{key}", self.id)
+    }
+
+    /// Returns the value template that reads the key `key`.
+    fn value(key: &str) -> String {
+        format!("{{{{ value_json.{key} }}}}")
+    }
+
+    /// Returns a sensor with a unit and the state class `measurement`.
+    fn measurement(
+        &self,
+        (key, name, dev_cla, ic, unit_of_meas): MeasurementId,
+        ent_cat: Option<&'static str>,
+    ) -> Measurement<'a> {
+        Measurement {
+            p: "sensor",
+            name,
+            uniq_id: self.unique(key),
+            dev_cla,
+            ic,
+            unit_of_meas,
+            stat_cla: "measurement",
+            stat_t: self.state_topic,
+            val_tpl: Self::value(key),
+            avty_t: self.status_topic,
+            avty_tpl: AVAILABLE_UNLESS_OFFLINE,
+            ent_cat,
+        }
+    }
+
+    /// Returns a binary sensor with the default payloads `ON` and `OFF`.
+    fn binary(
+        &self,
+        key: &str,
+        name: &'static str,
+        dev_cla: &'static str,
+        ent_cat: Option<&'static str>,
+    ) -> Binary<'a> {
+        Binary {
+            p: "binary_sensor",
+            name,
+            uniq_id: self.unique(key),
+            dev_cla,
+            stat_t: self.state_topic,
+            val_tpl: Self::value(key),
+            avty_t: self.status_topic,
+            avty_tpl: AVAILABLE_UNLESS_OFFLINE,
+            ent_cat,
+        }
+    }
+
+    /// Returns a diagnostic sensor with no device class and no unit, with
+    /// the state class `stat_cla` if it has one.
+    fn plain(&self, (key, name, ic): Named, stat_cla: Option<&'static str>) -> Plain<'a> {
+        Plain {
+            p: "sensor",
+            name,
+            uniq_id: self.unique(key),
+            ic,
+            stat_cla,
+            stat_t: self.state_topic,
+            val_tpl: Self::value(key),
+            avty_t: self.status_topic,
+            avty_tpl: AVAILABLE_UNLESS_OFFLINE,
+            ent_cat: "diagnostic",
+        }
+    }
+
+    /// Returns a diagnostic enum sensor with the labels `ops` and the value
+    /// template `val_tpl` that maps the wire values to them.
+    fn choice(
+        &self,
+        (key, name, ic): Named,
+        ops: &'static [&'static str],
+        val_tpl: &'static str,
+    ) -> Choice<'a> {
+        Choice {
+            p: "sensor",
+            name,
+            uniq_id: self.unique(key),
+            dev_cla: "enum",
+            ic,
+            ops,
+            stat_t: self.state_topic,
+            val_tpl,
+            avty_t: self.status_topic,
+            avty_tpl: AVAILABLE_UNLESS_OFFLINE,
+            ent_cat: "diagnostic",
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -226,16 +366,37 @@ struct Origin<'a> {
     sw: &'a str,
 }
 
+/// The components, in the order of the payload. The two groups are one
+/// map in the JSON.
 #[derive(Serialize)]
 struct Components<'a> {
+    #[serde(flatten)]
+    power: PowerComponents<'a>,
+    #[serde(flatten)]
+    diagnostics: DiagnosticComponents<'a>,
+}
+
+#[derive(Serialize)]
+struct PowerComponents<'a> {
     status: Status<'a>,
     battery: Measurement<'a>,
     stand: Binary<'a>,
     charging: Binary<'a>,
-    charge: Charge<'a>,
+    charge: Choice<'a>,
     voltage: Measurement<'a>,
     current: Measurement<'a>,
     temperature: Measurement<'a>,
+}
+
+#[derive(Serialize)]
+struct DiagnosticComponents<'a> {
+    rssi: Measurement<'a>,
+    bssid: Plain<'a>,
+    ip: Plain<'a>,
+    reconnects: Plain<'a>,
+    restarts: Plain<'a>,
+    reset: Choice<'a>,
+    wake: Choice<'a>,
 }
 
 #[derive(Serialize)]
@@ -261,7 +422,7 @@ struct Measurement<'a> {
     unit_of_meas: &'static str,
     stat_cla: &'static str,
     stat_t: &'a str,
-    val_tpl: &'static str,
+    val_tpl: String,
     avty_t: &'a str,
     avty_tpl: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -276,22 +437,39 @@ struct Binary<'a> {
     uniq_id: String,
     dev_cla: &'static str,
     stat_t: &'a str,
-    val_tpl: &'static str,
+    val_tpl: String,
     avty_t: &'a str,
     avty_tpl: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     ent_cat: Option<&'static str>,
 }
 
-/// The enum sensor of the phase of the charge.
+/// A sensor with no device class and no unit, for a text or a count. It
+/// is a diagnostic.
 #[derive(Serialize)]
-struct Charge<'a> {
+struct Plain<'a> {
+    p: &'static str,
+    name: &'static str,
+    uniq_id: String,
+    ic: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stat_cla: Option<&'static str>,
+    stat_t: &'a str,
+    val_tpl: String,
+    avty_t: &'a str,
+    avty_tpl: &'static str,
+    ent_cat: &'static str,
+}
+
+/// An enum sensor with labels, for example the phase of the charge.
+#[derive(Serialize)]
+struct Choice<'a> {
     p: &'static str,
     name: &'static str,
     uniq_id: String,
     dev_cla: &'static str,
     ic: &'static str,
-    ops: [&'static str; 4],
+    ops: &'static [&'static str],
     stat_t: &'a str,
     val_tpl: &'static str,
     avty_t: &'a str,

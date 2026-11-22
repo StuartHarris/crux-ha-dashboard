@@ -319,7 +319,8 @@ fn on_battery_checks_and_a_stray_wake_keep_the_device_asleep_until_a_touch() {
     shell.send(Event::Tapped(None));
     assert!(!shell.view().asleep);
     assert_eq!(shell.view().connection, Connection::Online);
-    let mut expected: Vec<String> = super::sleep_lines(1).into();
+    let mut expected: Vec<String> = vec![super::STARTED.into()];
+    expected.extend(super::sleep_lines(1));
     expected.push("info power: sleep 1 woke with no cause, so it sleeps again after 3 s".into());
     let power: Vec<String> = shell
         .take_logs()

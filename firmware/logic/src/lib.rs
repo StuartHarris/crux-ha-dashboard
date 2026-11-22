@@ -14,6 +14,9 @@
 //!   the fuel gauge, and decides which changes to send to the core.
 //! - [`config`] reads and checks the build-time configuration.
 //! - [`backoff`] is a wait that doubles after each failure.
+//! - [`boot`] maps the reset reason, counts the restarts, keeps the last
+//!   warn and error lines through a restart, and guards against a loop of
+//!   panics, in memory that a reset does not clear.
 //! - [`sleep`] decides when the chip can go into light sleep. The core
 //!   decides what each wake means.
 //! - [`forward`] decides which lines of the log of the firmware go to the
@@ -27,6 +30,7 @@
 extern crate alloc;
 
 pub mod backoff;
+pub mod boot;
 pub mod config;
 pub mod forward;
 pub mod power;

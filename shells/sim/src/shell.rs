@@ -59,8 +59,8 @@ use embedded_graphics::prelude::Point;
 use crux_core::{Request, capability::Operation};
 use crux_time::{TimerId, operation::NotifyAfter};
 use shared::{
-    Charge, Core, Dashboard, Effect, Event, Firmware, PowerSource, Reading, Settings, Start,
-    ViewModel,
+    Boot, Charge, Core, Dashboard, Effect, Event, Firmware, PowerSource, Reading, ResetReason,
+    Settings, Start, ViewModel,
     capabilities::{
         log::{Level, Uptime},
         power::{Sleep, Wake, WakeSource},
@@ -82,6 +82,14 @@ const NOT_OPEN: &str = "the stream is not open";
 
 /// The facts about the firmware that the simulator gives in `Start`. The
 /// MAC address is a fixed, locally administered address.
+/// The facts about the start of the chip. The simulator has no chip, so
+/// each start is a power-on with no restart, also the cold restart for
+/// `RadioRestart`, and no line comes from before a restart.
+const BOOT: Boot = Boot {
+    reset: ResetReason::PowerOn,
+    restarts: 0,
+};
+
 fn firmware() -> Firmware {
     Firmware {
         version: concat!(env!("CARGO_PKG_VERSION"), "+sim").into(),
@@ -291,6 +299,8 @@ impl Shell {
         self.send(Event::Start(Start {
             settings,
             firmware: firmware(),
+            boot: BOOT,
+            before_restart: Vec::new(),
             power,
             path,
             last_sync: None,
@@ -337,6 +347,8 @@ impl Shell {
         self.send(Event::Start(Start {
             settings,
             firmware: firmware(),
+            boot: BOOT,
+            before_restart: Vec::new(),
             power: view.power,
             path: Some(view.path),
             last_sync: view.last_sync,
@@ -390,6 +402,8 @@ impl Shell {
         let mut effects = self.core.process_event(Event::Start(Start {
             settings,
             firmware: firmware(),
+            boot: BOOT,
+            before_restart: Vec::new(),
             power: view.power,
             path: None,
             last_sync: None,
@@ -1624,6 +1638,8 @@ mod tests {
                 // The device publishes go in the next write.
                 "publish homeassistant/device/dashboard_test/config 1",
                 "publish dashboard/test/state 1",
+                // The start line of the log.
+                "publish dashboard/test/log 1",
             ]
         );
         assert!(fixture.shell().current_connection().is_some());
@@ -1906,6 +1922,15 @@ mod tests {
         let mut fixture = Fixture::new();
         fixture.start_with(PowerSource::Stand, None, true);
         fixture.connect();
+        // The log still goes in a dry run. The start line goes after the
+        // clock answer, so the test waits for it.
+        fixture.until("the start line", |fixture| {
+            fixture
+                .net()
+                .log
+                .iter()
+                .any(|entry| entry == "publish dashboard/test/log 1")
+        });
         fixture.take_log();
         assert!(fixture.shell().view().read_only);
 

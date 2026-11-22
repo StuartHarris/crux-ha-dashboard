@@ -24,6 +24,16 @@
 //! `ESP_LOG` does not print still goes to the core. Refer to
 //! [`logic::forward::route`].
 //!
+//! # The ring that a restart keeps
+//!
+//! The logger also keeps each warn and error line, also a line of the core
+//! and a line that `ESP_LOG` does not print, in a ring of 8 lines in RTC
+//! memory ([`crate::boot::record`]). [`forward`] sets the maximum level of
+//! the `log` facade to at least `Warn`, so each such line comes to the
+//! logger. The ring keeps its lines through a reset that
+//! is not a power-on, so the next start gives them to the core in `Start`.
+//! The ring starts to keep lines at [`crate::boot::read`].
+//!
 //! # Where a line can come from
 //!
 //! A line can come from any task of Embassy, from a thread of esp-rtos (for
@@ -81,7 +91,7 @@ struct Logger;
 impl log::Log for Logger {
     fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
         let Route { print, forward } = route(metadata.level(), metadata.target());
-        print || forward.is_some()
+        print || forward.is_some() || ring(metadata.level()).is_some()
     }
 
     fn log(&self, record: &log::Record<'_>) {
@@ -99,6 +109,9 @@ impl log::Log for Logger {
         }
         if let Some(level) = forward {
             keep(level, record);
+        }
+        if let Some(level) = ring(record.level()) {
+            persist(level, record);
         }
     }
 
@@ -152,6 +165,26 @@ pub fn take() -> Option<Event> {
         pending.pop()
     })?;
     Some(line.event(dropped))
+}
+
+/// Returns the level in the ring that a restart keeps, or `None` if a line
+/// with `level` does not go into it. The ring keeps each warn and error
+/// line of any target, also if it does not print, from
+/// [`crate::boot::read`]. Refer to [`logic::boot::kept`].
+fn ring(level: log::Level) -> Option<shared::features::logs::Kept> {
+    if crate::boot::recording() {
+        logic::boot::kept(level)
+    } else {
+        None
+    }
+}
+
+/// Keeps `record` in the ring that a restart keeps. The write is in a
+/// critical section, so a line from another context does not write the
+/// ring at the same time. The ring does not allocate.
+fn persist(level: shared::features::logs::Kept, record: &log::Record<'_>) {
+    let line = Line::kept(level, record.target(), *record.args());
+    critical_section::with(|_| crate::boot::record(&line));
 }
 
 /// Prints `record` as the logger of esp-println does.

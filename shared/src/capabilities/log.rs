@@ -10,7 +10,9 @@
 //!
 //! The core logs a decision of the Wi-Fi policy and a failure at `Info` or
 //! `Warn`. It logs the usual steps, for example each step of a sleep, at
-//! `Debug`. A start, a join and a connect give no lines.
+//! `Debug`. A join and a connect give no lines. A start gives one line with
+//! the reason of the last reset, for example `power: started after a
+//! power-on`.
 //!
 //! Before the core sends the kept lines to Home Assistant, it sends a
 //! [`LogClock`] request. The shell answers with the time on the same clock,

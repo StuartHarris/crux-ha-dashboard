@@ -189,6 +189,11 @@ pub struct State {
     /// takes the next id. The `Slot` `retry` of the phase decides if an
     /// expiry is stale.
     pub reconnect: u32,
+    /// The number of MQTT sessions since `Start` that ended with a failure
+    /// while the device was awake, so that the core scheduled a reconnect.
+    /// The state message publishes it. Refer to [`device`]. This is not
+    /// [`State::reconnect`], which is only the source of the timer ids.
+    pub reconnects: u32,
     /// The wait before the next reconnect.
     pub backoff: Duration,
     /// The service calls that wait for a connection.
@@ -448,6 +453,7 @@ impl Default for State {
             id: 0,
             skipped: 0,
             reconnect: 0,
+            reconnects: 0,
             backoff: RECONNECT_MIN,
             outbox: Vec::new(),
         }
@@ -458,12 +464,13 @@ impl Default for State {
 /// ignores the answers to earlier requests.
 ///
 /// The phase becomes `Offline`, and the core clears every timer of the
-/// connection.
+/// connection. The count of reconnects starts again at 0.
 pub fn reset(model: &mut Model) {
     wifi::reset(model);
     let state = &mut model.connection;
     mem::take(&mut state.phase).clear_timers();
     state.id = state.id.wrapping_add(1);
+    state.reconnects = 0;
     state.backoff = RECONNECT_MIN;
 }
 
@@ -1220,6 +1227,8 @@ fn ended(end: &End, model: &mut Model) -> Cmd {
     let retry = if !wants_online || clean {
         Cmd::done()
     } else {
+        // The session failed, so it counts as a reconnect.
+        model.connection.reconnects = model.connection.reconnects.saturating_add(1);
         schedule_reconnect(&end.to_string(), logs::warn, model)
     };
     health.and(close).and(redraw(model, false)).and(retry)

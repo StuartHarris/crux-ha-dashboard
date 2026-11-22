@@ -35,6 +35,9 @@ pub const STRONG_RSSI: i32 = -45;
 /// [`FakeRadio::move_strongest`], in dBm.
 pub const WEAK_RSSI: i32 = STRONG_RSSI - 3 * ROAM_MARGIN_DB;
 
+/// The IP address that DHCP gives the device by default.
+pub const IP: [u8; 4] = [192, 168, 1, 50];
+
 /// The fake radio, and the access points of the network.
 #[expect(
     clippy::struct_excessive_bools,
@@ -50,6 +53,9 @@ pub struct FakeRadio {
     pub associated: Option<AccessPoint>,
     /// If `true`, the network stack has an IP address.
     pub has_address: bool,
+    /// The IP address that DHCP gives at the next lease. The default is
+    /// [`IP`].
+    pub ip: [u8; 4],
     /// If `true`, the access points refuse the device, as when the router
     /// blocks it. Each join fails with `"authentication failed"`.
     pub blocked: bool,
@@ -87,6 +93,7 @@ impl FakeRadio {
             on: false,
             associated: None,
             has_address: false,
+            ip: IP,
             blocked: false,
             stuck: false,
             joins: 0,
@@ -140,7 +147,7 @@ impl FakeRadio {
             return Lease::NoLease;
         }
         self.has_address = true;
-        Lease::Leased
+        Lease::Leased { ip: self.ip }
     }
 
     /// Answers a [`Leave`] request. The device leaves the access point, and
@@ -226,7 +233,7 @@ impl FakeRadio {
 mod tests {
     use alloc::vec::Vec;
 
-    use super::{FakeRadio, HALL, LANDING, STRONG_RSSI, WEAK_RSSI};
+    use super::{FakeRadio, HALL, IP, LANDING, STRONG_RSSI, WEAK_RSSI};
     use crate::{
         capabilities::radio::{
             Address, Join, Joined, Lease, Leave, Off, Scan, Scanned, StopScan, Target,
@@ -247,7 +254,10 @@ mod tests {
     fn up() -> FakeRadio {
         let mut radio = FakeRadio::default();
         radio.join(&join(Target::Strongest, false));
-        assert_eq!(radio.address(&Address { radio: 2 }), Lease::Leased);
+        assert_eq!(
+            radio.address(&Address { radio: 2 }),
+            Lease::Leased { ip: IP }
+        );
         radio
     }
 

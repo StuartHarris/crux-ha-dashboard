@@ -6,6 +6,8 @@
 //! esp-hal, the Wi-Fi driver, the panel and the touch controller.
 //!
 //! - [`board`] starts the chip: the clocks, the heap and the scheduler.
+//! - [`boot`] keeps the restart count, the last warn and error lines and the
+//!   panic guard in RTC memory that a reset does not clear.
 //! - [`panel`] drives the panel and reads the touch controller.
 //! - [`lane`] is a queue between two tasks.
 //! - [`light`] drives the front light.
@@ -28,6 +30,7 @@
 extern crate alloc;
 
 pub mod board;
+pub mod boot;
 pub mod lane;
 pub mod light;
 pub mod logger;

@@ -431,10 +431,16 @@ async fn address(stack: Stack<'static>) -> Lease {
         log::warn!("wifi: no address from DHCP");
         return Lease::NoLease;
     }
-    if let Some(config) = stack.config_v4() {
-        log::info!("wifi: address {}", config.address);
+    let Some(config) = stack.config_v4() else {
+        // The stack is up only with an IPv4 configuration, so this does not
+        // occur. With no address, the core cannot use the link.
+        log::warn!("wifi: the network stack is up with no IPv4 address");
+        return Lease::NoLease;
+    };
+    log::info!("wifi: address {}", config.address);
+    Lease::Leased {
+        ip: config.address.address().octets(),
     }
-    Lease::Leased
 }
 
 /// Leaves the access point, and waits for the network stack to drop the

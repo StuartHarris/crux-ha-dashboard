@@ -158,7 +158,8 @@ fn a_refused_filter_still_makes_the_link_quiet_once() {
         mqtt,
         ["warn mqtt: the broker refused one or more topic filters, so some entities get no state"]
     );
-    // The refusal comes before the lines of the scan that the quiet link
-    // starts.
-    assert!(lines[0].contains("mqtt:"), "{lines:?}");
+    // The start line comes first. The refusal comes before the lines of the
+    // scan that the quiet link starts.
+    assert_eq!(lines[0], super::STARTED);
+    assert!(lines[1].contains("mqtt:"), "{lines:?}");
 }

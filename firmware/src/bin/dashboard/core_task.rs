@@ -9,17 +9,22 @@
 //! The task also takes each warn and error line that the logger keeps
 //! (`dashboard_firmware::logger`), and sends it to the core as
 //! `Event::ShellLogged`.
+//!
+//! The task also runs the time rule of the guard against a loop of panics
+//! (`logic::boot::Uptime`). After each signal, it gives the uptime. When the
+//! uptime reaches `STABLE_AFTER` (10 minutes), it calls `boot::stable` once.
 
 use core::time::Duration;
 
 use crux_time::operation::NotifyAfter;
 use dashboard_firmware::{
     board::{self, uptime},
-    logger,
+    boot, logger,
 };
 use embassy_futures::select::{Either, select};
 use embassy_time::Instant;
 use logic::{
+    boot::{STABLE_AFTER, Taken, Uptime},
     forward::{CORE_TARGET, PENDING},
     shell::{self, Job, Shell, StreamOp, TimerOp},
     sleep::Plan,
@@ -30,6 +35,24 @@ use shared::{Event, PowerSource, capabilities::log::Level};
 use crate::{
     IN_FLIGHT, LIGHT, RADIO, RENDER, SIGNALS, SLEEP, STREAM, TIMERS, config::CONFIG, radio, timers,
 };
+
+/// Gives the uptime to the guard against a loop of panics. When the
+/// uptime reaches [`STABLE_AFTER`], the count of panics in a row starts
+/// again at 0 ([`boot::stable`]).
+///
+/// The uptime (`esp_hal::time::Instant`) counts through light sleep. The
+/// task calls this function after each signal. The signals come often: the
+/// MQTT pings while the board is online, and the wake for the check of the
+/// power source every 60 seconds while it sleeps.
+fn check_uptime(guard: &mut Uptime) {
+    if guard.tick(Duration::from_millis(uptime().0)) {
+        log::info!(
+            "boot: up for {} minutes, so the count of panics in a row is 0",
+            STABLE_AFTER.as_secs() / 60
+        );
+        boot::stable();
+    }
+}
 
 /// The update statistics of the stream that the core opened last.
 #[derive(Default)]
@@ -47,9 +70,12 @@ struct Stats {
 /// update logs a warning, which the logger keeps, so a slow line would make
 /// one more line.
 ///
+/// `taken` has the boot facts and the lines from before the restart, which
+/// `main` read from RTC memory ([`boot::read`]). They go in `Start`.
+///
 /// If `display` is `false`, no display task runs. The core task then
 /// answers each `FrontLight` job itself, so the sleep steps continue.
-pub async fn run(source: PowerSource, display: bool) -> ! {
+pub async fn run(source: PowerSource, display: bool, taken: &Taken) -> ! {
     let mut shell = Shell::new();
     if CONFIG.read_only {
         log::info!("core: dry run, so a tap publishes no service call");
@@ -58,8 +84,17 @@ pub async fn run(source: PowerSource, display: bool) -> ! {
     // does not start the core again.
     // TODO: if the firmware uses deep sleep in the future, give the path and
     // the time of the last update that it kept in RTC memory.
-    let start = shell::start(&CONFIG, board::firmware(), source, None, None);
+    let start = shell::start(
+        &CONFIG,
+        board::firmware(),
+        taken.boot,
+        taken.lines(),
+        source,
+        None,
+        None,
+    );
     let mut stats = Stats::default();
+    let mut guard = Uptime::default();
     let started = Instant::now();
     let jobs = shell.send(Event::Start(start));
     record(&mut stats.updates, started);
@@ -96,6 +131,7 @@ pub async fn run(source: PowerSource, display: bool) -> ! {
             let jobs = shell.handle(shell::Signal::Event(event));
             dispatch(jobs, display, &mut stats);
         }
+        check_uptime(&mut guard);
     }
 }
 

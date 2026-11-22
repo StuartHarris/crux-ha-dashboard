@@ -30,7 +30,9 @@ mod radio;
 mod stream;
 mod timers;
 
-use dashboard_firmware::{board, lane::Lane, light::FrontLight, logger, panel::Panel, panel_pins};
+use dashboard_firmware::{
+    board, boot, lane::Lane, light::FrontLight, logger, panel::Panel, panel_pins,
+};
 use embassy_executor::Spawner;
 use embassy_net::StackResources;
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal as Latest};
@@ -84,6 +86,10 @@ const SOCKETS: usize = 4;
 #[esp_hal::main]
 async fn main(spawner: Spawner) -> ! {
     let peripherals = board::init();
+    // The reset reason and the memory that the reset kept. The read comes
+    // before the first warn line of this start, so a line of this start
+    // does not count as a line from before the restart.
+    let taken = boot::read();
     // From now, the warn and error lines wait for the core, also the lines
     // before the core starts.
     logger::forward();
@@ -155,7 +161,7 @@ async fn main(spawner: Spawner) -> ! {
         };
         spawner.spawn(display::task(panel, source, sleep, light).expect("spawn the display task"));
     }
-    core_task::run(source, has_display).await
+    core_task::run(source, has_display, &taken).await
 }
 
 /// The number of tries of the first read of the charger.

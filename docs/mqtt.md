@@ -335,8 +335,8 @@ Each message is one line as JSON:
 | Key | Value |
 | --- | --- |
 | `level` | `info` or `warn` for a line of the core. `warn` or `error` for a line of the shell. Never `debug`. |
-| `source` | For a line of the core, the part of the core that wrote the line: `wifi`, `mqtt` or `power`. For a line of the shell, the source that the shell gives, with at most 32 bytes. The drop message has `log`. |
-| `age` | The age of the line in whole seconds when the dashboard publishes it |
+| `source` | For a line of the core, the part of the core that wrote the line: `wifi`, `mqtt` or `power`. For a line of the shell, the source that the shell gives, with at most 32 bytes. The drop message has `log`. A line from before a restart has `boot`. |
+| `age` | The age of the line in whole seconds when the dashboard publishes it. A line from before a restart has the age 0, because its time is not known. |
 | `msg` | The text of the line, with at most 200 bytes. A longer text ends with `…`. |
 
 The firmware sends its own `warn` and `error` lines to the core, also the lines of
@@ -363,6 +363,28 @@ the serial port, but they do not go to Home Assistant.
 - The firmware keeps at most 16 lines for the core task. If more lines come before
   the core task takes them, the firmware drops the new lines, and the drop message
   counts them. Refer to `firmware/logic/src/forward.rs`.
+
+Each start of the core writes one line with the reason of the last reset and the
+restart count (refer to "The state message" below). A panic, a watchdog reset or a
+brownout gives `warn`. The other resets give `info`:
+
+```json
+{"level":"info","source":"power","age":0,"msg":"started after a power-on"}
+{"level":"warn","source":"power","age":0,"msg":"started after a watchdog reset, restart 3"}
+```
+
+The log of the core is in RAM, so a chip restart loses it. The firmware keeps its last
+8 `warn` and `error` lines in RTC memory, which a reset keeps, also the lines of the
+core. After a reset that is not a power-on, the firmware gives them back at the start.
+The core puts them first in its log, before the start line, with the source `boot` and
+the text `before the restart: <source>: <message>`. The time of such a line is not
+known on the new clock, so its age is 0, and Home Assistant shows it at the time of
+the message. After a power-on, the firmware gives no lines, because the RTC memory
+loses its content. Refer to `firmware/README.md`, "The restart facts".
+
+```json
+{"level":"warn","source":"boot","age":0,"msg":"before the restart: wifi: restart the chip: no address after 3 joins"}
+```
 
 The dashboard has no wall clock. Home Assistant gets the time of the line as the time
 when the message arrives, minus `age`. The clock of the device counts through a light
@@ -429,18 +451,23 @@ The automation `dashboard_log` writes the lines to the Home Assistant log.
   the level `warning`.
 - An `error` line calls `system_log.write` with the logger `dashboard.<device_id>`
   and the level `error`.
-- An `info` line also calls `system_log.write` with the logger
-  `dashboard.<device_id>` and the level `warning`, with `[info] ` before the
-  message. The Home Assistant log keeps only the level `warning` and higher. A later
-  PR moves the `info` lines to `logbook.log` on the status entity of the device.
+- An `info` line calls `logbook.log` with the name `Dashboard <device_id>` and the
+  entity `sensor.dashboard_<device_id>_status`. The line shows on the page of the
+  device and in the Logbook. The Home Assistant system log keeps only the level
+  `warning` and higher, so it is not the place for `info` lines. The Logbook stamps
+  each entry with the time when it arrives, so the real time of a line is the time in
+  the message.
 
 ### Home Assistant device
 
 The dashboard tells Home Assistant about itself with MQTT discovery. Home Assistant
-then shows the dashboard as a device with eight entities: the status, the charge of
-the battery, whether the dashboard is on the stand, and five power diagnostics
-(charging, the charge state, and the voltage, the current and the temperature of the
-battery). Refer to `shared/src/features/device/`.
+then shows the dashboard as a device with fifteen entities: the status, the charge of
+the battery, whether the dashboard is on the stand, five power diagnostics (charging,
+the charge state, and the voltage, the current and the temperature of the battery),
+and seven Wi-Fi and boot diagnostics (the signal, the access point, the IP address,
+the reconnects, the restarts, the last reset and the wake reason). Refer to
+`shared/src/features/device/`. The core gets a new signal only at a join or a scan,
+so on the stand the Wi-Fi signal entity can show a value that is hours or days old.
 
 | Topic | Direction | QoS | Retained |
 | --- | --- | --- | --- |
@@ -452,8 +479,10 @@ battery). Refer to `shared/src/features/device/`.
 #### The discovery message
 
 The discovery message is one device-based discovery config of Home Assistant
-(2024.11 and later), with abbreviated keys. It has about 2.9 KB (the limit in the
-tests is 4 KiB). For example, for the device id `hall`:
+(2024.11 and later), with abbreviated keys. It has 5,365 bytes for the device id
+`hall` (the limit in the tests is 6 KiB). The discovery and the state message go in
+one write, which has about 5.6 KB of the 16 KiB that a write can have (`MAX_OUTGOING`).
+For example, for the device id `hall`:
 
 ```json
 {
@@ -530,6 +559,65 @@ tests is 4 KiB). For example, for the device id `hall`:
       "avty_t": "dashboard/hall/status",
       "avty_tpl": "{{ 'offline' if value == 'offline' else 'online' }}",
       "ent_cat": "diagnostic"
+    },
+    "rssi": {
+      "p": "sensor", "name": "Wi-Fi signal", "uniq_id": "dashboard_hall_rssi",
+      "dev_cla": "signal_strength", "unit_of_meas": "dBm", "stat_cla": "measurement",
+      "stat_t": "dashboard/hall/state", "val_tpl": "{{ value_json.rssi }}",
+      "avty_t": "dashboard/hall/status",
+      "avty_tpl": "{{ 'offline' if value == 'offline' else 'online' }}",
+      "ent_cat": "diagnostic"
+    },
+    "bssid": {
+      "p": "sensor", "name": "Access point", "uniq_id": "dashboard_hall_bssid",
+      "ic": "mdi:access-point",
+      "stat_t": "dashboard/hall/state", "val_tpl": "{{ value_json.bssid }}",
+      "avty_t": "dashboard/hall/status",
+      "avty_tpl": "{{ 'offline' if value == 'offline' else 'online' }}",
+      "ent_cat": "diagnostic"
+    },
+    "ip": {
+      "p": "sensor", "name": "IP address", "uniq_id": "dashboard_hall_ip",
+      "ic": "mdi:ip-network",
+      "stat_t": "dashboard/hall/state", "val_tpl": "{{ value_json.ip }}",
+      "avty_t": "dashboard/hall/status",
+      "avty_tpl": "{{ 'offline' if value == 'offline' else 'online' }}",
+      "ent_cat": "diagnostic"
+    },
+    "reconnects": {
+      "p": "sensor", "name": "Reconnects", "uniq_id": "dashboard_hall_reconnects",
+      "ic": "mdi:lan-connect", "stat_cla": "total_increasing",
+      "stat_t": "dashboard/hall/state", "val_tpl": "{{ value_json.reconnects }}",
+      "avty_t": "dashboard/hall/status",
+      "avty_tpl": "{{ 'offline' if value == 'offline' else 'online' }}",
+      "ent_cat": "diagnostic"
+    },
+    "restarts": {
+      "p": "sensor", "name": "Restarts", "uniq_id": "dashboard_hall_restarts",
+      "ic": "mdi:restart", "stat_cla": "total_increasing",
+      "stat_t": "dashboard/hall/state", "val_tpl": "{{ value_json.restarts }}",
+      "avty_t": "dashboard/hall/status",
+      "avty_tpl": "{{ 'offline' if value == 'offline' else 'online' }}",
+      "ent_cat": "diagnostic"
+    },
+    "reset": {
+      "p": "sensor", "name": "Last reset", "uniq_id": "dashboard_hall_reset",
+      "dev_cla": "enum", "ic": "mdi:power-cycle",
+      "ops": ["Power on", "Software", "Panic", "Watchdog", "Brownout", "Other"],
+      "stat_t": "dashboard/hall/state",
+      "val_tpl": "{{ {'power_on': 'Power on', 'software': 'Software', 'panic': 'Panic', 'watchdog': 'Watchdog', 'brownout': 'Brownout', 'other': 'Other'}[value_json.reset] | default(None) }}",
+      "avty_t": "dashboard/hall/status",
+      "avty_tpl": "{{ 'offline' if value == 'offline' else 'online' }}",
+      "ent_cat": "diagnostic"
+    },
+    "wake": {
+      "p": "sensor", "name": "Wake reason", "uniq_id": "dashboard_hall_wake",
+      "dev_cla": "enum", "ic": "mdi:sleep-off", "ops": ["Boot", "Touch", "Stand"],
+      "stat_t": "dashboard/hall/state",
+      "val_tpl": "{{ {'boot': 'Boot', 'touch': 'Touch', 'stand': 'Stand'}[value_json.wake] | default(None) }}",
+      "avty_t": "dashboard/hall/status",
+      "avty_tpl": "{{ 'offline' if value == 'offline' else 'online' }}",
+      "ent_cat": "diagnostic"
     }
   }
 }
@@ -545,16 +633,21 @@ The message on the broker has no spaces or new lines.
   `02:00:00:00:00:01`.
 - The config has no shared options at its root. Each component has its own state topic
   and availability, because a shared availability would apply to the status sensor too.
-- The status, charge, voltage and current components set an icon with `ic`. The
-  battery, stand, charging and temperature components keep the default icon of their
-  device class.
+- The battery, stand, charging, temperature and signal components keep the default
+  icon of their device class. The other components set an icon with `ic`, because
+  they have no device class or the icon of the class does not tell what they are.
 - The state message keeps the snake_case values of `charge` (`not_charging`,
   `pre_charging`, `fast_charging`, `done`). The `charge` component has the options
   `Not charging`, `Pre-charging`, `Fast charging` and `Done`. Its value template maps
   each wire value to its label. If `charge` is null or unknown, the template gives
-  `None`, and Home Assistant shows the state as unknown.
-- The five power diagnostics have the entity category `diagnostic`, so Home Assistant
-  shows them in the "Diagnostic" part of the device page.
+  `None`, and Home Assistant shows the state as unknown. The `reset` and `wake`
+  components map their values to their labels in the same way.
+- `reconnects` and `restarts` have the state class `total_increasing`. Each count goes
+  to 0 at a new cycle: `reconnects` at each start of the core, and `restarts` at each
+  power-on. Home Assistant then starts a new cycle of the total.
+- The power diagnostics and the Wi-Fi and boot diagnostics have the entity category
+  `diagnostic`, so Home Assistant shows them in the "Diagnostic" part of the device
+  page.
 - The voltage is in mV, not in V. The dashboard then sends a whole number, so the
   payload is exact. Home Assistant converts the units of a voltage sensor, so you can
   set the display unit to V in the settings of the entity.
@@ -583,7 +676,7 @@ The state message has the values of all the sensors except the status as one JSO
 object:
 
 ```json
-{"battery":95,"stand":"OFF","charging":"OFF","charge":"not_charging","voltage":3870,"current":-40,"temperature":24.5}
+{"battery":95,"stand":"OFF","charging":"OFF","charge":"not_charging","voltage":3870,"current":-40,"temperature":24.5,"rssi":-62,"bssid":"24:5a:4c:01:02:03","ip":"192.168.1.50","reconnects":0,"restarts":0,"reset":"power_on","wake":"boot"}
 ```
 
 | Key | Value |
@@ -595,21 +688,29 @@ object:
 | `voltage` | The voltage of the battery in mV, rounded to 10 mV. |
 | `current` | The average current of the battery in mA, rounded to 10 mA. A positive current charges the battery, and a negative current discharges it. A check on the board is still to do. |
 | `temperature` | The temperature of the fuel gauge in °C, rounded to 0.5 °C. |
+| `rssi` | The signal of the access point in dBm, from the join or from the last scan that saw the access point. On the stand, the core scans only after a join with the cached access point, so the value can be hours old. |
+| `bssid` | The BSSID of the access point, as lowercase hex with colons. |
+| `ip` | The IPv4 address from DHCP. |
+| `reconnects` | The number of MQTT sessions since the start of the core that failed while the dashboard was awake, so that the core connected again. A link that fails before a session and a sleep do not count. |
+| `restarts` | The number of resets that were not a power-on, since the last power-on. The simulator gives 0. |
+| `reset` | The reason of the last reset: `power_on`, `software`, `panic`, `watchdog`, `brownout` or `other`. The simulator gives `power_on`. |
+| `wake` | What woke the dashboard last: `boot` (a start, with no sleep since), `touch` or `stand`. The check of the power source every 60 seconds and a wake with no cause keep the dashboard asleep, so they do not change it. |
 
-A value is `null` if the shell did not read it. Home Assistant then shows the entity as
-unknown. The shell keeps the last good value of each diagnostic after a read that fails,
+A value is `null` if the shell did not read it, and `rssi`, `bssid` and `ip` are `null`
+with no link. Home Assistant then shows the entity as unknown. The shell keeps the last good value of each diagnostic after a read that fails,
 so a value is `null` only until its first good read. The simulator gives fixed values
 for each power source.
 
-The message has about 120 bytes. The dashboard publishes it at these times:
+The message has about 240 bytes. The dashboard publishes it at these times:
 
 - Once on each connection.
 - At once after an urgent change, while the connection is up. An urgent change is a
   move on or off the stand, a start or an end of a charge (`charging`), the first level
-  of the battery, or a level of the battery that moves by more than 1%.
+  of the battery, a level of the battery that moves by more than 1%, and a change of
+  `ip`, `bssid`, `restarts`, `reset` or `wake`.
 - At most once in 60 seconds for each other change: the voltage, the current, the
-  temperature, the charge state while `charging` stays the same, and a level of the
-  battery that moves by 1%. The gauge can flap between two levels, so a move of 1% is
+  temperature, the charge state while `charging` stays the same, a level of the
+  battery that moves by 1%, `rssi` and `reconnects`. The gauge can flap between two levels, so a move of 1% is
   not urgent. The first of these changes goes at once and starts a timer of 60 seconds.
   The changes in that time wait. At the end of the time, the dashboard publishes the
   values of that time, if they changed, and starts a new timer. An urgent change in that
@@ -624,7 +725,7 @@ The message has about 120 bytes. The dashboard publishes it at these times:
 | Entity | Available |
 | --- | --- |
 | Status | Always. It shows `online`, `asleep` or `offline` from the status topic. |
-| Battery, On stand, and the power diagnostics | Unless the status is `offline`. While the dashboard is asleep, they keep their last value. |
+| Battery, On stand, the power diagnostics, and the Wi-Fi and boot diagnostics | Unless the status is `offline`. While the dashboard is asleep, they keep their last value. |
 
 #### When the dashboard publishes
 
