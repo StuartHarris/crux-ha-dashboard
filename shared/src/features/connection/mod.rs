@@ -632,7 +632,7 @@ fn issue(call: Call, tap: Option<Tap>, model: &mut Model) -> Result<Cmd, (Call, 
         return Err((call, tap));
     };
     match live.session.publish(call.publish.clone()) {
-        Ok(()) => Ok(pending::issued(call.entity_id, tap, model)),
+        Ok(_) => Ok(pending::issued(call.entity_id, tap, model)),
         Err(Refused::TooLong) => {
             let reason = log::warn(
                 Area::Mqtt,
@@ -918,8 +918,9 @@ pub fn pump(model: &mut Model) -> Cmd {
                         live.cancel_timer(kind);
                     }
                 }
-                // The core closes the stream when the session ends.
-                Action::Close => {}
+                // The core closes the stream when the session ends, and no
+                // feature waits for a PUBACK yet.
+                Action::Close | Action::Acked(_) => {}
                 Action::Connected => rest.push(connected(model)),
                 Action::Message(message) => rest.push(on_message(&message, model)),
                 Action::Skipped { length } => {

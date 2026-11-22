@@ -20,6 +20,7 @@ use crate::{
         radio::Target,
         stream::{StreamItem, Written},
     },
+    entities::topics,
     fake::radio::HALL,
     features::{
         connection::{CLOSE_TIMEOUT, Link, RECONNECT_MAX, RECONNECT_MIN},
@@ -36,6 +37,7 @@ use crate::{
         MAX_IN_FLIGHT, MAX_PACKET, SEND_TIMEOUT,
         codec::server::{Packet, suback},
     },
+    pages::PAGES,
 };
 
 /// The page of the living room. Tile 1 is a lamp.
@@ -451,6 +453,61 @@ fn the_outbox_the_status_and_the_subscribe_go_in_one_write() {
             .all(|packet| matches!(packet, Packet::Subscribe { .. })),
         "{burst:?}"
     );
+}
+
+/// The write after the CONNACK holds the call at `QoS` 1 with the packet id
+/// 1, then the retained `online` status with the id 2, then the SUBSCRIBE
+/// packets with all the topics at `QoS` 0, in order.
+#[test]
+fn the_write_after_the_connack_keeps_its_packets_and_their_ids() {
+    let mut shell = house();
+    shell.broker.down = true;
+    shell.send(start_at(PowerSource::Stand, Some(LIVING_ROOM)));
+    shell.send(tap_tile(1));
+    shell.broker.down = false;
+    shell.writes.clear();
+    shell.advance(RECONNECT_MIN * 2);
+
+    let burst = &shell.writes[1];
+    let [call, status, subscribes @ ..] = &burst[..] else {
+        panic!("a call, a status and subscribes: {burst:?}");
+    };
+    let Packet::Publish {
+        flags,
+        topic,
+        id,
+        payload,
+    } = call
+    else {
+        panic!("the call first: {burst:?}");
+    };
+    assert_eq!(
+        (*flags, topic.as_str(), *id),
+        (0x02, "dashboard/hall/cmd", Some(1))
+    );
+    assert_eq!(
+        payload,
+        br#"{"service":"light.toggle","entity_id":"light.living_room_rocket_lamp"}"#
+    );
+    assert_eq!(
+        *status,
+        Packet::Publish {
+            flags: 0x03,
+            topic: STATUS.into(),
+            id: Some(2),
+            payload: b"online".to_vec(),
+        }
+    );
+    let mut filters = Vec::new();
+    for (packet, expected_id) in subscribes.iter().zip(3..) {
+        let Packet::Subscribe { id, filters: more } = packet else {
+            panic!("then the subscribes: {burst:?}");
+        };
+        assert_eq!(*id, expected_id);
+        filters.extend(more.iter().cloned());
+    }
+    let expected: Vec<(String, u8)> = topics(PAGES).into_iter().map(|topic| (topic, 0)).collect();
+    assert_eq!(filters, expected);
 }
 
 #[test]

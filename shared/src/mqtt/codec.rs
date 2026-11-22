@@ -75,6 +75,9 @@ pub enum Inbound<'a> {
         payload: &'a [u8],
         /// The packet id, if the quality of service is above 0.
         id: Option<u16>,
+        /// The retain flag. The broker sets it on a retained message that it
+        /// sends because of a new subscription.
+        retain: bool,
     },
     /// The acknowledgement of a publish at `QoS` 1.
     PubAck {
@@ -321,7 +324,12 @@ pub fn decode(first: u8, body: &[u8]) -> Result<Inbound<'_>, Malformed> {
                 }
                 (Some(id), payload)
             };
-            Ok(Inbound::Publish { topic, payload, id })
+            Ok(Inbound::Publish {
+                topic,
+                payload,
+                id,
+                retain: flags & 0x01 != 0,
+            })
         }
         PUBACK if flags == 0 && body.len() == 2 => Ok(Inbound::PubAck {
             id: take_u16(body)?.0,

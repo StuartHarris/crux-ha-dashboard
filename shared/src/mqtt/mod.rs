@@ -26,7 +26,9 @@ pub mod types;
 #[cfg(test)]
 mod tests;
 
-pub use session::{Action, End, Input, Limits, Refused, Session, SubscribeId, Timer, TimerKind};
+pub use session::{
+    Action, End, Input, Limits, PacketId, Refused, Session, SubscribeId, Timer, TimerKind,
+};
 pub use types::{Connect, Credentials, LastWill, Message, Publish, Qos, SubscribeOutcome};
 
 /// The longest packet body that the session reads (256 KiB).
