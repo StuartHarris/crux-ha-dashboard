@@ -264,7 +264,7 @@ pub struct Start {
     /// The warn and error lines that the shell kept from before a reset
     /// that was not a power-on, from the oldest. After a power-on, the
     /// list is empty. The core puts them in its log before any new line.
-    /// Refer to [`logs::before_restart`].
+    /// Only the first `Start` uses them. Refer to [`logs::before_restart`].
     pub before_restart: Vec<BootLine>,
     /// The power source now.
     pub power: PowerSource,
@@ -640,14 +640,17 @@ fn on_start(start: Start, model: &mut Model) -> Cmd {
         path,
         last_sync,
     } = start;
+    // A second `Start` uses only the dry run of the shell. It keeps no lines
+    // from before the restart, because the first `Start` kept them.
+    let (requested, first) = match model.startup {
+        Startup::Waiting { read_only } => (read_only, true),
+        Startup::Started { .. } => (false, false),
+    };
     // The lines from before the restart go first, before the start line
     // and each other new line.
-    logs::before_restart(before_restart, model);
-    // A second `Start` uses only the dry run of the shell.
-    let requested = match model.startup {
-        Startup::Waiting { read_only } => read_only,
-        Startup::Started { .. } => false,
-    };
+    if first {
+        logs::before_restart(before_restart, model);
+    }
     model.startup = Startup::Started {
         settings: Settings {
             read_only: settings.read_only || requested,

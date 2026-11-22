@@ -204,11 +204,29 @@ for the serial port, and restarts the chip with `esp_hal::system::software_reset
 board until a power-on.
 
 If a panic occurs at each start, each restart causes the next panic, and the restarts
-empty the battery. So the firmware counts the panics in a row. The core task sets the count to 0 when the
-view model shows `Online`, after each MQTT connect. The third panic in a row with no
-connect between them (`logic::boot::PANIC_LIMIT`) stops the chip as before, and prints
-`panic: 3 panics in a row with no MQTT connect, so the chip stops`. The `restarts`
-sensor shows the restarts before that.
+empty the battery. So the firmware counts the panic restarts in a row. The count goes
+back to 0 only at these times:
+
+- A power-on, because esp-hal fills the memory with zeros.
+- The uptime of one start reaches 10 minutes (`logic::boot::STABLE_AFTER` and
+  `logic::boot::Uptime`). The uptime counts through light sleep, so the rule works on
+  battery too, where the board is online for only about 30 s at each wake. The core
+  task checks the uptime after each signal: the MQTT pings while online, and the wake
+  for the check of the power source every 60 s while asleep. An MQTT connect alone
+  does not set the count to 0, because a panic can follow each connect.
+
+Each other reset keeps the count: a software reset, a watchdog reset, a brownout and
+a reset by hand. The third panic in a row (`logic::boot::PANIC_LIMIT`) stops the chip,
+and prints `panic: 3 panics in a row, so the chip stops`. The `restarts` sensor shows
+the restarts before that.
+
+The stop masks and disables each interrupt, and then waits in `waiti`, so the CPU
+clock stops (`boot::halt`). No watchdog resets the stopped chip, because
+`esp_hal::init` disables each one. The stop does not stop the Wi-Fi radio, because a
+call to the driver is not safe in a panic. A panic that stops the chip does not set
+the panic flag, so the start after a reset by hand does not report `Panic`. That reset
+keeps the count at the limit, so the next panic stops the chip at once. Only a power
+cycle, or 10 minutes of uptime with no panic, clears the count.
 
 The panic message is not in the ring of lines. The hooks of esp-backtrace 0.20
 (`custom-pre-backtrace`, `custom-halt`) get no `PanicInfo`, and a panic handler of our

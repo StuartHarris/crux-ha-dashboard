@@ -6,8 +6,9 @@
 //! - [`read`] reads the reset reason and the memory once at the start. It
 //!   gives the facts for `Start`, and starts the record of lines.
 //! - [`record`] keeps a warn or error line of the logger.
-//! - [`connected`] tells the guard against a loop of panics that the core
-//!   made an MQTT connect.
+//! - [`stable`] tells the guard against a loop of panics that the uptime
+//!   reached [`STABLE_AFTER`](logic::boot::STABLE_AFTER). The core task
+//!   decides when, with [`logic::boot::Uptime`].
 //! - `custom_halt` runs at the end of each panic. It restarts the chip, or
 //!   stops it after [`PANIC_LIMIT`](logic::boot::PANIC_LIMIT) panics in a
 //!   row.
@@ -90,10 +91,10 @@ pub fn record(line: &Line) {
     }
 }
 
-/// The core made an MQTT connect, so the count of panics in a row starts
-/// again at 0. Refer to [`Rtc::connected`].
-pub fn connected() {
-    rtc().connected();
+/// The start is stable, so the count of panics in a row starts again at 0.
+/// Refer to [`Rtc::stable`].
+pub fn stable() {
+    rtc().stable();
 }
 
 /// Ends each panic, after esp-backtrace printed it and its backtrace.
@@ -107,9 +108,9 @@ pub fn connected() {
 /// The function counts the panic and sets the panic flag in the memory
 /// ([`Rtc::panicked`]). Then it waits for the serial port, and restarts the
 /// chip, so the next start reports `Panic`. After [`PANIC_LIMIT`] panics in
-/// a row with no MQTT connect, it stops the chip as esp-backtrace does
-/// without this feature, so a panic at each start cannot empty the battery.
-/// Before [`read`] (in the bring-up), it stops the chip too.
+/// a row, it stops the chip and does not set the flag, so a panic at each
+/// start cannot empty the battery. Before [`read`] (in the bring-up), it
+/// stops the chip too. Refer to [`halt`].
 #[unsafe(no_mangle)]
 #[expect(
     clippy::no_mangle_with_rust_abi,
@@ -131,15 +132,37 @@ pub fn custom_halt() -> ! {
         }
         AfterPanic::Halt => {
             if recording() {
-                esp_println::println!(
-                    "panic: {PANIC_LIMIT} panics in a row with no MQTT connect, so the chip stops"
-                );
+                esp_println::println!("panic: {PANIC_LIMIT} panics in a row, so the chip stops");
             }
-            critical_section::with(|_| {
-                loop {
-                    core::hint::spin_loop();
-                }
-            })
+            halt()
         }
     }
+}
+
+/// Stops the CPU until a reset, with as little power as is safe in a panic.
+///
+/// The function masks each interrupt (`PS.INTLEVEL` in the critical
+/// section) and also disables each one (`INTENABLE` = 0). Then it waits in
+/// `waiti`, which stops the clock of the CPU until an interrupt. No
+/// interrupt is enabled, so the CPU stays stopped. `waiti 0` lowers
+/// `PS.INTLEVEL` to 0, so `INTENABLE` = 0 is necessary: without it, the
+/// tasks of the scheduler and of the Wi-Fi driver would run again after the
+/// panic. The loop is for an interrupt that cannot be disabled (the debug
+/// interrupt of a debugger).
+///
+/// The function does not stop the Wi-Fi radio. The radio task owns the
+/// controller, and the panic can come from inside the driver, so a call to
+/// the driver here is not safe. With no interrupts, the driver does no more
+/// work, and the access point drops the device after its time limit.
+fn halt() -> ! {
+    // No watchdog resets the stopped chip: `esp_hal::init` disables the RTC
+    // watchdog, the super watchdog and the watchdogs of timer groups 0 and 1
+    // (esp-hal 1.2.2, `src/lib.rs`, "Disable watchdog timers"), and the
+    // firmware enables none.
+    critical_section::with(|_| {
+        xtensa_lx::interrupt::disable_mask(u32::MAX);
+        loop {
+            esp_hal::interrupt::wait_for_interrupt();
+        }
+    })
 }

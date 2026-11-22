@@ -466,7 +466,8 @@ the battery, whether the dashboard is on the stand, five power diagnostics (char
 the charge state, and the voltage, the current and the temperature of the battery),
 and seven Wi-Fi and boot diagnostics (the signal, the access point, the IP address,
 the reconnects, the restarts, the last reset and the wake reason). Refer to
-`shared/src/features/device/`.
+`shared/src/features/device/`. The core gets a new signal only at a join or a scan,
+so on the stand the Wi-Fi signal entity can show a value that is hours or days old.
 
 | Topic | Direction | QoS | Retained |
 | --- | --- | --- | --- |

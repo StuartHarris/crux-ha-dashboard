@@ -64,6 +64,9 @@ embassy-sync = "0.8.0"
 critical-section = "1.2.0"
 # Atomics that esp-hal accepts in RTC memory that a reset keeps (`src/boot.rs`).
 portable-atomic = { version = "1.15", default-features = false }
+# Disables each interrupt before the low-power stop after a panic
+# (`boot::halt` in `src/boot.rs`). esp-hal already depends on it.
+xtensa-lx = "0.13.0"
 embassy-futures = "0.1.2"
 embassy-net = { version = "0.9.1", features = ["dhcpv4", "medium-ethernet", "tcp", "dns", "proto-ipv4"] }
 static_cell = "2.1.1"

@@ -13,8 +13,8 @@
 //!   restarts, takes the lines that a restart kept, and clears them.
 //! - [`Rtc::record`] keeps a warn or error line in a ring of [`LINES`]
 //!   lines. The newest line replaces the oldest line.
-//! - [`Rtc::panicked`] and [`Rtc::connected`] are the guard against a loop
-//!   of panics. Refer to [`PANIC_LIMIT`].
+//! - [`Rtc::panicked`], [`Rtc::stable`] and [`Uptime`] are the guard
+//!   against a loop of panics. Refer to [`PANIC_LIMIT`].
 //!
 //! # The memory is not trusted
 //!
@@ -32,6 +32,7 @@
 //! firmware then needs no `unsafe` block for them.
 
 use alloc::{string::String, vec::Vec};
+use core::time::Duration;
 
 use portable_atomic::{AtomicU8, AtomicU32, Ordering};
 use shared::{Boot, BootLine, ResetReason, features::logs::Kept};
@@ -49,15 +50,29 @@ pub const SLOT: usize = 3 + SOURCE + MESSAGE;
 /// in its low byte, so a firmware with another layout clears the memory.
 pub const MAGIC: u32 = 0x4442_5401;
 
-/// The number of panics in a row, with no MQTT connect between them, after
-/// which a panic stops the chip and does not restart it.
+/// The number of panic restarts in a row after which a panic stops the
+/// chip and does not restart it.
 ///
 /// A panic restarts the chip, so the board recovers by itself on battery.
-/// If the panic occurs before the first connect at each start, the
-/// restarts empty the battery. So the third panic in a row stops the chip, as
-/// a panic did before this guard. The first MQTT connect after a start sets
-/// the count to 0 ([`Rtc::connected`]).
+/// If a panic occurs soon after each start, the restarts empty the battery.
+/// So the third panic in a row stops the chip, as a panic did before this
+/// guard. The count goes back to 0 only at these times:
+///
+/// - A power-on ([`Rtc::boot`]). esp-hal fills the memory with zeros, and
+///   the boot also clears the count.
+/// - The uptime of one start reaches [`STABLE_AFTER`] ([`Uptime`],
+///   [`Rtc::stable`]). An MQTT connect alone does not count, because a
+///   panic can follow each connect.
+///
+/// Each other reset keeps the count: a software reset, a watchdog reset,
+/// a brownout, and a reset by hand after the chip stopped. After a stop, a
+/// reset by hand thus keeps the count at the limit, and the next panic
+/// stops the chip again.
 pub const PANIC_LIMIT: u32 = 3;
+
+/// The uptime of one start after which the count of panics in a row goes
+/// back to 0. Refer to [`Uptime`].
+pub const STABLE_AFTER: Duration = Duration::from_mins(10);
 
 /// The raw reset reasons of the ESP32-S3 (`SocResetReason` in esp-hal).
 mod code {
@@ -136,8 +151,38 @@ pub enum AfterPanic {
     /// Restart the chip. The next start reports `Panic`.
     Restart,
     /// Stop the chip and do not restart it, because [`PANIC_LIMIT`] panics
-    /// came in a row with no MQTT connect.
+    /// came in a row.
     Halt,
+}
+
+/// The time rule of the guard against a loop of panics ([`PANIC_LIMIT`]):
+/// the start is stable when the uptime since the boot reaches
+/// [`STABLE_AFTER`]. The firmware then calls [`Rtc::stable`] once.
+///
+/// The firmware gives the uptime to [`Uptime::tick`] after each signal of
+/// the core task. The uptime counts through light sleep. The signals come
+/// often: the MQTT pings while the board is online, and the check of the
+/// power source every 60 seconds while it sleeps. So a tick comes soon
+/// after the uptime reaches [`STABLE_AFTER`].
+///
+/// The rule does not need the board online: on battery, the board is
+/// online for only about 30 s at each wake.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Uptime {
+    /// `true` after the start became stable.
+    stable: bool,
+}
+
+impl Uptime {
+    /// Checks the uptime `now` since the boot. Returns `true` once, when
+    /// the start becomes stable.
+    pub const fn tick(&mut self, now: Duration) -> bool {
+        if self.stable || now.as_millis() < STABLE_AFTER.as_millis() {
+            return false;
+        }
+        self.stable = true;
+        true
+    }
 }
 
 /// The memory that keeps its values through a reset. The firmware puts
@@ -150,7 +195,7 @@ pub struct Rtc<'a> {
     pub restarts: &'a AtomicU32,
     /// 1 if the last start ended with a panic that restarts the chip.
     pub panicked: &'a AtomicU32,
-    /// The number of panics in a row with no MQTT connect.
+    /// The number of panic restarts in a row. Refer to [`PANIC_LIMIT`].
     pub panics: &'a AtomicU32,
     /// The place of the ring for the next line.
     pub head: &'a AtomicU32,
@@ -217,7 +262,8 @@ impl Rtc<'_> {
     /// 1. If the memory does not start with [`MAGIC`], clears all the
     ///    values and writes the magic.
     /// 2. Maps the reason, with the panic flag of the last start, and
-    ///    clears the flag.
+    ///    clears the flag. After a power-on, sets the count of panics in a
+    ///    row to 0. Each other reset keeps the count ([`PANIC_LIMIT`]).
     /// 3. Counts the restart: 0 after a power-on, else 1 more.
     /// 4. Takes the lines of the ring, from the oldest, and clears the ring.
     ///    After a power-on, no line is taken.
@@ -234,6 +280,9 @@ impl Rtc<'_> {
         }
         let panicked = self.panicked.swap(0, Ordering::Relaxed) != 0;
         let reset = reset_reason(raw, panicked);
+        if reset == ResetReason::PowerOn {
+            self.panics.store(0, Ordering::Relaxed);
+        }
         let restarts = if reset == ResetReason::PowerOn {
             0
         } else {
@@ -292,23 +341,28 @@ impl Rtc<'_> {
             .store(((head + 1) % LINES) as u32, Ordering::Relaxed);
     }
 
-    /// Counts a panic, sets the panic flag, and returns what the panic
-    /// does: a restart, or a stop after [`PANIC_LIMIT`] panics in a row.
+    /// Counts a panic, and returns what the panic does: a restart, or a
+    /// stop after [`PANIC_LIMIT`] panics in a row.
+    ///
+    /// Only a restart sets the panic flag, so the next start reports
+    /// `Panic`. After a stop, only a reset by hand or a power-on starts the
+    /// chip, and that start does not report `Panic`. A reset by hand keeps
+    /// the count, so the next panic stops the chip again.
     #[must_use]
     pub fn panicked(&self) -> AfterPanic {
         let panics = self.panics.load(Ordering::Relaxed).saturating_add(1);
         self.panics.store(panics, Ordering::Relaxed);
-        self.panicked.store(1, Ordering::Relaxed);
         if panics >= PANIC_LIMIT {
             AfterPanic::Halt
         } else {
+            self.panicked.store(1, Ordering::Relaxed);
             AfterPanic::Restart
         }
     }
 
-    /// The core made an MQTT connect, so the start works. The count of
-    /// panics in a row starts again at 0.
-    pub fn connected(&self) {
+    /// The start is stable: its uptime reached [`STABLE_AFTER`]
+    /// ([`Uptime`]). The count of panics in a row starts again at 0.
+    pub fn stable(&self) {
         self.panics.store(0, Ordering::Relaxed);
     }
 

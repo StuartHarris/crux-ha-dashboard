@@ -1132,13 +1132,151 @@ fn an_association_after_the_sleep_started_has_no_address_and_no_link() {
     // The core keeps nothing in the cache.
     assert_eq!(model.wifi.cache.plan(), Target::Strongest);
 
-    // A tap before `Off` wakes the device, which joins again from `Up`. The
-    // cache has no access point, so the core leaves first.
+    // A tap before `Off` wakes the device, which joins again from
+    // `Associated`. The cache has no access point, so the core leaves first.
     Dashboard
         .update(Event::Tapped(None), &mut model)
         .expect_render()
         .expect_time_notify_after()
         .expect_radio_leave();
+}
+
+/// Returns a model in the steps of the sleep 1, with [`HALL`] in the cache.
+/// The `Join` request 9 to [`HALL`] waits. If `suspect` is `true`, the link
+/// is suspect.
+fn sleeping_while_joining_hall(suspect: bool) -> Model {
+    let mut model = sleeping_with(Phase::Joining(Target::Cached(HALL)));
+    model.wifi.cache.joined(Target::Strongest, HALL);
+    if suspect {
+        model.wifi.health.failed();
+    }
+    model
+}
+
+/// Sends the answer to the `Join` request 9: the device associated with
+/// [`HALL`], and kept the association and its address.
+fn associate_with_hall(model: &mut Model) {
+    let joined = Joined::Associated {
+        access_point: HALL,
+        rssi: Some(-55),
+        kept: true,
+        had_address: true,
+    };
+    Dashboard
+        .update(Event::Wifi(wifi::Event::Joined { radio: 9, joined }), model)
+        .expect_no_effects();
+    assert_eq!(model.wifi.phase, Phase::Associated(HALL));
+}
+
+/// Sends a tap, which wakes the device in the steps of a sleep. Returns the
+/// radio requests and the log lines of the wake, as in [`Shell::take_log`].
+fn wake_with_a_tap(model: &mut Model) -> Vec<String> {
+    let mut cmd = Dashboard.update(Event::Tapped(None), model);
+    cmd.effects()
+        .filter_map(|effect| match effect {
+            Effect::RadioJoin(request) => Some(format!(
+                "RadioJoin {:?} keep {}",
+                request.operation.target, request.operation.keep
+            )),
+            Effect::RadioLeave(_) => Some("RadioLeave".into()),
+            Effect::Log(request) => {
+                Some(format!("{} {}", request.operation.level, request.operation))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_lease_after_the_sleep_started_counts_nothing_and_a_wake_leaves_a_suspect_link() {
+    let mut model = sleeping_with(Phase::Leasing {
+        target: Target::Cached(HALL),
+        access_point: HALL,
+        rssi: Some(-55),
+        had_address: false,
+        kept: false,
+    });
+    model.wifi.cache.joined(Target::Strongest, HALL);
+    // The link is suspect, and one join got no address.
+    model.wifi.health.failed();
+    assert_eq!(model.wifi.health.no_lease(), Recovery::Continue);
+
+    let leased = Event::Wifi(wifi::Event::Leased {
+        radio: 9,
+        lease: Lease::Leased { ip: IP },
+    });
+    Dashboard.update(leased, &mut model).expect_no_effects();
+    // The new address in the steps of the sleep counts nothing, and the
+    // core keeps no address: the device has no link.
+    assert_eq!(model.wifi.health.joins_with_no_lease(), 1);
+    assert!(model.wifi.health.suspect());
+    assert_eq!(model.wifi.cache.plan(), Target::Cached(HALL));
+    assert_eq!(model.wifi.phase, Phase::Associated(HALL));
+    assert_eq!(model.wifi.phase.linked(), None);
+
+    // A tap wakes the device. The link is suspect, so the core leaves
+    // first.
+    assert_eq!(wake_with_a_tap(&mut model), [LEAVE_HALL, "RadioLeave"]);
+}
+
+#[test]
+fn a_no_lease_after_the_sleep_started_keeps_the_association_for_a_wake() {
+    let mut model = sleeping_with(Phase::Leasing {
+        target: Target::Cached(HALL),
+        access_point: HALL,
+        rssi: Some(-55),
+        had_address: false,
+        kept: false,
+    });
+    model.wifi.cache.joined(Target::Strongest, HALL);
+    let no_lease = Event::Wifi(wifi::Event::Leased {
+        radio: 9,
+        lease: Lease::NoLease,
+    });
+    Dashboard.update(no_lease, &mut model).expect_no_effects();
+    assert_eq!(model.wifi.phase, Phase::Associated(HALL));
+
+    // A tap wakes the device, which keeps the association with the cached
+    // access point.
+    assert_eq!(
+        wake_with_a_tap(&mut model),
+        [format!("RadioJoin {:?} keep true", Target::Cached(HALL))]
+    );
+}
+
+#[test]
+fn a_wake_from_an_association_during_a_sleep_on_a_suspect_link_leaves_first() {
+    let mut model = sleeping_while_joining_hall(true);
+    associate_with_hall(&mut model);
+    assert_eq!(wake_with_a_tap(&mut model), [LEAVE_HALL, "RadioLeave"]);
+}
+
+#[test]
+fn a_wake_from_an_association_during_a_sleep_with_the_cached_access_point_keeps_it() {
+    let mut model = sleeping_while_joining_hall(false);
+    associate_with_hall(&mut model);
+    assert_eq!(
+        wake_with_a_tap(&mut model),
+        [format!("RadioJoin {:?} keep true", Target::Cached(HALL))]
+    );
+}
+
+#[test]
+fn an_end_by_the_host_during_an_association_in_a_sleep_proves_traffic() {
+    let mut model = sleeping_while_joining_hall(true);
+    associate_with_hall(&mut model);
+    // No session can end in this phase, because a session starts only on a
+    // ready link. The rule for an association during a sleep is the rule for
+    // a link.
+    let end = crate::mqtt::End::ByHost("TCP connect failed: ConnectionReset".into());
+    crate::features::wifi::session_ended(&end, &mut model).expect_only_log_with(|log| {
+        assert_eq!(
+            log.to_string(),
+            "wifi: the broker host ended the session, so the link moves data and is not suspect"
+        );
+    });
+    assert!(!model.wifi.health.suspect());
+    assert_eq!(model.wifi.phase, Phase::Associated(HALL));
 }
 
 #[test]

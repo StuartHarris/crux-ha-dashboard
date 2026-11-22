@@ -9,6 +9,10 @@
 //! The task also takes each warn and error line that the logger keeps
 //! (`dashboard_firmware::logger`), and sends it to the core as
 //! `Event::ShellLogged`.
+//!
+//! The task also runs the time rule of the guard against a loop of panics
+//! (`logic::boot::Uptime`). After each signal, it gives the uptime. When the
+//! uptime reaches `STABLE_AFTER` (10 minutes), it calls `boot::stable` once.
 
 use core::time::Duration;
 
@@ -20,17 +24,35 @@ use dashboard_firmware::{
 use embassy_futures::select::{Either, select};
 use embassy_time::Instant;
 use logic::{
-    boot::Taken,
+    boot::{STABLE_AFTER, Taken, Uptime},
     forward::{CORE_TARGET, PENDING},
     shell::{self, Job, Shell, StreamOp, TimerOp},
     sleep::Plan,
     stream::UpdateStats,
 };
-use shared::{Connection, Event, PowerSource, capabilities::log::Level};
+use shared::{Event, PowerSource, capabilities::log::Level};
 
 use crate::{
     IN_FLIGHT, LIGHT, RADIO, RENDER, SIGNALS, SLEEP, STREAM, TIMERS, config::CONFIG, radio, timers,
 };
+
+/// Gives the uptime to the guard against a loop of panics. When the
+/// uptime reaches [`STABLE_AFTER`], the count of panics in a row starts
+/// again at 0 ([`boot::stable`]).
+///
+/// The uptime (`esp_hal::time::Instant`) counts through light sleep. The
+/// task calls this function after each signal. The signals come often: the
+/// MQTT pings while the board is online, and the wake for the check of the
+/// power source every 60 seconds while it sleeps.
+fn check_uptime(guard: &mut Uptime) {
+    if guard.tick(Duration::from_millis(uptime().0)) {
+        log::info!(
+            "boot: up for {} minutes, so the count of panics in a row is 0",
+            STABLE_AFTER.as_secs() / 60
+        );
+        boot::stable();
+    }
+}
 
 /// The update statistics of the stream that the core opened last.
 #[derive(Default)]
@@ -72,6 +94,7 @@ pub async fn run(source: PowerSource, display: bool, taken: &Taken) -> ! {
         None,
     );
     let mut stats = Stats::default();
+    let mut guard = Uptime::default();
     let started = Instant::now();
     let jobs = shell.send(Event::Start(start));
     record(&mut stats.updates, started);
@@ -108,6 +131,7 @@ pub async fn run(source: PowerSource, display: bool, taken: &Taken) -> ! {
             let jobs = shell.handle(shell::Signal::Event(event));
             dispatch(jobs, display, &mut stats);
         }
+        check_uptime(&mut guard);
     }
 }
 
@@ -148,14 +172,7 @@ fn record(stats: &mut UpdateStats, started: Instant) {
 fn dispatch(jobs: alloc::vec::Vec<Job>, display: bool, stats: &mut Stats) {
     for job in jobs {
         match job {
-            Job::Render(view) => {
-                // The view shows `Online` after an MQTT connect, so the
-                // start works and a later panic restarts the chip again.
-                if view.connection == Connection::Online {
-                    boot::connected();
-                }
-                RENDER.signal(view);
-            }
+            Job::Render(view) => RENDER.signal(view),
             Job::Stream { connection, op } => {
                 match &op {
                     StreamOp::Open(_) => {

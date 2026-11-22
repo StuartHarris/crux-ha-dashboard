@@ -3,7 +3,7 @@
 //! panics.
 
 use alloc::{format, string::String, vec::Vec};
-use core::array;
+use core::{array, time::Duration};
 
 use portable_atomic::{AtomicU8, AtomicU32, Ordering};
 use shared::{
@@ -11,7 +11,10 @@ use shared::{
     features::logs::{Kept, MAX_MESSAGE},
 };
 
-use super::{AfterPanic, LINES, MAGIC, MESSAGE, PANIC_LIMIT, Rtc, SLOT, kept, reset_reason};
+use super::{
+    AfterPanic, LINES, MAGIC, MESSAGE, PANIC_LIMIT, Rtc, SLOT, STABLE_AFTER, Uptime, kept,
+    reset_reason,
+};
 use crate::forward::Line;
 
 /// The memory of the tests, as the firmware has it in RTC fast memory.
@@ -90,6 +93,10 @@ const CPU_SW: Option<u32> = Some(0x0C);
 
 /// The raw reason of a reset by the watchdog of timer group 0.
 const CORE_MWDT0: Option<u32> = Some(0x07);
+
+/// The raw reason of a reset from the USB port (`CoreUsbUart`), for example
+/// a reset by hand with the tools.
+const CORE_USB_UART: Option<u32> = Some(0x15);
 
 fn boot_line(level: Kept, source: &str, message: &str) -> BootLine {
     BootLine {
@@ -326,7 +333,7 @@ fn the_third_panic_in_a_row_halts() {
 }
 
 #[test]
-fn a_connect_between_panics_starts_the_count_again() {
+fn a_stable_start_between_panics_starts_the_count_again() {
     let memory = Memory::zeroed();
     let _ = memory.power_on();
     for _ in 0..5 {
@@ -334,9 +341,114 @@ fn a_connect_between_panics_starts_the_count_again() {
         let _ = memory.boot(CPU_SW);
         assert_eq!(memory.rtc().panicked(), AfterPanic::Restart);
         let _ = memory.boot(CPU_SW);
-        memory.rtc().connected();
+        memory.rtc().stable();
     }
     assert_eq!(memory.panics.load(Ordering::Relaxed), 0);
+}
+
+/// Returns `secs` seconds as a duration.
+const fn secs(secs: u64) -> Duration {
+    Duration::from_secs(secs)
+}
+
+#[test]
+fn a_panic_5_s_after_each_connect_reaches_the_limit_and_halts() {
+    let memory = Memory::zeroed();
+    let _ = memory.power_on();
+    let mut after = AfterPanic::Restart;
+    for start in 1..=PANIC_LIMIT {
+        // Each start connects after 20 s, and panics 5 s later. The firmware
+        // tells the memory when the start is stable, as `core_task` does.
+        let mut uptime = Uptime::default();
+        for now in [secs(0), secs(20), secs(25)] {
+            if uptime.tick(now) {
+                memory.rtc().stable();
+            }
+        }
+        after = memory.rtc().panicked();
+        if start < PANIC_LIMIT {
+            assert_eq!(after, AfterPanic::Restart);
+            assert_eq!(memory.boot(CPU_SW).0.reset, ResetReason::Panic);
+        }
+    }
+    assert_eq!(after, AfterPanic::Halt);
+}
+
+#[test]
+fn ten_minutes_of_uptime_resets_the_count_once() {
+    let memory = Memory::zeroed();
+    let _ = memory.power_on();
+    for _ in 1..PANIC_LIMIT {
+        assert_eq!(memory.rtc().panicked(), AfterPanic::Restart);
+        let _ = memory.boot(CPU_SW);
+    }
+    // The next panic would halt. The uptime counts also while the board
+    // sleeps, so the board needs no link for the rule.
+    let mut uptime = Uptime::default();
+    assert!(!uptime.tick(secs(60)));
+    assert!(!uptime.tick(secs(599)));
+    assert!(uptime.tick(STABLE_AFTER));
+    memory.rtc().stable();
+    assert_eq!(STABLE_AFTER, secs(600));
+    // The start is stable once. A later tick does not reset the count
+    // again.
+    assert!(!uptime.tick(secs(660)));
+    assert!(!uptime.tick(secs(2000)));
+
+    assert_eq!(memory.rtc().panicked(), AfterPanic::Restart);
+    let _ = memory.boot(CPU_SW);
+    assert_eq!(memory.rtc().panicked(), AfterPanic::Restart);
+}
+
+#[test]
+fn a_watchdog_reset_between_panics_keeps_the_count() {
+    let memory = Memory::zeroed();
+    let _ = memory.power_on();
+    for _ in 1..PANIC_LIMIT {
+        assert_eq!(memory.rtc().panicked(), AfterPanic::Restart);
+        assert_eq!(memory.boot(CPU_SW).0.reset, ResetReason::Panic);
+        // A watchdog reset comes before the next panic.
+        assert_eq!(memory.boot(CORE_MWDT0).0.reset, ResetReason::Watchdog);
+    }
+    assert_eq!(memory.rtc().panicked(), AfterPanic::Halt);
+}
+
+#[test]
+fn a_reset_by_hand_after_a_halt_keeps_the_count_and_is_not_a_panic() {
+    let memory = Memory::zeroed();
+    let _ = memory.power_on();
+    for _ in 1..PANIC_LIMIT {
+        assert_eq!(memory.rtc().panicked(), AfterPanic::Restart);
+        let _ = memory.boot(CPU_SW);
+    }
+    assert_eq!(memory.rtc().panicked(), AfterPanic::Halt);
+    // The chip stops. A reset by hand starts it again, and the start does
+    // not report a panic.
+    assert_eq!(
+        memory.boot(CORE_USB_UART).0,
+        Boot {
+            reset: ResetReason::Other,
+            restarts: 3
+        }
+    );
+    // The count stays at the limit, so the next panic stops the chip at
+    // once.
+    assert_eq!(memory.panics.load(Ordering::Relaxed), PANIC_LIMIT);
+    assert_eq!(memory.rtc().panicked(), AfterPanic::Halt);
+}
+
+#[test]
+fn a_power_on_code_clears_the_count_also_if_the_memory_stays() {
+    let memory = Memory::zeroed();
+    let _ = memory.power_on();
+    for _ in 1..PANIC_LIMIT {
+        assert_eq!(memory.rtc().panicked(), AfterPanic::Restart);
+        let _ = memory.boot(CPU_SW);
+    }
+    // A brownout of the whole chip can give the code of a power-on while
+    // the memory keeps its values.
+    assert_eq!(memory.boot(Some(0x01)).0.reset, ResetReason::PowerOn);
+    assert_eq!(memory.rtc().panicked(), AfterPanic::Restart);
 }
 
 #[test]

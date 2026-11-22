@@ -220,9 +220,10 @@ pub enum Recovery {
 /// a session that the broker kept and a field that is too long are problems
 /// of the broker or of the configuration. A clean end is not a failure.
 ///
-/// `linked` is `true` if the device has a link with an address when the
-/// session ends. An end by the broker host ([`End::ByHost`]) is a failure of
-/// the link only if `linked` is `false`. Refer to [`proves_traffic`].
+/// `linked` is `true` if the device has a link or an association during a
+/// sleep when the session ends (refer to [`super::session_ended`]). An end by
+/// the broker host ([`End::ByHost`]) is a failure of the link only if
+/// `linked` is `false`. Refer to [`proves_traffic`].
 #[must_use]
 pub const fn fails_the_link(end: &End, linked: bool) -> bool {
     match end {
@@ -241,10 +242,12 @@ pub const fn fails_the_link(end: &End, linked: bool) -> bool {
 /// The host closes the session, and then it refuses each connect. The cause
 /// is not the link, so the core does not leave and join again for it.
 ///
-/// The end is a proof only if `linked` is `true`: the device has a link with
-/// an address when the session ends. This is a second check after the check
-/// of the shell. Without a link, the shell made a mistake, and the core
-/// uses the rules for a failure of the link.
+/// The end is a proof only if `linked` is `true`: the device has a link or
+/// an association during a sleep when the session ends. An end by the host
+/// needs an address on the device, and the core does not keep the address
+/// of an association during a sleep. This is a second check after the check
+/// of the shell. Without an association, the shell made a mistake, and the
+/// core uses the rules for a failure of the link.
 #[must_use]
 pub const fn proves_traffic(end: &End, linked: bool) -> bool {
     linked && matches!(end, End::ByHost(_))
@@ -305,9 +308,9 @@ impl Health {
     }
 
     /// Records an MQTT session that ended with `end`. `linked` is `true` if
-    /// the device has a link with an address. A failure of the link makes
-    /// it suspect. An end by the broker host proves traffic. Another end
-    /// changes nothing. Refer to [`fails_the_link`] and [`proves_traffic`].
+    /// the device has a link or an association during a sleep. A failure of
+    /// the link makes it suspect. An end by the broker host proves traffic.
+    /// Another end changes nothing. Refer to [`fails_the_link`] and [`proves_traffic`].
     pub const fn ended(&mut self, end: &End, linked: bool) {
         if proves_traffic(end, linked) {
             self.traffic();

@@ -191,6 +191,17 @@ fn the_wifi_facts_come_only_from_a_link_with_an_address() {
     assert_eq!(Snapshot::of(&Model::default()), None);
 }
 
+#[test]
+fn an_association_during_a_sleep_has_no_wifi_facts() {
+    let mut model = Model::default();
+    let _ = Dashboard.update(start(PowerSource::Battery), &mut model);
+    // The device associated with an access point after a sleep started. The
+    // core keeps no address for it, so the snapshot has no Wi-Fi facts.
+    model.wifi.phase = crate::features::wifi::Phase::Associated(HALL);
+    let snapshot = Snapshot::of(&model).expect("a snapshot after Start");
+    assert_eq!(snapshot.wifi, None);
+}
+
 // The urgent and the throttled fields.
 
 /// Returns a snapshot on the stand with a link to [`HALL`].
@@ -472,6 +483,36 @@ fn a_long_line_from_before_the_restart_is_cut_with_its_prefix() {
     let text = line.message.as_str();
     assert!(text.starts_with("before the restart: xxx"), "{text}");
     assert_eq!(text.len(), crate::features::logs::MAX_MESSAGE);
+}
+
+#[test]
+fn a_second_start_keeps_no_lines_from_before_the_restart() {
+    let mut model = Model::default();
+    let boot = Boot {
+        reset: ResetReason::Panic,
+        restarts: 1,
+    };
+    let kept = || {
+        vec![BootLine {
+            level: Kept::Warn,
+            source: "wifi".into(),
+            message: "restart the chip: no address after 3 joins".into(),
+        }]
+    };
+    let from_before = |model: &Model| {
+        model
+            .logs
+            .lines()
+            .filter(|line| line.source == crate::features::logs::Source::Boot)
+            .count()
+    };
+    let _ = Dashboard.update(start_after(boot, kept()), &mut model);
+    assert_eq!(from_before(&model), 1);
+
+    // A second `Start` (for example, after the shell started again with
+    // the same core) gives the same lines. The core keeps them only once.
+    let _ = Dashboard.update(start_after(boot, kept()), &mut model);
+    assert_eq!(from_before(&model), 1);
 }
 
 // The wake reason.

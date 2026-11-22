@@ -1785,8 +1785,6 @@ fn only_an_event_from_a_task_needs_an_ack() {
 
 #[test]
 fn the_connack_gives_a_render_job_with_the_view_online() {
-    // The core task resets the count of panics in a row when a `Render`
-    // job shows `Online`. Refer to `crate::boot::Rtc::connected`.
     let (mut device, _) = started(PowerSource::Stand, false);
     device.link();
     let jobs = device.connect(FIRST);

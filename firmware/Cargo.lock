@@ -363,6 +363,7 @@ dependencies = [
  "shared",
  "static_cell",
  "ui",
+ "xtensa-lx",
 ]
 
 [[package]]

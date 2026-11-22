@@ -12,9 +12,13 @@
 //! - From `Off` or `Idle`, the core joins the target of [`ApCache::plan`].
 //! - From `Up` with a link that is ready ([`Linked::ready`]), the core
 //!   connects with no join.
-//! - From another linked phase, the core joins again and keeps the
+//! - From another linked phase, or from an association during a sleep
+//!   ([`Phase::Associated`]), the core joins again and keeps the
 //!   association. If the link is suspect, or the cache has another access
 //!   point, the core leaves first. Refer to [`Health`].
+//! - If a sleep started before the answer to a join or to the `Address`
+//!   request, the answer gives [`Phase::Associated`]. It counts nothing,
+//!   and the steps of the sleep turn the radio off.
 //! - After the association, the core waits for an address. A lease that is
 //!   not new can count toward a restart. A join with no lease leaves, and
 //!   then joins the strongest access point or fails.
@@ -34,9 +38,11 @@
 //! The link ([`Linked`]) holds the facts that the core publishes to Home
 //! Assistant in the state message: the access point (its BSSID), the
 //! address from the lease and the signal. Only a phase with a link has
-//! them. An association during a sleep that has no lease is
-//! [`Phase::Associated`], which has no link. The core updates the facts at
-//! these times:
+//! them. An association during a sleep is [`Phase::Associated`], also when
+//! the shell gave an address. It keeps no facts, and the snapshot of the
+//! state reads it as no link. No state message goes during a sleep, and
+//! the lease after a wake gives the facts again. The core updates the facts
+//! at these times:
 //!
 //! - The join gives the access point and the first signal. The `Leasing`
 //!   phase keeps them until the lease.
@@ -188,10 +194,13 @@ pub enum Phase {
     },
     /// A `Leave` request waits for its answer. Then the core does this.
     Leaving(Then),
-    /// The device associated with this access point after a sleep started,
-    /// and the core knows no address for it. The steps of the sleep turn
-    /// the radio off. If the device wakes before that, [`link`] joins again
-    /// and keeps the association.
+    /// The device associated with this access point after a sleep started.
+    /// The core counts nothing, keeps nothing in the cache, and keeps no
+    /// address or signal from the answer, so this phase has no link
+    /// ([`Phase::linked`]). The steps of the sleep turn the radio off. If
+    /// the device wakes before that, [`link`] joins again from this access
+    /// point. For an MQTT session that ends, this phase counts as a link.
+    /// Refer to [`session_ended`].
     Associated(AccessPoint),
     /// The device has an address.
     Up(Linked),
@@ -262,8 +271,8 @@ pub struct Linked {
     /// access point gives a new value.
     pub rssi: Option<i32>,
     /// The core can connect on this link with no new join. It is `false`
-    /// after an MQTT session that did not end cleanly, after a decision to
-    /// change access point, and after an association during a sleep.
+    /// after an MQTT session that did not end cleanly, and after a decision
+    /// to change access point.
     pub ready: bool,
 }
 
@@ -361,8 +370,13 @@ fn rejoin(current: AccessPoint, model: &mut Model) -> Cmd {
 /// Records the end of an MQTT session with `end`.
 ///
 /// A failure of the link makes it suspect. An end by the broker host proves
-/// traffic, but only while the device has a link with an address. Refer to
-/// [`Health::ended`] and [`Phase::linked`].
+/// traffic, but only while the device has a link ([`Phase::linked`]) or an
+/// association during a sleep ([`Phase::Associated`]). Refer to
+/// [`Health::ended`].
+///
+/// No session can end in `Associated`, because a session starts only on a
+/// ready link. If one did, an end by the broker host needs an address on
+/// the device, so the end is a proof.
 ///
 /// After an end that is not clean, the link can be the cause, so the next
 /// [`link`] joins again. A clean end comes from the core, so the link stays
@@ -371,7 +385,8 @@ fn rejoin(current: AccessPoint, model: &mut Model) -> Cmd {
 /// The command writes a line to the log only when the link becomes suspect
 /// or stops being suspect.
 pub fn session_ended(end: &End, model: &mut Model) -> Cmd {
-    let has_link = model.wifi.phase.linked().is_some();
+    let has_link =
+        model.wifi.phase.linked().is_some() || matches!(model.wifi.phase, Phase::Associated(_));
     let health = &mut model.wifi.health;
     let was_suspect = health.suspect();
     health.ended(end, has_link);
@@ -510,16 +525,7 @@ pub fn leased(radio: u32, lease: Lease, model: &mut Model) -> Cmd {
         return Cmd::done();
     };
     if !model.wants_online() {
-        model.wifi.phase = match lease {
-            Lease::Leased { ip } => Phase::Up(Linked {
-                access_point,
-                ip,
-                rssi,
-                ready: false,
-            }),
-            Lease::NoLease | Lease::Stopped => Phase::Associated(access_point),
-        };
-        return Cmd::done();
+        return associated_during_sleep(access_point, model);
     }
     let ip = match lease {
         Lease::Leased { ip } => ip,
@@ -703,8 +709,7 @@ fn after_join(joined: &Joined, model: &mut Model) -> Cmd {
         };
     };
     if !model.wants_online() {
-        model.wifi.phase = Phase::Associated(access_point);
-        return Cmd::done();
+        return associated_during_sleep(access_point, model);
     }
     model.wifi.phase = Phase::Leasing {
         target,
@@ -717,6 +722,18 @@ fn after_join(joined: &Joined, model: &mut Model) -> Cmd {
     Radio::address(radio)
         .then_send(move |lease| Event::Leased { radio, lease }.into())
         .and(limit(radio, ADDRESS_TIMEOUT, model))
+}
+
+/// Records an association with `access_point` after a sleep started: the
+/// answer to a join, or an answer to the `Address` request with an address
+/// or with none. The core counts nothing, keeps nothing in the cache, and
+/// keeps no address or signal from the answer. Nothing reads them before
+/// the wake or the `Off`, and the lease after a wake gives them again. The
+/// steps of the sleep turn the radio off. If the device wakes before that,
+/// [`link`] joins again from [`Phase::Associated`].
+fn associated_during_sleep(access_point: AccessPoint, model: &mut Model) -> Cmd {
+    model.wifi.phase = Phase::Associated(access_point);
+    Cmd::done()
 }
 
 /// The join to `target` got no address from `access_point`. The core
