@@ -23,7 +23,9 @@ use crate::{
         power::{IDLE_TIMEOUT, STRAY_HOLD},
     },
     mqtt::codec::server::Packet,
-    tests::{broker::publish_of, flows::house, shell::Shell, sleep_lines, start, tap_all_lights},
+    tests::{
+        STARTED, broker::publish_of, flows::house, shell::Shell, sleep_lines, start, tap_all_lights,
+    },
 };
 
 /// The line of the first wake with no cause in the sleep 1.
@@ -289,6 +291,23 @@ fn published_texts(shell: &Shell) -> Vec<String> {
         .collect()
 }
 
+/// The message of the start line after a power-on. Refer to [`STARTED`].
+const STARTED_MSG: &str = "started after a power-on";
+
+/// Starts the core on `power`, and removes the publish of the start line
+/// from the messages of the broker. The start line went at the connect,
+/// so a test of other lines does not see it.
+fn start_and_forget_the_start_line(shell: &mut Shell, power: PowerSource) {
+    shell.send(start(power));
+    let before = shell.broker.published.len();
+    shell.broker.published.retain(|publish| {
+        publish.topic != LOG_TOPIC
+            || serde_json::from_slice::<Value>(&publish.payload).expect("JSON")["msg"]
+                != STARTED_MSG
+    });
+    assert_eq!(shell.broker.published.len(), before - 1, "one start line");
+}
+
 /// Returns the topics of the publishes in a write.
 fn topics(write: &[Packet]) -> Vec<String> {
     write
@@ -301,7 +320,7 @@ fn topics(write: &[Packet]) -> Vec<String> {
 /// Starts on the stand, and connects. No line waits.
 fn online() -> Shell {
     let mut shell = house();
-    shell.send(start(PowerSource::Stand));
+    start_and_forget_the_start_line(&mut shell, PowerSource::Stand);
     assert_eq!(shell.model.connection.link(), Link::Up);
     assert_eq!(shell.model.logs.lines().len(), 0);
     shell
@@ -310,7 +329,8 @@ fn online() -> Shell {
 #[test]
 fn the_lines_of_a_battery_sleep_go_out_after_the_wake_with_their_ages() {
     let mut shell = house();
-    shell.send(start(PowerSource::Stand));
+    start_and_forget_the_start_line(&mut shell, PowerSource::Stand);
+    assert_eq!(shell.take_logs(), [STARTED]);
     shell.advance(Duration::from_secs(5));
 
     // Off the stand, the device sleeps after the idle timeout. The steps of
@@ -406,10 +426,15 @@ fn the_connack_write_is_unchanged_and_the_log_goes_in_a_later_write() {
             "dashboard/hall/state"
         ]
     );
-    assert_eq!(topics(&shell.writes[3]), [LOG_TOPIC, LOG_TOPIC]);
+    // The start line came after the two lines, so it goes last.
+    assert_eq!(topics(&shell.writes[3]), [LOG_TOPIC, LOG_TOPIC, LOG_TOPIC]);
     assert_eq!(
         published_texts(&shell),
-        ["a line before the start", "a second line before the start"]
+        [
+            "a line before the start",
+            "a second line before the start",
+            STARTED_MSG
+        ]
     );
     assert_eq!(shell.clocks, 1);
     assert_eq!(shell.model.logs.lines().len(), 0);
@@ -424,16 +449,17 @@ fn the_drop_message_comes_first_and_the_count_resets_only_at_its_puback() {
     assert_eq!(shell.model.logs.dropped(), 3);
 
     shell.broker.hold_puback = true;
+    // The start line removes one more line from the full ring.
     shell.send(start(PowerSource::Stand));
 
     let payloads = published(&shell);
     assert_eq!(
         payloads[0],
-        serde_json::json!({"level": "warn", "source": "log", "age": 0, "msg": "3 older lines were dropped"})
+        serde_json::json!({"level": "warn", "source": "log", "age": 0, "msg": "4 older lines were dropped"})
     );
-    assert_eq!(payloads[1]["msg"], "line 3");
+    assert_eq!(payloads[1]["msg"], "line 4");
     // No PUBACK came, so the count and the lines stay.
-    assert_eq!(shell.model.logs.dropped(), 3);
+    assert_eq!(shell.model.logs.dropped(), 4);
     assert_eq!(shell.model.logs.lines().len(), CAPACITY);
 
     shell.broker.hold_puback = false;
@@ -443,11 +469,13 @@ fn the_drop_message_comes_first_and_the_count_resets_only_at_its_puback() {
 
     assert_eq!(shell.model.logs.dropped(), 0);
     assert_eq!(shell.model.logs.lines().len(), 0);
-    // Each line went once, in order, after the drop message.
+    // Each line went once, in order, after the drop message. The start line
+    // is last.
     let texts = published_texts(&shell);
-    let lines: Vec<String> = (3..CAPACITY as u64 + 3)
+    let mut lines: Vec<String> = (4..CAPACITY as u64 + 3)
         .map(|at| format!("line {at}"))
         .collect();
+    lines.push(STARTED_MSG.into());
     assert_eq!(texts[1..], lines[..]);
 }
 
@@ -549,7 +577,7 @@ fn a_log_at_its_limit_does_not_block_asleep_or_a_service_call() {
 #[test]
 fn each_line_of_a_battery_sleep_goes_once_after_the_wake() {
     let mut shell = house();
-    shell.send(start(PowerSource::Battery));
+    start_and_forget_the_start_line(&mut shell, PowerSource::Battery);
     // A tap turns the light on, so the first step of the sleep turns it off
     // while the connection is still up.
     shell.send(Event::Tapped(None));
@@ -589,7 +617,7 @@ fn each_line_of_a_battery_sleep_goes_once_after_the_wake() {
 #[test]
 fn a_wake_before_the_close_sends_the_lines_of_the_sleep() {
     let mut shell = house();
-    shell.send(start(PowerSource::Battery));
+    start_and_forget_the_start_line(&mut shell, PowerSource::Battery);
     shell.send(Event::Tapped(None));
 
     // The first step of the sleep waits for the light. A line in that step
@@ -610,7 +638,7 @@ fn a_wake_before_the_close_sends_the_lines_of_the_sleep() {
 #[test]
 fn nothing_goes_while_the_device_closes_for_a_sleep_or_sleeps() {
     let mut shell = house();
-    shell.send(start(PowerSource::Battery));
+    start_and_forget_the_start_line(&mut shell, PowerSource::Battery);
     // A line while the connection is up goes at once, so the core sends
     // lines when the sleep starts.
     stamp(&mut shell, 1, "a line before the sleep");
@@ -835,15 +863,17 @@ fn the_lines_that_the_shell_lost_add_to_the_drop_count() {
     assert_eq!(shell.model.logs.dropped(), 6);
     assert_eq!(shell.model.logs.lines().len(), CAPACITY);
 
-    // The drop message tells the sum. Then the lines go from the oldest
-    // line that the ring kept, and the line of the shell is last.
+    // The drop message tells the sum, with the line that the start line
+    // removed. Then the lines go from the oldest line that the ring kept,
+    // and the line of the shell is just before the start line.
     shell.send(start(PowerSource::Stand));
     let payloads = published(&shell);
-    assert_eq!(payloads[0]["msg"], "6 older lines were dropped");
-    assert_eq!(payloads[1]["msg"], "line 1");
-    let last = payloads.last().expect("a line");
-    assert_eq!(last["source"], "touch");
-    assert_eq!(last["msg"], "read failed");
+    assert_eq!(payloads[0]["msg"], "7 older lines were dropped");
+    assert_eq!(payloads[1]["msg"], "line 2");
+    let shell_line = &payloads[payloads.len() - 2];
+    assert_eq!(shell_line["source"], "touch");
+    assert_eq!(shell_line["msg"], "read failed");
+    assert_eq!(payloads.last().expect("a line")["msg"], STARTED_MSG);
     assert_eq!(shell.model.logs.dropped(), 0);
     assert_eq!(shell.model.logs.lines().len(), 0);
 }
@@ -851,7 +881,7 @@ fn the_lines_that_the_shell_lost_add_to_the_drop_count() {
 #[test]
 fn a_shell_line_during_a_sleep_waits_for_the_wake_and_does_not_wake() {
     let mut shell = house();
-    shell.send(start(PowerSource::Battery));
+    start_and_forget_the_start_line(&mut shell, PowerSource::Battery);
     shell.advance(IDLE_TIMEOUT);
     assert!(shell.sleep.is_some());
     let kept = shell.model.logs.lines().len();

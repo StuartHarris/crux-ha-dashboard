@@ -55,11 +55,11 @@ pub const OWN_CRATES: [&str; 2] = ["dashboard", "dashboard_firmware"];
 /// The bytes that a [`Line`] keeps of a message. A message that is longer
 /// than [`MAX_MESSAGE`] keeps at least one more character, so the core sees
 /// that it is too long, and cuts it with its mark.
-const MESSAGE: usize = MAX_MESSAGE + 4;
+pub(crate) const MESSAGE: usize = MAX_MESSAGE + 4;
 
 /// The bytes that a [`Line`] keeps of a source, with one more character as
 /// for [`MESSAGE`].
-const SOURCE: usize = MAX_SOURCE + 4;
+pub(crate) const SOURCE: usize = MAX_SOURCE + 4;
 
 /// The bytes of a line before the split: a source word, `": "` and a
 /// message.
@@ -146,6 +146,25 @@ pub fn split<'a>(text: &'a str, target: &'a str) -> (&'a str, &'a str) {
     (krate, text)
 }
 
+/// Returns the source and the message of the line `text` with the log
+/// target `target`, for the ring of lines that a restart keeps (refer to
+/// [`crate::boot`]).
+///
+/// The rules are those of [`split`], with one more: a line of the core
+/// ([`CORE_TARGET`]) that starts with a word and `": "` also names its
+/// source with the word. For example, `wifi: restart the chip: ...` gives
+/// `wifi`. The core task writes each line of the core as `{area}: {message}`.
+#[must_use]
+pub fn split_kept<'a>(text: &'a str, target: &'a str) -> (&'a str, &'a str) {
+    if target == CORE_TARGET
+        && let Some((word, message)) = text.split_once(": ")
+        && is_word(word)
+    {
+        return (word, message);
+    }
+    split(text, target)
+}
+
 /// Returns `true` if `word` can be the source at the start of a line.
 fn is_word(word: &str) -> bool {
     let mut bytes = word.bytes();
@@ -225,7 +244,7 @@ pub struct Line {
 
 impl Line {
     /// A line with no text, to fill the places of [`Pending`].
-    const EMPTY: Self = Self {
+    pub(crate) const EMPTY: Self = Self {
         at: Uptime(0),
         level: Kept::Warn,
         source: Text::EMPTY,
@@ -239,6 +258,26 @@ impl Line {
     /// too long, so the core cuts it with its mark.
     #[must_use]
     pub fn new(at: Uptime, level: Kept, target: &str, args: fmt::Arguments<'_>) -> Self {
+        Self::with_split(at, level, target, args, split)
+    }
+
+    /// Writes the line `args` with the log target `target` for the ring of
+    /// lines that a restart keeps, as [`Line::new`] does. The source comes
+    /// from [`split_kept`], so a line of the core has its area as the
+    /// source. The time is 0, because the ring does not keep it.
+    #[must_use]
+    pub fn kept(level: Kept, target: &str, args: fmt::Arguments<'_>) -> Self {
+        Self::with_split(Uptime(0), level, target, args, split_kept)
+    }
+
+    /// Writes the line `args`, and splits it with `split`.
+    fn with_split(
+        at: Uptime,
+        level: Kept,
+        target: &str,
+        args: fmt::Arguments<'_>,
+        split: for<'a> fn(&'a str, &'a str) -> (&'a str, &'a str),
+    ) -> Self {
         let mut text = Text::<TEXT>::EMPTY;
         // `Text` never fails. An error from a `Display` of an argument ends
         // the line early, and the line keeps what it has.

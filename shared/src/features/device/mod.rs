@@ -76,13 +76,22 @@
 //! change of the snapshot ([`changed`]) into one of two kinds:
 //!
 //! - An urgent change goes at once: a change of the stand, a start or an
-//!   end of a charge, the first level of the battery, or a level of the
-//!   battery that moves by more than [`BATTERY_FLAP`].
+//!   end of a charge, the first level of the battery, a level of the
+//!   battery that moves by more than [`BATTERY_FLAP`], a change of the
+//!   access point or of the address (also to no link), a change of the boot
+//!   facts (the restarts and the reset), and a change of the wake reason.
 //! - Each other change goes at most once in [`STATE_MIN_INTERVAL`]: the
 //!   voltage, the current, the temperature, the phase of the charge in a
-//!   charge or out of it, and a level of the battery that moves by
-//!   [`BATTERY_FLAP`]. Thus a value that flaps between two readings cannot
+//!   charge or out of it, a level of the battery that moves by
+//!   [`BATTERY_FLAP`], the signal of the access point, and the count of
+//!   reconnects. Thus a value that flaps between two readings cannot
 //!   publish each poll of the shell.
+//!
+//! The access point, the address, the restarts and the reset do not change
+//! during a session. A new session publishes the state at once, so only
+//! their urgency in [`Snapshot::is_urgent_after`] keeps them out of the
+//! throttle. The signal changes during a session at a scan that sees the
+//! access point. Refer to [`wifi`](crate::features::wifi).
 //!
 //! The [`Window`] is the throttle. While it is `Open`, a change that is
 //! not urgent goes at once, and the core starts a timer of
@@ -115,17 +124,21 @@
 
 mod discovery;
 
-use alloc::vec::Vec;
+use alloc::{string::String, vec::Vec};
 use core::{mem, time::Duration};
 
 use serde::Serialize;
 
 use crate::{
-    Cmd, Model, PowerSource,
-    capabilities::power::{Charge, Reading},
+    Boot, Cmd, Model, PowerSource, ResetReason,
+    capabilities::{
+        power::{Charge, Reading},
+        radio::{ip_text, mac_text},
+    },
     features::{
         connection::{self, Link},
         logs,
+        power::WakeReason,
         timer::Running,
     },
     mqtt::{MAX_IN_FLIGHT, Message, PacketId, Publish, Qos, Refused},
@@ -301,28 +314,71 @@ pub struct Snapshot {
     pub stand: bool,
     /// The power diagnostics.
     pub reading: Reading,
+    /// The Wi-Fi link, or `None` if the device has no link with an address.
+    pub wifi: Option<Wifi>,
+    /// The number of MQTT sessions since `Start` that failed while the
+    /// device was awake. Refer to
+    /// [`connection::State::reconnects`].
+    pub reconnects: u32,
+    /// The facts about the start of the chip.
+    pub boot: Boot,
+    /// What woke the device last.
+    pub wake: WakeReason,
+}
+
+/// The Wi-Fi facts of a link in the state message. Refer to
+/// [`Linked`](crate::features::wifi::Linked).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Wifi {
+    /// The BSSID of the access point.
+    pub bssid: [u8; 6],
+    /// The IPv4 address.
+    pub ip: [u8; 4],
+    /// The last signal of the access point, in dBm, if the shell could read
+    /// it.
+    pub rssi: Option<i32>,
 }
 
 impl Snapshot {
-    /// Returns the snapshot of the model now.
+    /// Returns the snapshot of the model now, or `None` before `Start`.
     #[must_use]
-    pub fn of(model: &Model) -> Self {
-        Self {
+    pub fn of(model: &Model) -> Option<Self> {
+        let boot = model.startup.boot()?;
+        let wifi = model.wifi.phase.linked().map(|linked| Wifi {
+            bssid: linked.access_point.bssid,
+            ip: linked.ip,
+            rssi: linked.rssi,
+        });
+        Some(Self {
             battery: model.power.battery,
             stand: model.power.source() == PowerSource::Stand,
             reading: model.power.reading,
-        }
+            wifi,
+            reconnects: model.connection.reconnects,
+            boot,
+            wake: model.power.wake(),
+        })
     }
 
     /// Returns `true` if the change from the snapshot `sent` to this one
     /// goes at once. Refer to the [module docs](self).
+    ///
+    /// The signal of the access point and the count of reconnects are not
+    /// urgent. A change of the access point, of the address, of the boot
+    /// facts or of the wake reason is urgent.
     #[must_use]
     pub fn is_urgent_after(&self, sent: &Self) -> bool {
         let battery = match (sent.battery, self.battery) {
             (Some(before), Some(now)) => before.abs_diff(now) > BATTERY_FLAP,
             (before, now) => before != now,
         };
-        battery || self.stand != sent.stand || self.charging() != sent.charging()
+        let address = |snapshot: &Self| snapshot.wifi.map(|wifi| (wifi.bssid, wifi.ip));
+        battery
+            || self.stand != sent.stand
+            || self.charging() != sent.charging()
+            || address(self) != address(sent)
+            || self.boot != sent.boot
+            || self.wake != sent.wake
     }
 
     /// Returns `true` if the charger charges the battery, or `None` if the
@@ -333,8 +389,10 @@ impl Snapshot {
 
     /// Returns the payload of the state message, for example
     /// `{"battery":95,"stand":"OFF","charging":"OFF","charge":"not_charging",`
-    /// `"voltage":3870,"current":-40,"temperature":24.5}`. An unknown value
-    /// is `null`.
+    /// `"voltage":3870,"current":-40,"temperature":24.5,"rssi":-62,`
+    /// `"bssid":"24:5a:4c:01:02:03","ip":"192.168.1.50","reconnects":0,`
+    /// `"restarts":0,"reset":"power_on","wake":"boot"}`. An unknown value is
+    /// `null`.
     #[must_use]
     pub(crate) fn to_json(&self) -> Vec<u8> {
         let on_off = |on| if on { "ON" } else { "OFF" };
@@ -347,6 +405,13 @@ impl Snapshot {
             voltage: reading.voltage_mv,
             current: reading.current_ma,
             temperature: reading.tenth_celsius.map(|tenths| f64::from(tenths) / 10.0),
+            rssi: self.wifi.and_then(|wifi| wifi.rssi),
+            bssid: self.wifi.map(|wifi| mac_text(wifi.bssid)),
+            ip: self.wifi.map(|wifi| ip_text(wifi.ip)),
+            reconnects: self.reconnects,
+            restarts: self.boot.restarts,
+            reset: reset_option(self.boot.reset),
+            wake: wake_option(self.wake),
         };
         // The fields are numbers and text, and the writer is a `Vec`, so
         // the serialization cannot fail.
@@ -369,6 +434,37 @@ const fn charge_option(charge: Charge) -> &'static str {
     }
 }
 
+/// The options of the enum sensor of the last reset, in the order of
+/// [`ResetReason`].
+pub(crate) const RESET_OPTIONS: [&str; 6] = [
+    "power_on", "software", "panic", "watchdog", "brownout", "other",
+];
+
+/// Returns the option of the enum sensor for the reset `reset`.
+const fn reset_option(reset: ResetReason) -> &'static str {
+    match reset {
+        ResetReason::PowerOn => RESET_OPTIONS[0],
+        ResetReason::Software => RESET_OPTIONS[1],
+        ResetReason::Panic => RESET_OPTIONS[2],
+        ResetReason::Watchdog => RESET_OPTIONS[3],
+        ResetReason::Brownout => RESET_OPTIONS[4],
+        ResetReason::Other => RESET_OPTIONS[5],
+    }
+}
+
+/// The options of the enum sensor of the wake reason, in the order of
+/// [`WakeReason`].
+pub(crate) const WAKE_OPTIONS: [&str; 3] = ["boot", "touch", "stand"];
+
+/// Returns the option of the enum sensor for the wake reason `wake`.
+const fn wake_option(wake: WakeReason) -> &'static str {
+    match wake {
+        WakeReason::Boot => WAKE_OPTIONS[0],
+        WakeReason::Touch => WAKE_OPTIONS[1],
+        WakeReason::Stand => WAKE_OPTIONS[2],
+    }
+}
+
 /// The JSON payload of the state message. Refer to `docs/mqtt.md`.
 #[derive(Serialize)]
 struct StatePayload {
@@ -387,6 +483,18 @@ struct StatePayload {
     /// the value is exact as a binary fraction, and it has one decimal in
     /// the JSON.
     temperature: Option<f64>,
+    /// In dBm.
+    rssi: Option<i32>,
+    /// Lowercase hex with colons.
+    bssid: Option<String>,
+    /// Four decimal numbers with dots.
+    ip: Option<String>,
+    reconnects: u32,
+    restarts: u32,
+    /// One of [`RESET_OPTIONS`].
+    reset: &'static str,
+    /// One of [`WAKE_OPTIONS`].
+    wake: &'static str,
 }
 
 /// A message that a publisher offers to the queue, and what the publisher
@@ -678,7 +786,9 @@ fn next_discovery(model: &Model) -> Next {
 /// due. A change that is not urgent is due only while the window is open.
 /// While a state message waits for its PUBACK, returns nothing.
 fn next_state(model: &mut Model) -> Next {
-    let snapshot = Snapshot::of(model);
+    let Some(snapshot) = Snapshot::of(model) else {
+        return Next::Nothing;
+    };
     let Some(settings) = model
         .startup
         .settings()

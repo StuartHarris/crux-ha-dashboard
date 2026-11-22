@@ -36,8 +36,11 @@ fn start_on_battery_also_starts_the_idle_timer() {
         .expect_full_refresh_timer()
         .expect_radio_join()
         .expect_radio_limit(JOIN_TIMEOUT)
-        .expect_only_time_notify_after_with(|notify| {
+        .expect_time_notify_after_with(|notify| {
             assert_eq!(Duration::from(notify.duration), IDLE_TIMEOUT);
+        })
+        .expect_only_log_with(|log| {
+            assert_eq!(log.to_string(), "power: started after a power-on");
         });
     assert_eq!(app.view(&model).power, PowerSource::Battery);
 }
@@ -332,6 +335,7 @@ fn asleep_on_battery() -> Model {
         startup: crate::Startup::Started {
             settings: crate::tests::settings(),
             firmware: crate::tests::firmware(),
+            boot: crate::tests::POWER_ON,
         },
         ..Model::default()
     }
@@ -1292,6 +1296,7 @@ fn an_answer_in_the_steps_or_in_the_hold_does_nothing() {
         startup: crate::Startup::Started {
             settings: crate::tests::settings(),
             firmware: crate::tests::firmware(),
+            boot: crate::tests::POWER_ON,
         },
         ..Model::default()
     };

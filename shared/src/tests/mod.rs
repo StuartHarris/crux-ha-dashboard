@@ -6,6 +6,7 @@
 //! fake radio and timers.
 
 pub mod broker;
+mod diagnostics;
 pub mod flows;
 mod session;
 mod subscribe;
@@ -23,7 +24,8 @@ use core::time::Duration;
 use crux_core::App;
 
 use crate::{
-    Cmd, Control, Dashboard, Effect, EffectTestExt, Firmware, Model, PowerSource, Settings, Start,
+    Boot, Cmd, Control, Dashboard, Effect, EffectTestExt, Firmware, Model, PowerSource,
+    ResetReason, Settings, Start,
     app::Event,
     entities::STATESTREAM,
     fake::FakeRadio,
@@ -52,11 +54,15 @@ pub fn settings() -> Settings {
 
 /// Returns the state message with the battery `battery` (a number or
 /// `null`), the stand `stand` (`ON` or `OFF`) and no power diagnostics.
+/// The Wi-Fi facts are those of a join of the default fake radio with no
+/// reconnect, and the boot facts are those of [`POWER_ON`] with no wake.
 pub fn state(battery: &str, stand: &str) -> String {
     alloc::format!(
         concat!(
             r#"{{"battery":{},"stand":"{}","charging":null,"charge":null,"#,
-            r#""voltage":null,"current":null,"temperature":null}}"#
+            r#""voltage":null,"current":null,"temperature":null,"#,
+            r#""rssi":-55,"bssid":"02:00:00:00:00:01","ip":"192.168.1.50","#,
+            r#""reconnects":0,"restarts":0,"reset":"power_on","wake":"boot"}}"#
         ),
         battery,
         stand
@@ -75,10 +81,22 @@ pub fn start(power: PowerSource) -> Event {
     start_at(power, None)
 }
 
+/// The start line of the log after [`POWER_ON`], as [`shell::Shell::logs`]
+/// keeps it.
+pub const STARTED: &str = "info power: started after a power-on";
+
+/// The facts of a start after a power-on, with no restart.
+pub const POWER_ON: Boot = Boot {
+    reset: ResetReason::PowerOn,
+    restarts: 0,
+};
+
 pub fn start_at(power: PowerSource, path: Option<&str>) -> Event {
     Event::Start(Start {
         settings: settings(),
         firmware: firmware(),
+        boot: POWER_ON,
+        before_restart: alloc::vec::Vec::new(),
         power,
         path: path.map(String::from),
         last_sync: None,

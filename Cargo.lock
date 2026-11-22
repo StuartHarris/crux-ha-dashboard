@@ -869,6 +869,7 @@ dependencies = [
  "crux_time",
  "embedded-graphics",
  "log",
+ "portable-atomic",
  "shared",
  "ui",
 ]

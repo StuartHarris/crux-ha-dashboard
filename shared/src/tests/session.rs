@@ -61,6 +61,7 @@ fn connected(power: PowerSource) -> Shell {
     shell.send(start_at(power, Some(LIVING_ROOM)));
     assert_eq!(shell.model.connection.link(), Link::Up);
     shell.take_log();
+    assert_eq!(shell.take_logs(), [super::STARTED]);
     shell
 }
 

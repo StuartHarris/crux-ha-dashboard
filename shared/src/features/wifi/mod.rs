@@ -29,6 +29,27 @@
 //! so it ignores the other one. A time limit that expires acts as a failure
 //! of the request, but it never counts toward a restart.
 //!
+//! # The Wi-Fi facts
+//!
+//! The link ([`Linked`]) holds the facts that the core publishes to Home
+//! Assistant in the state message: the access point (its BSSID), the
+//! address from the lease and the signal. Only a phase with a link has
+//! them. An association during a sleep that has no lease is
+//! [`Phase::Associated`], which has no link. The core updates the facts at
+//! these times:
+//!
+//! - The join gives the access point and the first signal. The `Leasing`
+//!   phase keeps them until the lease.
+//! - The lease gives the address, and the link starts with all three facts.
+//! - A scan (after a join with the cached access point, for example after
+//!   each wake) that sees the current access point gives a new signal. The
+//!   core then publishes the state, at most once in the throttle window
+//!   ([`device`]).
+//!
+//! The device on the stand scans only after a join with the cached access
+//! point. A stable link on the stand thus keeps the signal of its last join
+//! or scan, for hours or days.
+//!
 //! Each decision writes a line through the log capability
 //! ([`crate::capabilities::log`]), with the area `wifi`. The core writes only
 //! the decisions that are not usual. The line comes
@@ -46,7 +67,7 @@ use crate::{
         log::Area,
         radio::{AccessPoint, Joined, Lease, Radio, Scanned, Target, signal},
     },
-    features::{connection, logs, power, timer::Slot},
+    features::{connection, device, logs, power, timer::Slot},
     mqtt::End,
 };
 
@@ -158,6 +179,8 @@ pub enum Phase {
         target: Target,
         /// The access point of the association.
         access_point: AccessPoint,
+        /// The signal after the join, in dBm, if the shell can read it.
+        rssi: Option<i32>,
         /// The device had an address before the join.
         had_address: bool,
         /// The join kept an association that the device had.
@@ -165,6 +188,11 @@ pub enum Phase {
     },
     /// A `Leave` request waits for its answer. Then the core does this.
     Leaving(Then),
+    /// The device associated with this access point after a sleep started,
+    /// and the core knows no address for it. The steps of the sleep turn
+    /// the radio off. If the device wakes before that, [`link`] joins again
+    /// and keeps the association.
+    Associated(AccessPoint),
     /// The device has an address.
     Up(Linked),
     /// A `Scan` request waits for its answer. The link stays up.
@@ -218,10 +246,21 @@ impl Phase {
 }
 
 /// The link of the device with an address.
+///
+/// The link holds the Wi-Fi facts that the core publishes to Home Assistant
+/// (refer to [`device`]): the access point, the address and the signal.
+/// Only a phase with a link has them, so the core cannot publish an address
+/// without a link.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Linked {
     /// The access point of the link.
     pub access_point: AccessPoint,
+    /// The IPv4 address from the lease.
+    pub ip: [u8; 4],
+    /// The last signal of the access point, in dBm, if the shell could
+    /// read it. The join gives the first value. Each scan that sees the
+    /// access point gives a new value.
+    pub rssi: Option<i32>,
     /// The core can connect on this link with no new join. It is `false`
     /// after an MQTT session that did not end cleanly, after a decision to
     /// change access point, and after an association during a sleep.
@@ -281,6 +320,7 @@ pub fn link(model: &mut Model) -> Cmd {
         Phase::Up(linked) | Phase::Scanning(linked) | Phase::StoppingScan { linked, .. } => {
             rejoin(linked.access_point, model)
         }
+        Phase::Associated(access_point) => rejoin(access_point, model),
         Phase::Off | Phase::Idle => {
             let target = state.cache.plan();
             join(target, false, model)
@@ -462,6 +502,7 @@ pub fn leased(radio: u32, lease: Lease, model: &mut Model) -> Cmd {
     let Phase::Leasing {
         target,
         access_point,
+        rssi,
         had_address,
         kept,
     } = model.wifi.phase
@@ -469,18 +510,31 @@ pub fn leased(radio: u32, lease: Lease, model: &mut Model) -> Cmd {
         return Cmd::done();
     };
     if !model.wants_online() {
-        return associated_during_sleep(access_point, model);
+        model.wifi.phase = match lease {
+            Lease::Leased { ip } => Phase::Up(Linked {
+                access_point,
+                ip,
+                rssi,
+                ready: false,
+            }),
+            Lease::NoLease | Lease::Stopped => Phase::Associated(access_point),
+        };
+        return Cmd::done();
     }
-    let state = &mut model.wifi;
-    if lease == Lease::NoLease {
-        let recovery = state.health.no_lease();
-        let count = counted(state.health);
-        if recovery == Recovery::Restart {
-            let reason = format!("no address after {RESTART_AFTER} joins");
-            return count.and(restart(reason, model));
+    let ip = match lease {
+        Lease::Leased { ip } => ip,
+        Lease::NoLease | Lease::Stopped => {
+            let state = &mut model.wifi;
+            let recovery = state.health.no_lease();
+            let count = counted(state.health);
+            if recovery == Recovery::Restart {
+                let reason = format!("no address after {RESTART_AFTER} joins");
+                return count.and(restart(reason, model));
+            }
+            return count.and(no_address(target, access_point, model));
         }
-        return count.and(no_address(target, access_point, model));
-    }
+    };
+    let state = &mut model.wifi;
     let mut lines = Cmd::done();
     if had_address {
         // The stack kept its address through the join, so the address
@@ -507,6 +561,8 @@ pub fn leased(radio: u32, lease: Lease, model: &mut Model) -> Cmd {
     }
     state.phase = Phase::Up(Linked {
         access_point,
+        ip,
+        rssi,
         ready: true,
     });
     lines.and(connection::link_up(model))
@@ -592,7 +648,9 @@ pub fn timeout(radio: u32, model: &mut Model) -> Cmd {
         Phase::Scanning(_) => after_scan(&Scanned::Failed(NO_ANSWER.into()), model),
         Phase::StoppingScan { .. } => after_stop_scan(model),
         Phase::TurningOff { .. } => after_off(model),
-        Phase::Off | Phase::Idle | Phase::Up(_) | Phase::Restarting => Cmd::done(),
+        Phase::Off | Phase::Idle | Phase::Associated(_) | Phase::Up(_) | Phase::Restarting => {
+            Cmd::done()
+        }
     };
     reason.and(next)
 }
@@ -607,7 +665,7 @@ const fn request_name(phase: Phase) -> Option<&'static str> {
         Phase::Scanning(_) => Some("scan"),
         Phase::StoppingScan { .. } => Some("stop scan"),
         Phase::TurningOff { .. } => Some("off"),
-        Phase::Off | Phase::Idle | Phase::Up(_) | Phase::Restarting => None,
+        Phase::Off | Phase::Idle | Phase::Associated(_) | Phase::Up(_) | Phase::Restarting => None,
     }
 }
 
@@ -618,9 +676,9 @@ fn after_join(joined: &Joined, model: &mut Model) -> Cmd {
     };
     let &Joined::Associated {
         access_point,
+        rssi,
         kept,
         had_address,
-        ..
     } = joined
     else {
         // A join that fails never counts toward a restart, because the
@@ -645,11 +703,13 @@ fn after_join(joined: &Joined, model: &mut Model) -> Cmd {
         };
     };
     if !model.wants_online() {
-        return associated_during_sleep(access_point, model);
+        model.wifi.phase = Phase::Associated(access_point);
+        return Cmd::done();
     }
     model.wifi.phase = Phase::Leasing {
         target,
         access_point,
+        rssi,
         had_address,
         kept,
     };
@@ -657,18 +717,6 @@ fn after_join(joined: &Joined, model: &mut Model) -> Cmd {
     Radio::address(radio)
         .then_send(move |lease| Event::Leased { radio, lease }.into())
         .and(limit(radio, ADDRESS_TIMEOUT, model))
-}
-
-/// Records an association with `access_point` after a sleep started. The
-/// core counts nothing and keeps nothing in the cache. The steps of the
-/// sleep turn the radio off. If the device wakes before that, [`link`]
-/// joins again from `Up`.
-fn associated_during_sleep(access_point: AccessPoint, model: &mut Model) -> Cmd {
-    model.wifi.phase = Phase::Up(Linked {
-        access_point,
-        ready: false,
-    });
-    Cmd::done()
 }
 
 /// The join to `target` got no address from `access_point`. The core
@@ -726,23 +774,34 @@ fn after_scan(scanned: &Scanned, model: &mut Model) -> Cmd {
             format!("the signal of {current} is unknown, so stay"),
         );
     };
+    // The scan saw the current access point, so its signal is new.
+    let linked = Linked {
+        rssi: Some(rssi_now),
+        ..linked
+    };
+    state.phase = Phase::Up(linked);
     let now = signal(Some(rssi_now));
     let Some(best) = better_access_point(current, *rssi, seen) else {
+        // The state message publishes the new signal, at most once in the
+        // throttle window. Refer to [`device`].
         return logs::debug(
             Area::Wifi,
             format!(
                 "the scan found no access point that is {ROAM_MARGIN_DB} dB stronger than {current} ({now}), so stay"
             ),
-        );
+        )
+        .and(device::changed(model));
     };
     state.cache.roam_to(best.access_point);
     state.phase = Phase::Up(Linked {
-        access_point: current,
         ready: false,
+        ..linked
     });
     let to = best.access_point;
     // During the steps of a sleep, the sleep closes the session. The next
-    // wake joins the better access point.
+    // wake joins the better access point. In both cases the session ends
+    // soon, so the core does not publish the new signal now. The next
+    // session publishes the state.
     if model.wants_online() {
         let reason = logs::info(
             Area::Wifi,

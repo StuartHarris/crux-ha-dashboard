@@ -359,6 +359,7 @@ dependencies = [
  "esp-rtos",
  "firmware-logic",
  "log",
+ "portable-atomic",
  "shared",
  "static_cell",
  "ui",
@@ -1360,6 +1361,7 @@ dependencies = [
  "crux_time",
  "embedded-graphics",
  "log",
+ "portable-atomic",
  "shared",
  "ui",
 ]

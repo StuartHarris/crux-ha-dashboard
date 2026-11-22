@@ -65,7 +65,8 @@ use crux_time::{
 };
 use embedded_graphics::prelude::Point;
 use shared::{
-    Core, Dashboard, Effect, Event, Firmware, PowerSource, Settings, Start, ViewModel,
+    Boot, BootLine, Core, Dashboard, Effect, Event, Firmware, PowerSource, Settings, Start,
+    ViewModel,
     capabilities::{
         light::FrontLight,
         log::{Log, LogClock, Uptime},
@@ -782,6 +783,9 @@ fn resolve<Op: Operation>(
 /// about the firmware. The settings have `read_only` from the configuration,
 /// so the core does a dry run if it is `true`.
 ///
+/// `boot` and `before_restart` come from the memory that a reset keeps.
+/// Refer to [`crate::boot`].
+///
 /// `path` and `last_sync` are for a start after a deep sleep, with the
 /// values that the firmware kept in RTC memory. The firmware uses light
 /// sleep, which keeps the core, so it gives `None` for both.
@@ -789,6 +793,8 @@ fn resolve<Op: Operation>(
 pub fn start(
     config: &Config<'_>,
     firmware: Firmware,
+    boot: Boot,
+    before_restart: Vec<BootLine>,
     power: PowerSource,
     path: Option<String>,
     last_sync: Option<u64>,
@@ -806,6 +812,8 @@ pub fn start(
             read_only: config.read_only,
         },
         firmware,
+        boot,
+        before_restart,
         power,
         path,
         last_sync,

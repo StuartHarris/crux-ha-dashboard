@@ -23,10 +23,10 @@
 //!   shell still writes the full message.
 //! - The ring is in the model, so it keeps its lines through a light sleep,
 //!   which keeps the RAM, and while the device is offline.
-//! - The ring is only in RAM, so a chip restart loses its lines. This
-//!   includes the lines that tell why the chip restarts, for example the
-//!   restart of the Wi-Fi policy after 3 joins with no new address. A later
-//!   PR can keep the lines through a restart.
+//! - The ring is only in RAM, so a chip restart loses its lines. The shell
+//!   keeps its last warn and error lines in memory that a reset does not
+//!   clear, and gives them back in `Start`. The core puts them first in the
+//!   ring, with the source [`BOOT_SOURCE`]. Refer to [`before_restart`].
 //!
 //! # Publish
 //!
@@ -87,7 +87,7 @@ use core::fmt;
 use serde::Serialize;
 
 use crate::{
-    Cmd, Model,
+    BootLine, Cmd, Model,
     capabilities::log::{self, Area, Level, Uptime},
     features::{
         connection::{self, Link},
@@ -112,6 +112,13 @@ pub const CUT_MARK: &str = "…";
 /// how many lines the ring removed before they went. It has the level
 /// `warn` and the age 0.
 pub const DROP_SOURCE: &str = "log";
+
+/// The `source` of a line from before a restart. Refer to
+/// [`before_restart`].
+pub const BOOT_SOURCE: &str = "boot";
+
+/// The text at the start of the message of a line from before a restart.
+pub const BOOT_PREFIX: &str = "before the restart: ";
 
 /// The internal events of the logs feature. The core makes them from the
 /// answers to its `Log` and `LogClock` requests.
@@ -196,6 +203,37 @@ pub fn shell_logged(
     publish(model)
 }
 
+/// Keeps the warn and error lines that the shell kept from before a
+/// restart, at the end of the ring. The core calls this function at
+/// `Start`, before any new line, so these lines go first.
+///
+/// Each line gets the source [`BOOT_SOURCE`], and its message is
+/// [`BOOT_PREFIX`], the source from the shell, `": "` and the message from
+/// the shell, for example `before the restart: wifi: restart the chip: no
+/// address after 3 joins`. The ring keeps at most [`MAX_MESSAGE`] bytes of
+/// it. The time of the line is not known, so its age in the payload is 0.
+/// Refer to [`Source::Boot`].
+pub fn before_restart(lines: Vec<BootLine>, model: &mut Model) {
+    for BootLine {
+        level,
+        source,
+        message,
+    } in lines
+    {
+        let text = if source.is_empty() {
+            format!("{BOOT_PREFIX}{message}")
+        } else {
+            format!("{BOOT_PREFIX}{source}: {message}")
+        };
+        model.logs.push(Line {
+            at: Uptime(0),
+            level,
+            source: Source::Boot,
+            message: Message::new(&text),
+        });
+    }
+}
+
 /// Starts to publish with the time `now`, if the answer is for the
 /// `LogClock` request of the current session. The core ignores the answer
 /// for an older connection.
@@ -260,7 +298,9 @@ fn write(level: Kept, area: Area, message: String) -> Cmd {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Line {
     /// The time on the monotonic clock of the shell when the shell wrote
-    /// the line.
+    /// the line. A line from before a restart ([`Source::Boot`]) has the
+    /// time 0, because it is older than each time on the clock. The core
+    /// does not use that time.
     pub at: Uptime,
     /// How important the line is.
     pub level: Kept,
@@ -317,6 +357,10 @@ pub enum Source {
     Core(Area),
     /// A part of the shell, as the shell names it.
     Shell(ShellSource),
+    /// A line that the shell kept from before a restart of the chip. Its
+    /// name is [`BOOT_SOURCE`]. The time of the line is not known, so its
+    /// age in the payload is always 0. Refer to [`before_restart`].
+    Boot,
 }
 
 impl Source {
@@ -327,6 +371,7 @@ impl Source {
         match self {
             Self::Core(area) => area.name(),
             Self::Shell(source) => source.as_str(),
+            Self::Boot => BOOT_SOURCE,
         }
     }
 }
@@ -655,12 +700,17 @@ struct Payload<'a> {
 
 impl<'a> Payload<'a> {
     /// Returns the payload of `line` at the time `now`. A line that is
-    /// newer than `now` has the age 0.
+    /// newer than `now` has the age 0. A line from before a restart has the
+    /// age 0, because its time is not known.
     fn of(line: &'a Line, now: Uptime) -> Self {
+        let age = match line.source {
+            Source::Boot => 0,
+            Source::Core(_) | Source::Shell(_) => now.0.saturating_sub(line.at.0) / 1000,
+        };
         Self {
             level: line.level.name(),
             source: line.source.name(),
-            age: now.0.saturating_sub(line.at.0) / 1000,
+            age,
             msg: line.message.as_str(),
         }
     }

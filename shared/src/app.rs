@@ -1,7 +1,7 @@
 //! The root of the app: the events, the effects, the model and the dispatch
 //! to the features.
 
-use alloc::{format, string::String};
+use alloc::{format, string::String, vec::Vec};
 
 use chrono::{DateTime, Utc};
 use crux_core::{App, Command, macros::effect, render::RenderOperation};
@@ -10,7 +10,7 @@ use crux_time::operation as time;
 use crate::{
     capabilities::{
         light::FrontLight,
-        log::{Log, LogClock, Uptime},
+        log::{Area, Log, LogClock, Uptime},
         power::{PowerSource, Reading, Sleep},
         radio::{Address, Join, Leave, Off, Restart, Scan, StopScan},
         stream::{Close, Open, Write},
@@ -98,8 +98,82 @@ pub struct Firmware {
     pub mac: [u8; 6],
 }
 
+/// Why the chip started: the kind of its last reset. The shell gives it in
+/// [`Boot`].
+///
+/// The core writes it in the line `power: started after <reset>` and
+/// publishes it in the state message. Refer to [`device`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResetReason {
+    /// The power came on, for example after the battery was empty, or a
+    /// reset that also clears the RTC memory. The simulator always gives
+    /// this reason.
+    PowerOn,
+    /// The software restarted the chip, for example at a `RadioRestart`
+    /// request.
+    Software,
+    /// The software stopped with a panic.
+    Panic,
+    /// A watchdog timer reset the chip.
+    Watchdog,
+    /// The supply voltage was too low.
+    Brownout,
+    /// A reset of another kind, for example from the USB port.
+    Other,
+}
+
+impl ResetReason {
+    /// Returns the words for the start line of the log, for example
+    /// `a watchdog reset`.
+    #[must_use]
+    pub const fn words(self) -> &'static str {
+        match self {
+            Self::PowerOn => "a power-on",
+            Self::Software => "a software reset",
+            Self::Panic => "a panic",
+            Self::Watchdog => "a watchdog reset",
+            Self::Brownout => "a brownout",
+            Self::Other => "a reset of another kind",
+        }
+    }
+
+    /// Returns `true` if the reset tells of a fault: a panic, a watchdog
+    /// reset or a brownout. The start line is then a warning.
+    #[must_use]
+    pub const fn is_fault(self) -> bool {
+        matches!(self, Self::Panic | Self::Watchdog | Self::Brownout)
+    }
+}
+
+/// The facts about the start of the chip, which the shell gives in
+/// [`Start`]. The core publishes them in the state message. Refer to
+/// [`device`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Boot {
+    /// The kind of the last reset.
+    pub reset: ResetReason,
+    /// The number of resets that were not a power-on, since the last
+    /// power-on. This start counts. After a power-on, the value is 0. The
+    /// simulator always gives 0.
+    pub restarts: u32,
+}
+
+/// A warn or error line that the shell kept through a restart, in memory
+/// that a reset does not clear. The shell gives these lines in
+/// [`Start::before_restart`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BootLine {
+    /// How important the line is.
+    pub level: logs::Kept,
+    /// The part of the shell or of the core that wrote the line, for
+    /// example `wifi`.
+    pub source: String,
+    /// The text of the line.
+    pub message: String,
+}
+
 /// The start of the app: before the first `Start`, or after it with the
-/// settings and the facts about the firmware.
+/// settings and the facts about the firmware and the boot.
 #[derive(Debug)]
 pub enum Startup {
     /// The core waits for the first `Start`. It has no settings, and it
@@ -121,6 +195,8 @@ pub enum Startup {
         settings: Settings,
         /// The facts about the firmware.
         firmware: Firmware,
+        /// The facts about the start of the chip.
+        boot: Boot,
     },
 }
 
@@ -149,6 +225,16 @@ impl Startup {
         }
     }
 
+    /// Returns the facts about the start of the chip, or `None` before
+    /// `Start`.
+    #[must_use]
+    pub const fn boot(&self) -> Option<Boot> {
+        match self {
+            Self::Waiting { .. } => None,
+            Self::Started { boot, .. } => Some(*boot),
+        }
+    }
+
     /// Returns `true` after `Start`.
     #[must_use]
     pub const fn is_started(&self) -> bool {
@@ -173,6 +259,13 @@ pub struct Start {
     pub settings: Settings,
     /// The facts about the firmware.
     pub firmware: Firmware,
+    /// The facts about the start of the chip.
+    pub boot: Boot,
+    /// The warn and error lines that the shell kept from before a reset
+    /// that was not a power-on, from the oldest. After a power-on, the
+    /// list is empty. The core puts them in its log before any new line.
+    /// Refer to [`logs::before_restart`].
+    pub before_restart: Vec<BootLine>,
     /// The power source now.
     pub power: PowerSource,
     /// The path of the page to show, from [`ViewModel::path`]. After a deep
@@ -541,10 +634,15 @@ fn on_start(start: Start, model: &mut Model) -> Cmd {
     let Start {
         settings,
         firmware,
+        boot,
+        before_restart,
         power: source,
         path,
         last_sync,
     } = start;
+    // The lines from before the restart go first, before the start line
+    // and each other new line.
+    logs::before_restart(before_restart, model);
     // A second `Start` uses only the dry run of the shell.
     let requested = match model.startup {
         Startup::Waiting { read_only } => read_only,
@@ -556,6 +654,7 @@ fn on_start(start: Start, model: &mut Model) -> Cmd {
             ..settings
         },
         firmware,
+        boot,
     };
     let kept = last_sync
         .and_then(|seconds| i64::try_from(seconds).ok())
@@ -578,4 +677,22 @@ fn on_start(start: Start, model: &mut Model) -> Cmd {
         .and(connection::go_online(model))
         .and(power::restart_idle_timer(model))
         .and(summary)
+        .and(started(boot))
+}
+
+/// Writes the start line, for example `power: started after a watchdog
+/// reset, restart 3`. A reset that tells of a fault gives a warning, and the
+/// other resets give an Info line.
+fn started(boot: Boot) -> Cmd {
+    let Boot { reset, restarts } = boot;
+    let message = if restarts > 0 {
+        format!("started after {}, restart {restarts}", reset.words())
+    } else {
+        format!("started after {}", reset.words())
+    };
+    if reset.is_fault() {
+        logs::warn(Area::Power, message)
+    } else {
+        logs::info(Area::Power, message)
+    }
 }

@@ -64,6 +64,21 @@ impl fmt::Display for AccessPoint {
     }
 }
 
+/// Returns the text of an IPv4 address, for example `192.168.1.50`.
+#[must_use]
+pub fn ip_text(ip: [u8; 4]) -> String {
+    let [a, b, c, d] = ip;
+    format!("{a}.{b}.{c}.{d}")
+}
+
+/// Returns the text of a MAC address, for example a BSSID, as lowercase hex
+/// with colons, for example `24:5a:4c:01:02:03`.
+#[must_use]
+pub fn mac_text(bssid: [u8; 6]) -> String {
+    let bytes: Vec<String> = bssid.iter().map(|byte| format!("{byte:02x}")).collect();
+    bytes.join(":")
+}
+
 /// Returns the text of a signal for the log: `-62 dBm`, or `no signal` if
 /// the shell cannot read the signal.
 #[must_use]
@@ -136,7 +151,8 @@ pub enum Joined {
 
 /// Waits for an IP address from DHCP.
 ///
-/// The shell gives up after 20 seconds.
+/// The shell answers with the IPv4 address ([`Lease::Leased`]). The core
+/// publishes it to Home Assistant. The shell gives up after 20 seconds.
 #[derive(Operation, Clone, Copy, Debug, PartialEq, Eq)]
 #[operation(request, output = Lease)]
 pub struct Address {
@@ -147,8 +163,11 @@ pub struct Address {
 /// The answer to an [`Address`] request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Lease {
-    /// The device has an IP address.
-    Leased,
+    /// The device has this IPv4 address.
+    Leased {
+        /// The address, for example `[192, 168, 1, 50]`.
+        ip: [u8; 4],
+    },
     /// The device did not get an IP address in the time limit.
     NoLease,
     /// A newer request stopped the wait.
@@ -344,7 +363,7 @@ mod tests {
 
     use super::{
         AccessPoint, Address, Join, Joined, Lease, Leave, Off, Radio, Restart, Scan, Scanned, Seen,
-        StopScan, Target, signal,
+        StopScan, Target, ip_text, mac_text, signal,
     };
 
     const HALL: AccessPoint = AccessPoint {
@@ -431,7 +450,13 @@ mod tests {
 
     #[test]
     fn address_gives_the_lease() {
-        for lease in [Lease::Leased, Lease::NoLease, Lease::Stopped] {
+        for lease in [
+            Lease::Leased {
+                ip: [192, 168, 1, 50],
+            },
+            Lease::NoLease,
+            Lease::Stopped,
+        ] {
             let mut command = Radio::address(4).then_send(Event::Lease);
             let Effect::Address(mut request) = effect(&mut command) else {
                 panic!("an Address request");
@@ -540,5 +565,7 @@ mod tests {
         assert_eq!(KITCHEN.to_string(), "02:66:77:88:99:aa on channel 11");
         assert_eq!(signal(Some(-62)), "-62 dBm");
         assert_eq!(signal(None), "no signal");
+        assert_eq!(ip_text([192, 168, 1, 50]), "192.168.1.50");
+        assert_eq!(mac_text(access_point.bssid), "24:5a:4c:01:02:03");
     }
 }

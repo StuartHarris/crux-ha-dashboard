@@ -9,7 +9,7 @@ use core::time::Duration;
 
 use serde_json::{Value, json};
 
-use super::{BIRTH_ONLINE, BIRTH_TOPIC, IN_FLIGHT, STATE_MIN_INTERVAL, Snapshot, discovery};
+use super::{BIRTH_ONLINE, BIRTH_TOPIC, IN_FLIGHT, STATE_MIN_INTERVAL, Snapshot, Wifi, discovery};
 use crate::{
     Charge, Event, PowerSource, Reading,
     capabilities::{
@@ -19,10 +19,12 @@ use crate::{
     features::{
         connection::{Link, RECONNECT_MIN},
         logs::{self, Kept, Line, Message, Source},
-        power::IDLE_TIMEOUT,
+        power::{IDLE_TIMEOUT, WakeReason},
     },
-    mqtt::{Qos, codec::server::Packet},
-    tests::{broker::publish_of, firmware, flows::house, settings, shell::Shell, start, state},
+    mqtt::{MAX_OUTGOING, Qos, codec::server::Packet},
+    tests::{
+        POWER_ON, broker::publish_of, firmware, flows::house, settings, shell::Shell, start, state,
+    },
 };
 
 /// The discovery topic of the test settings.
@@ -103,6 +105,54 @@ const DISCOVERY_JSON: &str = concat!(
     r#""stat_t":"dashboard/hall/state","val_tpl":"{{ value_json.temperature }}","#,
     r#""avty_t":"dashboard/hall/status","#,
     r#""avty_tpl":"{{ 'offline' if value == 'offline' else 'online' }}","#,
+    r#""ent_cat":"diagnostic"},"#,
+    r#""rssi":{"p":"sensor","name":"Wi-Fi signal","uniq_id":"dashboard_hall_rssi","#,
+    r#""dev_cla":"signal_strength","unit_of_meas":"dBm","stat_cla":"measurement","#,
+    r#""stat_t":"dashboard/hall/state","val_tpl":"{{ value_json.rssi }}","#,
+    r#""avty_t":"dashboard/hall/status","#,
+    r#""avty_tpl":"{{ 'offline' if value == 'offline' else 'online' }}","#,
+    r#""ent_cat":"diagnostic"},"#,
+    r#""bssid":{"p":"sensor","name":"Access point","uniq_id":"dashboard_hall_bssid","#,
+    r#""ic":"mdi:access-point","#,
+    r#""stat_t":"dashboard/hall/state","val_tpl":"{{ value_json.bssid }}","#,
+    r#""avty_t":"dashboard/hall/status","#,
+    r#""avty_tpl":"{{ 'offline' if value == 'offline' else 'online' }}","#,
+    r#""ent_cat":"diagnostic"},"#,
+    r#""ip":{"p":"sensor","name":"IP address","uniq_id":"dashboard_hall_ip","#,
+    r#""ic":"mdi:ip-network","#,
+    r#""stat_t":"dashboard/hall/state","val_tpl":"{{ value_json.ip }}","#,
+    r#""avty_t":"dashboard/hall/status","#,
+    r#""avty_tpl":"{{ 'offline' if value == 'offline' else 'online' }}","#,
+    r#""ent_cat":"diagnostic"},"#,
+    r#""reconnects":{"p":"sensor","name":"Reconnects","uniq_id":"dashboard_hall_reconnects","#,
+    r#""ic":"mdi:lan-connect","stat_cla":"total_increasing","#,
+    r#""stat_t":"dashboard/hall/state","val_tpl":"{{ value_json.reconnects }}","#,
+    r#""avty_t":"dashboard/hall/status","#,
+    r#""avty_tpl":"{{ 'offline' if value == 'offline' else 'online' }}","#,
+    r#""ent_cat":"diagnostic"},"#,
+    r#""restarts":{"p":"sensor","name":"Restarts","uniq_id":"dashboard_hall_restarts","#,
+    r#""ic":"mdi:restart","stat_cla":"total_increasing","#,
+    r#""stat_t":"dashboard/hall/state","val_tpl":"{{ value_json.restarts }}","#,
+    r#""avty_t":"dashboard/hall/status","#,
+    r#""avty_tpl":"{{ 'offline' if value == 'offline' else 'online' }}","#,
+    r#""ent_cat":"diagnostic"},"#,
+    r#""reset":{"p":"sensor","name":"Last reset","uniq_id":"dashboard_hall_reset","#,
+    r#""dev_cla":"enum","ic":"mdi:power-cycle","#,
+    r#""ops":["Power on","Software","Panic","Watchdog","Brownout","Other"],"#,
+    r#""stat_t":"dashboard/hall/state","val_tpl":""#,
+    r#"{{ {'power_on': 'Power on', 'software': 'Software', 'panic': 'Panic', "#,
+    r#"'watchdog': 'Watchdog', 'brownout': 'Brownout', 'other': 'Other'}[value_json.reset] "#,
+    r#"| default(None) }}","#,
+    r#""avty_t":"dashboard/hall/status","#,
+    r#""avty_tpl":"{{ 'offline' if value == 'offline' else 'online' }}","#,
+    r#""ent_cat":"diagnostic"},"#,
+    r#""wake":{"p":"sensor","name":"Wake reason","uniq_id":"dashboard_hall_wake","#,
+    r#""dev_cla":"enum","ic":"mdi:sleep-off","ops":["Boot","Touch","Stand"],"#,
+    r#""stat_t":"dashboard/hall/state","val_tpl":""#,
+    r#"{{ {'boot': 'Boot', 'touch': 'Touch', 'stand': 'Stand'}[value_json.wake] "#,
+    r#"| default(None) }}","#,
+    r#""avty_t":"dashboard/hall/status","#,
+    r#""avty_tpl":"{{ 'offline' if value == 'offline' else 'online' }}","#,
     r#""ent_cat":"diagnostic"}}}"#,
 );
 
@@ -116,9 +166,17 @@ fn the_discovery_message_has_the_exact_json() {
 }
 
 #[test]
-fn the_discovery_message_is_json_with_the_keys_and_under_4_kib() {
+fn the_discovery_message_is_json_with_the_keys_and_under_6_kib() {
     let payload = discovery::payload(&settings(), &firmware());
-    assert!(payload.len() < 4 * 1024, "{} bytes", payload.len());
+    assert!(payload.len() < 6 * 1024, "{} bytes", payload.len());
+    // The discovery and the state go in one write, and each write has at
+    // most `MAX_OUTGOING` bytes. The two messages use about a third.
+    let state = snapshot(Some(100), true, CHARGING).to_json();
+    assert!(
+        (payload.len() + state.len()) * 2 < MAX_OUTGOING,
+        "{} bytes",
+        payload.len() + state.len()
+    );
     let config: Value = serde_json::from_slice(&payload).expect("JSON");
 
     let device = &config["dev"];
@@ -134,20 +192,31 @@ fn the_discovery_message_is_json_with_the_keys_and_under_4_kib() {
     );
 
     let components = config["cmps"].as_object().expect("components");
-    assert_eq!(components.len(), 8);
+    assert_eq!(components.len(), 15);
     for (key, platform, class) in [
-        ("status", "sensor", "enum"),
-        ("battery", "sensor", "battery"),
-        ("stand", "binary_sensor", "plug"),
-        ("charging", "binary_sensor", "battery_charging"),
-        ("charge", "sensor", "enum"),
-        ("voltage", "sensor", "voltage"),
-        ("current", "sensor", "current"),
-        ("temperature", "sensor", "temperature"),
+        ("status", "sensor", Some("enum")),
+        ("battery", "sensor", Some("battery")),
+        ("stand", "binary_sensor", Some("plug")),
+        ("charging", "binary_sensor", Some("battery_charging")),
+        ("charge", "sensor", Some("enum")),
+        ("voltage", "sensor", Some("voltage")),
+        ("current", "sensor", Some("current")),
+        ("temperature", "sensor", Some("temperature")),
+        ("rssi", "sensor", Some("signal_strength")),
+        ("bssid", "sensor", None),
+        ("ip", "sensor", None),
+        ("reconnects", "sensor", None),
+        ("restarts", "sensor", None),
+        ("reset", "sensor", Some("enum")),
+        ("wake", "sensor", Some("enum")),
     ] {
         let component = &components[key];
         assert_eq!(component["p"], platform, "{key}");
-        assert_eq!(component["dev_cla"], class, "{key}");
+        assert_eq!(
+            component.get("dev_cla").and_then(Value::as_str),
+            class,
+            "{key}"
+        );
         assert_eq!(component["uniq_id"], format!("dashboard_hall_{key}"));
     }
     let status = &components["status"];
@@ -165,10 +234,17 @@ fn the_discovery_message_is_json_with_the_keys_and_under_4_kib() {
         "voltage",
         "current",
         "temperature",
+        "rssi",
+        "bssid",
+        "ip",
+        "reconnects",
+        "restarts",
+        "reset",
+        "wake",
     ] {
         let component = &components[key];
         assert_eq!(component["stat_t"], STATE, "{key}");
-        if key != "charge" {
+        if !["charge", "reset", "wake"].contains(&key) {
             assert_eq!(component["val_tpl"], format!("{{{{ value_json.{key} }}}}"));
         }
         assert_eq!(component["avty_t"], STATUS, "{key}");
@@ -177,23 +253,59 @@ fn the_discovery_message_is_json_with_the_keys_and_under_4_kib() {
             "{{ 'offline' if value == 'offline' else 'online' }}"
         );
     }
+}
+
+#[test]
+fn the_components_have_their_units_state_classes_and_categories() {
+    let payload = discovery::payload(&settings(), &firmware());
+    let config: Value = serde_json::from_slice(&payload).expect("JSON");
+    let components = config["cmps"].as_object().expect("components");
     for (key, unit) in [
         ("battery", "%"),
         ("voltage", "mV"),
         ("current", "mA"),
         ("temperature", "°C"),
+        ("rssi", "dBm"),
     ] {
         assert_eq!(components[key]["unit_of_meas"], unit, "{key}");
         assert_eq!(components[key]["stat_cla"], "measurement", "{key}");
     }
-    // The power diagnostics are in the diagnostic category. The status,
-    // the battery and the stand are not.
-    for key in ["charging", "charge", "voltage", "current", "temperature"] {
+    // The counts only go up, except at a start or a power-on.
+    for key in ["reconnects", "restarts"] {
+        assert_eq!(components[key]["stat_cla"], "total_increasing", "{key}");
+        assert!(components[key].get("unit_of_meas").is_none(), "{key}");
+    }
+    for key in ["bssid", "ip", "reset", "wake"] {
+        assert!(components[key].get("stat_cla").is_none(), "{key}");
+    }
+    // The power, Wi-Fi and boot diagnostics are in the diagnostic
+    // category. The status, the battery and the stand are not.
+    for key in [
+        "charging",
+        "charge",
+        "voltage",
+        "current",
+        "temperature",
+        "rssi",
+        "bssid",
+        "ip",
+        "reconnects",
+        "restarts",
+        "reset",
+        "wake",
+    ] {
         assert_eq!(components[key]["ent_cat"], "diagnostic", "{key}");
     }
     for key in ["status", "battery", "stand"] {
         assert!(components[key].get("ent_cat").is_none(), "{key}");
     }
+}
+
+#[test]
+fn the_enum_components_have_labels_and_each_component_has_its_icon() {
+    let payload = discovery::payload(&settings(), &firmware());
+    let config: Value = serde_json::from_slice(&payload).expect("JSON");
+    let components = config["cmps"].as_object().expect("components");
     // The charge shows labels, and its template maps the snake_case wire
     // values to them. A null or unknown value gives `None`.
     assert_eq!(
@@ -204,6 +316,24 @@ fn the_discovery_message_is_json_with_the_keys_and_under_4_kib() {
         components["charge"]["val_tpl"],
         "{{ {'not_charging': 'Not charging', 'pre_charging': 'Pre-charging', \
          'fast_charging': 'Fast charging', 'done': 'Done'}[value_json.charge] \
+         | default(None) }}"
+    );
+    assert_eq!(
+        components["reset"]["ops"],
+        json!([
+            "Power on", "Software", "Panic", "Watchdog", "Brownout", "Other"
+        ])
+    );
+    assert_eq!(
+        components["reset"]["val_tpl"],
+        "{{ {'power_on': 'Power on', 'software': 'Software', 'panic': 'Panic', \
+         'watchdog': 'Watchdog', 'brownout': 'Brownout', 'other': 'Other'}[value_json.reset] \
+         | default(None) }}"
+    );
+    assert_eq!(components["wake"]["ops"], json!(["Boot", "Touch", "Stand"]));
+    assert_eq!(
+        components["wake"]["val_tpl"],
+        "{{ {'boot': 'Boot', 'touch': 'Touch', 'stand': 'Stand'}[value_json.wake] \
          | default(None) }}"
     );
     // Only these components set an icon. The others keep the icon of their
@@ -217,6 +347,13 @@ fn the_discovery_message_is_json_with_the_keys_and_under_4_kib() {
         ("voltage", Some("mdi:flash-triangle-outline")),
         ("current", Some("mdi:current-dc")),
         ("temperature", None),
+        ("rssi", None),
+        ("bssid", Some("mdi:access-point")),
+        ("ip", Some("mdi:ip-network")),
+        ("reconnects", Some("mdi:lan-connect")),
+        ("restarts", Some("mdi:restart")),
+        ("reset", Some("mdi:power-cycle")),
+        ("wake", Some("mdi:sleep-off")),
     ] {
         assert_eq!(
             components[key].get("ic").and_then(Value::as_str),
@@ -226,25 +363,51 @@ fn the_discovery_message_is_json_with_the_keys_and_under_4_kib() {
     }
 }
 
+/// The Wi-Fi facts of a link in the tests.
+const LINK: Wifi = Wifi {
+    bssid: [0x24, 0x5a, 0x4c, 0x01, 0x02, 0x03],
+    ip: [192, 168, 1, 50],
+    rssi: Some(-62),
+};
+
+/// The JSON of [`LINK`], no reconnect, a power-on and no wake. It is a
+/// macro, so `concat!` can use it.
+macro_rules! link_json {
+    () => {
+        concat!(
+            r#""rssi":-62,"bssid":"24:5a:4c:01:02:03","ip":"192.168.1.50","#,
+            r#""reconnects":0,"restarts":0,"reset":"power_on","wake":"boot""#
+        )
+    };
+}
+
+/// Returns a snapshot with `battery`, `stand` and `reading`, the link
+/// [`LINK`], no reconnect, a power-on and no wake.
+const fn snapshot(battery: Option<u8>, stand: bool, reading: Reading) -> Snapshot {
+    Snapshot {
+        battery,
+        stand,
+        reading,
+        wifi: Some(LINK),
+        reconnects: 0,
+        boot: POWER_ON,
+        wake: WakeReason::Boot,
+    }
+}
+
 #[test]
 fn the_state_message_has_the_exact_json() {
     let text = |battery, stand, reading| {
-        String::from_utf8(
-            Snapshot {
-                battery,
-                stand,
-                reading,
-            }
-            .to_json(),
-        )
-        .unwrap()
+        String::from_utf8(snapshot(battery, stand, reading).to_json()).unwrap()
     };
     // On battery, with a full reading.
     assert_eq!(
         text(Some(95), false, ON_BATTERY),
         concat!(
             r#"{"battery":95,"stand":"OFF","charging":"OFF","charge":"not_charging","#,
-            r#""voltage":3870,"current":-40,"temperature":24.5}"#
+            r#""voltage":3870,"current":-40,"temperature":24.5,"#,
+            link_json!(),
+            "}"
         )
     );
     // On the stand, in a fast charge. A whole degree has one decimal.
@@ -252,7 +415,9 @@ fn the_state_message_has_the_exact_json() {
         text(Some(100), true, CHARGING),
         concat!(
             r#"{"battery":100,"stand":"ON","charging":"ON","charge":"fast_charging","#,
-            r#""voltage":4150,"current":450,"temperature":26.0}"#
+            r#""voltage":4150,"current":450,"temperature":26.0,"#,
+            link_json!(),
+            "}"
         )
     );
     // A pre-charge is a charge. A done charge is not.
@@ -278,13 +443,15 @@ fn the_state_message_has_the_exact_json() {
         tenth_celsius: Some(-15),
         ..Reading::default()
     };
-    assert!(text(None, false, cold).ends_with(r#""temperature":-1.5}"#));
+    assert!(text(None, false, cold).contains(r#""temperature":-1.5,"#));
     // The shell did not read the battery or the diagnostics.
     assert_eq!(
         text(None, true, Reading::default()),
         concat!(
             r#"{"battery":null,"stand":"ON","charging":null,"charge":null,"#,
-            r#""voltage":null,"current":null,"temperature":null}"#
+            r#""voltage":null,"current":null,"temperature":null,"#,
+            link_json!(),
+            "}"
         )
     );
 }
@@ -478,6 +645,10 @@ fn the_state_goes_on_each_connection_and_after_each_change() {
     reconnect(&mut shell);
     shell.send(Event::PowerSourceChanged(PowerSource::Stand));
 
+    // The new connection is after a failed session, so it counts one
+    // reconnect.
+    let after_the_reconnect =
+        |battery, stand| state(battery, stand).replace(r#""reconnects":0"#, r#""reconnects":1"#);
     assert_eq!(
         on(&shell, STATE),
         [
@@ -485,8 +656,8 @@ fn the_state_goes_on_each_connection_and_after_each_change() {
             state("95", "ON"),
             state("95", "OFF"),
             // The new connection.
-            state("95", "OFF"),
-            state("95", "ON"),
+            after_the_reconnect("95", "OFF"),
+            after_the_reconnect("95", "ON"),
         ]
     );
 }
@@ -560,17 +731,18 @@ fn the_queue_sends_the_discovery_then_the_state_then_the_log() {
     shell.send(start(PowerSource::Stand));
 
     // The CONNECT, the CONNACK write, the discovery and the state, then the
-    // line after the clock answer.
+    // line and the start line after the clock answer.
     assert_eq!(topics(&shell.writes[1]), [STATUS]);
     assert_eq!(topics(&shell.writes[2]), [CONFIG, STATE]);
-    assert_eq!(topics(&shell.writes[3]), [LOG]);
+    assert_eq!(topics(&shell.writes[3]), [LOG, LOG]);
 }
 
 #[test]
 fn all_device_publishes_share_one_limit_that_leaves_the_reserved_places() {
     let mut shell = house();
     shell.broker.hold_puback = true;
-    for at in 0..logs::CAPACITY as u64 {
+    // The start line fills the last place of the ring.
+    for at in 0..logs::CAPACITY as u64 - 1 {
         stamp(&mut shell, at, &format!("line {at}"));
     }
     shell.send(start(PowerSource::Stand));
@@ -656,8 +828,8 @@ fn a_dry_run_publishes_no_discovery_and_no_state() {
     assert_eq!(shell.model.connection.link(), Link::Up);
     assert_eq!(discoveries(&shell), 0);
     assert_eq!(on(&shell, STATE), Vec::<String>::new());
-    // The log still goes.
-    assert_eq!(on(&shell, LOG).len(), 1);
+    // The log still goes: the line and the start line.
+    assert_eq!(on(&shell, LOG).len(), 2);
 
     // The end of the dry run sends the discovery and the state.
     shell.send(Event::SetReadOnly(false));

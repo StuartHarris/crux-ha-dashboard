@@ -15,17 +15,18 @@ use core::time::Duration;
 use crux_time::operation::NotifyAfter;
 use dashboard_firmware::{
     board::{self, uptime},
-    logger,
+    boot, logger,
 };
 use embassy_futures::select::{Either, select};
 use embassy_time::Instant;
 use logic::{
+    boot::Taken,
     forward::{CORE_TARGET, PENDING},
     shell::{self, Job, Shell, StreamOp, TimerOp},
     sleep::Plan,
     stream::UpdateStats,
 };
-use shared::{Event, PowerSource, capabilities::log::Level};
+use shared::{Connection, Event, PowerSource, capabilities::log::Level};
 
 use crate::{
     IN_FLIGHT, LIGHT, RADIO, RENDER, SIGNALS, SLEEP, STREAM, TIMERS, config::CONFIG, radio, timers,
@@ -47,9 +48,12 @@ struct Stats {
 /// update logs a warning, which the logger keeps, so a slow line would make
 /// one more line.
 ///
+/// `taken` has the boot facts and the lines from before the restart, which
+/// `main` read from RTC memory ([`boot::read`]). They go in `Start`.
+///
 /// If `display` is `false`, no display task runs. The core task then
 /// answers each `FrontLight` job itself, so the sleep steps continue.
-pub async fn run(source: PowerSource, display: bool) -> ! {
+pub async fn run(source: PowerSource, display: bool, taken: &Taken) -> ! {
     let mut shell = Shell::new();
     if CONFIG.read_only {
         log::info!("core: dry run, so a tap publishes no service call");
@@ -58,7 +62,15 @@ pub async fn run(source: PowerSource, display: bool) -> ! {
     // does not start the core again.
     // TODO: if the firmware uses deep sleep in the future, give the path and
     // the time of the last update that it kept in RTC memory.
-    let start = shell::start(&CONFIG, board::firmware(), source, None, None);
+    let start = shell::start(
+        &CONFIG,
+        board::firmware(),
+        taken.boot,
+        taken.lines(),
+        source,
+        None,
+        None,
+    );
     let mut stats = Stats::default();
     let started = Instant::now();
     let jobs = shell.send(Event::Start(start));
@@ -136,7 +148,14 @@ fn record(stats: &mut UpdateStats, started: Instant) {
 fn dispatch(jobs: alloc::vec::Vec<Job>, display: bool, stats: &mut Stats) {
     for job in jobs {
         match job {
-            Job::Render(view) => RENDER.signal(view),
+            Job::Render(view) => {
+                // The view shows `Online` after an MQTT connect, so the
+                // start works and a later panic restarts the chip again.
+                if view.connection == Connection::Online {
+                    boot::connected();
+                }
+                RENDER.signal(view);
+            }
             Job::Stream { connection, op } => {
                 match &op {
                     StreamOp::Open(_) => {

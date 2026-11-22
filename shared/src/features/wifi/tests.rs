@@ -6,12 +6,14 @@
 //! [`Shell::hold_radio`].
 
 use crate::features::wifi;
-use alloc::{format, string::String, vec::Vec};
+use alloc::{format, string::String, vec, vec::Vec};
 use core::time::Duration;
 
 use crux_core::App;
 
-use crate::tests::{asleep as is_asleep, flows::house, settings, shell::Shell, sleep_lines, start};
+use crate::tests::{
+    STARTED, asleep as is_asleep, flows::house, settings, shell::Shell, sleep_lines, start,
+};
 use crate::{
     Connection, Dashboard, Effect, EffectTestExt, Event, Model, PowerSource,
     capabilities::{
@@ -19,7 +21,7 @@ use crate::{
         power::Wake,
         radio::{AccessPoint, Joined, Lease, Scanned, Seen, Target},
     },
-    fake::radio::{HALL, LANDING},
+    fake::radio::{HALL, IP, LANDING, STRONG_RSSI},
     features::{
         connection::{RECONNECT_MAX, RECONNECT_MIN},
         power::{self, IDLE_TIMEOUT, SleepStep},
@@ -106,6 +108,8 @@ fn place(log: &[String], entry: &str) -> usize {
 const fn ready(access_point: AccessPoint) -> Linked {
     Linked {
         access_point,
+        ip: IP,
+        rssi: Some(-55),
         ready: true,
     }
 }
@@ -115,6 +119,8 @@ const fn ready(access_point: AccessPoint) -> Linked {
 const fn not_ready(access_point: AccessPoint) -> Linked {
     Linked {
         access_point,
+        ip: IP,
+        rssi: Some(-55),
         ready: false,
     }
 }
@@ -125,6 +131,7 @@ fn online() -> Shell {
     shell.send(start(PowerSource::Stand));
     assert_eq!(shell.view().connection, Connection::Online);
     shell.take_log();
+    assert_eq!(shell.take_logs(), [STARTED]);
     shell
 }
 
@@ -136,7 +143,9 @@ fn asleep() -> Shell {
     shell.advance(IDLE_TIMEOUT);
     assert!(shell.sleep.is_some());
     shell.take_log();
-    assert_eq!(shell.take_logs(), sleep_lines(1));
+    let mut lines = vec![String::from(STARTED)];
+    lines.extend(sleep_lines(1));
+    assert_eq!(shell.take_logs(), lines);
     shell
 }
 
@@ -193,8 +202,11 @@ fn the_usual_steps_write_no_line_to_the_log() {
     assert_eq!(shell.view().connection, Connection::Online);
     shell.advance(IDLE_TIMEOUT);
     assert!(shell.sleep.is_some());
-    // Only the steps of the sleep write lines, with the area `power`.
-    assert_eq!(shell.take_logs(), sleep_lines(1));
+    // Only the start and the steps of the sleep write lines, with the area
+    // `power`.
+    let mut lines = vec![String::from(STARTED)];
+    lines.extend(sleep_lines(1));
+    assert_eq!(shell.take_logs(), lines);
 }
 
 #[test]
@@ -323,7 +335,14 @@ fn a_better_access_point_closes_cleanly_and_the_core_joins_it_once() {
     // scan after it.
     assert_eq!(shell.radio.associated, Some(LANDING));
     assert_eq!(shell.radio.joins, 3);
-    assert_eq!(shell.model.wifi.phase, Phase::Up(ready(LANDING)));
+    // The join gave the signal of the better access point.
+    assert_eq!(
+        shell.model.wifi.phase,
+        Phase::Up(Linked {
+            rssi: Some(STRONG_RSSI),
+            ..ready(LANDING)
+        })
+    );
     assert_eq!(shell.model.wifi.cache.plan(), Target::Cached(LANDING));
     assert!(!shell.model.wifi.cache.scan_due());
 }
@@ -1052,6 +1071,7 @@ fn sleeping_with(phase: Phase) -> Model {
         startup: crate::Startup::Started {
             settings: settings(),
             firmware: crate::tests::firmware(),
+            boot: crate::tests::POWER_ON,
         },
         ..Model::default()
     };
@@ -1092,7 +1112,7 @@ fn a_no_lease_after_the_sleep_started_does_not_count_or_restart_the_chip() {
 }
 
 #[test]
-fn an_association_after_the_sleep_started_is_up_but_not_ready() {
+fn an_association_after_the_sleep_started_has_no_address_and_no_link() {
     let mut model = sleeping_with(Phase::Joining(Target::Strongest));
     let joined = Joined::Associated {
         access_point: HALL,
@@ -1106,7 +1126,9 @@ fn an_association_after_the_sleep_started_is_up_but_not_ready() {
             &mut model,
         )
         .expect_no_effects();
-    assert_eq!(model.wifi.phase, Phase::Up(not_ready(HALL)));
+    // The core knows no address, so the device has no link.
+    assert_eq!(model.wifi.phase, Phase::Associated(HALL));
+    assert_eq!(model.wifi.phase.linked(), None);
     // The core keeps nothing in the cache.
     assert_eq!(model.wifi.cache.plan(), Target::Strongest);
 
@@ -1124,6 +1146,7 @@ fn a_time_limit_after_the_sleep_started_changes_nothing_in_the_cache() {
     let mut model = sleeping_with(Phase::Leasing {
         target: Target::Cached(HALL),
         access_point: HALL,
+        rssi: None,
         had_address: false,
         kept: false,
     });
@@ -1191,7 +1214,10 @@ fn a_rejoin_that_keeps_the_association_and_its_address_writes_no_line() {
     shell.broker.code = 5;
     shell.send(start(PowerSource::Stand));
     shell.take_log();
-    assert_eq!(shell.take_logs(), [connect_again(NOT_AUTHORIZED, 1)]);
+    assert_eq!(
+        shell.take_logs(),
+        [String::from(STARTED), connect_again(NOT_AUTHORIZED, 1)]
+    );
 
     shell.advance(RECONNECT_MIN);
     let log = shell.take_log();
@@ -1240,12 +1266,14 @@ fn the_count_of_joins_with_no_new_address_comes_before_the_restart() {
         startup: crate::Startup::Started {
             settings: settings(),
             firmware: crate::tests::firmware(),
+            boot: crate::tests::POWER_ON,
         },
         ..Model::default()
     };
     model.wifi.phase = Phase::Leasing {
         target: Target::Strongest,
         access_point: HALL,
+        rssi: None,
         had_address: false,
         kept: false,
     };
@@ -1279,12 +1307,14 @@ fn a_stale_address_on_a_link_that_is_not_suspect_writes_no_line() {
         startup: crate::Startup::Started {
             settings: settings(),
             firmware: crate::tests::firmware(),
+            boot: crate::tests::POWER_ON,
         },
         ..Model::default()
     };
     model.wifi.phase = Phase::Leasing {
         target: Target::Cached(HALL),
         access_point: HALL,
+        rssi: Some(-55),
         had_address: true,
         kept: false,
     };
@@ -1292,7 +1322,7 @@ fn a_stale_address_on_a_link_that_is_not_suspect_writes_no_line() {
 
     let leased = Event::Wifi(wifi::Event::Leased {
         radio: 9,
-        lease: Lease::Leased,
+        lease: Lease::Leased { ip: IP },
     });
     let mut cmd = Dashboard.update(leased, &mut model);
     let lines: Vec<Effect> = cmd
@@ -1310,6 +1340,7 @@ fn a_scan_with_no_signal_for_the_current_access_point_stays() {
         startup: crate::Startup::Started {
             settings: settings(),
             firmware: crate::tests::firmware(),
+            boot: crate::tests::POWER_ON,
         },
         ..Model::default()
     };
@@ -1757,6 +1788,10 @@ fn a_wake_scan_with_no_better_access_point_keeps_no_line() {
         ]
     );
     // The line is not in the ring, and it does not go to Home Assistant.
+    // Only the start line went.
     assert_eq!(shell.model.logs.lines().len(), 0);
-    assert_eq!(published_lines(&shell), Vec::new());
+    assert_eq!(
+        published_lines(&shell),
+        [("info".into(), "started after a power-on".into())]
+    );
 }

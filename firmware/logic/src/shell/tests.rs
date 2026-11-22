@@ -7,7 +7,7 @@ use core::{
 
 use embedded_graphics::prelude::Point;
 use shared::{
-    Cmd, Connection, Effect, Event, Firmware, PowerSource,
+    Boot, BootLine, Cmd, Connection, Effect, Event, Firmware, PowerSource, ResetReason,
     capabilities::{
         log::{self, Area, Level, Log, Uptime},
         power::Wake,
@@ -422,6 +422,11 @@ fn started(power: PowerSource, read_only: bool) -> (Device, Vec<Job>) {
     let start = start(
         &config,
         firmware(),
+        Boot {
+            reset: ResetReason::PowerOn,
+            restarts: 0,
+        },
+        Vec::new(),
         power,
         Some("/room/living_room".into()),
         None,
@@ -1014,7 +1019,7 @@ fn a_close_ends_at_the_end_of_its_stream() {
     };
     assert_eq!(device.handle(late), Vec::new());
     let jobs = device.closed(FIRST, "closed");
-    assert_eq!(names(&jobs), ["wifi off", "start timer 14"]);
+    assert_eq!(names(&jobs), ["wifi off", "start timer 15"]);
 }
 
 #[test]
@@ -1058,7 +1063,26 @@ fn a_timer_that_the_core_clears_cancels_its_task_and_the_count_does_not_grow() {
 
 #[test]
 fn start_has_the_settings_of_the_config() {
-    let start = start(&CONFIG, firmware(), PowerSource::Stand, None, Some(5));
+    let boot = Boot {
+        reset: ResetReason::Watchdog,
+        restarts: 2,
+    };
+    let lines = vec![BootLine {
+        level: Kept::Warn,
+        source: "wifi".into(),
+        message: "restart the chip: no address after 3 joins".into(),
+    }];
+    let start = start(
+        &CONFIG,
+        firmware(),
+        boot,
+        lines.clone(),
+        PowerSource::Stand,
+        None,
+        Some(5),
+    );
+    assert_eq!(start.boot, boot);
+    assert_eq!(start.before_restart, lines);
     assert_eq!(start.settings.host, "broker");
     assert_eq!(start.settings.port, 1883);
     assert_eq!(start.settings.device_id, "test");
@@ -1072,7 +1096,15 @@ fn start_has_the_settings_of_the_config() {
         mqtt_username: "",
         ..CONFIG
     };
-    let start = super::start(&anonymous, firmware(), PowerSource::Stand, None, None);
+    let start = super::start(
+        &anonymous,
+        firmware(),
+        boot,
+        Vec::new(),
+        PowerSource::Stand,
+        None,
+        None,
+    );
     assert_eq!(start.settings.credentials, None);
 }
 
@@ -1119,7 +1151,9 @@ fn an_answer_with_an_unknown_token_or_of_another_kind_is_dropped() {
     // Job 1 is a join, so a lease is not its answer. The join still waits.
     let wrong = Signal::Radio {
         token: 1,
-        answer: RadioAnswer::Lease(Lease::Leased),
+        answer: RadioAnswer::Lease(Lease::Leased {
+            ip: [192, 168, 1, 50],
+        }),
     };
     assert_eq!(device.handle(wrong), Vec::new());
     let jobs = device.link();
@@ -1244,7 +1278,7 @@ fn each_step_of_the_sleep_waits_for_the_answer_of_its_task() {
     // time limit.
     device.broker.drop_connection();
     let jobs = device.closed(FIRST, "closed");
-    assert_eq!(names(&jobs), ["wifi off", "start timer 14"]);
+    assert_eq!(names(&jobs), ["wifi off", "start timer 15"]);
     // The broker keeps `asleep`, because the client sent a DISCONNECT.
     assert_eq!(
         device.broker.retained("dashboard/test/status"),
@@ -1747,4 +1781,17 @@ fn only_an_event_from_a_task_needs_an_ack() {
     assert!(!Signal::Woke(Wake::Timer).needs_ack());
     assert!(!Signal::Tap(ui::layout::next().center()).needs_ack());
     assert!(!Signal::Light { token: 1 }.needs_ack());
+}
+
+#[test]
+fn the_connack_gives_a_render_job_with_the_view_online() {
+    // The core task resets the count of panics in a row when a `Render`
+    // job shows `Online`. Refer to `crate::boot::Rtc::connected`.
+    let (mut device, _) = started(PowerSource::Stand, false);
+    device.link();
+    let jobs = device.connect(FIRST);
+    let online = jobs
+        .iter()
+        .any(|job| matches!(job, Job::Render(view) if view.connection == Connection::Online));
+    assert!(online, "{:?}", names(&jobs));
 }

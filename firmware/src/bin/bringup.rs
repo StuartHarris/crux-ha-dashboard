@@ -37,7 +37,7 @@ use logic::{
     shell::{Job, Shell},
     touch::{Sample, Tapper, TouchMap},
 };
-use shared::{Event, PowerSource};
+use shared::{Boot, Event, PowerSource, ResetReason};
 use static_cell::StaticCell;
 use ui::Framebuffer;
 
@@ -135,7 +135,22 @@ async fn main(spawner: Spawner) -> ! {
         read_only: true,
         ..config::CONFIG
     };
-    let start = logic::shell::start(&dry_run, board::firmware(), PowerSource::Stand, None, None);
+    // The bring-up does not read the memory that a reset keeps, so the
+    // lines from before a restart stay for the dashboard. The core gets the
+    // facts of a power-on.
+    let boot = Boot {
+        reset: ResetReason::PowerOn,
+        restarts: 0,
+    };
+    let start = logic::shell::start(
+        &dry_run,
+        board::firmware(),
+        boot,
+        alloc::vec::Vec::new(),
+        PowerSource::Stand,
+        None,
+        None,
+    );
     let view = shell
         .send(Event::Start(start))
         .into_iter()

@@ -53,13 +53,17 @@ esp-bootloader-esp-idf = { version = "0.6.0", features = ["esp32s3"] }
 # the GPS header on this board. The logger of the firmware (`src/logger.rs`)
 # prints with `println!`, so the logger of esp-println is not used.
 esp-println = { version = "0.18.0", default-features = false, features = ["esp32s3", "jtag-serial", "critical-section"] }
-esp-backtrace = { version = "0.20.0", features = ["esp32s3", "panic-handler", "println"] }
+# `custom-halt` calls `boot::custom_halt` at the end of a panic, which
+# restarts the chip. Refer to `src/boot.rs`.
+esp-backtrace = { version = "0.20.0", features = ["esp32s3", "panic-handler", "println", "custom-halt"] }
 
 embassy-executor = "0.10.0"
 embassy-time = "0.5.1"
 embassy-sync = "0.8.0"
 # The light sleep runs in a critical section (`display::Sleep`).
 critical-section = "1.2.0"
+# Atomics that esp-hal accepts in RTC memory that a reset keeps (`src/boot.rs`).
+portable-atomic = { version = "1.15", default-features = false }
 embassy-futures = "0.1.2"
 embassy-net = { version = "0.9.1", features = ["dhcpv4", "medium-ethernet", "tcp", "dns", "proto-ipv4"] }
 static_cell = "2.1.1"

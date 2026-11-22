@@ -64,6 +64,15 @@
 //! or the timer of an older sleep, and an answer in `Steps` or `Held`.
 //! `BatteryChanged`, `PowerRead` and `SleepNow` do not change the sleep.
 //!
+//! # The wake reason
+//!
+//! The core keeps what woke the device last ([`WakeReason`]) and publishes
+//! it in the state message. `Start` sets `Boot`. A touch wake, or a tap in
+//! the steps of a sleep or in a hold, sets `Touch` ([`wake_up`]). A move to
+//! the stand while the device is asleep sets `Stand`. The checks of
+//! [`CHECK_PERIOD`] and the wakes with no cause keep the device asleep, so
+//! they do not change it.
+//!
 //! # Lines of the log
 //!
 //! At the start of each step, the core writes a `Debug` line through the
@@ -179,6 +188,27 @@ pub struct State {
     /// The id of the newest sleep. The core takes a new id for each sleep,
     /// and ignores the answers of an older one.
     pub sleep: u32,
+    /// What woke the device last. Refer to [`WakeReason`].
+    wake: WakeReason,
+}
+
+/// What woke the device last. The core publishes it in the state message.
+/// Refer to [`device`].
+///
+/// Only a wake of the device changes it. The check of the power source
+/// after [`CHECK_PERIOD`] and a wake with no cause keep the device asleep,
+/// so they do not change it. A move to the stand while the device is awake
+/// does not change it either.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WakeReason {
+    /// The chip started (`Start`), and the device did not sleep since.
+    #[default]
+    Boot,
+    /// A touch woke the device: a touch wake of the `Sleep` request, or a
+    /// tap in the steps of a sleep or after a wake with no cause.
+    Touch,
+    /// A move to the stand woke the device.
+    Stand,
 }
 
 /// The power phase. Each phase holds only the data that is valid in it.
@@ -273,6 +303,12 @@ impl State {
         }
     }
 
+    /// Returns what woke the device last.
+    #[must_use]
+    pub const fn wake(&self) -> WakeReason {
+        self.wake
+    }
+
     /// Returns `true` if the device is asleep, or in the steps before the
     /// sleep.
     #[must_use]
@@ -300,6 +336,7 @@ impl State {
             },
             idle: 0,
             sleep,
+            wake: WakeReason::Boot,
         }
     }
 
@@ -316,6 +353,7 @@ impl State {
             },
             idle: 0,
             sleep,
+            wake: WakeReason::Boot,
         }
     }
 
@@ -469,10 +507,12 @@ const fn awake_on(source: PowerSource) -> Phase {
 /// Sets the power phase for `Start` on `source`. The device is awake.
 ///
 /// The core clears the idle timer or the hold timer that runs, and ignores
-/// the answers of a sleep that `Start` ended. Returns the line with the
-/// number of wakes with no cause in that sleep, if there was more than one.
-/// The caller then starts the idle timer with [`restart_idle_timer`].
+/// the answers of a sleep that `Start` ended. The wake reason is
+/// [`WakeReason::Boot`]. Returns the line with the number of wakes with no
+/// cause in that sleep, if there was more than one. The caller then starts
+/// the idle timer with [`restart_idle_timer`].
 pub fn reset(source: PowerSource, model: &mut Model) -> Cmd {
+    model.power.wake = WakeReason::Boot;
     model.power.wake_to(awake_on(source))
 }
 
@@ -598,8 +638,8 @@ pub fn radio_off(id: u32, model: &mut Model) -> Cmd {
         .and(sleep_request(id))
 }
 
-/// Wakes the device from a sleep, or from the steps before it, and connects
-/// again.
+/// Wakes the device from a sleep, or from the steps before it, after a
+/// touch, and connects again. The wake reason is [`WakeReason::Touch`].
 ///
 /// The caller makes sure that the device is asleep. If the device stays
 /// awake after a wake with no cause, the core clears the hold timer.
@@ -608,6 +648,7 @@ pub fn wake_up(model: &mut Model) -> Cmd {
         model.power.is_asleep(),
         "only a device that sleeps can wake"
     );
+    model.power.wake = WakeReason::Touch;
     let summary = model.power.wake_to(awake_on(PowerSource::Battery));
     connection::restart(model);
     summary
@@ -617,6 +658,9 @@ pub fn wake_up(model: &mut Model) -> Cmd {
 }
 
 /// The device moved to the stand or off the stand.
+///
+/// If the device was asleep, the move to the stand wakes it, and the wake
+/// reason is [`WakeReason::Stand`].
 ///
 /// The core publishes the new power source in the state message. On the
 /// stand, [`connection::go_online`] publishes it, or the next connection
@@ -628,6 +672,9 @@ pub fn source_changed(source: PowerSource, model: &mut Model) -> Cmd {
     match source {
         PowerSource::Stand => {
             let was_asleep = model.power.is_asleep();
+            if was_asleep {
+                model.power.wake = WakeReason::Stand;
+            }
             // The device stays awake on the stand, so it needs no idle
             // timer. `enter` clears the idle timer or the hold timer that
             // runs.
