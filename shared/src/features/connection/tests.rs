@@ -21,6 +21,7 @@ use crate::{
     },
     features::{
         connection::{self, CLOSE_TIMEOUT, Call, Link, RECONNECT_MAX, RECONNECT_MIN},
+        light, power,
         refresh::DRAW_DELAY,
         wifi::{JOIN_TIMEOUT, Phase},
     },
@@ -1054,6 +1055,51 @@ fn a_link_while_the_old_stream_drains_opens_no_stream() {
         .count();
     assert_eq!(opens, 0);
     assert_ne!(Dashboard.view(&model).connection, Connection::Online);
+}
+
+/// A link while the old stream drains after a failure makes the core
+/// connect at the answer to the `Close` request. It does not wait for the
+/// end of the backoff.
+#[test]
+fn a_link_while_the_old_stream_drains_connects_at_the_answer_to_the_close() {
+    let (mut model, mut dropped) = drive_to_a_drain_after_a_failure();
+    let _ = connection::link_up(&mut model);
+
+    // The link is suspect, so the core leaves and joins again at once.
+    let mut answer = answer_the_close(&mut dropped, &mut model);
+    let radio = answer.effects().filter(is_radio).count();
+    assert_eq!(radio, 1);
+}
+
+/// A sleep during the close for a change of access point replaces the
+/// reconnect. The answer to the `Close` request continues the sleep, and
+/// the core does not connect again.
+#[test]
+fn a_sleep_during_the_close_for_a_roam_goes_on_at_the_answer_to_the_close() {
+    let (mut model, mut wire) = drive_to_connected(PowerSource::Battery);
+    // The DISCONNECT of the roam waits for the answer to its `Write`.
+    let roam = connection::close_for_roam(&mut model);
+    assert!(!light::is_on(&model));
+    let sleep = Dashboard.update(Event::SleepNow, &mut model);
+    assert!(model.power.is_asleep());
+    let id = model.power.sleep;
+
+    wire.settle(roam, &mut model);
+    wire.settle(sleep, &mut model);
+    assert!(
+        wire.events
+            .contains(&Event::Power(power::Event::Offline(id))),
+        "{:?}",
+        wire.events
+    );
+    assert!(
+        !wire
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::StreamOpen(_)) || is_radio(effect)),
+        "{:?}",
+        wire.effects
+    );
 }
 
 /// A state message after the stream opened and before the CONNACK

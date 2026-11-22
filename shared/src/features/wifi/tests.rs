@@ -691,6 +691,9 @@ fn a_stuck_driver_restarts_the_chip_after_3_joins_with_no_address() {
     );
     assert_eq!(shell.restarts, ["no address after 3 joins"]);
     assert_eq!(shell.model.wifi.phase, Phase::Restarting);
+    // The connection has no stream at the restart, so the restart needs
+    // no clean close: the session before it already failed.
+    assert!(!shell.model.connection.has_stream());
     assert_eq!(
         shell.take_logs(),
         [
