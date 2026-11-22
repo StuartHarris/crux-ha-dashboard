@@ -462,6 +462,16 @@ impl Shell {
         self.timers.iter().filter(|timer| timer.session).count()
     }
 
+    /// Returns the durations of the timers that wait and are not timers of
+    /// the MQTT session, in the order in which the core started them.
+    pub fn waiting(&self) -> Vec<Duration> {
+        self.timers
+            .iter()
+            .filter(|timer| !timer.session)
+            .map(|timer| Duration::from(timer.request.operation.duration))
+            .collect()
+    }
+
     /// Returns the log and clears it, so that a test can check the effects
     /// of the next step.
     pub fn take_log(&mut self) -> Vec<String> {

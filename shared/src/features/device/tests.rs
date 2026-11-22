@@ -9,9 +9,9 @@ use core::time::Duration;
 
 use serde_json::{Value, json};
 
-use super::{BIRTH_ONLINE, BIRTH_TOPIC, IN_FLIGHT, Snapshot, discovery};
+use super::{BIRTH_ONLINE, BIRTH_TOPIC, IN_FLIGHT, STATE_MIN_INTERVAL, Snapshot, discovery};
 use crate::{
-    Event, PowerSource,
+    Charge, Event, PowerSource, Reading,
     capabilities::{
         log::{Area, Uptime},
         power::Wake,
@@ -22,7 +22,7 @@ use crate::{
         power::IDLE_TIMEOUT,
     },
     mqtt::{Qos, codec::server::Packet},
-    tests::{broker::publish_of, firmware, flows::house, settings, shell::Shell, start},
+    tests::{broker::publish_of, firmware, flows::house, settings, shell::Shell, start, state},
 };
 
 /// The discovery topic of the test settings.
@@ -37,6 +37,22 @@ const STATUS: &str = "dashboard/hall/status";
 /// The log topic of the test settings.
 const LOG: &str = "dashboard/hall/log";
 
+/// A reading on battery.
+const ON_BATTERY: Reading = Reading {
+    charge: Some(Charge::NotCharging),
+    voltage_mv: Some(3870),
+    current_ma: Some(-40),
+    tenth_celsius: Some(245),
+};
+
+/// A reading on the stand, in a fast charge.
+const CHARGING: Reading = Reading {
+    charge: Some(Charge::FastCharging),
+    voltage_mv: Some(4150),
+    current_ma: Some(450),
+    tenth_celsius: Some(260),
+};
+
 /// The discovery payload for the test settings and firmware.
 const DISCOVERY_JSON: &str = concat!(
     r#"{"dev":{"ids":"dashboard_hall","name":"Dashboard hall","mf":"LilyGo","#,
@@ -44,7 +60,8 @@ const DISCOVERY_JSON: &str = concat!(
     r#""o":{"name":"crux-ha-dashboard","sw":"0.1.0+test"},"#,
     r#""cmps":{"#,
     r#""status":{"p":"sensor","name":"Status","uniq_id":"dashboard_hall_status","#,
-    r#""dev_cla":"enum","ops":["online","asleep","offline"],"stat_t":"dashboard/hall/status"},"#,
+    r#""dev_cla":"enum","ic":"mdi:tablet-dashboard","ops":["online","asleep","offline"],"#,
+    r#""stat_t":"dashboard/hall/status"},"#,
     r#""battery":{"p":"sensor","name":"Battery","uniq_id":"dashboard_hall_battery","#,
     r#""dev_cla":"battery","unit_of_meas":"%","stat_cla":"measurement","#,
     r#""stat_t":"dashboard/hall/state","val_tpl":"{{ value_json.battery }}","#,
@@ -53,7 +70,40 @@ const DISCOVERY_JSON: &str = concat!(
     r#""stand":{"p":"binary_sensor","name":"On stand","uniq_id":"dashboard_hall_stand","#,
     r#""dev_cla":"plug","stat_t":"dashboard/hall/state","val_tpl":"{{ value_json.stand }}","#,
     r#""avty_t":"dashboard/hall/status","#,
-    r#""avty_tpl":"{{ 'offline' if value == 'offline' else 'online' }}"}}}"#,
+    r#""avty_tpl":"{{ 'offline' if value == 'offline' else 'online' }}"},"#,
+    r#""charging":{"p":"binary_sensor","name":"Charging","uniq_id":"dashboard_hall_charging","#,
+    r#""dev_cla":"battery_charging","stat_t":"dashboard/hall/state","#,
+    r#""val_tpl":"{{ value_json.charging }}","avty_t":"dashboard/hall/status","#,
+    r#""avty_tpl":"{{ 'offline' if value == 'offline' else 'online' }}","#,
+    r#""ent_cat":"diagnostic"},"#,
+    r#""charge":{"p":"sensor","name":"Charge state","uniq_id":"dashboard_hall_charge","#,
+    r#""dev_cla":"enum","ic":"mdi:battery-charging-outline","#,
+    r#""ops":["Not charging","Pre-charging","Fast charging","Done"],"#,
+    r#""stat_t":"dashboard/hall/state","val_tpl":""#,
+    r#"{{ {'not_charging': 'Not charging', 'pre_charging': 'Pre-charging', "#,
+    r#"'fast_charging': 'Fast charging', 'done': 'Done'}[value_json.charge] | default(None) }}","#,
+    r#""avty_t":"dashboard/hall/status","#,
+    r#""avty_tpl":"{{ 'offline' if value == 'offline' else 'online' }}","#,
+    r#""ent_cat":"diagnostic"},"#,
+    r#""voltage":{"p":"sensor","name":"Battery voltage","uniq_id":"dashboard_hall_voltage","#,
+    r#""dev_cla":"voltage","ic":"mdi:flash-triangle-outline","unit_of_meas":"mV","stat_cla":"measurement","#,
+    r#""stat_t":"dashboard/hall/state","val_tpl":"{{ value_json.voltage }}","#,
+    r#""avty_t":"dashboard/hall/status","#,
+    r#""avty_tpl":"{{ 'offline' if value == 'offline' else 'online' }}","#,
+    r#""ent_cat":"diagnostic"},"#,
+    r#""current":{"p":"sensor","name":"Battery current","uniq_id":"dashboard_hall_current","#,
+    r#""dev_cla":"current","ic":"mdi:current-dc","unit_of_meas":"mA","stat_cla":"measurement","#,
+    r#""stat_t":"dashboard/hall/state","val_tpl":"{{ value_json.current }}","#,
+    r#""avty_t":"dashboard/hall/status","#,
+    r#""avty_tpl":"{{ 'offline' if value == 'offline' else 'online' }}","#,
+    r#""ent_cat":"diagnostic"},"#,
+    r#""temperature":{"p":"sensor","name":"Gauge temperature","#,
+    r#""uniq_id":"dashboard_hall_temperature","#,
+    r#""dev_cla":"temperature","unit_of_meas":"°C","stat_cla":"measurement","#,
+    r#""stat_t":"dashboard/hall/state","val_tpl":"{{ value_json.temperature }}","#,
+    r#""avty_t":"dashboard/hall/status","#,
+    r#""avty_tpl":"{{ 'offline' if value == 'offline' else 'online' }}","#,
+    r#""ent_cat":"diagnostic"}}}"#,
 );
 
 // The payloads.
@@ -84,11 +134,16 @@ fn the_discovery_message_is_json_with_the_keys_and_under_4_kib() {
     );
 
     let components = config["cmps"].as_object().expect("components");
-    assert_eq!(components.len(), 3);
+    assert_eq!(components.len(), 8);
     for (key, platform, class) in [
         ("status", "sensor", "enum"),
         ("battery", "sensor", "battery"),
         ("stand", "binary_sensor", "plug"),
+        ("charging", "binary_sensor", "battery_charging"),
+        ("charge", "sensor", "enum"),
+        ("voltage", "sensor", "voltage"),
+        ("current", "sensor", "current"),
+        ("temperature", "sensor", "temperature"),
     ] {
         let component = &components[key];
         assert_eq!(component["p"], platform, "{key}");
@@ -102,23 +157,136 @@ fn the_discovery_message_is_json_with_the_keys_and_under_4_kib() {
         status.get("avty_t").is_none(),
         "the status has no availability"
     );
-    for key in ["battery", "stand"] {
+    for key in [
+        "battery",
+        "stand",
+        "charging",
+        "charge",
+        "voltage",
+        "current",
+        "temperature",
+    ] {
         let component = &components[key];
         assert_eq!(component["stat_t"], STATE, "{key}");
-        assert_eq!(component["val_tpl"], format!("{{{{ value_json.{key} }}}}"));
+        if key != "charge" {
+            assert_eq!(component["val_tpl"], format!("{{{{ value_json.{key} }}}}"));
+        }
         assert_eq!(component["avty_t"], STATUS, "{key}");
+        assert_eq!(
+            component["avty_tpl"],
+            "{{ 'offline' if value == 'offline' else 'online' }}"
+        );
     }
-    assert_eq!(components["battery"]["unit_of_meas"], "%");
-    assert_eq!(components["battery"]["stat_cla"], "measurement");
+    for (key, unit) in [
+        ("battery", "%"),
+        ("voltage", "mV"),
+        ("current", "mA"),
+        ("temperature", "°C"),
+    ] {
+        assert_eq!(components[key]["unit_of_meas"], unit, "{key}");
+        assert_eq!(components[key]["stat_cla"], "measurement", "{key}");
+    }
+    // The power diagnostics are in the diagnostic category. The status,
+    // the battery and the stand are not.
+    for key in ["charging", "charge", "voltage", "current", "temperature"] {
+        assert_eq!(components[key]["ent_cat"], "diagnostic", "{key}");
+    }
+    for key in ["status", "battery", "stand"] {
+        assert!(components[key].get("ent_cat").is_none(), "{key}");
+    }
+    // The charge shows labels, and its template maps the snake_case wire
+    // values to them. A null or unknown value gives `None`.
+    assert_eq!(
+        components["charge"]["ops"],
+        json!(["Not charging", "Pre-charging", "Fast charging", "Done"])
+    );
+    assert_eq!(
+        components["charge"]["val_tpl"],
+        "{{ {'not_charging': 'Not charging', 'pre_charging': 'Pre-charging', \
+         'fast_charging': 'Fast charging', 'done': 'Done'}[value_json.charge] \
+         | default(None) }}"
+    );
+    // Only these components set an icon. The others keep the icon of their
+    // device class.
+    for (key, icon) in [
+        ("status", Some("mdi:tablet-dashboard")),
+        ("battery", None),
+        ("stand", None),
+        ("charging", None),
+        ("charge", Some("mdi:battery-charging-outline")),
+        ("voltage", Some("mdi:flash-triangle-outline")),
+        ("current", Some("mdi:current-dc")),
+        ("temperature", None),
+    ] {
+        assert_eq!(
+            components[key].get("ic").and_then(Value::as_str),
+            icon,
+            "{key}"
+        );
+    }
 }
 
 #[test]
 fn the_state_message_has_the_exact_json() {
-    let text = |battery, stand| String::from_utf8(Snapshot { battery, stand }.to_json()).unwrap();
-    assert_eq!(text(Some(95), false), r#"{"battery":95,"stand":"OFF"}"#);
-    assert_eq!(text(Some(100), true), r#"{"battery":100,"stand":"ON"}"#);
-    // The shell did not read the battery.
-    assert_eq!(text(None, true), r#"{"battery":null,"stand":"ON"}"#);
+    let text = |battery, stand, reading| {
+        String::from_utf8(
+            Snapshot {
+                battery,
+                stand,
+                reading,
+            }
+            .to_json(),
+        )
+        .unwrap()
+    };
+    // On battery, with a full reading.
+    assert_eq!(
+        text(Some(95), false, ON_BATTERY),
+        concat!(
+            r#"{"battery":95,"stand":"OFF","charging":"OFF","charge":"not_charging","#,
+            r#""voltage":3870,"current":-40,"temperature":24.5}"#
+        )
+    );
+    // On the stand, in a fast charge. A whole degree has one decimal.
+    assert_eq!(
+        text(Some(100), true, CHARGING),
+        concat!(
+            r#"{"battery":100,"stand":"ON","charging":"ON","charge":"fast_charging","#,
+            r#""voltage":4150,"current":450,"temperature":26.0}"#
+        )
+    );
+    // A pre-charge is a charge. A done charge is not.
+    let phase = |charge| {
+        let json: Value = serde_json::from_str(&text(
+            None,
+            true,
+            Reading {
+                charge: Some(charge),
+                ..Reading::default()
+            },
+        ))
+        .unwrap();
+        (json["charging"].clone(), json["charge"].clone())
+    };
+    assert_eq!(
+        phase(Charge::PreCharging),
+        (json!("ON"), json!("pre_charging"))
+    );
+    assert_eq!(phase(Charge::Done), (json!("OFF"), json!("done")));
+    // A temperature below 0 °C.
+    let cold = Reading {
+        tenth_celsius: Some(-15),
+        ..Reading::default()
+    };
+    assert!(text(None, false, cold).ends_with(r#""temperature":-1.5}"#));
+    // The shell did not read the battery or the diagnostics.
+    assert_eq!(
+        text(None, true, Reading::default()),
+        concat!(
+            r#"{"battery":null,"stand":"ON","charging":null,"charge":null,"#,
+            r#""voltage":null,"current":null,"temperature":null}"#
+        )
+    );
 }
 
 // The flows.
@@ -195,7 +363,7 @@ fn the_discovery_and_the_state_are_retained_at_qos_1() {
     assert_eq!(shell.broker.retained(CONFIG), Some(DISCOVERY_JSON));
     assert_eq!(
         shell.broker.retained(STATE),
-        Some(r#"{"battery":null,"stand":"ON"}"#)
+        Some(state("null", "ON").as_str())
     );
 }
 
@@ -301,7 +469,7 @@ fn a_session_that_ends_with_the_discovery_in_flight_sends_it_again() {
 fn the_state_goes_on_each_connection_and_after_each_change() {
     let mut shell = house();
     shell.send(start(PowerSource::Stand));
-    assert_eq!(on(&shell, STATE), [r#"{"battery":null,"stand":"ON"}"#]);
+    assert_eq!(on(&shell, STATE), [state("null", "ON")]);
 
     shell.send(Event::BatteryChanged(Some(95)));
     shell.send(Event::PowerSourceChanged(PowerSource::Battery));
@@ -313,12 +481,12 @@ fn the_state_goes_on_each_connection_and_after_each_change() {
     assert_eq!(
         on(&shell, STATE),
         [
-            r#"{"battery":null,"stand":"ON"}"#,
-            r#"{"battery":95,"stand":"ON"}"#,
-            r#"{"battery":95,"stand":"OFF"}"#,
+            state("null", "ON"),
+            state("95", "ON"),
+            state("95", "OFF"),
             // The new connection.
-            r#"{"battery":95,"stand":"OFF"}"#,
-            r#"{"battery":95,"stand":"ON"}"#,
+            state("95", "OFF"),
+            state("95", "ON"),
         ]
     );
 }
@@ -340,20 +508,14 @@ fn a_change_while_the_state_is_in_flight_goes_after_the_puback() {
     shell.broker.release_pubacks();
     shell.broker.flush();
     shell.run();
-    assert_eq!(
-        on(&shell, STATE),
-        [
-            r#"{"battery":null,"stand":"ON"}"#,
-            r#"{"battery":59,"stand":"ON"}"#,
-        ]
-    );
+    assert_eq!(on(&shell, STATE), [state("null", "ON"), state("59", "ON"),]);
 }
 
 #[test]
 fn nothing_goes_while_the_device_sleeps() {
     let mut shell = house();
     shell.send(start(PowerSource::Battery));
-    let states = on(&shell, STATE).len();
+    let before = on(&shell, STATE).len();
 
     // A tap turns the light on, so the first step of the sleep waits for the
     // light while the connection is still up.
@@ -364,9 +526,10 @@ fn nothing_goes_while_the_device_sleeps() {
     assert_eq!(shell.model.connection.link(), Link::Up);
     let writes = shell.writes.len();
 
-    // A change of the battery and a birth message in that step send
-    // nothing.
+    // A change of the battery, a power reading and a birth message in that
+    // step send nothing.
     shell.send(Event::BatteryChanged(Some(40)));
+    shell.send(Event::PowerRead(ON_BATTERY));
     birth(&mut shell, BIRTH_ONLINE);
     assert_eq!(shell.writes.len(), writes);
 
@@ -375,17 +538,18 @@ fn nothing_goes_while_the_device_sleeps() {
     shell.answer_lights();
     assert!(shell.sleep.is_some());
     shell.send(Event::BatteryChanged(Some(39)));
-    assert_eq!(on(&shell, STATE).len(), states);
+    assert_eq!(on(&shell, STATE).len(), before);
     assert_eq!(discoveries(&shell), 1);
 
     // The wake sends the state, and the discovery that the birth made due.
     shell.advance(Duration::from_secs(60));
     shell.wake(Wake::Touch(None));
     assert_eq!(shell.model.connection.link(), Link::Up);
-    assert_eq!(
-        on(&shell, STATE)[states..],
-        [r#"{"battery":39,"stand":"OFF"}"#]
-    );
+    let sent = &states(&shell)[before..];
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0]["battery"], 39);
+    assert_eq!(sent[0]["stand"], "OFF");
+    assert_eq!(sent[0]["current"], -40);
     assert_eq!(discoveries(&shell), 2);
 }
 
@@ -444,7 +608,7 @@ fn all_device_publishes_share_one_limit_that_leaves_the_reserved_places() {
     assert_eq!(on(&shell, LOG).len(), logs::CAPACITY);
     assert_eq!(
         on(&shell, STATE).last().map(String::as_str),
-        Some(r#"{"battery":70,"stand":"ON"}"#)
+        Some(state("70", "ON").as_str())
     );
     assert_eq!(shell.model.logs.lines().len(), 0);
 }
@@ -498,5 +662,287 @@ fn a_dry_run_publishes_no_discovery_and_no_state() {
     // The end of the dry run sends the discovery and the state.
     shell.send(Event::SetReadOnly(false));
     assert_eq!(discoveries(&shell), 1);
-    assert_eq!(on(&shell, STATE), [r#"{"battery":80,"stand":"ON"}"#]);
+    assert_eq!(on(&shell, STATE), [state("80", "ON")]);
+}
+
+// The throttle of the state message.
+
+/// Returns each state message that the broker got, as JSON.
+fn states(shell: &Shell) -> Vec<Value> {
+    on(shell, STATE)
+        .iter()
+        .map(|payload| serde_json::from_str(payload).unwrap())
+        .collect()
+}
+
+/// Returns the value of `key` in each state message that the broker got.
+fn state_values(shell: &Shell, key: &str) -> Vec<Value> {
+    states(shell)
+        .iter()
+        .map(|state| state[key].clone())
+        .collect()
+}
+
+/// Returns `CHARGING` with the voltage `millivolts`.
+const fn charging_at(millivolts: u16) -> Reading {
+    Reading {
+        voltage_mv: Some(millivolts),
+        ..CHARGING
+    }
+}
+
+/// Returns `true` if the timer of the throttle window waits.
+fn window_waits(shell: &Shell) -> bool {
+    shell.waiting().contains(&STATE_MIN_INTERVAL)
+}
+
+#[test]
+fn a_change_of_the_stand_or_of_the_charging_goes_at_once() {
+    let mut shell = house();
+    shell.send(start(PowerSource::Stand));
+    // The first reading starts a charge, so it goes at once.
+    shell.send(Event::PowerRead(CHARGING));
+    // A change of only the voltage goes, and the window is throttled. The
+    // next one waits.
+    shell.send(Event::PowerRead(charging_at(4160)));
+    shell.send(Event::PowerRead(charging_at(4170)));
+    assert!(window_waits(&shell));
+    assert_eq!(on(&shell, STATE).len(), 3);
+
+    // The end of the charge goes at once, with the voltage that waits.
+    shell.send(Event::PowerRead(Reading {
+        charge: Some(Charge::Done),
+        ..charging_at(4170)
+    }));
+    // A move off the stand goes at once.
+    shell.send(Event::PowerSourceChanged(PowerSource::Battery));
+
+    assert_eq!(
+        state_values(&shell, "charging"),
+        [
+            Value::Null,
+            json!("ON"),
+            json!("ON"),
+            json!("OFF"),
+            json!("OFF")
+        ]
+    );
+    assert_eq!(
+        state_values(&shell, "voltage"),
+        [
+            Value::Null,
+            json!(4150),
+            json!(4160),
+            json!(4170),
+            json!(4170)
+        ]
+    );
+    assert_eq!(
+        state_values(&shell, "stand"),
+        [
+            json!("ON"),
+            json!("ON"),
+            json!("ON"),
+            json!("ON"),
+            json!("OFF")
+        ]
+    );
+}
+
+#[test]
+fn other_changes_go_at_most_once_in_the_window_and_the_last_one_goes_at_its_end() {
+    let mut shell = house();
+    shell.send(start(PowerSource::Stand));
+    shell.send(Event::PowerRead(CHARGING));
+    assert_eq!(on(&shell, STATE).len(), 2);
+    assert!(!window_waits(&shell), "an urgent change starts no timer");
+
+    // The window is open, so the change goes at once, and the timer starts.
+    shell.send(Event::PowerRead(charging_at(4160)));
+    assert_eq!(on(&shell, STATE).len(), 3);
+    assert!(window_waits(&shell));
+
+    // Each change in the window waits: the current, the temperature, the
+    // voltage, and the phase of the charge in a charge.
+    shell.advance(Duration::from_secs(20));
+    shell.send(Event::PowerRead(Reading {
+        current_ma: Some(460),
+        ..charging_at(4160)
+    }));
+    shell.advance(Duration::from_secs(20));
+    let last = Reading {
+        charge: Some(Charge::PreCharging),
+        voltage_mv: Some(4170),
+        current_ma: Some(460),
+        tenth_celsius: Some(265),
+    };
+    shell.send(Event::PowerRead(last));
+    shell.advance(Duration::from_secs(19));
+    assert_eq!(on(&shell, STATE).len(), 3);
+
+    // The end of the window sends the last values once, and starts a new
+    // timer.
+    shell.advance(Duration::from_secs(1));
+    assert_eq!(on(&shell, STATE).len(), 4);
+    let state = &states(&shell)[3];
+    assert_eq!(state["charge"], "pre_charging");
+    assert_eq!(state["voltage"], 4170);
+    assert_eq!(state["current"], 460);
+    assert_eq!(state["temperature"], 26.5);
+    assert!(window_waits(&shell));
+
+    shell.send(Event::PowerRead(Reading {
+        current_ma: Some(470),
+        ..last
+    }));
+    assert_eq!(on(&shell, STATE).len(), 4);
+    shell.advance(STATE_MIN_INTERVAL);
+    assert_eq!(on(&shell, STATE).len(), 5);
+
+    // A window with no change sends nothing at its end, and starts no new
+    // timer.
+    shell.advance(STATE_MIN_INTERVAL);
+    assert_eq!(on(&shell, STATE).len(), 5);
+    assert!(!window_waits(&shell));
+}
+
+#[test]
+fn a_battery_that_flaps_by_1_goes_at_most_once_in_the_window() {
+    let mut shell = house();
+    shell.send(start(PowerSource::Stand));
+    shell.send(Event::BatteryChanged(Some(50)));
+    // A move of 1% is not urgent. The window is open, so it goes, and the
+    // flaps after it wait.
+    for level in [51, 50, 51, 50] {
+        shell.send(Event::BatteryChanged(Some(level)));
+    }
+    assert_eq!(
+        state_values(&shell, "battery"),
+        [Value::Null, json!(50), json!(51)]
+    );
+
+    // The end of the window sends the level of that time.
+    shell.advance(STATE_MIN_INTERVAL);
+    // A move of more than 1% goes at once, also in the new window.
+    shell.send(Event::BatteryChanged(Some(52)));
+    assert!(window_waits(&shell));
+    assert_eq!(
+        state_values(&shell, "battery"),
+        [Value::Null, json!(50), json!(51), json!(50), json!(52)]
+    );
+}
+
+#[test]
+fn the_window_ends_while_the_state_waits_for_its_puback() {
+    let mut shell = house();
+    shell.send(start(PowerSource::Stand));
+    shell.send(Event::PowerRead(CHARGING));
+    shell.broker.hold_puback = true;
+    shell.send(Event::PowerRead(charging_at(4160)));
+    shell.send(Event::PowerRead(charging_at(4170)));
+    assert_eq!(on(&shell, STATE).len(), 3);
+
+    // The window ends, but the state message waits for its PUBACK.
+    shell.advance(STATE_MIN_INTERVAL);
+    assert_eq!(on(&shell, STATE).len(), 3);
+    assert!(!window_waits(&shell));
+
+    // The PUBACK comes, and the window is open, so the last voltage goes.
+    shell.broker.hold_puback = false;
+    shell.broker.release_pubacks();
+    shell.broker.flush();
+    shell.run();
+    assert_eq!(
+        state_values(&shell, "voltage"),
+        [Value::Null, json!(4150), json!(4160), json!(4170)]
+    );
+}
+
+#[test]
+fn the_sleep_clears_the_window_and_the_wake_sends_the_state_at_once() {
+    let mut shell = house();
+    shell.send(start(PowerSource::Battery));
+    shell.send(Event::PowerRead(ON_BATTERY));
+    shell.send(Event::PowerRead(Reading {
+        current_ma: Some(-50),
+        ..ON_BATTERY
+    }));
+    shell.send(Event::PowerRead(Reading {
+        current_ma: Some(-60),
+        ..ON_BATTERY
+    }));
+    assert!(window_waits(&shell));
+    let sent = on(&shell, STATE).len();
+    shell.take_cleared();
+
+    // The end of the idle time sleeps. The session ends before the `Sleep`
+    // request, and its end clears the timer of the window. The test shell
+    // checks that no timer waits at the `Sleep` request.
+    shell.advance(IDLE_TIMEOUT);
+    assert!(shell.sleep.is_some());
+    assert!(shell.take_cleared().contains(&STATE_MIN_INTERVAL));
+    assert_eq!(shell.timers_at_sleep.last(), Some(&Vec::new()));
+    assert_eq!(on(&shell, STATE).len(), sent);
+
+    // A reading while the device sleeps only changes the model: no state,
+    // no draw, no wake.
+    let frames = shell.frames.len();
+    let writes = shell.writes.len();
+    let asleep = Reading {
+        current_ma: Some(-10),
+        ..ON_BATTERY
+    };
+    shell.send(Event::PowerRead(asleep));
+    assert_eq!(shell.model.power.reading, asleep);
+    assert!(shell.model.power.is_asleep());
+    assert!(shell.sleep.is_some());
+    assert_eq!(shell.frames.len(), frames);
+    assert_eq!(shell.writes.len(), writes);
+
+    // The wake sends the state at once, with the reading of the sleep.
+    shell.wake(Wake::Touch(None));
+    assert_eq!(shell.model.connection.link(), Link::Up);
+    assert_eq!(on(&shell, STATE).len(), sent + 1);
+    assert_eq!(states(&shell)[sent]["current"], -10);
+}
+
+#[test]
+fn a_dry_run_starts_no_window() {
+    let mut shell = house();
+    let mut start = start(PowerSource::Stand);
+    if let Event::Start(start) = &mut start {
+        start.settings.read_only = true;
+    }
+    shell.send(start);
+    shell.send(Event::PowerRead(CHARGING));
+    shell.send(Event::PowerRead(charging_at(4160)));
+    assert_eq!(on(&shell, STATE), Vec::<String>::new());
+    assert!(!window_waits(&shell));
+}
+
+#[test]
+fn a_reading_then_a_source_change_send_two_state_messages() {
+    let mut shell = house();
+    shell.send(start(PowerSource::Stand));
+    shell.send(Event::PowerRead(CHARGING));
+    let before = on(&shell, STATE).len();
+
+    // The plug comes out. The shell sends the new reading first, then the
+    // new source, as the firmware does in one pass. The core publishes at
+    // the end of each event, so the first message has the new charging and
+    // the old stand. The second message waits for the PUBACK of the first.
+    shell.queue(Event::PowerRead(ON_BATTERY));
+    shell.queue(Event::PowerSourceChanged(PowerSource::Battery));
+    shell.run();
+
+    let sent = &states(&shell)[before..];
+    assert_eq!(sent.len(), 2);
+    assert_eq!(
+        (&sent[0]["charging"], &sent[0]["stand"]),
+        (&json!("OFF"), &json!("ON"))
+    );
+    assert_eq!(
+        (&sent[1]["charging"], &sent[1]["stand"]),
+        (&json!("OFF"), &json!("OFF"))
+    );
 }

@@ -32,7 +32,7 @@ use crate::{
     panel::{Scale, Viewport, share},
     screen::Screen,
     settings::Options,
-    shell::{Notifier, Shell, Signal},
+    shell::{Notifier, Shell, Signal, reading},
     stream,
 };
 
@@ -97,6 +97,7 @@ pub fn run(options: Options) -> Result<(), String> {
             let mut shell = Shell::new(handle, notifier, stream::tcp_opener());
             shell.start(settings, power, path);
             shell.send(Event::BatteryChanged(Some(level)));
+            shell.send(Event::PowerRead(reading(power)));
             Ok(Box::new(App::new(shell, signals, power, level)))
         }),
     );

@@ -11,10 +11,10 @@
 //!
 //! The BQ25896 charger and the BQ27220 fuel gauge are on the same bus. Each
 //! [`POWER_POLL`] while the chip is awake, after a touch read or a render,
-//! the task reads the power source and the charge, and sends each change to
-//! the core (`logic::power::PowerMonitor`). While the chip sleeps, the timer
-//! wake of the `Sleep` job reads the charger. The task only reads these
-//! chips. It never writes to them.
+//! the task reads the power source, the charge and the power diagnostics,
+//! and sends each change to the core (`logic::power::PowerMonitor`). While
+//! the chip sleeps, the timer wake of the `Sleep` job reads only the
+//! charger. The task only reads these chips. It never writes to them.
 //!
 //! The task also sets the front light ([`Light`]). The core task writes each
 //! `FrontLight` job in [`LIGHT`]. The task sets the level at the start of
@@ -48,14 +48,15 @@ use logic::{
     backoff::Backoff,
     power::{
         CHARGER_ADDRESS, CHARGER_STATUS, GAUGE_ADDRESS, GAUGE_AVERAGE_CURRENT,
-        GAUGE_STATE_OF_CHARGE, PowerMonitor, current_from_bq27220, level_from_bq27220,
-        source_from_bq25896,
+        GAUGE_STATE_OF_CHARGE, GAUGE_TEMPERATURE, GAUGE_VOLTAGE, PowerMonitor, charge_from_bq25896,
+        current_from_bq27220, level_from_bq27220, source_from_bq25896, tenth_celsius_from_bq27220,
+        voltage_from_bq27220,
     },
     shell::Signal,
     sleep::{Blocker, Cause, Plan, Readiness, Sleeper},
     touch::{Sample, Tapper, TouchMap},
 };
-use shared::{Event, PowerSource, ViewModel, capabilities::power::Wake};
+use shared::{Event, PowerSource, Reading, ViewModel, capabilities::power::Wake};
 use ui::{Framebuffer, Refresh, Refresher};
 
 use crate::{IN_FLIGHT, LIGHT, RENDER, SIGNALS, SLEEP};
@@ -277,7 +278,7 @@ impl Sleep {
         match cause {
             Cause::Touch => {
                 log::info!(
-                    "power: woke by a touch after {slept} ms, average current {} (not verified)",
+                    "power: woke by a touch after {slept} ms, average current {}",
                     Milliamps(current)
                 );
                 // The GT911 holds the point while INT is low. The tap at the
@@ -303,7 +304,7 @@ impl Sleep {
             }
             Cause::Other => {
                 log::info!(
-                    "power: woke with no known cause after {slept} ms, average current {} (not verified)",
+                    "power: woke with no known cause after {slept} ms, average current {}",
                     Milliamps(current)
                 );
                 SIGNALS.push(Signal::Woke(Wake::Other));
@@ -383,19 +384,43 @@ impl core::fmt::Display for Milliamps {
 /// Reads the average current in mA from the BQ27220 fuel gauge. A negative
 /// value is a discharge. Returns `None` if the read fails.
 fn read_average_current(panel: &mut Panel<'static>) -> Option<i16> {
+    read_gauge(panel, GAUGE_AVERAGE_CURRENT).map(current_from_bq27220)
+}
+
+/// Reads two bytes of the BQ27220 fuel gauge from the command `command`.
+/// Returns `None` if the read fails.
+fn read_gauge(panel: &mut Panel<'static>, command: u8) -> Option<[u8; 2]> {
     let mut bytes = [0; 2];
     panel
-        .read_registers(GAUGE_ADDRESS, GAUGE_AVERAGE_CURRENT, &mut bytes)
+        .read_registers(GAUGE_ADDRESS, command, &mut bytes)
         .ok()
-        .map(|()| current_from_bq27220(bytes))
+        .map(|()| bytes)
+}
+
+/// Reads the power diagnostics. `status` is REG0B of the charger, or
+/// `None` if its read failed. A value is `None` if its read fails. The
+/// monitor keeps the last good value then.
+fn read_diagnostics(panel: &mut Panel<'static>, status: Option<u8>) -> Reading {
+    Reading {
+        charge: status.map(charge_from_bq25896),
+        voltage_mv: read_gauge(panel, GAUGE_VOLTAGE).and_then(voltage_from_bq27220),
+        current_ma: read_gauge(panel, GAUGE_AVERAGE_CURRENT).map(current_from_bq27220),
+        tenth_celsius: read_gauge(panel, GAUGE_TEMPERATURE).and_then(tenth_celsius_from_bq27220),
+    }
 }
 
 /// Reads the power source from the BQ25896 charger. Returns `None` if the
 /// read fails. If `warn` is `true`, logs a failure.
 pub fn read_source(panel: &mut Panel<'static>, warn: bool) -> Option<PowerSource> {
+    read_status(panel, warn).map(source_from_bq25896)
+}
+
+/// Reads REG0B of the BQ25896 charger. Returns `None` if the read fails.
+/// If `warn` is `true`, logs a failure.
+fn read_status(panel: &mut Panel<'static>, warn: bool) -> Option<u8> {
     let mut status = [0];
     match panel.read_registers(CHARGER_ADDRESS, CHARGER_STATUS, &mut status) {
-        Ok(()) => Some(source_from_bq25896(status[0])),
+        Ok(()) => Some(status[0]),
         Err(error) => {
             if warn {
                 log::warn!("power: cannot read the BQ25896 ({error:?})");
@@ -464,19 +489,24 @@ impl Power {
             return;
         }
         // The task logs only the first failure in a row of each chip.
-        let source = read_source(panel, !self.charger_failed);
+        let status = read_status(panel, !self.charger_failed);
         let level = read_level(panel, !self.gauge_failed);
-        self.charger_failed = source.is_none();
+        self.charger_failed = status.is_none();
         self.gauge_failed = level.is_none();
-        self.send(source, level, now);
+        let reading = read_diagnostics(panel, status);
+        self.send(status.map(source_from_bq25896), level, Some(reading), now);
     }
 
     /// Reads only the charger now, as the check of the power source during
-    /// a sleep does. Sends a change to the core.
+    /// a sleep does. Sends a change of the source to the core.
+    ///
+    /// The check does not read the charge or the diagnostics. While the
+    /// device sleeps, the core publishes nothing, so the first poll after the
+    /// wake reads them.
     fn check(&mut self, panel: &mut Panel<'static>) {
-        let source = read_source(panel, !self.charger_failed);
-        self.charger_failed = source.is_none();
-        self.send(source, None, Instant::now());
+        let status = read_status(panel, !self.charger_failed);
+        self.charger_failed = status.is_none();
+        self.send(status.map(source_from_bq25896), None, None, Instant::now());
     }
 
     /// Returns `true` if a new power source waits for its second read.
@@ -486,11 +516,19 @@ impl Power {
 
     /// Gives the reads to the monitor, sends each change to the core, and
     /// sets the time of the next read.
-    fn send(&mut self, source: Option<PowerSource>, level: Option<u8>, now: Instant) {
-        for event in self.monitor.update(source, level) {
+    fn send(
+        &mut self,
+        source: Option<PowerSource>,
+        level: Option<u8>,
+        reading: Option<Reading>,
+        now: Instant,
+    ) {
+        // `PowerRead` comes first (`PowerMonitor::poll`).
+        for event in self.monitor.poll(source, level, reading) {
             match &event {
                 Event::PowerSourceChanged(source) => log::info!("power: source {source:?}"),
                 Event::BatteryChanged(Some(level)) => log::info!("power: battery {level}%"),
+                Event::PowerRead(reading) => log::debug!("power: {reading:?}"),
                 _ => {}
             }
             // Count the event first, so the count is never 0 while the

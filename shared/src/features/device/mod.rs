@@ -69,37 +69,64 @@
 //!
 //! # State
 //!
-//! The state message has the values of the sensors as one JSON object, for
-//! example `{"battery":95,"stand":"OFF"}`. It is retained. Refer to
-//! [`Snapshot`].
+//! The state message has the values of the sensors as one JSON object. It
+//! is retained. Refer to [`Snapshot`].
+//!
+//! The state goes once on each connection. After that, the core sorts each
+//! change of the snapshot ([`changed`]) into one of two kinds:
+//!
+//! - An urgent change goes at once: a change of the stand, a start or an
+//!   end of a charge, the first level of the battery, or a level of the
+//!   battery that moves by more than [`BATTERY_FLAP`].
+//! - Each other change goes at most once in [`STATE_MIN_INTERVAL`]: the
+//!   voltage, the current, the temperature, the phase of the charge in a
+//!   charge or out of it, and a level of the battery that moves by
+//!   [`BATTERY_FLAP`]. Thus a value that flaps between two readings cannot
+//!   publish each poll of the shell.
+//!
+//! The [`Window`] is the throttle. While it is `Open`, a change that is
+//! not urgent goes at once, and the core starts a timer of
+//! [`STATE_MIN_INTERVAL`]. The window is then `Throttled`, and each change
+//! that is not urgent waits. When the timer expires, the window is `Open`
+//! again. The snapshot of that time then goes, if it is not equal to the
+//! last one, and the core starts a new timer. An urgent change goes at
+//! once also while the window is `Throttled`, with the values that wait,
+//! and the timer continues.
 //!
 //! | `StateSync` | Event | Next | What the core does |
 //! | --- | --- | --- | --- |
 //! | (none) | a new session | `Unsent` | the queue publishes the snapshot |
-//! | `Unsent` | the session takes it | `InFlight` | nothing |
+//! | `Unsent` | the session takes it | `InFlight`, `Open` | nothing |
 //! | `InFlight` | a value changes | `InFlight` | nothing yet |
-//! | `InFlight` | its PUBACK | `Sent` | the queue publishes again if the snapshot changed |
-//! | `Sent` | a value changes | `Sent` | the queue publishes the new snapshot |
-//! | any | the session ends | (none) | nothing |
+//! | `InFlight` | its PUBACK | `Sent` | the queue publishes if the snapshot is due |
+//! | `Sent` | an urgent change | `InFlight` | the queue publishes it, and the window does not change |
+//! | `Sent`, `Open` | a change that is not urgent | `InFlight`, `Throttled` | the queue publishes it, and the core starts the timer |
+//! | `Sent`, `Throttled` | a change that is not urgent | `Sent`, `Throttled` | nothing yet |
+//! | `Throttled` | the timer expires | `Open` | the queue publishes if the snapshot is due |
+//! | any | the session ends | (none) | the core clears the timer |
 //!
-//! - The state goes once on each connection, and then each time that a
-//!   value in it changes ([`changed`]). At most one state message waits for
-//!   a PUBACK.
+//! - At most one state message waits for a PUBACK.
 //! - While the device sleeps, the queue publishes nothing. The next
 //!   connection publishes the state.
+//! - The timer ends with the session. Each sleep closes the session before
+//!   its first `Sleep` request, so no timer of the throttle waits in a
+//!   sleep. A timer of the core cannot wake the chip, and the next
+//!   connection publishes the state at once.
 
 mod discovery;
 
 use alloc::vec::Vec;
-use core::mem;
+use core::{mem, time::Duration};
 
 use serde::Serialize;
 
 use crate::{
     Cmd, Model, PowerSource,
+    capabilities::power::{Charge, Reading},
     features::{
         connection::{self, Link},
         logs,
+        timer::Running,
     },
     mqtt::{MAX_IN_FLIGHT, Message, PacketId, Publish, Qos, Refused},
 };
@@ -125,11 +152,46 @@ pub const BIRTH_TOPIC: &str = "homeassistant/status";
 /// The payload of the birth message when Home Assistant starts.
 pub const BIRTH_ONLINE: &str = "online";
 
+/// The shortest time between two state messages for changes that are not
+/// urgent. Refer to the [module docs](self).
+pub const STATE_MIN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The largest move of the level of the battery, in percent, that is not
+/// urgent. The gauge can flap between two levels, so a move of 1% goes at
+/// most once in [`STATE_MIN_INTERVAL`].
+pub const BATTERY_FLAP: u8 = 1;
+
+/// The internal events of the device feature. The core makes them from its
+/// timers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Event {
+    /// The timer of the throttle window with this id expired. Refer to
+    /// [`Window`].
+    WindowEnded(u32),
+}
+
+impl From<Event> for crate::Event {
+    fn from(event: Event) -> Self {
+        Self::Device(event)
+    }
+}
+
+/// Handles an internal event of the device feature.
+pub fn update(event: Event, model: &mut Model) -> Cmd {
+    match event {
+        Event::WindowEnded(id) => window_ended(id, model),
+    }
+}
+
 /// The state of the device feature.
 #[derive(Debug, Default)]
 pub struct State {
     /// The publish of the discovery message.
     discovery: Discovery,
+    /// The last id that the core took for a timer of the throttle window.
+    /// Each new timer takes the next id, so an expiry from an older timer
+    /// (also of an older session) does not match.
+    window: u32,
 }
 
 impl State {
@@ -158,8 +220,9 @@ pub enum Discovery {
 /// the [module docs](self).
 ///
 /// The sync is in the [`Live`](connection::Live) of the session, so each
-/// session starts with `Unsent`.
-#[derive(Debug, Default, PartialEq, Eq)]
+/// session starts with `Unsent`. The end of the session clears the timer of
+/// the window ([`StateSync::clear_timer`]).
+#[derive(Debug, Default)]
 pub enum StateSync {
     /// The session did not publish the state.
     #[default]
@@ -170,16 +233,65 @@ pub enum StateSync {
         packet: PacketId,
         /// The snapshot in the message.
         sent: Snapshot,
+        /// The throttle of the changes that are not urgent.
+        window: Window,
     },
     /// The broker acknowledged the state message with this snapshot.
-    Sent(Snapshot),
+    Sent {
+        /// The snapshot in the last message.
+        sent: Snapshot,
+        /// The throttle of the changes that are not urgent.
+        window: Window,
+    },
+}
+
+impl StateSync {
+    /// Clears the timer of the window, if it runs. The connection calls
+    /// this function when the session ends, so the timer does not wait in a
+    /// sleep.
+    pub(crate) fn clear_timer(&mut self) {
+        if let Self::InFlight { window, .. } | Self::Sent { window, .. } = self
+            && let Window::Throttled(timer) = mem::take(window)
+        {
+            timer.clear();
+        }
+    }
+
+    /// Returns the window, or `None` before the first state message.
+    const fn window_mut(&mut self) -> Option<&mut Window> {
+        match self {
+            Self::Unsent => None,
+            Self::InFlight { window, .. } | Self::Sent { window, .. } => Some(window),
+        }
+    }
+
+    /// Takes the window, and leaves `Unsent`.
+    fn take_window(&mut self) -> Window {
+        match mem::take(self) {
+            Self::Unsent => Window::Open,
+            Self::InFlight { window, .. } | Self::Sent { window, .. } => window,
+        }
+    }
+}
+
+/// The throttle of the changes of the state that are not urgent. Refer to
+/// the [module docs](self).
+#[derive(Debug, Default)]
+pub enum Window {
+    /// The next change that is not urgent goes at once.
+    #[default]
+    Open,
+    /// A change that is not urgent went less than [`STATE_MIN_INTERVAL`]
+    /// ago. The changes that are not urgent wait for this timer.
+    Throttled(Running),
 }
 
 /// The values of the sensors in the state message.
 ///
 /// The core compares the snapshot of the model with the last snapshot that
-/// it sent. If they are not equal, it publishes the new snapshot. To add a
-/// sensor, add a field here and a key to the payload.
+/// it sent. If they are not equal, it publishes the new snapshot, at once
+/// or when the window is open ([`Snapshot::is_urgent_after`]). To add a sensor,
+/// add a field here and a key to the payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Snapshot {
     /// The charge of the battery in percent, or `None` if the shell did not
@@ -187,6 +299,8 @@ pub struct Snapshot {
     pub battery: Option<u8>,
     /// The device is on the stand.
     pub stand: bool,
+    /// The power diagnostics.
+    pub reading: Reading,
 }
 
 impl Snapshot {
@@ -196,20 +310,62 @@ impl Snapshot {
         Self {
             battery: model.power.battery,
             stand: model.power.source() == PowerSource::Stand,
+            reading: model.power.reading,
         }
     }
 
+    /// Returns `true` if the change from the snapshot `sent` to this one
+    /// goes at once. Refer to the [module docs](self).
+    #[must_use]
+    pub fn is_urgent_after(&self, sent: &Self) -> bool {
+        let battery = match (sent.battery, self.battery) {
+            (Some(before), Some(now)) => before.abs_diff(now) > BATTERY_FLAP,
+            (before, now) => before != now,
+        };
+        battery || self.stand != sent.stand || self.charging() != sent.charging()
+    }
+
+    /// Returns `true` if the charger charges the battery, or `None` if the
+    /// shell did not read the charger.
+    fn charging(&self) -> Option<bool> {
+        self.reading.charge.map(Charge::is_charging)
+    }
+
     /// Returns the payload of the state message, for example
-    /// `{"battery":95,"stand":"OFF"}`. An unknown battery is `null`.
+    /// `{"battery":95,"stand":"OFF","charging":"OFF","charge":"not_charging",`
+    /// `"voltage":3870,"current":-40,"temperature":24.5}`. An unknown value
+    /// is `null`.
     #[must_use]
     pub(crate) fn to_json(&self) -> Vec<u8> {
+        let on_off = |on| if on { "ON" } else { "OFF" };
+        let reading = &self.reading;
         let payload = StatePayload {
             battery: self.battery,
-            stand: if self.stand { "ON" } else { "OFF" },
+            stand: on_off(self.stand),
+            charging: self.charging().map(on_off),
+            charge: reading.charge.map(charge_option),
+            voltage: reading.voltage_mv,
+            current: reading.current_ma,
+            temperature: reading.tenth_celsius.map(|tenths| f64::from(tenths) / 10.0),
         };
-        // The fields are a number and text, and the writer is a `Vec`, so
+        // The fields are numbers and text, and the writer is a `Vec`, so
         // the serialization cannot fail.
-        serde_json::to_vec(&payload).expect("a payload of a number and text serializes")
+        serde_json::to_vec(&payload).expect("a payload of numbers and text serializes")
+    }
+}
+
+/// The options of the enum sensor of the phase of the charge, in the order
+/// of [`Charge`].
+pub(crate) const CHARGE_OPTIONS: [&str; 4] =
+    ["not_charging", "pre_charging", "fast_charging", "done"];
+
+/// Returns the option of the enum sensor for the phase `charge`.
+const fn charge_option(charge: Charge) -> &'static str {
+    match charge {
+        Charge::NotCharging => CHARGE_OPTIONS[0],
+        Charge::PreCharging => CHARGE_OPTIONS[1],
+        Charge::FastCharging => CHARGE_OPTIONS[2],
+        Charge::Done => CHARGE_OPTIONS[3],
     }
 }
 
@@ -219,6 +375,18 @@ struct StatePayload {
     battery: Option<u8>,
     /// `ON` or `OFF`, the default payloads of a binary sensor.
     stand: &'static str,
+    /// `ON` or `OFF`.
+    charging: Option<&'static str>,
+    /// One of [`CHARGE_OPTIONS`].
+    charge: Option<&'static str>,
+    /// In mV.
+    voltage: Option<u16>,
+    /// In mA.
+    current: Option<i16>,
+    /// In degrees Celsius. The shell rounds the temperature to 0.5 °C, so
+    /// the value is exact as a binary fraction, and it has one decimal in
+    /// the JSON.
+    temperature: Option<f64>,
 }
 
 /// A message that a publisher offers to the queue, and what the publisher
@@ -228,7 +396,13 @@ pub(crate) enum Item {
     /// The discovery message.
     Discovery,
     /// The state message with this snapshot.
-    State(Snapshot),
+    State {
+        /// The snapshot in the message.
+        snapshot: Snapshot,
+        /// The message has a change that is not urgent, so the window
+        /// becomes `Throttled`.
+        throttles: bool,
+    },
     /// A message of the log.
     Log(logs::Item),
 }
@@ -290,14 +464,36 @@ pub(crate) fn route(message: &Message, model: &mut Model) -> bool {
 }
 
 /// A value in the state message can have changed: publish the state, if
-/// the connection is up. The queue publishes only a snapshot that is not
-/// equal to the last one.
+/// the connection is up.
+///
+/// The queue publishes only a snapshot that is not equal to the last one,
+/// and a change that is not urgent only when the window is open. Refer to
+/// the [module docs](self).
 pub fn changed(model: &mut Model) -> Cmd {
     if model.connection.link() == Link::Up {
         connection::pump(model)
     } else {
         Cmd::done()
     }
+}
+
+/// The timer of the window with the id `id` expired. If it is the timer of
+/// the window now, the window opens, and the queue publishes the snapshot
+/// if it changed. The core ignores the expiry of an older timer.
+fn window_ended(id: u32, model: &mut Model) -> Cmd {
+    let Some(window) = model
+        .connection
+        .live_mut()
+        .and_then(|live| live.state.window_mut())
+    else {
+        return Cmd::done();
+    };
+    if !matches!(window, Window::Throttled(timer) if timer.id() == id) {
+        return Cmd::done();
+    }
+    // The timer completed, so it needs no clear.
+    *window = Window::Open;
+    changed(model)
 }
 
 /// The session of the connection ended. A discovery message in flight
@@ -310,7 +506,8 @@ pub(crate) const fn session_ended(model: &mut Model) {
 
 /// The queue of the device publishes: publishes the next message of each
 /// publisher while the session takes them. Returns the commands of the
-/// publishers that wait, and `true` if the session took a publish. Refer to
+/// publishers that wait and of the timers that start, and `true` if the
+/// session took a publish. Refer to
 /// the [module docs](self).
 ///
 /// [`connection::pump`] calls this function after the outbox. The session
@@ -346,7 +543,7 @@ pub(crate) fn drain(model: &mut Model) -> (Cmd, bool) {
             };
             match live.session.publish(publish) {
                 Ok(Some(packet)) => {
-                    taken(item, packet, model);
+                    waits.push(taken(item, packet, model));
                     published = true;
                 }
                 Err(Refused::TooLong) => never(item, model),
@@ -372,8 +569,8 @@ pub(crate) fn acked(id: PacketId, model: &mut Model) {
     if let Some(live) = model.connection.live_mut()
         && matches!(live.state, StateSync::InFlight { packet, .. } if packet == id)
     {
-        if let StateSync::InFlight { sent, .. } = mem::take(&mut live.state) {
-            live.state = StateSync::Sent(sent);
+        if let StateSync::InFlight { sent, window, .. } = mem::take(&mut live.state) {
+            live.state = StateSync::Sent { sent, window };
         }
         return;
     }
@@ -390,16 +587,45 @@ fn in_flight(model: &mut Model) -> usize {
 }
 
 /// The session took the message `item` with the packet id `packet`.
-fn taken(item: Item, packet: PacketId, model: &mut Model) {
+/// Returns the command of the timer of the window, if the message makes
+/// the window `Throttled`.
+fn taken(item: Item, packet: PacketId, model: &mut Model) -> Cmd {
     match item {
         Item::Discovery => model.device.discovery = Discovery::InFlight(packet),
-        Item::State(sent) => {
-            if let Some(live) = model.connection.live_mut() {
-                live.state = StateSync::InFlight { packet, sent };
-            }
+        Item::State {
+            snapshot,
+            throttles,
+        } => {
+            model.device.window = model.device.window.wrapping_add(1);
+            let id = model.device.window;
+            let Some(live) = model.connection.live_mut() else {
+                return Cmd::done();
+            };
+            let mut window = live.state.take_window();
+            let timer = if throttles {
+                let (command, running) =
+                    Running::start(id, STATE_MIN_INTERVAL, Event::WindowEnded(id).into());
+                // A change that is not urgent goes only while the window is
+                // open, so no old timer runs. This is a guard.
+                if let Window::Throttled(old) =
+                    mem::replace(&mut window, Window::Throttled(running))
+                {
+                    old.clear();
+                }
+                command
+            } else {
+                Cmd::done()
+            };
+            live.state = StateSync::InFlight {
+                packet,
+                sent: snapshot,
+                window,
+            };
+            return timer;
         }
         Item::Log(item) => logs::taken(item, packet, model),
     }
+    Cmd::done()
 }
 
 /// The session can never take the message `item`, because it is too long
@@ -411,9 +637,13 @@ fn taken(item: Item, packet: PacketId, model: &mut Model) {
 fn never(item: Item, model: &mut Model) {
     match item {
         Item::Discovery => model.device.discovery = Discovery::Sent,
-        Item::State(sent) => {
+        Item::State { snapshot, .. } => {
             if let Some(live) = model.connection.live_mut() {
-                live.state = StateSync::Sent(sent);
+                let window = live.state.take_window();
+                live.state = StateSync::Sent {
+                    sent: snapshot,
+                    window,
+                };
             }
         }
         Item::Log(item) => logs::never(item, model),
@@ -443,9 +673,10 @@ fn next_discovery(model: &Model) -> Next {
 }
 
 /// During a dry run, returns nothing. Else returns the state message if
-/// the session did not publish it, or if the
-/// snapshot changed since the last state message. While a state message
-/// waits for its PUBACK, returns nothing.
+/// the session did not publish it, or if the snapshot changed since the
+/// last state message and the change is due. An urgent change is always
+/// due. A change that is not urgent is due only while the window is open.
+/// While a state message waits for its PUBACK, returns nothing.
 fn next_state(model: &mut Model) -> Next {
     let snapshot = Snapshot::of(model);
     let Some(settings) = model
@@ -458,21 +689,33 @@ fn next_state(model: &mut Model) -> Next {
     let Some(live) = model.connection.live_mut() else {
         return Next::Nothing;
     };
-    let due = match &live.state {
-        StateSync::Unsent => true,
-        StateSync::InFlight { .. } => false,
-        StateSync::Sent(sent) => *sent != snapshot,
+    let throttles = match &live.state {
+        StateSync::Unsent => false,
+        StateSync::InFlight { .. } => return Next::Nothing,
+        StateSync::Sent { sent, window } => {
+            if *sent == snapshot {
+                return Next::Nothing;
+            }
+            let urgent = snapshot.is_urgent_after(sent);
+            if !urgent && matches!(window, Window::Throttled(_)) {
+                return Next::Nothing;
+            }
+            !urgent
+        }
     };
-    if !due {
-        return Next::Nothing;
-    }
     let publish = Publish {
         topic: settings.state_topic(),
         payload: snapshot.to_json(),
         qos: Qos::AtLeastOnce,
         retain: true,
     };
-    Next::Offer(publish, Item::State(snapshot))
+    Next::Offer(
+        publish,
+        Item::State {
+            snapshot,
+            throttles,
+        },
+    )
 }
 
 #[cfg(test)]

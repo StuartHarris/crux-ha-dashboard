@@ -512,10 +512,37 @@ These items stay open:
 
 ## Power check (phase 6)
 
-The display task reads the BQ25896 charger (REG0B) and the BQ27220 fuel gauge
-(`StateOfCharge()`) each 5 seconds while the chip is awake. While the chip sleeps, the
-check of the power source reads the charger each 60 seconds. The display task only
-reads these chips. Do these steps with the board on USB power:
+The display task reads the BQ25896 charger and the BQ27220 fuel gauge each 5 seconds
+while the chip is awake. While the chip sleeps, the check of the power source each 60
+seconds reads only the charger (REG0B). The core publishes nothing while the device
+sleeps, so the first poll after the wake reads the charge and the diagnostics. The
+display task only reads these chips.
+
+| Chip | Register or command | Value | Unit |
+| --- | --- | --- | --- |
+| BQ25896 | REG0B, bits 7:5 and 2 (`VBUS_STAT`, `PG_STAT`) | the power source | |
+| BQ25896 | REG0B, bits 4:3 (`CHRG_STAT`) | the charge state: 00 not charging, 01 pre-charge, 10 fast charge, 11 done | |
+| BQ27220 | `StateOfCharge()`, 0x2C | the charge | % |
+| BQ27220 | `Voltage()`, 0x08 | the voltage of the cell | mV, `u16` |
+| BQ27220 | `AverageCurrent()`, 0x14 | the average current | mA, `i16` |
+| BQ27220 | `Temperature()`, 0x06 | the temperature of the gauge | 0.1 K, `u16` |
+
+The registers come from the BQ25896 data sheet (SLUSC76C, table 17) and the BQ27220
+technical reference manual (SLUUBD4A, table 2-1 and chapter 2). The firmware rounds the
+voltage to 10 mV, the current to 10 mA and the temperature to 0.5 °C
+(`logic::power::PowerMonitor`). A new charge state counts only after two equal reads in
+a row, as the power source does, because `CHRG_STAT` can toggle at the end of a charge.
+A voltage below 2000 mV is not valid, and the monitor keeps the last good value. It
+sends `PowerRead` to the core only when a rounded value changes, and before a change of
+the power source in the same pass. The core publishes the values to Home Assistant (`docs/mqtt.md`, "Home
+Assistant device").
+
+The sign of `AverageCurrent()` is still to check on the board. The manual tells that
+the gauge is in its CHARGE mode when the current is positive, and in its DISCHARGE mode
+when it is negative. Thus the current must be positive on the stand while the battery
+charges, and negative on battery. Do the check in step 4.
+
+Do these steps with the board on USB power:
 
 1. Run `just flash`. The log shows `power: source Stand at the start`, then
    `power: battery N%`. The header shows the percent and a plug icon. Keep
@@ -525,6 +552,15 @@ reads these chips. Do these steps with the board on USB power:
    see the log line `power: source Battery` now.
 3. Connect USB again. In about 6 seconds, the header shows the plug icon. If the serial
    log connects again, it shows `power: source Stand`.
+
+4. In Home Assistant, open the device of the dashboard and its "Diagnostic" entities.
+   On USB power, "Charging" is on while the battery is not full, and "Battery current"
+   is positive. Disconnect USB. In about 6 seconds, "Charging" is off. Tap the panel
+   about each 20 seconds for 1 minute, so that the device stays awake. The gauge
+   averages the current over about 15 seconds, and the dashboard sends a change of
+   only the current at most once each 60 seconds. "Battery current" must then be
+   negative. "Battery voltage" is about 3500 to 4200 mV, and "Gauge temperature" is
+   near the room temperature.
 
 If a read fails, the log shows one warning, and the header keeps the last values.
 
@@ -555,16 +591,18 @@ log.
 5. Tap a room button on the panel. The panel must show that room, so the tap that
    wakes the device also acts. In a few seconds the status is `online` again. If the
    log continues, it shows
-   `power: woke by a touch after N ms, average current M mA (not verified)` and
+   `power: woke by a touch after N ms, average current M mA` and
    `touch: wake tap at (x, y)`.
 6. Wait 30 seconds again. The panel must show "Asleep" again.
 7. Set `force_battery = false` in `cfg.toml` and run `just flash`.
 
 ### Drain while asleep
 
-The wake line gives `AverageCurrent()` of the BQ27220 (command 0x14). The unit (mA) and
-the sign (negative for a discharge) are not verified on the board, so the log marks
-the value "not verified". The display task reads it directly after the wake, so the value is
+The wake line gives `AverageCurrent()` of the BQ27220 (command 0x14). The technical
+reference manual gives the unit (mA) and the sign (negative for a discharge). The board
+confirmed the unit and the sign of a discharge on 2026-11-22: off the stand, Home
+Assistant showed −20 mA. The sign while the battery charges is not seen on the board yet
+(refer to "Power check", step 4). The display task reads it directly after the wake, so the value is
 mostly the current while the device was asleep. But the serial log needs USB, and on
 USB the value is the charge current, not the drain. Thus the wake line cannot give
 the drain. To measure the drain:

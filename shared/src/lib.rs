@@ -50,7 +50,7 @@ pub mod view;
 mod tests;
 
 pub use app::*;
-pub use capabilities::power::PowerSource;
+pub use capabilities::power::{Charge, PowerSource, Reading};
 pub use crux_core::Core;
 pub use layout::TileKind;
 pub use route::Route;

@@ -8,10 +8,11 @@ use crux_core::App;
 
 use crate::tests::{
     ExpectFullRefreshTimer, ExpectLight, ExpectRadioLimit, ExpectStep, asleep, drive_to_connected,
-    drive_to_connecting, shell::Shell, start, tap_tile, wire::ExpectWrite,
+    drive_to_connecting, shell::Shell, start, state, tap_tile, wire::ExpectWrite,
 };
 use crate::{
-    Connection, Control, Dashboard, Effect, EffectTestExt, Event, Model, PowerSource,
+    Charge, Connection, Control, Dashboard, Effect, EffectTestExt, Event, Model, PowerSource,
+    Reading,
     capabilities::{
         log::Level,
         power::{Wake, WakeSource},
@@ -229,7 +230,7 @@ fn off_the_stand_starts_the_idle_timer() {
     app.update(Event::PowerSourceChanged(PowerSource::Battery), &mut model)
         .expect_render()
         .expect_time_notify_after()
-        .expect_state(&mut wire, &mut model, r#"{"battery":null,"stand":"OFF"}"#)
+        .expect_state(&mut wire, &mut model, &state("null", "OFF"))
         .expect_only_session_clear(&wire);
     assert_eq!(model.connection.link(), Link::Up);
 }
@@ -440,7 +441,7 @@ fn a_battery_level_draws_once_and_the_same_level_draws_nothing() {
     // A partial render, with no timer. The core also publishes the level.
     app.update(Event::BatteryChanged(Some(80)), &mut model)
         .expect_render()
-        .expect_state(&mut wire, &mut model, r#"{"battery":80,"stand":"OFF"}"#)
+        .expect_state(&mut wire, &mut model, &state("80", "OFF"))
         .expect_only_session_clear(&wire);
     assert_eq!(app.view(&model).battery, Some(80));
     assert_eq!(model.power.idle, idle);
@@ -454,7 +455,7 @@ fn a_battery_level_draws_once_and_the_same_level_draws_nothing() {
     // The shell cannot read the charge now.
     app.update(Event::BatteryChanged(None), &mut model)
         .expect_render()
-        .expect_state(&mut wire, &mut model, r#"{"battery":null,"stand":"OFF"}"#)
+        .expect_state(&mut wire, &mut model, &state("null", "OFF"))
         .expect_only_session_clear(&wire);
     assert_eq!(app.view(&model).battery, None);
 }
@@ -520,13 +521,14 @@ fn a_battery_change_that_does_not_change_the_rounded_level_does_not_draw() {
     let (mut model, mut wire) = drive_to_connected(PowerSource::Battery);
     app.update(Event::BatteryChanged(Some(80)), &mut model)
         .expect_render()
-        .expect_state(&mut wire, &mut model, r#"{"battery":80,"stand":"OFF"}"#)
+        .expect_state(&mut wire, &mut model, &state("80", "OFF"))
         .expect_only_session_clear(&wire);
 
-    // 79, 78 and 81 all show as 80%. The core keeps the exact value, and
-    // publishes it, but does not draw.
-    for level in [79, 78, 81] {
-        let json = format!(r#"{{"battery":{level},"stand":"OFF"}}"#);
+    // 78, 81 and 79 all show as 80%. The core keeps the exact value, and
+    // publishes it, but does not draw. Each one moves by more than 1%, so
+    // the state message goes at once. Refer to `device::BATTERY_FLAP`.
+    for level in [78, 81, 79] {
+        let json = state(&level.to_string(), "OFF");
         app.update(Event::BatteryChanged(Some(level)), &mut model)
             .expect_state(&mut wire, &mut model, &json)
             .expect_only_session_clear(&wire);
@@ -537,7 +539,7 @@ fn a_battery_change_that_does_not_change_the_rounded_level_does_not_draw() {
     // 77 shows as 75%, so the core draws.
     app.update(Event::BatteryChanged(Some(77)), &mut model)
         .expect_render()
-        .expect_state(&mut wire, &mut model, r#"{"battery":77,"stand":"OFF"}"#)
+        .expect_state(&mut wire, &mut model, &state("77", "OFF"))
         .expect_only_session_clear(&wire);
     assert_eq!(app.view(&model).battery, Some(75));
 }
@@ -655,6 +657,38 @@ fn a_page_turn_clears_the_idle_timer_and_only_the_new_timer_fires() {
     assert_eq!(idle_timeouts(&shell.advance(half)), 0);
     assert!(shell.sleep.is_none());
     // The new timer fires, and the device sleeps.
+    assert_eq!(idle_timeouts(&shell.advance(half)), 1);
+    assert!(shell.sleep.is_some());
+}
+
+#[test]
+fn a_power_reading_is_kept_and_does_not_draw_or_keep_the_device_awake() {
+    let mut shell = Shell::new();
+    shell.send(start(PowerSource::Battery));
+    let half = IDLE_TIMEOUT / 2;
+    shell.advance(half);
+    shell.take_log();
+    let frames = shell.frames.len();
+
+    let reading = Reading {
+        charge: Some(Charge::NotCharging),
+        voltage_mv: Some(3870),
+        current_ma: Some(-40),
+        tenth_celsius: Some(245),
+    };
+    shell.send(Event::PowerRead(reading));
+
+    assert_eq!(shell.model.power.reading, reading);
+    // The core publishes the state message, but it does not draw, and it
+    // does not start the idle timer again.
+    let log = shell.take_log();
+    assert_eq!(log.len(), 1, "{log:?}");
+    assert!(
+        log[0].starts_with("MqttPublish dashboard/hall/state "),
+        "{log:?}"
+    );
+    assert_eq!(shell.frames.len(), frames);
+    // The idle timer of the start still ends the idle time.
     assert_eq!(idle_timeouts(&shell.advance(half)), 1);
     assert!(shell.sleep.is_some());
 }

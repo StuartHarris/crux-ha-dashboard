@@ -421,11 +421,13 @@ impl Live {
         }
     }
 
-    /// Clears all the timers of the session.
+    /// Clears all the timers of the session, and the timer of the throttle
+    /// window of the state message ([`device::StateSync::clear_timer`]).
     fn clear_timers(&mut self) {
         for handle in self.timers.iter_mut().filter_map(Option::take) {
             handle.clear();
         }
+        self.state.clear_timer();
     }
 }
 
