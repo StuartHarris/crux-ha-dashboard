@@ -218,8 +218,10 @@ pub async fn task(stack: Stack<'static>) {
         log::info!("stream: open {connection} to {}:{}", open.host, open.port);
         let end = session(stack, rx, tx, &streams, connection, &open, &mut pending).await;
         let by_host = if end.by_host { " (by the host)" } else { "" };
+        // The core writes one warning with the reason of a failed end, so
+        // this line is for the serial log only.
         if end.failed {
-            log::warn!("stream: {connection} failed: {}{by_host}", end.reason);
+            log::info!("stream: {connection} failed: {}{by_host}", end.reason);
         } else {
             log::info!("stream: {connection} closed: {}{by_host}", end.reason);
         }

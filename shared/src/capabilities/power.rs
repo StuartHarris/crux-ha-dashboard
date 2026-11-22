@@ -39,24 +39,32 @@ pub enum Wake {
     /// the touch wakes the device and turns the front light on, but it does
     /// not act on a control.
     Touch(Option<Control>),
-    /// The timer of [`WakeSource::Timer`] expired.
+    /// The timer of [`WakeSource::Timer`] expired. The core decides what the
+    /// timer means. It can send a new `Sleep` at once.
     Timer,
     /// The shell saw a change of the power source. It sends
     /// [`Event::PowerSourceChanged`](crate::Event::PowerSourceChanged) first.
     PowerSource,
+    /// The device woke with no cause in `wake_on`, or the hardware rejected
+    /// the sleep.
+    Other,
 }
 
 /// Puts the device to sleep until one of `wake_on` occurs. The panel keeps
 /// its last image.
 ///
-/// The core sends `Sleep` together with the `Render` of the last image. The
-/// shell must draw that image on the panel before the device sleeps.
+/// The first `Sleep` of a sleep comes together with the `Render` of the last
+/// image. The shell must draw that image on the panel before the device
+/// sleeps. A later `Sleep` of the same sleep has no `Render`, and the panel
+/// keeps its image.
 ///
-/// The shell answers once, at the first real wake, with the [`Wake`] that
-/// ended the sleep. A wake that has no cause in `wake_on` (for example a
-/// sleep that the hardware rejects) is a detail of the shell. The shell then
-/// sleeps again and does not answer. If the shell sees a change of the power
-/// source before it answers, it answers [`Wake::PowerSource`].
+/// If `wake_on` has more than one timer, the shortest timer wins.
+///
+/// The shell answers once, at the first wake, with the [`Wake`] that ended
+/// the sleep. It answers each wake at once, also a wake with no cause in
+/// `wake_on` ([`Wake::Other`]). The shell keeps no schedule. The core
+/// decides what to do next. If the shell sees a change of the power source
+/// before it answers, it answers [`Wake::PowerSource`].
 ///
 /// After a deep sleep, the device starts again and the shell sends
 /// [`Event::Start`](crate::Event::Start). Then no answer comes.

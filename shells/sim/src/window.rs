@@ -462,6 +462,10 @@ impl App {
             ui.label(if view.asleep { "Asleep" } else { "Awake" });
             if ui
                 .add_enabled(view.asleep, egui::Button::new("Wake"))
+                .on_hover_text(
+                    "A wake with no cause. The device sleeps again after 3 s. \
+                     Click the panel to wake the device.",
+                )
                 .clicked()
             {
                 self.shell.wake();
@@ -506,7 +510,7 @@ impl App {
         ui.label(
             RichText::new(
                 "Keys (when no text box has the focus): S stand/battery, [ and ] \
-                 battery −10% and +10%, W wake, Z sleep now, R restart, \
+                 battery −10% and +10%, W wake with no cause, Z sleep now, R restart, \
                  L drop the link, B block or unblock the device, A move the strongest \
                  access point, K make the driver stuck or free, D outline, \
                  Left/Right page, Q quit",

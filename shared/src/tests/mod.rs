@@ -223,7 +223,7 @@ impl ExpectRadioLimit for Cmd {
 /// Expects the line of the log for the start of a step of a sleep.
 pub trait ExpectStep {
     /// Expects the next effect to write `message` with the area `power` at
-    /// the level `Info`. Refer to [`crate::features::power::sleep_step`].
+    /// the level `Debug`. Refer to [`crate::features::power::sleep_step`].
     ///
     /// The helper drops the `Log` request with no answer. The core then
     /// keeps no line, and the command ends as if the line was not there.
@@ -234,7 +234,7 @@ impl ExpectStep for Cmd {
     #[track_caller]
     fn expect_step(&mut self, message: &str) -> &mut Self {
         self.expect_log_with(|log| {
-            assert_eq!(log.level, crate::capabilities::log::Level::Info);
+            assert_eq!(log.level, crate::capabilities::log::Level::Debug);
             assert_eq!(log.area, crate::capabilities::log::Area::Power);
             assert_eq!(log.message, message);
         })
@@ -345,9 +345,9 @@ pub fn send(model: &mut Model, wire: &mut Wire, topic: &str, payload: &str) -> C
 /// off, then sleep.
 pub fn sleep_lines(id: u32) -> [alloc::string::String; 3] {
     [
-        format!("info power: sleep {id} closes the connection"),
-        format!("info power: sleep {id} turns the radio off"),
-        format!("info power: sleep {id} draws the last image and sleeps"),
+        format!("debug power: sleep {id} closes the connection"),
+        format!("debug power: sleep {id} turns the radio off"),
+        format!("debug power: sleep {id} draws the last image and sleeps"),
     ]
 }
 

@@ -354,7 +354,9 @@ mod tests {
         match signals.recv_timeout(WAIT).expect("a signal") {
             Signal::Stream { token, item } => format!("{token} {item:?}"),
             Signal::Written { token, outcome } => format!("{token} {outcome:?}"),
-            Signal::Timer { .. } => panic!("a timer signal from a stream task"),
+            Signal::Timer { .. } | Signal::Check { .. } => {
+                panic!("a timer signal from a stream task")
+            }
         }
     }
 

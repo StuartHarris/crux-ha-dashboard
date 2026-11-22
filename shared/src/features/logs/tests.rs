@@ -8,7 +8,7 @@ use crux_core::App;
 use serde_json::Value;
 
 use super::{
-    CAPACITY, CUT_MARK, LOG_IN_FLIGHT, Line, MAX_MESSAGE, MAX_SOURCE, Message, Payload,
+    CAPACITY, CUT_MARK, Kept, LOG_IN_FLIGHT, Line, MAX_MESSAGE, MAX_SOURCE, Message, Payload,
     ShellSource, Source, State, dropped_json, info, warn,
 };
 use crate::{
@@ -19,11 +19,14 @@ use crate::{
     },
     features::{
         connection::{Link, RECONNECT_MIN},
-        power::IDLE_TIMEOUT,
+        power::{IDLE_TIMEOUT, STRAY_HOLD},
     },
     mqtt::codec::server::Packet,
-    tests::{broker::publish_of, flows::house, shell::Shell, start, tap_all_lights},
+    tests::{broker::publish_of, flows::house, shell::Shell, sleep_lines, start, tap_all_lights},
 };
+
+/// The line of the first wake with no cause in the sleep 1.
+const STRAY: &str = "sleep 1 woke with no cause, so it sleeps again after 3 s";
 
 /// The log topic of the test settings.
 const LOG_TOPIC: &str = "dashboard/hall/log";
@@ -34,7 +37,7 @@ const STATUS: &str = "dashboard/hall/status";
 fn line(at: u64, message: &str) -> Line {
     Line {
         at: Uptime(at),
-        level: Level::Info,
+        level: Kept::Info,
         source: Source::Core(Area::Wifi),
         message: Message::new(message),
     }
@@ -91,8 +94,8 @@ fn a_line_has_the_time_of_the_answer_of_the_shell() {
     assert_eq!(
         lines,
         [
-            (Uptime(1_000), Level::Info, Source::Core(Area::Wifi)),
-            (Uptime(2_500), Level::Warn, Source::Core(Area::Mqtt)),
+            (Uptime(1_000), Kept::Info, Source::Core(Area::Wifi)),
+            (Uptime(2_500), Kept::Warn, Source::Core(Area::Mqtt)),
         ]
     );
     assert_eq!(
@@ -187,7 +190,7 @@ fn the_shell_writes_the_whole_message_and_the_ring_keeps_the_cut_message() {
 fn an_info_line_has_its_age_in_whole_seconds() {
     let line = Line {
         at: Uptime(3_000),
-        level: Level::Info,
+        level: Kept::Info,
         source: Source::Core(Area::Wifi),
         message: Message::new("the scan found no better access point, so stay"),
     };
@@ -204,7 +207,7 @@ fn an_info_line_has_its_age_in_whole_seconds() {
 fn a_warn_line_escapes_its_message() {
     let line = Line {
         at: Uptime(0),
-        level: Level::Warn,
+        level: Kept::Warn,
         source: Source::Core(Area::Mqtt),
         message: Message::new("a \"quoted\" topic\nand a new line"),
     };
@@ -221,7 +224,7 @@ fn a_warn_line_escapes_its_message() {
 fn a_line_newer_than_the_clock_has_the_age_0() {
     let line = Line {
         at: Uptime(9_000),
-        level: Level::Info,
+        level: Kept::Info,
         source: Source::Core(Area::Power),
         message: Message::new("sleep 1 closes the connection"),
     };
@@ -257,7 +260,7 @@ fn the_drop_message_for_one_line_is_singular() {
 fn stamp(shell: &mut Shell, at_secs: u64, text: &str) {
     let line = Line {
         at: Uptime(at_secs * 1_000),
-        level: Level::Info,
+        level: Kept::Info,
         source: Source::Core(Area::Wifi),
         message: Message::new(text),
     };
@@ -309,27 +312,26 @@ fn the_lines_of_a_battery_sleep_go_out_after_the_wake_with_their_ages() {
     shell.send(start(PowerSource::Stand));
     shell.advance(Duration::from_secs(5));
 
-    // Off the stand, the device sleeps after the idle timeout. Each step
-    // of the sleep writes a line while the connection closes or is down, so
-    // no line goes to Home Assistant before the sleep.
+    // Off the stand, the device sleeps after the idle timeout. The steps of
+    // the sleep write `Debug` lines, which the core does not keep.
     shell.send(Event::PowerSourceChanged(PowerSource::Battery));
     shell.advance(IDLE_TIMEOUT);
     assert!(shell.sleep.is_some());
+    assert_eq!(power_lines(&shell.model), Vec::new());
+    assert_eq!(&shell.take_logs()[..3], sleep_lines(1));
+
+    // A wake with no cause writes a line while the connection is down, so
+    // the line does not go to Home Assistant before the next wake.
+    shell.wake(Wake::Other);
     let slept_at = u64::try_from(shell.now().as_millis()).unwrap();
-    let first = power_lines(&shell.model);
-    assert_eq!(
-        first,
-        [
-            (slept_at, "sleep 1 closes the connection".into()),
-            (slept_at, "sleep 1 turns the radio off".into()),
-            (slept_at, "sleep 1 draws the last image and sleeps".into()),
-        ]
-    );
+    shell.advance(STRAY_HOLD);
+    assert!(shell.sleep.is_some());
+    assert_eq!(power_lines(&shell.model), [(slept_at, STRAY.into())]);
     assert_eq!(published(&shell), Vec::<Value>::new());
 
     // An hour later, a touch wakes the device. After the connect, the
-    // lines go with their ages on the clock of the shell.
-    shell.advance(Duration::from_secs(3_600));
+    // line goes with its age on the clock of the shell.
+    shell.advance(Duration::from_secs(3_600).saturating_sub(STRAY_HOLD));
     let writes = shell.writes.len();
     shell.wake(Wake::Touch(None));
     assert_eq!(shell.model.connection.link(), Link::Up);
@@ -345,11 +347,9 @@ fn the_lines_of_a_battery_sleep_go_out_after_the_wake_with_their_ages() {
     assert_eq!(
         payloads,
         [
-            r#"{"level":"info","source":"power","age":3600,"msg":"sleep 1 closes the connection"}"#,
-            r#"{"level":"info","source":"power","age":3600,"msg":"sleep 1 turns the radio off"}"#,
-            r#"{"level":"info","source":"power","age":3600,"msg":"sleep 1 draws the last image and sleeps"}"#,
-            // The scan after the wake writes a new line. It goes at once.
-            r#"{"level":"info","source":"wifi","age":0,"msg":"the scan found no access point that is 10 dB stronger than 02:00:00:00:00:01 on channel 6 (-55 dBm), so stay"}"#,
+            // The scan after the wake finds no better access point. It writes
+            // a `Debug` line, which does not go.
+            r#"{"level":"info","source":"power","age":3600,"msg":"sleep 1 woke with no cause, so it sleeps again after 3 s"}"#,
         ]
     );
     assert!(
@@ -369,12 +369,10 @@ fn the_lines_of_a_battery_sleep_go_out_after_the_wake_with_their_ages() {
             .all(|publish| !publish.retain)
     );
 
-    // The writes of the wake: the CONNECT, the CONNACK write, the write of
-    // the 3 lines of the sleep (326 bytes), and the write of the line of
-    // the scan.
+    // The writes of the wake: the CONNECT, the CONNACK write, and the write
+    // of the line of the sleep.
     let bytes = &shell.write_bytes[writes..];
-    assert_eq!(bytes.len(), 4, "{bytes:?}");
-    assert_eq!(bytes[2], 326, "{bytes:?}");
+    assert_eq!(bytes.len(), 3, "{bytes:?}");
 
     // The broker acknowledged each line, so the ring is empty.
     assert_eq!(shell.model.logs.lines().len(), 0);
@@ -546,13 +544,19 @@ fn each_line_of_a_battery_sleep_goes_once_after_the_wake() {
     shell.send(Event::Tapped(None));
     assert!(shell.light > 0);
 
-    // The first step waits for the light while the connection is up. The
-    // PUBACKs during the sleep are lost, as when they race the DISCONNECT.
+    // The first step waits for the light while the connection is up, and
+    // a line comes then. The PUBACKs during the sleep are lost, as when
+    // they race the DISCONNECT.
     shell.broker.hold_puback = true;
     shell.hold_light = true;
     shell.send(Event::SleepNow);
+    stamp(&mut shell, 40, "a line in the first step");
     shell.hold_light = false;
     shell.answer_lights();
+    assert!(shell.sleep.is_some());
+    // A wake with no cause writes a line while the connection is down.
+    shell.wake(Wake::Other);
+    shell.advance(STRAY_HOLD);
     assert!(shell.sleep.is_some());
     assert_eq!(published(&shell), Vec::<Value>::new());
     shell.broker.held_pubacks.clear();
@@ -565,17 +569,9 @@ fn each_line_of_a_battery_sleep_goes_once_after_the_wake() {
     // Each line of the sleep went once, after the wake.
     let sleep_lines: Vec<String> = published_texts(&shell)
         .into_iter()
-        .filter(|text| text.starts_with("sleep 1 "))
+        .filter(|text| text.starts_with("sleep 1 ") || text.starts_with("a line"))
         .collect();
-    assert_eq!(
-        sleep_lines,
-        [
-            "sleep 1 turns the front light off",
-            "sleep 1 closes the connection",
-            "sleep 1 turns the radio off",
-            "sleep 1 draws the last image and sleeps",
-        ]
-    );
+    assert_eq!(sleep_lines, ["a line in the first step", STRAY]);
     assert_eq!(shell.model.logs.lines().len(), 0);
 }
 
@@ -585,9 +581,11 @@ fn a_wake_before_the_close_sends_the_lines_of_the_sleep() {
     shell.send(start(PowerSource::Battery));
     shell.send(Event::Tapped(None));
 
-    // The first step of the sleep waits for the light. Its line waits too.
+    // The first step of the sleep waits for the light. A line in that step
+    // waits too.
     shell.hold_light = true;
     shell.send(Event::SleepNow);
+    stamp(&mut shell, 1, "a line in the first step");
     assert_eq!(published(&shell), Vec::<Value>::new());
 
     // A tap wakes the device before the close. The session is still up, so
@@ -595,10 +593,7 @@ fn a_wake_before_the_close_sends_the_lines_of_the_sleep() {
     shell.hold_light = false;
     shell.send(Event::Tapped(None));
     assert_eq!(shell.model.connection.link(), Link::Up);
-    assert_eq!(
-        published_texts(&shell),
-        ["sleep 1 turns the front light off"]
-    );
+    assert_eq!(published_texts(&shell), ["a line in the first step"]);
 }
 
 #[test]
@@ -612,31 +607,18 @@ fn nothing_goes_while_the_device_closes_for_a_sleep_or_sleeps() {
 
     shell.advance(IDLE_TIMEOUT);
     assert!(shell.sleep.is_some());
-    // The steps of the sleep wrote lines during the close and after it.
-    // They wait in the ring.
+    // The steps of the sleep wrote `Debug` lines, which the core does not
+    // keep.
     assert_eq!(published_texts(&shell), ["a line before the sleep"]);
-    let kept: Vec<&str> = shell
-        .model
-        .logs
-        .lines()
-        .map(|line| line.message.as_str())
-        .collect();
-    assert_eq!(
-        kept,
-        [
-            "sleep 1 closes the connection",
-            "sleep 1 turns the radio off",
-            "sleep 1 draws the last image and sleeps"
-        ]
-    );
+    assert_eq!(shell.model.logs.lines().len(), 0);
     let writes = shell.writes.len();
 
-    // A line while the device sleeps waits too.
+    // A line while the device sleeps waits in the ring.
     stamp(&mut shell, 100, "a line while the device sleeps");
 
     assert_eq!(published_texts(&shell), ["a line before the sleep"]);
     assert_eq!(shell.writes.len(), writes);
-    assert_eq!(shell.model.logs.lines().len(), 4);
+    assert_eq!(shell.model.logs.lines().len(), 1);
 }
 
 #[test]
@@ -649,7 +631,7 @@ fn the_line_of_a_change_of_access_point_goes_on_the_next_connection() {
 
     // The wake joins the cached access point, and the scan finds a better
     // one. The core writes the line of the change when the close starts.
-    shell.wake(Wake::Timer);
+    shell.wake(Wake::Touch(None));
     assert_eq!(shell.broker.connections, 3);
 
     // The line went once, on the third connection: after the DISCONNECT
@@ -735,7 +717,7 @@ fn a_line_while_the_core_sends_goes_at_once_with_the_age_0() {
 // The lines of the shell.
 
 /// Returns a `ShellLogged` event with no lost lines.
-fn shell_line(at: u64, level: Level, source: &str, message: &str) -> Event {
+fn shell_line(at: u64, level: Kept, source: &str, message: &str) -> Event {
     Event::ShellLogged {
         at: Uptime(at),
         level,
@@ -753,7 +735,7 @@ fn a_shell_line_goes_into_the_ring_with_its_source_and_level() {
     // The link is down, so the line only goes into the ring. The event does
     // not render.
     app.update(
-        shell_line(4_000, Level::Error, "panel", "power on failed: Timeout"),
+        shell_line(4_000, Kept::Error, "panel", "power on failed: Timeout"),
         &mut model,
     )
     .expect_done();
@@ -763,7 +745,7 @@ fn a_shell_line_goes_into_the_ring_with_its_source_and_level() {
         lines,
         [&Line {
             at: Uptime(4_000),
-            level: Level::Error,
+            level: Kept::Error,
             source: Source::Shell(ShellSource::new("panel")),
             message: Message::new("power on failed: Timeout"),
         }]
@@ -778,7 +760,7 @@ fn a_shell_line_keeps_a_cut_source_and_a_cut_message() {
     let source = "s".repeat(MAX_SOURCE + 8);
     let message = "m".repeat(MAX_MESSAGE + 8);
 
-    app.update(shell_line(0, Level::Warn, &source, &message), &mut model)
+    app.update(shell_line(0, Kept::Warn, &source, &message), &mut model)
         .expect_done();
 
     let line = model.logs.lines().next().expect("a line");
@@ -796,16 +778,11 @@ fn a_shell_line_goes_out_with_its_source_and_level() {
     let at = u64::try_from(shell.now().as_millis()).unwrap();
     shell.send(shell_line(
         at,
-        Level::Warn,
+        Kept::Warn,
         "stream",
         "10 failed: TCP connect failed: ConnectionReset (by the host)",
     ));
-    shell.send(shell_line(
-        at,
-        Level::Error,
-        "panel",
-        "refresh failed: Busy",
-    ));
+    shell.send(shell_line(at, Kept::Error, "panel", "refresh failed: Busy"));
 
     let payloads: Vec<String> = shell
         .broker
@@ -839,7 +816,7 @@ fn the_lines_that_the_shell_lost_add_to_the_drop_count() {
     // The shell also lost 5 lines of its own.
     shell.send(Event::ShellLogged {
         at: Uptime(70_000),
-        level: Level::Warn,
+        level: Kept::Warn,
         source: "touch".into(),
         message: "read failed".into(),
         dropped: 5,
@@ -876,7 +853,7 @@ fn a_shell_line_during_a_sleep_waits_for_the_wake_and_does_not_wake() {
         .update(
             shell_line(
                 slept_at,
-                Level::Warn,
+                Kept::Warn,
                 "power",
                 "cannot read the BQ27220 (Nack)",
             ),
@@ -900,4 +877,44 @@ fn a_shell_line_during_a_sleep_waits_for_the_wake_and_does_not_wake() {
         .expect("the line of the shell");
     assert_eq!(line["msg"], "cannot read the BQ27220 (Nack)");
     assert_eq!(line["age"], 60);
+}
+
+#[test]
+fn a_debug_line_is_a_log_request_that_the_core_does_not_keep() {
+    let mut cmd = super::debug(Area::Power, "sleep 1 turns the radio off");
+    cmd.resolve_log(|log| {
+        assert_eq!(
+            *log,
+            Log {
+                level: Level::Debug,
+                area: Area::Power,
+                message: "sleep 1 turns the radio off".into(),
+            }
+        );
+        Uptime(1_000)
+    })
+    .expect_no_events();
+    assert!(cmd.is_done());
+}
+
+#[test]
+fn a_whole_sleep_and_wake_publish_no_debug_line() {
+    let mut shell = house();
+    shell.send(start(PowerSource::Battery));
+    shell.advance(IDLE_TIMEOUT);
+    assert!(shell.sleep.is_some());
+    // The steps wrote their lines at `Debug`, so the ring is empty.
+    assert_eq!(shell.model.logs.lines().len(), 0);
+    shell.wake(Wake::Touch(None));
+    assert_eq!(shell.model.connection.link(), Link::Up);
+    let levels: Vec<String> = published(&shell)
+        .iter()
+        .map(|payload| payload["level"].as_str().expect("a level").into())
+        .collect();
+    assert!(!levels.contains(&"debug".into()), "{levels:?}");
+    assert!(
+        !published_texts(&shell)
+            .iter()
+            .any(|text| text.starts_with("sleep "))
+    );
 }

@@ -13,8 +13,10 @@ rustflags = [
 ]
 
 [env]
-# The level of the log. The firmware reads it at build time.
-ESP_LOG = "info"
+# The level of the log. The firmware reads it at build time. The `Debug`
+# lines of the core (target `core`) print. The `Debug` lines of the other
+# targets do not print.
+ESP_LOG = "info,core=debug"
 
 [unstable]
 build-std = ["alloc", "core"]

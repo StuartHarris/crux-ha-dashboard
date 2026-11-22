@@ -55,10 +55,32 @@ fn no_new_address(count: u32) -> String {
     )
 }
 
-/// Returns the log line of a reconnect that the core schedules after `secs`
-/// seconds.
-fn connect_again(secs: u32) -> String {
-    format!("info mqtt: connect again in {secs} s")
+/// The end of a session that failed because the fake broker dropped the
+/// connection.
+const LOST: &str = "the stream closed: connection lost";
+
+/// The end of a session that the broker host refused.
+const REFUSED: &str = "the broker host ended the stream: connection refused";
+
+/// The end of a session that the broker closed when it stopped.
+const BROKER_CLOSED: &str = "the broker host ended the stream: the broker closed the stream";
+
+/// The end of a session that the broker refused with the code 5.
+const NOT_AUTHORIZED: &str = "the broker refused the connection (5: not authorized)";
+
+/// The end of a session on a link that moves no data.
+const NO_ANSWER: &str = "the stream closed: no answer from the host";
+
+/// Returns the log line of a session that ended with `cause`, and of the
+/// reconnect that the core schedules after `secs` seconds.
+fn connect_again(cause: &str, secs: u32) -> String {
+    format!("warn mqtt: {cause}, so connect again in {secs} s")
+}
+
+/// Returns the log line of a reconnect after a link that failed, which the
+/// core schedules after `secs` seconds.
+fn link_down(secs: u32) -> String {
+    format!("info mqtt: the link is down, so connect again in {secs} s")
 }
 
 /// Returns the radio entries of `log` in order: the radio requests,
@@ -131,7 +153,7 @@ fn fail_the_session(shell: &mut Shell) {
 fn scanning() -> Shell {
     let mut shell = asleep();
     shell.hold_radio = true;
-    shell.wake(Wake::Timer);
+    shell.wake(Wake::Touch(None));
     shell.answer_radio();
     shell.answer_radio();
     assert_eq!(shell.model.wifi.phase, Phase::Scanning(ready(HALL)));
@@ -209,7 +231,7 @@ fn a_stop_of_the_broker_writes_only_the_waits_of_the_reconnects() {
     // Each failure of the broker host schedules a reconnect, so the core
     // writes the wait. The other steps write no line, except the steps of
     // the sleep.
-    let mut expected = alloc::vec![connect_again(1), connect_again(2)];
+    let mut expected = alloc::vec![connect_again(BROKER_CLOSED, 1), connect_again(REFUSED, 2)];
     expected.extend(sleep_lines(1));
     assert_eq!(shell.take_logs(), expected);
 }
@@ -220,7 +242,7 @@ fn a_wake_joins_the_cached_access_point_and_stays_if_the_scan_finds_less_than_th
     // The other access point is stronger, but by less than the margin.
     shell.radio.access_points[1].rssi = -46;
 
-    shell.wake(Wake::Timer);
+    shell.wake(Wake::Touch(None));
     let log = shell.take_log();
     assert_eq!(
         radio(&log),
@@ -235,7 +257,7 @@ fn a_wake_joins_the_cached_access_point_and_stays_if_the_scan_finds_less_than_th
     assert_eq!(
         shell.take_logs(),
         [
-            "info wifi: the scan found no access point that is 10 dB stronger than \
+            "debug wifi: the scan found no access point that is 10 dB stronger than \
              02:00:00:00:00:01 on channel 6 (-55 dBm), so stay"
         ]
     );
@@ -260,7 +282,7 @@ fn a_better_access_point_closes_cleanly_and_the_core_joins_it_once() {
     };
     let before = disconnects(&shell);
 
-    shell.wake(Wake::Timer);
+    shell.wake(Wake::Touch(None));
     let log = shell.take_log();
     assert_eq!(
         radio(&log),
@@ -328,7 +350,7 @@ fn a_join_to_a_better_access_point_that_a_sleep_stops_does_not_skip_the_next_sca
 
     // The next join is not the join of a change of access point, so a scan
     // is due after it.
-    shell.wake(Wake::Timer);
+    shell.wake(Wake::Touch(None));
     let log = shell.take_log();
     assert_eq!(
         radio(&log),
@@ -346,7 +368,7 @@ fn a_cached_join_that_fails_joins_the_strongest_access_point_with_no_backoff() {
         .access_points
         .retain(|seen| seen.access_point != HALL);
 
-    shell.wake(Wake::Timer);
+    shell.wake(Wake::Touch(None));
     let log = shell.take_log();
     assert_eq!(
         radio(&log),
@@ -365,7 +387,7 @@ fn a_join_to_the_strongest_that_fails_waits_for_the_backoff() {
     let mut shell = asleep();
     shell.radio.blocked = true;
 
-    shell.wake(Wake::Timer);
+    shell.wake(Wake::Touch(None));
     let log = shell.take_log();
     assert_eq!(radio(&log), ["RadioJoin Cached", "RadioJoin Strongest"]);
     let strongest = place(&log, "RadioJoin Strongest");
@@ -380,7 +402,7 @@ fn a_join_to_the_strongest_that_fails_waits_for_the_backoff() {
         [
             JOIN_TO_HALL_FAILED,
             "warn wifi: the join to the strongest access point failed, so the link is down",
-            &connect_again(1),
+            &link_down(1),
         ]
     );
 
@@ -498,11 +520,11 @@ fn a_refused_connect_clears_a_suspect_link() {
         shell.take_logs(),
         [
             SUSPECT,
-            &connect_again(1),
+            &connect_again(LOST, 1),
             LEAVE_HALL,
             "info wifi: the broker host ended the session, so the link moves data and is not \
              suspect",
-            &connect_again(2),
+            &connect_again(REFUSED, 2),
         ]
     );
 
@@ -513,7 +535,7 @@ fn a_refused_connect_clears_a_suspect_link() {
     assert_eq!(radio(&log), ["RadioJoin Cached keep", "RadioAddress"]);
     assert_eq!(shell.restarts, Vec::<String>::new());
     // The refused connect schedules the next wait.
-    assert_eq!(shell.take_logs(), [connect_again(4)]);
+    assert_eq!(shell.take_logs(), [connect_again(REFUSED, 4)]);
 }
 
 #[test]
@@ -542,13 +564,13 @@ fn a_refused_connect_clears_a_suspect_link_and_its_count() {
         shell.take_logs(),
         [
             SUSPECT,
-            &connect_again(1),
+            &connect_again(LOST, 1),
             LEAVE_HALL,
             "warn wifi: the address is from before the join, so the network stack can be stuck",
             &no_new_address(1),
             "info wifi: the broker host ended the session, so the link moves data and is not \
              suspect",
-            &connect_again(2),
+            &connect_again(REFUSED, 2),
         ]
     );
 }
@@ -654,7 +676,7 @@ fn a_stuck_driver_restarts_the_chip_after_3_joins_with_no_address() {
         shell.take_logs(),
         [
             SUSPECT,
-            &connect_again(1),
+            &connect_again(LOST, 1),
             LEAVE_HALL,
             &no_new_address(1),
             "warn wifi: 02:00:00:00:00:01 on channel 6 gave no address, so leave it and join \
@@ -662,7 +684,7 @@ fn a_stuck_driver_restarts_the_chip_after_3_joins_with_no_address() {
             &no_new_address(2),
             "warn wifi: the strongest access point 02:00:00:00:00:01 on channel 6 gave no \
              address, so leave it",
-            &connect_again(2),
+            &link_down(2),
             &no_new_address(3),
         ]
     );
@@ -700,11 +722,11 @@ fn a_stale_lease_counts_and_bytes_from_the_broker_clear_the_count() {
         shell.take_logs(),
         [
             SUSPECT,
-            &connect_again(1),
+            &connect_again(LOST, 1),
             LEAVE_HALL,
             "warn wifi: the address is from before the join, so the network stack can be stuck",
             &no_new_address(1),
-            &connect_again(2),
+            &connect_again(NO_ANSWER, 2),
         ]
     );
 
@@ -1085,14 +1107,10 @@ fn an_association_after_the_sleep_started_is_up_but_not_ready() {
     // The core keeps nothing in the cache.
     assert_eq!(model.wifi.cache.plan(), Target::Strongest);
 
-    // A wake before `Off` joins again from `Up`. The cache has no access
-    // point, so the core leaves first.
-    let woke = Event::Power(power::Event::Woke {
-        sleep: 1,
-        wake: Wake::Timer,
-    });
+    // A tap before `Off` wakes the device, which joins again from `Up`. The
+    // cache has no access point, so the core leaves first.
     Dashboard
-        .update(woke, &mut model)
+        .update(Event::Tapped(None), &mut model)
         .expect_render()
         .expect_time_notify_after()
         .expect_radio_leave();
@@ -1151,11 +1169,11 @@ fn bytes_from_the_broker_clear_a_suspect_link_with_one_line() {
         shell.take_logs(),
         [
             SUSPECT,
-            &connect_again(1),
+            &connect_again(LOST, 1),
             LEAVE_HALL,
             "info wifi: bytes from the broker arrived, so the link is not suspect",
             // The join went to the cached access point, so a scan follows.
-            "info wifi: the scan found no access point that is 10 dB stronger than \
+            "debug wifi: the scan found no access point that is 10 dB stronger than \
              02:00:00:00:00:01 on channel 6 (-55 dBm), so stay",
         ]
     );
@@ -1170,7 +1188,7 @@ fn a_rejoin_that_keeps_the_association_and_its_address_writes_no_line() {
     shell.broker.code = 5;
     shell.send(start(PowerSource::Stand));
     shell.take_log();
-    assert_eq!(shell.take_logs(), [connect_again(1)]);
+    assert_eq!(shell.take_logs(), [connect_again(NOT_AUTHORIZED, 1)]);
 
     shell.advance(RECONNECT_MIN);
     let log = shell.take_log();
@@ -1178,7 +1196,7 @@ fn a_rejoin_that_keeps_the_association_and_its_address_writes_no_line() {
     assert!(shell.radio.has_address);
     // The rejoin writes no line of its own. The refused connect writes the
     // wait of the next reconnect.
-    assert_eq!(shell.take_logs(), [connect_again(2)]);
+    assert_eq!(shell.take_logs(), [connect_again(NOT_AUTHORIZED, 2)]);
 }
 
 #[test]
@@ -1299,7 +1317,7 @@ fn a_scan_with_no_signal_for_the_current_access_point_stays() {
             &mut model,
         )
         .expect_only_log_with(|log| {
-            assert_eq!(log.level, Level::Info);
+            assert_eq!(log.level, Level::Debug);
             assert_eq!(
                 log.to_string(),
                 "wifi: the signal of 02:00:00:00:00:01 on channel 6 is unknown, so stay"
@@ -1475,17 +1493,17 @@ fn a_sleep_during_a_scan_goes_through_each_step_and_writes_one_line_for_each() {
     assert_eq!(
         shell.take_logs(),
         [
-            "info power: sleep 2 turns the front light off",
-            "info power: sleep 2 waits for the end of the scan",
-            "info power: sleep 2 closes the connection",
-            "info power: sleep 2 turns the radio off",
-            "info power: sleep 2 draws the last image and sleeps",
+            "debug power: sleep 2 turns the front light off",
+            "debug power: sleep 2 waits for the end of the scan",
+            "debug power: sleep 2 closes the connection",
+            "debug power: sleep 2 turns the radio off",
+            "debug power: sleep 2 draws the last image and sleeps",
         ]
     );
 
     // The wake ends the sleep.
     shell.hold_radio = false;
-    shell.wake(Wake::Timer);
+    shell.wake(Wake::Touch(None));
     assert_eq!(power::sleep_step(&shell.model), None);
 }
 
@@ -1529,7 +1547,7 @@ fn scanning_with_no_better_access_point() -> Shell {
     let mut shell = asleep();
     shell.radio.access_points[1].rssi = -46;
     shell.hold_radio = true;
-    shell.wake(Wake::Timer);
+    shell.wake(Wake::Touch(None));
     shell.answer_radio();
     shell.answer_radio();
     assert!(matches!(shell.model.wifi.phase, Phase::Scanning(_)));
@@ -1602,11 +1620,11 @@ fn a_session_that_fails_again_after_a_stale_address_keeps_the_count_of_joins() {
         shell.take_logs(),
         [
             SUSPECT,
-            &connect_again(1),
+            &connect_again(LOST, 1),
             LEAVE_HALL,
             "warn wifi: the address is from before the join, so the network stack can be stuck",
             &no_new_address(1),
-            &connect_again(2),
+            &connect_again(NO_ANSWER, 2),
         ]
     );
     shell.take_log();
@@ -1713,4 +1731,20 @@ fn a_failed_wake_scan_keeps_its_warning() {
     shell.answer_radio();
     let lines = published_lines(&shell);
     assert!(lines.contains(&("warn".into(), failed.into())), "{lines:?}");
+}
+
+#[test]
+fn a_wake_scan_with_no_better_access_point_keeps_no_line() {
+    let mut shell = at_the_sleep_step();
+    shell.send(Event::Tapped(None));
+    assert_eq!(
+        shell.take_logs(),
+        [
+            "debug wifi: the scan found no access point that is 10 dB stronger than \
+             02:00:00:00:00:01 on channel 6 (-55 dBm), so stay"
+        ]
+    );
+    // The line is not in the ring, and it does not go to Home Assistant.
+    assert_eq!(shell.model.logs.lines().len(), 0);
+    assert_eq!(published_lines(&shell), Vec::new());
 }

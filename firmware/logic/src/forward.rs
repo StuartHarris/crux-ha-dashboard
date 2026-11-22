@@ -6,8 +6,10 @@
 //! lines of the core. This module has the parts of the logger that do not
 //! touch the hardware:
 //!
-//! - [`Filter`] reads `ESP_LOG` as the logger of esp-println does, so the
-//!   serial log prints the same lines.
+//! - [`Filter`] reads `ESP_LOG` once, at build time, with the rules of the
+//!   logger of esp-println. One rule differs: a target matches only if it
+//!   is equal, or if it ends at `::`. The serial log prints the same lines
+//!   otherwise.
 //! - [`forwarded`] decides which lines go to the core.
 //! - [`route`] decides for each line if it prints, if it goes to the core,
 //!   or both. The two are separate: a warn line that `ESP_LOG` does not
@@ -27,8 +29,8 @@ use core::fmt::{self, Write};
 use log::LevelFilter;
 use shared::{
     Event,
-    capabilities::log::{Level, Uptime},
-    features::logs::{MAX_MESSAGE, MAX_SOURCE},
+    capabilities::log::Uptime,
+    features::logs::{Kept, MAX_MESSAGE, MAX_SOURCE},
 };
 
 /// The log target of the lines of the core. The core task writes each line
@@ -69,13 +71,13 @@ const TEXT: usize = MAX_WORD + 2 + MESSAGE;
 /// target is not [`CORE_TARGET`]. The logger writes no lines of its own, so
 /// no other target needs a check.
 #[must_use]
-pub fn forwarded(level: log::Level, target: &str) -> Option<Level> {
+pub fn forwarded(level: log::Level, target: &str) -> Option<Kept> {
     if target == CORE_TARGET {
         return None;
     }
     match level {
-        log::Level::Error => Some(Level::Error),
-        log::Level::Warn => Some(Level::Warn),
+        log::Level::Error => Some(Kept::Error),
+        log::Level::Warn => Some(Kept::Warn),
         log::Level::Info | log::Level::Debug | log::Level::Trace => None,
     }
 }
@@ -86,7 +88,7 @@ pub struct Route {
     /// The line prints on the serial port.
     pub print: bool,
     /// The line goes to the core at this level.
-    pub forward: Option<Level>,
+    pub forward: Option<Kept>,
 }
 
 /// Returns what the logger does with a line with `level` and `target`.
@@ -214,7 +216,7 @@ pub struct Line {
     /// The time of the line on the monotonic clock of the device.
     pub at: Uptime,
     /// How important the line is.
-    pub level: Level,
+    pub level: Kept,
     /// The source of the line. Refer to [`split`].
     pub source: Text<SOURCE>,
     /// The message of the line.
@@ -225,7 +227,7 @@ impl Line {
     /// A line with no text, to fill the places of [`Pending`].
     const EMPTY: Self = Self {
         at: Uptime(0),
-        level: Level::Warn,
+        level: Kept::Warn,
         source: Text::EMPTY,
         message: Text::EMPTY,
     };
@@ -236,7 +238,7 @@ impl Line {
     /// The line keeps one more character of a source or a message that is
     /// too long, so the core cuts it with its mark.
     #[must_use]
-    pub fn new(at: Uptime, level: Level, target: &str, args: fmt::Arguments<'_>) -> Self {
+    pub fn new(at: Uptime, level: Kept, target: &str, args: fmt::Arguments<'_>) -> Self {
         let mut text = Text::<TEXT>::EMPTY;
         // `Text` never fails. An error from a `Display` of an argument ends
         // the line early, and the line keeps what it has.
@@ -354,46 +356,153 @@ impl Pending {
     }
 }
 
+/// The most directives of `ESP_LOG` that a [`Filter`] keeps. A longer text
+/// stops the build of the firmware.
+pub const MAX_DIRECTIVES: usize = 8;
+
+/// One directive of `ESP_LOG`: the level of a target.
+#[derive(Clone, Copy, Debug)]
+struct Directive<'a> {
+    target: &'a str,
+    level: LevelFilter,
+}
+
+impl Directive<'_> {
+    const EMPTY: Self = Self {
+        target: "",
+        level: LevelFilter::Off,
+    };
+}
+
 /// The levels of the log for each target, from the `ESP_LOG` text at build
 /// time.
 ///
-/// The rules are the rules of the logger of esp-println 0.18, which reads
-/// the same text:
+/// [`Filter::new`] is a `const fn`. It reads the text once, at compile time,
+/// when the filter is a `static`. So the filter does no string parsing for
+/// a line. The rules follow the logger of esp-println 0.18, which reads the
+/// same text, with one change in how a target matches:
 ///
 /// - The text is a list of directives with `,` between them. The text
 ///   after a `/` does not count.
 /// - `<level>` is the level of all targets. `<target>=<level>` is the level
-///   of each target that starts with `<target>`. A `<target>` alone, or
+///   of each target that matches `<target>`. A `<target>` alone, or
 ///   `<target>=`, has the level `trace`.
+/// - A target matches `<target>` if it is equal to `<target>`, or if it
+///   starts with `<target>` and the next two bytes are `::`. So `core`
+///   matches `core` and `core::x`, and does not match `core_task` or
+///   `coreutils`. This is the change: esp-println uses `starts_with`, so
+///   with it `core` also matches `core_task`.
 /// - The directive with the longest `<target>` that matches is the one that
-///   counts. If no `<target>` matches, the level of all targets counts. If
-///   the text has no such level, the line does not print.
+///   counts. If no `<target>` matches, the first level of all targets
+///   counts. If the text has no such level, the line does not print.
 /// - With no `ESP_LOG`, the maximum level is `off`, so no line prints.
 ///
 /// The build of esp-println stops on a directive that is not valid. This
-/// type ignores such a directive.
+/// type ignores such a directive. It stops the build if the text has more
+/// than [`MAX_DIRECTIVES`] valid directives.
 #[derive(Clone, Copy, Debug)]
 pub struct Filter<'a> {
-    spec: Option<&'a str>,
+    /// `false` if there is no `ESP_LOG`.
+    set: bool,
+    /// The first level of all targets.
+    global: Option<LevelFilter>,
+    /// The directives with a target, in the order of the text.
+    targets: [Directive<'a>; MAX_DIRECTIVES],
+    /// The number of directives in `targets`.
+    len: usize,
+    /// The highest level of a directive.
+    max: LevelFilter,
 }
 
 impl<'a> Filter<'a> {
     /// Makes the filter for the `ESP_LOG` text `spec`.
+    ///
+    /// # Panics
+    ///
+    /// In a `const` context, this stops the build if `spec` has more than
+    /// [`MAX_DIRECTIVES`] directives with a target.
     #[must_use]
     pub const fn new(spec: Option<&'a str>) -> Self {
-        Self { spec }
+        let mut filter = Self {
+            set: spec.is_some(),
+            global: None,
+            targets: [Directive::EMPTY; MAX_DIRECTIVES],
+            len: 0,
+            max: LevelFilter::Off,
+        };
+        let Some(spec) = spec else {
+            return filter;
+        };
+        // The text after a `/` does not count.
+        let mut rest = match find(spec.as_bytes(), b'/') {
+            Some(at) => spec.as_bytes().split_at(at).0,
+            None => spec.as_bytes(),
+        };
+        while !rest.is_empty() {
+            let part = if let Some(at) = find(rest, b',') {
+                let (part, tail) = rest.split_at(at);
+                rest = tail.split_at(1).1;
+                part
+            } else {
+                let part = rest;
+                rest = &[];
+                part
+            };
+            filter.add(trim(part));
+        }
+        filter
+    }
+
+    /// Adds the directive `part`, or ignores it if it is not valid.
+    const fn add(&mut self, part: &'a [u8]) {
+        if part.is_empty() {
+            return;
+        }
+        let (name, level) = match find(part, b'=') {
+            None => match level_of(part) {
+                Some(level) => (None, level),
+                None => (Some(part), LevelFilter::Trace),
+            },
+            Some(at) => {
+                let (name, tail) = part.split_at(at);
+                let level = trim(tail.split_at(1).1);
+                if find(level, b'=').is_some() {
+                    return;
+                }
+                if level.is_empty() {
+                    (Some(name), LevelFilter::Trace)
+                } else if let Some(level) = level_of(level) {
+                    (Some(name), level)
+                } else {
+                    return;
+                }
+            }
+        };
+        if level as usize > self.max as usize {
+            self.max = level;
+        }
+        match name {
+            Some(name) => {
+                assert!(self.len < MAX_DIRECTIVES, "ESP_LOG has too many directives");
+                let Ok(target) = core::str::from_utf8(name) else {
+                    return;
+                };
+                self.targets[self.len] = Directive { target, level };
+                self.len += 1;
+            }
+            None => {
+                if self.global.is_none() {
+                    self.global = Some(level);
+                }
+            }
+        }
     }
 
     /// Returns the highest level of a directive, for
     /// [`log::set_max_level`].
     #[must_use]
-    pub fn max_level(&self) -> LevelFilter {
-        self.spec.map_or(LevelFilter::Off, |spec| {
-            directives(spec)
-                .map(|(_, level)| level)
-                .max()
-                .unwrap_or(LevelFilter::Off)
-        })
+    pub const fn max_level(&self) -> LevelFilter {
+        self.max
     }
 
     /// Returns `true` if a line with `level` and `target` prints: its level
@@ -401,7 +510,7 @@ impl<'a> Filter<'a> {
     /// through.
     #[must_use]
     pub fn prints(&self, level: log::Level, target: &str) -> bool {
-        level <= self.max_level() && self.enabled(level, target)
+        level <= self.max && self.enabled(level, target)
     }
 
     /// Returns `true` if the directives let a line with `level` and `target`
@@ -410,49 +519,83 @@ impl<'a> Filter<'a> {
     /// [`Filter::prints`] to know if a line prints.
     #[must_use]
     pub fn enabled(&self, level: log::Level, target: &str) -> bool {
-        let Some(spec) = self.spec else {
+        if !self.set {
             return true;
-        };
-        let mut best: Option<(usize, LevelFilter)> = None;
-        let mut global = None;
-        for (name, filter) in directives(spec) {
-            match name {
-                Some(name) if target.starts_with(name) => {
-                    if best.is_none_or(|(len, _)| name.len() > len) {
-                        best = Some((name.len(), filter));
-                    }
-                }
-                Some(_) => {}
-                None => global = global.or(Some(filter)),
+        }
+        let mut best: Option<&Directive<'_>> = None;
+        for directive in &self.targets[..self.len] {
+            if matches(directive.target, target)
+                && best.is_none_or(|best| directive.target.len() > best.target.len())
+            {
+                best = Some(directive);
             }
         }
-        best.map(|(_, filter)| filter)
-            .or(global)
+        best.map(|directive| directive.level)
+            .or(self.global)
             .is_some_and(|filter| level <= filter)
     }
 }
 
-/// Returns the valid directives of `spec`: the target, if any, and the
-/// level of each one.
-fn directives(spec: &str) -> impl Iterator<Item = (Option<&str>, LevelFilter)> {
-    let mods = spec.split('/').next().unwrap_or_default();
-    mods.split(',')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .filter_map(|part| {
-            let mut parts = part.split('=');
-            match (parts.next(), parts.next().map(str::trim), parts.next()) {
-                (Some(part), None, None) => Some(
-                    part.parse()
-                        .map_or_else(|_| (Some(part), LevelFilter::max()), |level| (None, level)),
-                ),
-                (Some(name), Some(""), None) => Some((Some(name), LevelFilter::max())),
-                (Some(name), Some(level), None) => {
-                    level.parse().ok().map(|level| (Some(name), level))
-                }
-                _ => None,
-            }
-        })
+/// Returns `true` if `target` is equal to `name`, or starts with `name` and
+/// `::`.
+fn matches(name: &str, target: &str) -> bool {
+    target
+        .strip_prefix(name)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
+}
+
+/// Returns the index of the first `byte` in `bytes`.
+const fn find(bytes: &[u8], byte: u8) -> Option<usize> {
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] == byte {
+            return Some(at);
+        }
+        at += 1;
+    }
+    None
+}
+
+/// Returns `bytes` without the ASCII white space at both ends.
+const fn trim(mut bytes: &[u8]) -> &[u8] {
+    while let [first, tail @ ..] = bytes
+        && first.is_ascii_whitespace()
+    {
+        bytes = tail;
+    }
+    while let [head @ .., last] = bytes
+        && last.is_ascii_whitespace()
+    {
+        bytes = head;
+    }
+    bytes
+}
+
+/// Returns the level that `word` names, as `log` reads it: a name in any
+/// case, or a number from 0 to 5.
+const fn level_of(word: &[u8]) -> Option<LevelFilter> {
+    const LEVELS: [(&[u8], LevelFilter); 12] = [
+        (b"off", LevelFilter::Off),
+        (b"error", LevelFilter::Error),
+        (b"warn", LevelFilter::Warn),
+        (b"info", LevelFilter::Info),
+        (b"debug", LevelFilter::Debug),
+        (b"trace", LevelFilter::Trace),
+        (b"0", LevelFilter::Off),
+        (b"1", LevelFilter::Error),
+        (b"2", LevelFilter::Warn),
+        (b"3", LevelFilter::Info),
+        (b"4", LevelFilter::Debug),
+        (b"5", LevelFilter::Trace),
+    ];
+    let mut at = 0;
+    while at < LEVELS.len() {
+        if word.eq_ignore_ascii_case(LEVELS[at].0) {
+            return Some(LEVELS[at].1);
+        }
+        at += 1;
+    }
+    None
 }
 
 #[cfg(test)]
@@ -462,8 +605,8 @@ mod tests {
     use log::LevelFilter;
     use shared::{
         Event,
-        capabilities::log::{Level, Uptime},
-        features::logs::{MAX_MESSAGE, MAX_SOURCE},
+        capabilities::log::Uptime,
+        features::logs::{Kept, MAX_MESSAGE, MAX_SOURCE},
     };
 
     use super::{
@@ -474,7 +617,7 @@ mod tests {
     fn line(message: &str) -> Line {
         Line::new(
             Uptime(1_000),
-            Level::Warn,
+            Kept::Warn,
             "dashboard::stream",
             format_args!("{message}"),
         )
@@ -486,11 +629,11 @@ mod tests {
     fn warn_and_error_lines_go_to_the_core() {
         assert_eq!(
             forwarded(log::Level::Warn, "dashboard::stream"),
-            Some(Level::Warn)
+            Some(Kept::Warn)
         );
         assert_eq!(
             forwarded(log::Level::Error, "esp_radio::wifi"),
-            Some(Level::Error)
+            Some(Kept::Error)
         );
     }
 
@@ -508,7 +651,7 @@ mod tests {
         // Only the exact target is the core.
         assert_eq!(
             forwarded(log::Level::Warn, "dashboard::core_task"),
-            Some(Level::Warn)
+            Some(Kept::Warn)
         );
     }
 
@@ -584,7 +727,7 @@ mod tests {
             line.event(3),
             Event::ShellLogged {
                 at: Uptime(1_000),
-                level: Level::Warn,
+                level: Kept::Warn,
                 source: "stream".into(),
                 message: "10 failed: timeout".into(),
                 dropped: 3,
@@ -616,7 +759,7 @@ mod tests {
     #[test]
     fn a_long_target_keeps_one_more_character_of_its_crate() {
         let target = "c".repeat(MAX_SOURCE * 2);
-        let line = Line::new(Uptime(0), Level::Error, &target, format_args!("Oops"));
+        let line = Line::new(Uptime(0), Kept::Error, &target, format_args!("Oops"));
 
         assert_eq!(line.source.as_str().len(), MAX_SOURCE + 4);
         assert_eq!(line.message.as_str(), "Oops");
@@ -716,7 +859,7 @@ mod tests {
             both(log::Level::Error, "esp_radio::wifi"),
             Route {
                 print: true,
-                forward: Some(Level::Error)
+                forward: Some(Kept::Error)
             }
         );
         // Forward only: `ESP_LOG` does not print a warn line of esp-radio.
@@ -724,7 +867,7 @@ mod tests {
             both(log::Level::Warn, "esp_radio::wifi"),
             Route {
                 print: false,
-                forward: Some(Level::Warn)
+                forward: Some(Kept::Warn)
             }
         );
         // Print only: an info line, and a warn line of the core.
@@ -782,12 +925,85 @@ mod tests {
             route(&none, true, log::Level::Warn, "dashboard"),
             Route {
                 print: false,
-                forward: Some(Level::Warn)
+                forward: Some(Kept::Warn)
             }
         );
     }
 
     // The filter of `ESP_LOG`.
+
+    #[test]
+    fn the_filter_of_the_firmware_prints_the_debug_lines_of_the_core_only() {
+        // The value of `ESP_LOG` in `firmware/.cargo/config.toml`.
+        let filter = Filter::new(Some("info,core=debug"));
+
+        assert_eq!(filter.max_level(), LevelFilter::Debug);
+        assert!(filter.prints(log::Level::Debug, CORE_TARGET));
+        assert!(filter.prints(log::Level::Info, CORE_TARGET));
+        assert!(!filter.prints(log::Level::Debug, "dashboard::display"));
+        assert!(!filter.prints(log::Level::Debug, "esp_radio::wifi"));
+        assert!(filter.prints(log::Level::Info, "dashboard::display"));
+        // A `Debug` line of the core does not go back to the core.
+        assert_eq!(
+            route(&filter, true, log::Level::Debug, CORE_TARGET),
+            Route {
+                print: true,
+                forward: None
+            }
+        );
+    }
+
+    #[test]
+    fn a_target_matches_if_it_is_equal_or_ends_at_a_double_colon() {
+        let filter = Filter::new(Some("error,core=debug"));
+
+        assert!(filter.enabled(log::Level::Debug, "core"));
+        assert!(filter.enabled(log::Level::Debug, "core::x"));
+        assert!(filter.enabled(log::Level::Debug, "core::x::y"));
+        assert!(!filter.enabled(log::Level::Debug, "core_task"));
+        assert!(!filter.enabled(log::Level::Debug, "coreutils"));
+        assert!(!filter.enabled(log::Level::Debug, "cor"));
+        assert!(!filter.enabled(log::Level::Debug, "core:x"));
+    }
+
+    #[test]
+    fn a_debug_line_of_another_crate_neither_prints_nor_goes_to_the_core() {
+        let filter = Filter::new(Some("info,core=debug"));
+
+        for forwarding in [false, true] {
+            for target in [
+                "esp_hal::gpio",
+                "esp_radio",
+                "embassy_net::device",
+                "core_task",
+            ] {
+                assert_eq!(
+                    route(&filter, forwarding, log::Level::Debug, target),
+                    Route {
+                        print: false,
+                        forward: None
+                    },
+                    "{target}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_filter_built_at_compile_time_gives_the_same_answers() {
+        const FILTER: Filter<'static> =
+            Filter::new(Some("warn, Esp_Radio=ERROR, a=, b=bad, c=1=2, 4"));
+
+        assert_eq!(FILTER.max_level(), LevelFilter::Trace);
+        assert!(FILTER.enabled(log::Level::Trace, "a::x"));
+        // The target is case sensitive, but the level is not.
+        assert!(!FILTER.enabled(log::Level::Warn, "Esp_Radio"));
+        assert!(FILTER.enabled(log::Level::Error, "Esp_Radio"));
+        // A directive that is not valid does not count, so the first level
+        // of all targets counts.
+        assert!(FILTER.enabled(log::Level::Warn, "b"));
+        assert!(!FILTER.enabled(log::Level::Info, "c"));
+    }
 
     #[test]
     fn a_global_level_prints_that_level_and_higher() {

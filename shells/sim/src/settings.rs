@@ -19,9 +19,11 @@ Runs the dashboard core in a window, connected to the MQTT broker.
 
 Modes:
   (none)              Open a window. Click to tap. Keys: S moves the device on
-                      or off the stand, W wakes it, Z ends the idle time on
-                      battery so that the core sleeps, R restarts the
-                      sleeping device with a new core (a deep sleep), [ and ]
+                      or off the stand, W wakes the sleeping device with no
+                      cause (the device sleeps again after 3 s), Z ends the
+                      idle time on battery so that the core sleeps, R
+                      restarts the sleeping device with a new core (a deep
+                      sleep), [ and ]
                       decrease and increase the charge of the battery by 10%,
                       L drops the Wi-Fi link, B blocks or unblocks the device
                       (as the router does), A moves the strongest access

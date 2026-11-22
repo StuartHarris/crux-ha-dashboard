@@ -10,7 +10,7 @@ use crux_time::operation as time;
 use crate::{
     capabilities::{
         light::FrontLight,
-        log::{Level, Log, LogClock, Uptime},
+        log::{Log, LogClock, Uptime},
         power::{PowerSource, Sleep},
         radio::{Address, Join, Leave, Off, Restart, Scan, StopScan},
         stream::{Close, Open, Write},
@@ -203,7 +203,7 @@ pub enum Event {
         /// The time of the line, on the clock of the `Log` answers.
         at: Uptime,
         /// How important the line is: `Warn` or `Error`.
-        level: Level,
+        level: logs::Kept,
         /// The part of the shell that wrote the line, for example `stream`.
         /// The core keeps at most [`logs::MAX_SOURCE`] bytes.
         source: String,
@@ -503,7 +503,7 @@ fn on_start(start: Start, model: &mut Model) -> Cmd {
         .filter(|route| model.pages.iter().any(|page| page.is_at(route)))
         .or_else(|| model.pages.first().map(Page::route))
         .unwrap_or_default();
-    power::reset(source, model);
+    let summary = power::reset(source, model);
     connection::reset(model);
 
     // The state of the light after a reset is not known, so the core turns
@@ -512,4 +512,5 @@ fn on_start(start: Start, model: &mut Model) -> Cmd {
         .and(redraw(model, true))
         .and(connection::go_online(model))
         .and(power::restart_idle_timer(model))
+        .and(summary)
 }

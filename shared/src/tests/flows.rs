@@ -17,7 +17,7 @@ use crate::{
     features::{
         connection::{RECONNECT_MAX, RECONNECT_MIN},
         pending::{PENDING_TIMEOUT, SCENE_TIMEOUT, TARGET_TIMEOUT},
-        power::IDLE_TIMEOUT,
+        power::{IDLE_TIMEOUT, STRAY_HOLD},
     },
 };
 
@@ -270,7 +270,10 @@ fn on_battery_the_dashboard_wakes_syncs_accepts_taps_then_sleeps() {
             "Sleep",
         ]
     );
-    assert_eq!(shell.sleep.as_ref().unwrap().wake_on, [WakeSource::Touch]);
+    assert_eq!(
+        shell.sleep.as_ref().unwrap().wake_on,
+        [WakeSource::Touch, WakeSource::Timer { seconds: 60 }]
+    );
     assert!(!shell.radio.on);
     assert!(!shell.broker.is_connected());
     // A disconnect is not a lost connection, so the broker keeps `asleep`.
@@ -289,6 +292,51 @@ fn on_battery_the_dashboard_wakes_syncs_accepts_taps_then_sleeps() {
 }
 
 #[test]
+fn on_battery_checks_and_a_stray_wake_keep_the_device_asleep_until_a_touch() {
+    let mut shell = house();
+    shell.send(start(PowerSource::Battery));
+    shell.advance(IDLE_TIMEOUT);
+    assert!(shell.sleep.is_some());
+    let frames = shell.frames.len();
+
+    // Three checks of the power source: each one sleeps again.
+    for _ in 0..3 {
+        shell.check();
+        assert!(shell.sleep.is_some());
+    }
+    // A wake with no cause, the hold, then a check.
+    shell.stray();
+    assert!(shell.sleep.is_none());
+    shell.advance(STRAY_HOLD);
+    assert!(shell.sleep.is_some());
+    shell.check();
+    // The panel kept its last image, and the radio stayed off.
+    assert_eq!(shell.frames.len(), frames);
+    assert!(!shell.radio.on);
+    assert!(shell.view().asleep);
+
+    // A touch wakes the device, which connects.
+    shell.send(Event::Tapped(None));
+    assert!(!shell.view().asleep);
+    assert_eq!(shell.view().connection, Connection::Online);
+    let mut expected: Vec<String> = super::sleep_lines(1).into();
+    expected.push("info power: sleep 1 woke with no cause, so it sleeps again after 3 s".into());
+    let power: Vec<String> = shell
+        .take_logs()
+        .into_iter()
+        .filter(|line| line.contains(" power: "))
+        .collect();
+    assert_eq!(power, expected);
+    // No timer of the core waited at a `Sleep` request.
+    assert_eq!(shell.timers_at_sleep.len(), 6);
+    assert!(
+        shell.timers_at_sleep.iter().all(Vec::is_empty),
+        "{:?}",
+        shell.timers_at_sleep
+    );
+}
+
+#[test]
 fn a_battery_wake_shows_the_changes_from_while_it_slept() {
     let mut shell = house();
     shell.send(start(PowerSource::Battery));
@@ -299,7 +347,7 @@ fn a_battery_wake_shows_the_changes_from_while_it_slept() {
     shell.broker.set_state("light.all_lights", "off", &[]);
     shell.broker.set_state("weather.home", "sunny", &[]);
 
-    shell.wake(Wake::Timer);
+    shell.wake(Wake::Touch(None));
     assert!(shell.radio.associated.is_some());
     assert_eq!(shell.broker.connections, 2);
     assert_eq!(shell.view().connection, Connection::Online);
@@ -627,7 +675,7 @@ fn on_battery_a_tap_that_waits_for_a_connection_delays_the_sleep_once() {
 
     // The next connection clears the notice.
     shell.broker.down = false;
-    shell.wake(Wake::Timer);
+    shell.wake(Wake::Touch(None));
     assert_eq!(shell.view().status, "Online");
 }
 
@@ -673,7 +721,7 @@ fn a_wake_after_a_long_outage_retries_after_the_shortest_wait() {
     while shell.sleep.is_none() {
         shell.advance_to_next();
     }
-    shell.wake(Wake::Timer);
+    shell.wake(Wake::Touch(None));
     // The wake tries at once, and again after the shortest wait.
     shell.take_log();
     shell.advance(RECONNECT_MIN);

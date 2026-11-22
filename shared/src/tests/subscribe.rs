@@ -120,7 +120,7 @@ fn a_wake_subscribes_again_and_then_the_link_is_quiet() {
     assert!(shell.model.power.is_asleep());
     shell.take_log();
 
-    shell.wake(Wake::Timer);
+    shell.wake(Wake::Touch(None));
     let log = shell.take_log();
     let status = place(&log, "MqttPublish dashboard/hall/status online");
     let subscribe = place(&log, "MqttSubscribe");

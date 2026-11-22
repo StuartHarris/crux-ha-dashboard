@@ -19,9 +19,9 @@ use crate::{
     features::{
         connection::{OUTBOX_LIMIT, RECONNECT_MIN},
         light::STAND_LEVEL,
-        pending::{PENDING_TIMEOUT, QUEUED_TIMEOUT, SCENE_TIMEOUT},
+        pending::{PENDING_TIMEOUT, QUEUED_TIMEOUT, SCENE_TIMEOUT, TARGET_TIMEOUT},
         power::IDLE_TIMEOUT,
-        refresh::{DRAW_DELAY, redraw},
+        refresh::{DRAW_DELAY, PARTIALS_PER_FULL, redraw},
     },
     mqtt::{MAX_IN_FLIGHT, codec::server::Packet},
 };
@@ -281,23 +281,29 @@ fn a_call_that_the_sleep_drops_loses_its_mark() {
 #[test]
 fn a_timeout_while_asleep_removes_the_mark_but_does_not_draw() {
     let app = Dashboard;
-    let (mut model, _wire) = drive_to_connected(PowerSource::Battery);
-    model.route = Route::room("living_room");
-    set_state(&mut model, LAMP, "on");
+    let (mut model, mut wire) = lamp_on();
 
-    let _ = app.update(tap_tile(1), &mut model);
+    // The call for the lamp goes out. Then the connection closes, and a call
+    // for the other light waits in the outbox.
+    wire.settle(app.update(tap_tile(1), &mut model), &mut model);
     let id = model.pending.timer;
-    let _ = app.update(
-        Event::Power(power::Event::IdleTimeout(model.power.idle)),
-        &mut model,
-    );
+    let closed = wire.drop_connection(&mut model, "connection lost");
+    wire.settle(closed, &mut model);
+    wire.settle(app.update(tap_tile(0), &mut model), &mut model);
+    assert_eq!(model.connection.outbox.len(), 1);
+
+    // The first `SleepNow` waits one more idle period for the outbox. A call
+    // still waits at the second one, so the sleep starts with the marks.
+    let _ = app.update(Event::PowerSourceChanged(PowerSource::Battery), &mut model);
+    let _ = app.update(Event::SleepNow, &mut model);
+    let _ = app.update(Event::SleepNow, &mut model);
     assert!(model.power.is_asleep());
-    // The call went out before the sleep, so the mark stays.
+    // The light-off step waits for its answer, so the mark stays.
     assert_eq!(tile_state(&model, 1), TileState::Pending);
 
     app.update(Event::Pending(pending::Event::Timeout(id)), &mut model)
         .expect_no_effects();
-    assert!(model.pending.marks.is_empty());
+    assert!(!pending::is_pending(&model, LAMP));
 }
 
 #[test]
@@ -714,7 +720,7 @@ fn queued_timers(cmd: &mut Cmd) -> usize {
 }
 
 #[test]
-fn a_sleep_keeps_the_mark_of_a_call_that_went_out_through_the_queued_timeout() {
+fn a_sleep_ends_the_mark_of_a_call_that_went_out_and_waits_again() {
     let app = Dashboard;
     let (mut model, mut wire) = lamp_on();
 
@@ -738,13 +744,15 @@ fn a_sleep_keeps_the_mark_of_a_call_that_went_out_through_the_queued_timeout() {
     let _ = app.update(light_off, &mut model);
     assert!(model.connection.outbox.is_empty());
 
-    // The first call went out, so its mark stays.
-    assert_eq!(tile_state(&model, 1), TileState::Pending);
+    // The sleep ends the mark, also for the first call, which went out. The
+    // tile shows the last state.
+    assert!(model.pending.marks.is_empty());
+    assert_eq!(tile_state(&model, 1), TileState::On);
 
-    // No call waits, so the queued timeout does not remove the mark.
+    // The expiry of the old queued timer does nothing.
     app.update(Event::Pending(pending::Event::Timeout(queued)), &mut model)
         .expect_no_effects();
-    assert_eq!(tile_state(&model, 1), TileState::Pending);
+    assert_eq!(tile_state(&model, 1), TileState::On);
 }
 
 #[test]
@@ -827,7 +835,7 @@ fn an_issued_call_keeps_the_queued_timer_while_another_call_waits() {
 }
 
 #[test]
-fn a_sleep_clears_the_queued_timer_of_a_mark_whose_call_went_out() {
+fn a_sleep_clears_both_timers_of_a_mark_whose_call_went_out_and_waits_again() {
     let app = Dashboard;
     let (mut model, mut wire) = lamp_on();
 
@@ -835,6 +843,18 @@ fn a_sleep_clears_the_queued_timer_of_a_mark_whose_call_went_out() {
     // call waits in the outbox. The wire keeps the command of the queued
     // timer.
     wire.settle(app.update(tap_tile(1), &mut model), &mut model);
+    let issued = wire
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            crate::Effect::TimeNotifyAfter(request)
+                if Duration::from(request.operation.duration) == PENDING_TIMEOUT =>
+            {
+                Some(request.operation.id)
+            }
+            _ => None,
+        })
+        .expect("the timeout of the issued call");
     let closed = wire.drop_connection(&mut model, "connection lost");
     wire.settle(closed, &mut model);
     wire.effects.clear();
@@ -864,18 +884,20 @@ fn a_sleep_clears_the_queued_timer_of_a_mark_whose_call_went_out() {
     let _ = app.update(light_off, &mut model);
     assert!(model.connection.outbox.is_empty());
 
-    // The first call went out, so the mark stays. No call waits, so the
-    // core clears the queued timer.
-    assert_eq!(tile_state(&model, 1), TileState::Pending);
+    // The sleep ends the mark, and the core clears both of its timers.
+    assert!(model.pending.marks.is_empty());
     wire.run(&mut model);
-    assert!(
-        wire.effects.iter().any(|effect| matches!(
-            effect,
-            crate::Effect::TimeClear(request) if request.operation.id == queued
-        )),
-        "{:?}",
-        wire.effects
-    );
+    let cleared: Vec<_> = wire
+        .effects
+        .iter()
+        .filter_map(|effect| match effect {
+            crate::Effect::TimeClear(request) => Some(request.operation.id),
+            _ => None,
+        })
+        .collect();
+    // The queued timer, and the timeout of the call that went out.
+    assert!(cleared.contains(&queued), "{cleared:?}");
+    assert!(cleared.contains(&issued), "{cleared:?}");
 }
 
 /// No flow of events reaches this state: the drain fills each place in the
@@ -916,7 +938,7 @@ fn an_issued_timeout_removes_a_mark_that_has_no_queued_timer_while_an_old_call_w
 }
 
 #[test]
-fn a_sleep_keeps_the_mark_of_a_call_that_went_out_until_its_timeout() {
+fn the_timeout_of_the_last_mark_starts_the_sleep_that_waits() {
     let app = Dashboard;
     let (mut model, mut wire) = lamp_on();
 
@@ -925,20 +947,15 @@ fn a_sleep_keeps_the_mark_of_a_call_that_went_out_until_its_timeout() {
     let issued = model.pending.timer;
     assert!(model.connection.outbox.is_empty());
 
-    // The device sleeps. The sleep drops the outbox, which is empty.
+    // The call went out, so the sleep waits for its mark.
     let _ = app.update(Event::PowerSourceChanged(PowerSource::Battery), &mut model);
-    let mut sleep = app.update(Event::SleepNow, &mut model);
-    assert!(model.power.is_asleep());
-    let light_off = sleep
-        .expect_step("sleep 1 turns the front light off")
-        .resolve_front_light(|_| ())
-        .expect_one_event();
-    let _ = app.update(light_off, &mut model);
-
-    // The call went out, so the mark stays until its timeout.
+    let _ = app.update(Event::SleepNow, &mut model);
+    assert!(!model.power.is_asleep());
     assert!(pending::is_pending(&model, LAMP));
-    app.update(Event::Pending(pending::Event::Timeout(issued)), &mut model)
-        .expect_no_effects();
+
+    // The timeout ends the mark, and the sleep starts.
+    let _ = app.update(Event::Pending(pending::Event::Timeout(issued)), &mut model);
+    assert!(model.power.is_asleep());
     assert!(!pending::is_pending(&model, LAMP));
 }
 
@@ -996,4 +1013,251 @@ fn a_full_outbox_clears_the_queued_timer_of_a_mark_whose_call_went_out() {
         "{:?}",
         wire.effects
     );
+}
+
+/// Starts the house on battery on the page `path`, where Home Assistant
+/// does not answer the service calls, so each mark waits for its timeout.
+fn quiet_house(path: &str) -> Shell {
+    let mut shell = crate::tests::flows::house();
+    shell.broker.ignore_calls = true;
+    shell.broker.set_state(
+        "climate.dining_room_thermostat",
+        "heat",
+        &[("current_temperature", "19.5"), ("temperature", "21.0")],
+    );
+    shell.send(start_at(PowerSource::Battery, Some(path)));
+    shell
+}
+
+/// Asserts that the last image of the sleep shows no mark.
+#[track_caller]
+fn assert_last_image_has_no_mark(shell: &Shell, path: &str) {
+    let last = &shell.frames.last().expect("the last image").view;
+    assert!(last.asleep, "{path}");
+    assert!(
+        last.tiles()
+            .iter()
+            .all(|tile| tile.state != TileState::Pending),
+        "{path}"
+    );
+    assert!(last.scenes().iter().all(|scene| !scene.pending), "{path}");
+}
+
+#[test]
+fn sleep_now_waits_until_the_timeout_ends_each_kind_of_mark() {
+    // A toggle (5 s), a step of a thermostat (20 s) and a scene (2 s).
+    for (path, tap, timeout) in [
+        ("/room/living_room", tap_tile(1), PENDING_TIMEOUT),
+        ("/room/dining_room", tap_plus(4), TARGET_TIMEOUT),
+        ("/room/living_room", tap_scene(0), SCENE_TIMEOUT),
+    ] {
+        let mut shell = quiet_house(path);
+        shell.send(tap);
+        assert_eq!(shell.model.pending.marks.len(), 1, "{path}");
+        shell.take_logs();
+
+        // The user asks to sleep inside the timeout of the mark. The sleep
+        // waits, and a second request changes nothing.
+        shell.send(Event::SleepNow);
+        shell.send(Event::SleepNow);
+        assert!(shell.sleep.is_none(), "{path}");
+        let logs = shell.take_logs();
+        let waits = "debug power: the sleep waits for 1 pending mark";
+        assert_eq!(
+            logs.iter().filter(|line| *line == waits).count(),
+            1,
+            "{path}: {logs:?}"
+        );
+
+        // Halfway through the timeout, the sleep still waits.
+        shell.advance(timeout / 2);
+        assert!(shell.sleep.is_none(), "{path}");
+        assert_eq!(shell.model.pending.marks.len(), 1, "{path}");
+
+        // The timeout ends the mark, and the sleep starts with no timer.
+        shell.advance(timeout / 2);
+        assert!(shell.sleep.is_some(), "{path}");
+        assert!(shell.model.pending.marks.is_empty(), "{path}");
+        assert_eq!(shell.timers_at_sleep.last(), Some(&Vec::new()), "{path}");
+        assert_last_image_has_no_mark(&shell, path);
+    }
+}
+
+#[test]
+fn sleep_now_sleeps_after_home_assistant_confirms_the_mark() {
+    let mut shell = quiet_house("/room/living_room");
+    shell.send(tap_tile(1));
+    shell.send(Event::SleepNow);
+    assert!(shell.sleep.is_none());
+
+    // Home Assistant confirms the toggle on the state stream, inside the
+    // timeout. The sleep starts when the draw timer expires.
+    shell
+        .broker
+        .set_state(LAMP, "off", &[("brightness", "null")]);
+    shell.run();
+    assert!(shell.sleep.is_some());
+    assert!(shell.model.pending.marks.is_empty());
+    assert_eq!(shell.timers_at_sleep.last(), Some(&Vec::new()));
+
+    // The last image shows the new state.
+    let last = &shell.frames.last().expect("the last image").view;
+    assert!(last.asleep);
+    assert_eq!(last.tiles()[1].state, TileState::Off);
+}
+
+#[test]
+fn the_sleep_after_a_confirmed_step_shows_the_new_brightness() {
+    let mut shell = quiet_house("/room/living_room");
+    shell.send(tap_minus(1));
+    shell.send(Event::SleepNow);
+    assert!(shell.sleep.is_none());
+
+    // The new `last_updated` confirms the step. The sleep waits for the draw
+    // timer, so the brightness that comes after the time still arrives.
+    shell.auto_draw = false;
+    let updated = iso_time(shell.broker.time);
+    shell
+        .broker
+        .publish(&topic(LAMP, "last_updated"), updated.as_bytes(), true);
+    shell.run();
+    assert!(shell.model.pending.marks.is_empty());
+    shell
+        .broker
+        .publish(&topic(LAMP, "brightness"), b"64", true);
+    shell.run();
+    assert!(shell.sleep.is_none());
+
+    // The draw timer expires, and the sleep starts. The last image has the
+    // new brightness.
+    shell.advance(DRAW_DELAY);
+    assert!(shell.sleep.is_some());
+    let last = &shell.frames.last().expect("the last image").view;
+    assert!(last.asleep);
+    let lamp = &last.tiles()[1];
+    assert!(
+        lamp.text.contains("25%") || lamp.detail.contains("25%"),
+        "{lamp:?}"
+    );
+}
+
+#[test]
+fn a_full_refresh_after_the_confirmation_starts_the_sleep() {
+    let mut shell = quiet_house("/room/living_room");
+    shell.send(tap_tile(1));
+    shell.send(Event::SleepNow);
+    shell.auto_draw = false;
+    shell
+        .broker
+        .set_state(LAMP, "off", &[("brightness", "null")]);
+    shell.run();
+    assert!(shell.model.pending.marks.is_empty());
+    assert!(shell.sleep.is_none());
+
+    // A new battery level draws before the draw timer expires. This draw
+    // comes after the largest number of partial renders, so it is a full
+    // refresh, which clears the draw timer. The full refresh then starts
+    // the sleep.
+    shell.model.refresh.partials = PARTIALS_PER_FULL;
+    let level = if shell.model.power.battery == Some(10) {
+        90
+    } else {
+        10
+    };
+    shell.send(Event::BatteryChanged(Some(level)));
+    assert!(shell.sleep.is_some());
+    assert_eq!(shell.timers_at_sleep.last(), Some(&Vec::new()));
+}
+
+#[test]
+fn a_tap_while_the_sleep_waits_cancels_the_sleep() {
+    let mut shell = quiet_house("/room/living_room");
+    shell.send(tap_tile(1));
+    shell.send(Event::SleepNow);
+
+    // The user taps the lamp again. The tap acts as usual, and the idle
+    // timer starts again.
+    shell.send(tap_tile(1));
+    assert_eq!(shell.broker.service_calls.len(), 2);
+    shell.advance(PENDING_TIMEOUT);
+    assert!(shell.model.pending.marks.is_empty());
+    assert!(shell.sleep.is_none());
+
+    // The end of the idle time then starts the sleep.
+    shell.advance(
+        IDLE_TIMEOUT
+            .checked_sub(PENDING_TIMEOUT)
+            .expect("the idle timeout is longer than the pending timeout"),
+    );
+    assert!(shell.sleep.is_some());
+}
+
+#[test]
+fn a_touch_on_no_control_while_the_sleep_waits_only_turns_the_light_on() {
+    let mut shell = quiet_house("/room/living_room");
+    shell.send(tap_tile(1));
+    shell.send(Event::SleepNow);
+
+    // A touch on no control does not start the idle timer again, so the
+    // sleep still waits. The timeout of the mark then starts the sleep,
+    // which turns the light off first.
+    shell.send(Event::Tapped(None));
+    assert!(shell.light > 0);
+    shell.advance(PENDING_TIMEOUT);
+    assert!(shell.sleep.is_some());
+    assert_eq!(shell.light, 0);
+}
+
+#[test]
+fn a_move_to_the_stand_while_the_sleep_waits_cancels_the_sleep() {
+    let mut shell = quiet_house("/room/living_room");
+    shell.send(tap_tile(1));
+    shell.send(Event::SleepNow);
+
+    // The device stays awake on the stand after the end of the mark.
+    shell.send(Event::PowerSourceChanged(PowerSource::Stand));
+    shell.advance(PENDING_TIMEOUT);
+    assert!(shell.model.pending.marks.is_empty());
+    shell.advance(IDLE_TIMEOUT);
+    assert!(shell.sleep.is_none());
+    assert_eq!(shell.model.power.source(), PowerSource::Stand);
+}
+
+#[test]
+fn sleep_now_with_no_mark_sleeps_at_once() {
+    let mut shell = quiet_house("/room/living_room");
+    shell.send(Event::SleepNow);
+    assert!(shell.sleep.is_some());
+    assert_eq!(shell.timers_at_sleep.last(), Some(&Vec::new()));
+}
+
+#[test]
+fn a_tap_that_wakes_the_device_queues_its_call_and_the_timeout_starts_at_the_connect() {
+    let mut shell = quiet_house("/room/living_room");
+    shell.advance(IDLE_TIMEOUT);
+    assert!(shell.sleep.is_some());
+
+    // The wake tap queues its call while the connection opens. The mark has
+    // only the queued timer.
+    shell.broker.down = true;
+    shell.take_log();
+    shell.send(tap_tile(1));
+    assert_eq!(shell.model.connection.outbox.len(), 1);
+    assert_eq!(tile_state(&shell.model, 1), TileState::Pending);
+    let mark_timer = alloc::format!("TimeNotifyAfter {}ms", PENDING_TIMEOUT.as_millis());
+    let queued_timer = alloc::format!("TimeNotifyAfter {}ms", QUEUED_TIMEOUT.as_millis());
+    let log = shell.take_log();
+    assert!(!log.contains(&mark_timer), "{log:?}");
+    assert!(log.contains(&queued_timer), "{log:?}");
+
+    // The connection opens, the call goes out, and its timeout starts.
+    shell.broker.down = false;
+    shell.advance(RECONNECT_MIN);
+    let log = shell.take_log();
+    assert!(log.contains(&mark_timer), "{log:?}");
+    assert!(shell.model.connection.outbox.is_empty());
+
+    // Home Assistant does not answer, so the timeout ends the mark.
+    shell.advance(PENDING_TIMEOUT);
+    assert_eq!(tile_state(&shell.model, 1), TileState::On);
 }

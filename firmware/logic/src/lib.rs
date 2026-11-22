@@ -14,8 +14,8 @@
 //!   the fuel gauge, and decides which changes to send to the core.
 //! - [`config`] reads and checks the build-time configuration.
 //! - [`backoff`] is a wait that doubles after each failure.
-//! - [`sleep`] decides when the chip can go into light sleep, and which
-//!   wake is a real wake.
+//! - [`sleep`] decides when the chip can go into light sleep. The core
+//!   decides what each wake means.
 //! - [`forward`] decides which lines of the log of the firmware go to the
 //!   core, splits each line into its source and its message, and keeps the
 //!   lines that wait for the core task.

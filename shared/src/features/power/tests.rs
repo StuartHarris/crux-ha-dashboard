@@ -12,11 +12,14 @@ use crate::tests::{
 };
 use crate::{
     Connection, Control, Dashboard, Effect, EffectTestExt, Event, Model, PowerSource,
-    capabilities::power::{Wake, WakeSource},
+    capabilities::{
+        log::Level,
+        power::{Wake, WakeSource},
+    },
     features::{
         connection::Link,
         light::BATTERY_LEVEL,
-        power::{IDLE_TIMEOUT, SleepStep},
+        power::{CHECK_PERIOD, IDLE_TIMEOUT, STRAY_HOLD, SleepStep},
         wifi::{JOIN_TIMEOUT, OFF_TIMEOUT, Phase},
     },
 };
@@ -84,7 +87,7 @@ fn the_idle_timeout_sleeps_in_steps_and_a_touch_wakes() {
             _ => None,
         })
         .expect("a Sleep request");
-    assert_eq!(request.operation.wake_on, [WakeSource::Touch]);
+    assert_eq!(request.operation.wake_on, wake_sources());
     // The touch is on no control, so it does not act on a control.
     request.resolve(Wake::Touch(None)).unwrap();
     let woke = last.expect_one_event();
@@ -265,30 +268,49 @@ fn on_the_stand_while_asleep_wakes_and_connects() {
     );
 }
 
-#[test]
-fn a_timer_wake_joins_and_starts_the_idle_timer() {
-    let app = Dashboard;
-    let mut model = asleep_on_battery();
-
-    app.update(woke(&model, Wake::Timer), &mut model)
-        .expect_render()
-        .expect_full_refresh_timer()
-        .expect_radio_join()
-        .expect_radio_limit(JOIN_TIMEOUT)
-        .expect_only_time_notify_after();
-    assert_eq!(model.full_refresh_seq, 1);
+/// The wake sources of each `Sleep` request: a touch, and the check of the
+/// power source.
+fn wake_sources() -> Vec<WakeSource> {
+    alloc::vec![
+        WakeSource::Touch,
+        WakeSource::Timer {
+            seconds: u32::try_from(CHECK_PERIOD.as_secs()).unwrap(),
+        },
+    ]
 }
 
 #[test]
-fn a_power_source_wake_on_battery_is_ignored() {
+fn a_timer_wake_is_a_check_that_only_sleeps_again() {
     let app = Dashboard;
     let mut model = asleep_on_battery();
 
-    // The shell answers `PowerSource` only after a real change. If the core
-    // is still on battery, the answer does not wake it.
-    app.update(woke(&model, Wake::PowerSource), &mut model)
-        .expect_no_effects();
+    // No `Render`, no line and no radio: only a new `Sleep` request.
+    app.update(woke(&model, Wake::Timer), &mut model)
+        .expect_only_sleep_with(|sleep| assert_eq!(sleep.wake_on, wake_sources()));
     assert!(model.power.is_asleep());
+    assert_eq!(power::sleep_step(&model), Some(SleepStep::Sleep));
+    assert_eq!(model.full_refresh_seq, 0);
+    assert_eq!(model.wifi.phase, Phase::Off);
+}
+
+#[test]
+fn a_power_source_wake_on_battery_sleeps_again_with_a_warning() {
+    let app = Dashboard;
+    let mut model = asleep_on_battery();
+
+    // The shell answers `PowerSource` only after a real change, which comes
+    // first as `PowerSourceChanged`. If the core is still on battery, it
+    // writes a warning and sleeps again.
+    app.update(woke(&model, Wake::PowerSource), &mut model)
+        .expect_log_with(|log| {
+            assert_eq!(log.level, Level::Warn);
+            assert_eq!(
+                log.to_string(),
+                "power: sleep 0 got a power source wake on battery, so it sleeps again"
+            );
+        })
+        .expect_only_sleep_with(|sleep| assert_eq!(sleep.wake_on, wake_sources()));
+    assert_eq!(power::sleep_step(&model), Some(SleepStep::Sleep));
 }
 
 /// The answer to the `Sleep` request of the newest sleep.
@@ -302,7 +324,7 @@ const fn woke(model: &Model, wake: Wake) -> Event {
 /// Returns a model of a device on battery that sleeps, with settings.
 fn asleep_on_battery() -> Model {
     Model {
-        power: crate::features::power::State::asleep_in(0),
+        power: crate::features::power::State::sleeping_in(0),
         startup: crate::Startup::Started(crate::tests::settings()),
         ..Model::default()
     }
@@ -440,7 +462,7 @@ fn a_battery_level_while_asleep_does_not_wake_the_device() {
     assert_eq!(app.view(&model).battery, Some(40));
 
     // The wake draws the level.
-    let _ = app.update(woke(&model, Wake::Timer), &mut model);
+    let _ = app.update(woke(&model, Wake::Touch(None)), &mut model);
     assert_eq!(app.view(&model).battery, Some(40));
     assert_eq!(model.full_refresh_seq, 1);
 }
@@ -992,4 +1014,294 @@ fn a_battery_level_at_the_sleep_step_sends_nothing() {
     assert!(shell.sleep.is_some());
     assert_eq!(power::sleep_step(&shell.model), Some(SleepStep::Sleep));
     assert_eq!(shell.view().battery, Some(40));
+}
+
+/// The line of the first wake with no cause in the sleep `id`.
+fn stray_line(id: u32) -> alloc::string::String {
+    alloc::format!("info power: sleep {id} woke with no cause, so it sleeps again after 3 s")
+}
+
+/// Returns the `TimeNotifyAfter` entry of the log for the hold timer.
+fn hold_timer() -> alloc::string::String {
+    alloc::format!("TimeNotifyAfter {}ms", STRAY_HOLD.as_millis())
+}
+
+#[test]
+fn the_first_sleep_has_the_check_timer_and_comes_after_the_last_image() {
+    let mut shell = crate::tests::flows::house();
+    shell.send(start(PowerSource::Battery));
+    shell.take_log();
+    shell.advance(IDLE_TIMEOUT);
+    let log = shell.take_log();
+    let render = log.iter().rposition(|entry| entry == "Render").unwrap();
+    let sleep = log.iter().position(|entry| entry == "Sleep").unwrap();
+    assert!(render < sleep, "{log:?}");
+    assert_eq!(shell.sleep.as_ref().unwrap().wake_on, wake_sources());
+    assert!(shell.frames.last().unwrap().full);
+}
+
+#[test]
+fn a_hundred_checks_give_a_hundred_sleeps_and_then_a_touch_wakes() {
+    let mut shell = at_the_sleep_step();
+    let frames = shell.frames.len();
+
+    for _ in 0..100 {
+        shell.check();
+        assert_eq!(shell.take_log(), ["Wake Timer", "Sleep"]);
+    }
+    assert_eq!(shell.take_logs(), Vec::<alloc::string::String>::new());
+    assert_eq!(shell.frames.len(), frames);
+    assert!(!shell.radio.on);
+
+    shell.send(Event::Tapped(None));
+    assert!(!asleep(&shell.model));
+    assert_eq!(shell.view().connection, Connection::Online);
+}
+
+#[test]
+fn a_stray_wake_holds_the_device_awake_then_sleeps_again() {
+    let mut shell = at_the_sleep_step();
+    let frames = shell.frames.len();
+
+    // The device stays awake with the radio off, and writes one line.
+    shell.stray();
+    assert_eq!(shell.take_log(), ["Wake Other".into(), hold_timer()]);
+    assert_eq!(shell.take_logs(), [stray_line(1)]);
+    assert_eq!(power::sleep_step(&shell.model), Some(SleepStep::Held));
+    assert!(asleep(&shell.model));
+    assert!(shell.sleep.is_none());
+
+    // At the end of the hold, a new `Sleep` request with no `Render`.
+    shell.advance(STRAY_HOLD.saturating_sub(Duration::from_millis(1)));
+    assert!(shell.sleep.is_none());
+    shell.advance(Duration::from_millis(1));
+    assert_eq!(shell.take_log(), ["Sleep"]);
+    assert_eq!(shell.take_logs(), Vec::<alloc::string::String>::new());
+    assert_eq!(shell.sleep.as_ref().unwrap().wake_on, wake_sources());
+    assert_eq!(power::sleep_step(&shell.model), Some(SleepStep::Sleep));
+    assert_eq!(shell.frames.len(), frames);
+    assert!(!shell.radio.on);
+}
+
+#[test]
+fn a_second_stray_wake_writes_no_line_and_the_wake_writes_the_count() {
+    let mut shell = at_the_sleep_step();
+    shell.stray();
+    shell.advance(STRAY_HOLD);
+    assert_eq!(shell.take_logs(), [stray_line(1)]);
+
+    shell.stray();
+    shell.advance(STRAY_HOLD);
+    shell.check();
+    assert_eq!(shell.take_logs(), Vec::<alloc::string::String>::new());
+
+    // The touch wake writes the count of the wakes with no cause.
+    shell.send(Event::Tapped(None));
+    assert!(!asleep(&shell.model));
+    let logs = shell.take_logs();
+    assert_eq!(
+        power_lines(&logs),
+        ["info power: sleep 1 had 2 wakes with no cause"],
+        "{logs:?}"
+    );
+}
+
+#[test]
+fn one_stray_wake_writes_no_count_at_the_wake() {
+    let mut shell = at_the_sleep_step();
+    shell.stray();
+    shell.advance(STRAY_HOLD);
+    shell.take_logs();
+
+    shell.send(Event::Tapped(None));
+    let logs = shell.take_logs();
+    assert_eq!(power_lines(&logs), Vec::<&str>::new(), "{logs:?}");
+}
+
+#[test]
+fn a_tap_in_the_hold_clears_the_hold_timer_wakes_and_acts_on_its_control() {
+    let mut shell = at_the_sleep_step();
+    shell.stray();
+    shell.take_log();
+    shell.take_cleared();
+
+    // No `Sleep` request waits, so the tap comes to the core as `Tapped`.
+    shell.send(crate::tests::tap_all_lights());
+    let log = shell.take_log();
+    assert_eq!(
+        log.first().map(String::as_str),
+        Some("TimeClear"),
+        "{log:?}"
+    );
+    assert_eq!(shell.take_cleared().first(), Some(&STRAY_HOLD));
+    assert!(!asleep(&shell.model));
+    assert_eq!(shell.view().connection, Connection::Online);
+    assert_eq!(shell.broker.service_calls.len(), 1);
+
+    // The hold timer does not fire, so no `Sleep` request comes.
+    let events = shell.advance(STRAY_HOLD);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, Event::Power(power::Event::HoldEnded(_)))),
+        "{events:?}"
+    );
+    assert!(shell.sleep.is_none());
+}
+
+#[test]
+fn the_stand_in_the_hold_clears_the_hold_timer_and_connects() {
+    let mut shell = at_the_sleep_step();
+    shell.stray();
+    shell.take_cleared();
+
+    shell.send(Event::PowerSourceChanged(PowerSource::Stand));
+    assert_eq!(shell.take_cleared().first(), Some(&STRAY_HOLD));
+    assert_eq!(shell.view().power, PowerSource::Stand);
+    assert!(!asleep(&shell.model));
+    assert_eq!(shell.view().connection, Connection::Online);
+    shell.advance(STRAY_HOLD);
+    assert!(shell.sleep.is_none());
+}
+
+#[test]
+fn start_in_the_hold_clears_the_hold_timer() {
+    let mut shell = at_the_sleep_step();
+    shell.stray();
+    shell.take_cleared();
+
+    shell.send(start(PowerSource::Battery));
+    assert_eq!(shell.take_cleared().first(), Some(&STRAY_HOLD));
+    assert!(!asleep(&shell.model));
+    shell.advance(STRAY_HOLD);
+    assert!(shell.sleep.is_none());
+}
+
+#[test]
+fn a_late_hold_end_does_nothing() {
+    let app = Dashboard;
+    // The device woke from the hold, so the expiry of its timer is late.
+    let mut shell = at_the_sleep_step();
+    let first = shell.model.power.sleep;
+    shell.stray();
+    shell.send(Event::Tapped(None));
+    let mut model = shell.model;
+    app.update(Event::Power(power::Event::HoldEnded(first)), &mut model)
+        .expect_no_effect_or_events();
+    assert!(!asleep(&model));
+
+    // The expiry of a timer of an older sleep does not end the hold of the
+    // new sleep.
+    let mut shell = at_the_sleep_step();
+    shell.stray();
+    let current = shell.model.power.sleep;
+    let mut model = shell.model;
+    app.update(
+        Event::Power(power::Event::HoldEnded(current.wrapping_sub(1))),
+        &mut model,
+    )
+    .expect_no_effect_or_events();
+    assert_eq!(power::sleep_step(&model), Some(SleepStep::Held));
+
+    // While a `Sleep` request waits, an expiry does nothing.
+    let mut model = asleep_on_battery();
+    app.update(
+        Event::Power(power::Event::HoldEnded(model.power.sleep)),
+        &mut model,
+    )
+    .expect_no_effect_or_events();
+    assert_eq!(power::sleep_step(&model), Some(SleepStep::Sleep));
+}
+
+#[test]
+fn a_check_or_a_stray_wake_of_an_older_sleep_does_nothing() {
+    let app = Dashboard;
+    let mut model = asleep_on_battery();
+    let old = model.power.sleep.wrapping_sub(1);
+    for wake in [Wake::Timer, Wake::Other, Wake::PowerSource] {
+        app.update(
+            Event::Power(power::Event::Woke { sleep: old, wake }),
+            &mut model,
+        )
+        .expect_no_effect_or_events();
+        assert_eq!(power::sleep_step(&model), Some(SleepStep::Sleep));
+    }
+}
+
+#[test]
+fn an_answer_in_the_steps_or_in_the_hold_does_nothing() {
+    let app = Dashboard;
+    // In the steps, no `Sleep` request waits.
+    let mut model = Model {
+        power: crate::features::power::State::asleep_in(0),
+        startup: crate::Startup::Started(crate::tests::settings()),
+        ..Model::default()
+    };
+    app.update(woke(&model, Wake::Other), &mut model)
+        .expect_no_effect_or_events();
+    assert!(asleep(&model));
+
+    // In the hold, no `Sleep` request waits either.
+    let mut shell = at_the_sleep_step();
+    shell.stray();
+    let mut model = shell.model;
+    for wake in [Wake::Timer, Wake::Other, Wake::Touch(None)] {
+        app.update(woke(&model, wake), &mut model)
+            .expect_no_effect_or_events();
+        assert_eq!(power::sleep_step(&model), Some(SleepStep::Held));
+    }
+}
+
+#[test]
+fn a_battery_level_or_sleep_now_in_the_hold_does_nothing() {
+    let mut shell = at_the_sleep_step();
+    shell.stray();
+    shell.take_log();
+
+    shell.send(Event::BatteryChanged(Some(41)));
+    shell.send(Event::SleepNow);
+    assert_eq!(shell.take_log(), Vec::<alloc::string::String>::new());
+    assert_eq!(power::sleep_step(&shell.model), Some(SleepStep::Held));
+
+    // The hold continues.
+    shell.advance(STRAY_HOLD);
+    assert_eq!(shell.take_log(), ["Sleep"]);
+}
+
+/// Asserts that no timer waited at any `Sleep` request of `shell`. Refer
+/// to [`Shell::timers_at_sleep`].
+#[track_caller]
+fn assert_no_timer_at_sleep(shell: &Shell) {
+    assert!(!shell.timers_at_sleep.is_empty(), "no Sleep request");
+    for (index, timers) in shell.timers_at_sleep.iter().enumerate() {
+        assert_eq!(timers, &Vec::<Duration>::new(), "Sleep request {index}");
+    }
+}
+
+#[test]
+fn no_core_timer_waits_at_a_sleep_request() {
+    // A timer of the core cannot wake the chip, so no timer of the core may
+    // wait at a `Sleep` request. The check is the timer of the request.
+    let mut shell = crate::tests::flows::house();
+    shell.send(start(PowerSource::Battery));
+    // A tap on a light turns the front light on and sends a call.
+    shell.send(Event::Navigate(crate::Route::room("living_room")));
+    shell.send(crate::tests::tap_tile(0));
+    // The sleep after the idle timeout, checks, a stray wake and its hold.
+    shell.advance(IDLE_TIMEOUT);
+    shell.check();
+    shell.stray();
+    shell.advance(STRAY_HOLD);
+    shell.check();
+    // A touch wake, then a sleep with the front light on.
+    shell.send(Event::Tapped(None));
+    shell.send(Event::SleepNow);
+    shell.stray();
+    shell.advance(STRAY_HOLD);
+    // Off the stand and the idle timeout.
+    shell.send(Event::PowerSourceChanged(PowerSource::Stand));
+    shell.send(Event::PowerSourceChanged(PowerSource::Battery));
+    shell.advance(IDLE_TIMEOUT);
+    assert_eq!(shell.timers_at_sleep.len(), 7);
+    assert_no_timer_at_sleep(&shell);
 }

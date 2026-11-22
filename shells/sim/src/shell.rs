@@ -33,9 +33,16 @@
 //! the tasks, makes a new core and sends `Start`, as the firmware does.
 //!
 //! The shell prints each line of the log of the core to stderr as
-//! `{area}: {message}`, with `warning: ` first for a warning.
+//! `{area}: {message}`, with `warning: ` first for a warning, and `debug: `
+//! first for a `Debug` line.
 //! Then it answers the `Log` request at once with the time since the shell
 //! started, in milliseconds.
+//!
+//! While a `Sleep` request with a timer waits, the shell runs a check timer
+//! of that length. At its end, the shell answers `Wake::Timer`, as the
+//! firmware does at the check of the power source. Any other answer stops
+//! the check timer. The Wake button answers `Wake::Other`, a wake with no
+//! cause.
 //!
 //! The shell writes each effect to an [`Inspector`], which the window shows.
 //! The inspector also finds the MQTT packets in a copy of the bytes of each
@@ -55,7 +62,7 @@ use shared::{
     Core, Dashboard, Effect, Event, PowerSource, Settings, Start, ViewModel,
     capabilities::{
         log::{Level, Uptime},
-        power::{Sleep, Wake},
+        power::{Sleep, Wake, WakeSource},
         radio::AccessPoint,
         stream::{Close, Open, StreamItem, Write, Written},
     },
@@ -89,6 +96,13 @@ pub enum Signal {
         token: u64,
         /// The answer.
         outcome: Written,
+    },
+    /// The check timer of the `Sleep` request with this token expired.
+    Check {
+        /// The token of the check timer in the shell. A new `Sleep` request
+        /// starts a new check timer, so the shell ignores a signal with an
+        /// old token.
+        token: u64,
     },
     /// The timer with this id expired.
     Timer {
@@ -134,9 +148,9 @@ struct Live {
     wire: Wire,
 }
 
-/// A timer that runs.
-struct Timer {
-    request: Request<NotifyAfter>,
+/// A timer that runs, with the request that its end answers.
+struct Timer<R = Request<NotifyAfter>> {
+    request: R,
     task: JoinHandle<()>,
     token: u64,
 }
@@ -172,6 +186,9 @@ pub struct Shell {
     restarting: bool,
     /// The `Sleep` request that waits for a wake.
     sleep: Option<Request<Sleep>>,
+    /// The check timer of the `Sleep` request that waits, if the request has
+    /// a timer.
+    check: Option<Timer<()>>,
     /// The level of the front light, in percent. The window shows the
     /// light as a tint over the panel.
     light: u8,
@@ -190,6 +207,9 @@ impl Drop for Shell {
         }
         for timer in self.timers.values() {
             timer.task.abort();
+        }
+        if let Some(check) = &self.check {
+            check.task.abort();
         }
     }
 }
@@ -216,6 +236,7 @@ impl Shell {
             radio: FakeRadio::default(),
             restarting: false,
             sleep: None,
+            check: None,
             light: 0,
             started: Instant::now(),
         }
@@ -303,6 +324,7 @@ impl Shell {
         self.writes.clear();
         self.closes.clear();
         self.sleep = None;
+        self.stop_check();
         self.restarting = false;
         self.core = Core::new();
     }
@@ -437,15 +459,23 @@ impl Shell {
         self.send(Event::Tapped(control));
     }
 
-    /// Answers the `Sleep` request that waits with `Wake::Timer`, a wake that
-    /// is not a tap, for example from the Wake button. If no request waits,
-    /// does nothing.
+    /// Answers the `Sleep` request that waits with `Wake::Other`, a wake
+    /// with no cause, for example from the Wake button. The core then stays
+    /// awake for a short time and sleeps again. If no request waits, does
+    /// nothing.
     ///
     /// The core stays in memory while the simulator sleeps, as in a light
     /// sleep.
     pub fn wake(&mut self) {
-        if !self.answer_sleep(Wake::Timer) {
+        if !self.answer_sleep(Wake::Other) {
             eprintln!("power: wake, but the device does not sleep");
+        }
+    }
+
+    /// Stops the check timer, if it runs.
+    fn stop_check(&mut self) {
+        if let Some(check) = self.check.take() {
+            check.task.abort();
         }
     }
 
@@ -459,6 +489,7 @@ impl Shell {
     /// Answers the `Sleep` request that waits with `wake`. Returns `false`
     /// if no request waits.
     fn answer_sleep(&mut self, wake: Wake) -> bool {
+        self.stop_check();
         let Some(mut request) = self.sleep.take() else {
             return false;
         };
@@ -559,6 +590,16 @@ impl Shell {
                 );
                 let effects = resolve(&self.core, &mut request, outcome);
                 self.process(effects);
+            }
+            Signal::Check { token } => {
+                if self
+                    .check
+                    .as_ref()
+                    .is_some_and(|check| check.token == token)
+                {
+                    self.check = None;
+                    self.answer_sleep(Wake::Timer);
+                }
             }
             Signal::Timer { id, token } => {
                 if self
@@ -686,6 +727,10 @@ impl Shell {
             Effect::Log(mut request) => {
                 let line = &request.operation;
                 let outcome = match line.level {
+                    Level::Debug => {
+                        eprintln!("debug: {line}");
+                        "printed for debug"
+                    }
                     Level::Info => {
                         eprintln!("{line}");
                         "printed"
@@ -711,13 +756,7 @@ impl Shell {
                 resolve(&self.core, &mut request, now)
             }
             Effect::Sleep(request) => {
-                eprintln!("power: asleep. Click the panel or press W to wake it.");
-                self.inspector.effect(
-                    "Sleep",
-                    String::new(),
-                    "asleep: click the panel or press W to wake it",
-                );
-                self.sleep = Some(request);
+                self.sleep(request);
                 Vec::new()
             }
             Effect::FrontLight(mut request) => {
@@ -939,6 +978,61 @@ impl Shell {
     }
 }
 
+impl Shell {
+    /// Keeps the `Sleep` request until a wake. If the request has a timer,
+    /// starts the check timer.
+    fn sleep(&mut self, request: Request<Sleep>) {
+        eprintln!(
+            "power: asleep. Click the panel to wake it, or press W for a wake with no cause."
+        );
+        let check = check_seconds(&request.operation);
+        let wake_on = check.map_or_else(
+            || "touch".into(),
+            |seconds| format!("touch, check after {seconds} s"),
+        );
+        self.inspector.effect(
+            "Sleep",
+            wake_on,
+            "asleep: click the panel to wake it, or press W for a wake with no cause",
+        );
+        self.sleep = Some(request);
+        self.stop_check();
+        if let Some(seconds) = check {
+            self.start_check(seconds);
+        }
+    }
+
+    /// Starts the check timer of `seconds`. At its end, the shell answers
+    /// the `Sleep` request with `Wake::Timer`.
+    fn start_check(&mut self, seconds: u32) {
+        self.last_token += 1;
+        let token = self.last_token;
+        let notifier = self.notifier.clone();
+        let task = self.runtime.spawn(async move {
+            tokio::time::sleep(Duration::from_secs(u64::from(seconds))).await;
+            notifier.send(Signal::Check { token });
+        });
+        self.check = Some(Timer {
+            request: (),
+            task,
+            token,
+        });
+    }
+}
+
+/// Returns the shortest timer in the wake sources of `sleep`, in seconds, or
+/// `None` if it has no timer.
+fn check_seconds(sleep: &Sleep) -> Option<u32> {
+    sleep
+        .wake_on
+        .iter()
+        .filter_map(|source| match source {
+            WakeSource::Timer { seconds } => Some(*seconds),
+            WakeSource::Touch => None,
+        })
+        .min()
+}
+
 /// Gives the core the answer to a request, and returns the new effects. If
 /// the core no longer waits for the answer, logs it and returns no effects.
 fn resolve<Op: Operation>(
@@ -970,7 +1064,7 @@ mod tests {
         fake::{Broker, NoConnection},
         features::{
             connection::{KEEP_ALIVE_SECS, RECONNECT_MAX, RECONNECT_MIN},
-            power::IDLE_TIMEOUT,
+            power::{IDLE_TIMEOUT, STRAY_HOLD},
             refresh::{DRAW_DELAY, FULL_REFRESH_INTERVAL},
         },
         mqtt::{Credentials, OPEN_TIMEOUT, codec::server::Packet as Received, ping_interval},
@@ -1503,10 +1597,9 @@ mod tests {
                 "open 2",
                 "connect 2",
                 "publish dashboard/test/status 2",
+                // The steps of the sleep write `Debug` lines, so no line
+                // goes to Home Assistant.
                 "subscribe 2",
-                // The lines of the sleep go to Home Assistant in a later
-                // write.
-                "publish dashboard/test/log 2"
             ]
         );
         assert_eq!(fixture.net().closed, [1]);
@@ -1994,9 +2087,10 @@ mod tests {
             log.contains(&"publish dashboard/test/cmd 2".into()),
             "{log:?}"
         );
-        // The lines of the sleep go to Home Assistant after the wake.
+        // The steps of the sleep write `Debug` lines, so no line goes to
+        // Home Assistant after the wake.
         assert!(
-            log.contains(&"publish dashboard/test/log 2".into()),
+            !log.contains(&"publish dashboard/test/log 2".into()),
             "{log:?}"
         );
 
@@ -2004,6 +2098,64 @@ mod tests {
         fixture.shell().wake();
         fixture.settle();
         assert_eq!(fixture.take_log(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_check_timer_of_a_sleep_answers_with_a_timer_wake_and_the_core_sleeps_again() {
+        let mut fixture = Fixture::new();
+        fixture.start(PowerSource::Battery);
+        fixture.connect();
+        assert!(fixture.shell().sleep_now());
+        fixture.sleep();
+        let first = fixture.shell().check.as_ref().expect("a check timer").token;
+
+        // The end of the check timer answers `Wake::Timer`. The core sends a
+        // new `Sleep` request at once, with a new check timer.
+        fixture.shell().handle(Signal::Check { token: first });
+        assert!(fixture.shell().sleep.is_some());
+        assert!(fixture.shell().view().asleep);
+        let second = fixture.shell().check.as_ref().expect("a check timer").token;
+        assert_ne!(second, first);
+        assert!(
+            fixture.outcomes("Sleep")[1].ends_with("resolved: Timer"),
+            "{:?}",
+            fixture.outcomes("Sleep")
+        );
+        assert!(fixture.outcomes("Sleep")[0].starts_with("touch, check after 60 s"));
+
+        // The signal of an old check timer does nothing.
+        fixture.shell().handle(Signal::Check { token: first });
+        assert!(fixture.shell().sleep.is_some());
+        assert_eq!(
+            fixture.shell().check.as_ref().map(|check| check.token),
+            Some(second)
+        );
+
+        // A tap answers the request, and stops the check timer.
+        fixture.shell().tap(Point::new(1, 1));
+        assert!(fixture.shell().check.is_none());
+        assert!(!fixture.shell().view().asleep);
+    }
+
+    #[test]
+    fn the_wake_button_is_a_wake_with_no_cause_and_the_core_sleeps_again_after_the_hold() {
+        let mut fixture = Fixture::new();
+        fixture.start(PowerSource::Battery);
+        fixture.connect();
+        assert!(fixture.shell().sleep_now());
+        fixture.sleep();
+
+        fixture.shell().wake();
+        assert!(fixture.shell().sleep.is_none());
+        assert!(fixture.shell().check.is_none());
+        assert!(fixture.shell().view().asleep);
+        assert!(fixture.outcomes("Sleep")[0].ends_with("resolved: Other"));
+
+        // After the hold, the core sends a new `Sleep` request.
+        fixture.advance(STRAY_HOLD);
+        assert!(fixture.shell().sleep.is_some());
+        assert!(fixture.shell().check.is_some());
+        assert!(fixture.shell().view().asleep);
     }
 
     #[test]
@@ -2403,7 +2555,8 @@ mod tests {
 
         let moved = fixture.shell().move_strongest().unwrap();
         assert_ne!(moved, first);
-        fixture.shell().wake();
+        // A tap on no control wakes the device.
+        fixture.shell().tap(Point::new(1, 1));
         fixture.until("the second SUBACK", |fixture| {
             fixture.shell().suback_count() >= 2
         });

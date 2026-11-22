@@ -292,11 +292,28 @@ has no state, so its button shows the pattern for 2 seconds. Refer to
 
 ### Log
 
-The core keeps its lines of the log in a ring of 64 lines, with the time of each line
-on the monotonic clock of the shell. The ring also keeps the `warn` and `error` lines
-of the shell, which the shell sends as `Event::ShellLogged`. Refer to
-`shared/src/features/logs/mod.rs`. The dashboard publishes each line to Home
+The core keeps its `info` and `warn` lines of the log in a ring of 64 lines, with the
+time of each line on the monotonic clock of the shell. The ring also keeps the `warn`
+and `error` lines of the shell, which the shell sends as `Event::ShellLogged`. Refer
+to `shared/src/features/logs/mod.rs`. The dashboard publishes each line to Home
 Assistant.
+
+The core writes the usual steps at the level `debug`, for example each step of a
+sleep, and a scan after a wake that finds no better access point. The shell prints a
+`debug` line (the firmware on the serial port), but the core does not keep it. So a
+`debug` line never goes to Home Assistant, and a usual sleep sends no line. Only
+unusual decisions and failures go, for example:
+
+- `power: sleep 3 woke with no cause, so it sleeps again after 3 s` (`info`), for the
+  first wake with no cause in a sleep. If more than one came, the next real wake writes
+  `power: sleep 3 had 5 wakes with no cause` (`info`).
+- `mqtt: the broker host ended the stream: connection reset, so connect again in 4 s`
+  (`warn`), one line for each failed session, with the reason and the wait. During
+  the steps of a sleep, the line ends with `, during the sleep`, because the sleep
+  does not connect again.
+- `mqtt: the link is down, so connect again in 2 s` (`info`), after a Wi-Fi warning
+  that gives the reason.
+- `mqtt: the close of connection 7 got no answer in 6 s` (`warn`).
 
 | Topic | QoS | Retained |
 | --- | --- | --- |
@@ -310,7 +327,7 @@ Each message is one line as JSON:
 
 | Key | Value |
 | --- | --- |
-| `level` | `info` or `warn` for a line of the core. `warn` or `error` for a line of the shell. |
+| `level` | `info` or `warn` for a line of the core. `warn` or `error` for a line of the shell. Never `debug`. |
 | `source` | For a line of the core, the part of the core that wrote the line: `wifi`, `mqtt` or `power`. For a line of the shell, the source that the shell gives, with at most 32 bytes. The drop message has `log`. |
 | `age` | The age of the line in whole seconds when the dashboard publishes it |
 | `msg` | The text of the line, with at most 200 bytes. A longer text ends with `…`. |
@@ -323,8 +340,12 @@ change. A line of the firmware has the time when the firmware wrote it, so
 a line from an outage or a sleep goes after the next connect with its age:
 
 ```json
-{"level":"warn","source":"stream","age":40,"msg":"10 failed: TCP connect failed: ConnectionReset (by the host)"}
+{"level":"warn","source":"power","age":40,"msg":"cannot read the BQ27220 (Nack)"}
 ```
+
+The firmware writes the failure of a stream at `info`, because the core writes one
+`warn` line with the reason. So the stream lines (`stream: 10 failed: ...`) print on
+the serial port, but they do not go to Home Assistant.
 
 - For a line of the firmware itself (the crates `dashboard` and
   `dashboard_firmware`), if the line starts with a lowercase word and `": "`, the
@@ -358,7 +379,7 @@ When the dashboard publishes:
 - While the connection is up, a new line goes at once, with the age 0.
 - From the start of a sleep, while the device sleeps, while it is offline, and while
   the connection closes for a change of access point, the lines wait in the ring. Thus
-  the lines of a battery sleep go after the next wake. The connection can still be up
+  the lines from a battery sleep go after the next wake. The connection can still be up
   in the first step of a sleep, but a line from that step waits too. Its PUBACK would
   race the DISCONNECT, so the line would often go two times.
 

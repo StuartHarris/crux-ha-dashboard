@@ -24,7 +24,9 @@ use logic::{
 };
 use shared::{Event, PowerSource, capabilities::log::Level};
 
-use crate::{LIGHT, RADIO, RENDER, SIGNALS, SLEEP, STREAM, TIMERS, config::CONFIG, radio, timers};
+use crate::{
+    IN_FLIGHT, LIGHT, RADIO, RENDER, SIGNALS, SLEEP, STREAM, TIMERS, config::CONFIG, radio, timers,
+};
 
 /// The update statistics of the stream that the core opened last.
 #[derive(Default)]
@@ -64,6 +66,7 @@ pub async fn run(source: PowerSource, display: bool) -> ! {
             let sleeping = shell.is_sleeping();
             // The answer to a `Log` job is not real work, so it does not count.
             let counts = signal.counts();
+            let ack = signal.needs_ack();
             let started = Instant::now();
             let jobs = shell.handle(signal);
             if counts {
@@ -74,6 +77,11 @@ pub async fn run(source: PowerSource, display: bool) -> ! {
             // the sleep.
             if sleeping && !shell.is_sleeping() {
                 SLEEP.signal(None);
+            }
+            // Last, so the display task sees the end of the `Sleep` job
+            // before it can sleep (`logic::sleep::InFlight`).
+            if ack {
+                IN_FLIGHT.handled();
             }
         }
         // At most one full queue. A line that the logger keeps after this
@@ -110,13 +118,14 @@ fn record(stats: &mut UpdateStats, started: Instant) {
 /// with `Signal::Radio`.
 ///
 /// This task writes each line of the log of the core as `{area}: {message}`,
-/// with no prefix of its own. Thus a `wifi:` line comes between the lines of
-/// the radio task. The line has the log target `core`, which the printed
-/// line does not show. The logger does not keep a line with this target
-/// for the core, because the core keeps it already. Then the task answers
-/// at once with
-/// `Signal::Logged` and the time of the line ([`uptime`]).
-/// A `Clock` job gets the same answer at once as `Signal::Clock`.
+/// with no prefix of its own, at the level of the line. A `Debug` line
+/// prints because `ESP_LOG` has `core=debug`. Thus a `wifi:` line comes
+/// between the lines of the radio task. The line has the log target `core`,
+/// which the printed line does not show. The logger does not keep a line
+/// with this target for the core, because the core keeps it already. Then
+/// the task answers at once with `Signal::Logged` and the time of the line
+/// ([`uptime`]). A `Clock` job gets the same answer at once as
+/// `Signal::Clock`.
 ///
 /// An `Open` starts new update statistics. The first `Close` of the same
 /// connection logs them. A `Close` of an older connection, or a second
@@ -134,10 +143,13 @@ fn dispatch(jobs: alloc::vec::Vec<Job>, display: bool, stats: &mut Stats) {
                         };
                     }
                     StreamOp::Close(close) => {
+                        // The core writes one warning with the reason of a
+                        // failed session, so this line is for the serial log
+                        // only.
                         if close.clean {
                             log::info!("stream: the core closes {connection}: {}", close.reason);
                         } else {
-                            log::warn!(
+                            log::info!(
                                 "stream: the session on {connection} failed: {}",
                                 close.reason
                             );
@@ -160,9 +172,11 @@ fn dispatch(jobs: alloc::vec::Vec<Job>, display: bool, stats: &mut Stats) {
             Job::Restart(restart) => RADIO.push(radio::Request::Restart(restart)),
             Job::Log { token, line } => {
                 match line.level {
+                    Level::Debug => log::debug!(target: CORE_TARGET, "{line}"),
                     Level::Info => log::info!(target: CORE_TARGET, "{line}"),
                     Level::Warn => log::warn!(target: CORE_TARGET, "{line}"),
-                    // The core writes no line at this level.
+                    // The core writes lines at `Info`, `Warn` and `Debug`, never at
+                    // `Error`. This arm keeps the match complete.
                     Level::Error => log::error!(target: CORE_TARGET, "{line}"),
                 }
                 SIGNALS.push(shell::Signal::Logged {
@@ -177,7 +191,9 @@ fn dispatch(jobs: alloc::vec::Vec<Job>, display: bool, stats: &mut Stats) {
             Job::FrontLight { token, level } if display => LIGHT.push((token, level)),
             Job::FrontLight { token, .. } => SIGNALS.push(shell::Signal::Light { token }),
             Job::Sleep(sleep) => {
-                log::info!("power: sleep until {:?}", sleep.wake_on);
+                // A `Sleep` job comes at each check of the power source, so
+                // this line is at `Debug`.
+                log::debug!("power: sleep until {:?}", sleep.wake_on);
                 SLEEP.signal(Some(Plan::new(&sleep)));
             }
             Job::Timer {

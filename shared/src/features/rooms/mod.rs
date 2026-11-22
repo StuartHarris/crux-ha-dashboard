@@ -102,7 +102,9 @@ pub fn turn_page(model: &mut Model, forward: bool) -> Cmd {
         (index + count - 1) % count
     };
     model.route = model.pages[next].route();
-    redraw(model, true).and(power::restart_idle_timer(model))
+    // The tap cancels a sleep that waits before the full refresh.
+    let idle = power::restart_idle_timer(model);
+    redraw(model, true).and(idle)
 }
 
 /// Returns the current page if it is the page of a room, or `None` on the
