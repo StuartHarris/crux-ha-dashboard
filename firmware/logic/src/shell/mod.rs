@@ -65,7 +65,7 @@ use crux_time::{
 };
 use embedded_graphics::prelude::Point;
 use shared::{
-    Core, Dashboard, Effect, Event, PowerSource, Settings, Start, ViewModel,
+    Core, Dashboard, Effect, Event, Firmware, PowerSource, Settings, Start, ViewModel,
     capabilities::{
         light::FrontLight,
         log::{Log, LogClock, Uptime},
@@ -778,9 +778,9 @@ fn resolve<Op: Operation>(
     core.resolve(request, output).unwrap_or_default()
 }
 
-/// Makes the `Start` event from the build-time configuration. The settings
-/// have `read_only` from the configuration, so the core does a dry run if
-/// it is `true`.
+/// Makes the `Start` event from the build-time configuration and the facts
+/// about the firmware. The settings have `read_only` from the configuration,
+/// so the core does a dry run if it is `true`.
 ///
 /// `path` and `last_sync` are for a start after a deep sleep, with the
 /// values that the firmware kept in RTC memory. The firmware uses light
@@ -788,6 +788,7 @@ fn resolve<Op: Operation>(
 #[must_use]
 pub fn start(
     config: &Config<'_>,
+    firmware: Firmware,
     power: PowerSource,
     path: Option<String>,
     last_sync: Option<u64>,
@@ -804,6 +805,7 @@ pub fn start(
             credentials,
             read_only: config.read_only,
         },
+        firmware,
         power,
         path,
         last_sync,

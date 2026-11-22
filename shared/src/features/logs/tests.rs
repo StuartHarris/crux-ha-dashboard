@@ -8,8 +8,8 @@ use crux_core::App;
 use serde_json::Value;
 
 use super::{
-    CAPACITY, CUT_MARK, Kept, LOG_IN_FLIGHT, Line, MAX_MESSAGE, MAX_SOURCE, Message, Payload,
-    ShellSource, Source, State, dropped_json, info, warn,
+    CAPACITY, CUT_MARK, Kept, Line, MAX_MESSAGE, MAX_SOURCE, Message, Payload, ShellSource, Source,
+    State, dropped_json, info, warn,
 };
 use crate::{
     Dashboard, EffectTestExt, Event, Model, PowerSource,
@@ -19,6 +19,7 @@ use crate::{
     },
     features::{
         connection::{Link, RECONNECT_MIN},
+        device::IN_FLIGHT,
         power::{IDLE_TIMEOUT, STRAY_HOLD},
     },
     mqtt::codec::server::Packet,
@@ -369,10 +370,10 @@ fn the_lines_of_a_battery_sleep_go_out_after_the_wake_with_their_ages() {
             .all(|publish| !publish.retain)
     );
 
-    // The writes of the wake: the CONNECT, the CONNACK write, and the write
-    // of the line of the sleep.
+    // The writes of the wake: the CONNECT, the CONNACK write, the write of
+    // the state message, and the write of the line of the sleep.
     let bytes = &shell.write_bytes[writes..];
-    assert_eq!(bytes.len(), 3, "{bytes:?}");
+    assert_eq!(bytes.len(), 4, "{bytes:?}");
 
     // The broker acknowledged each line, so the ring is empty.
     assert_eq!(shell.model.logs.lines().len(), 0);
@@ -396,8 +397,16 @@ fn the_connack_write_is_unchanged_and_the_log_goes_in_a_later_write() {
             .iter()
             .all(|packet| matches!(packet, Packet::Publish { .. } | Packet::Subscribe { .. }))
     );
-    // The lines go in the next write.
-    assert_eq!(topics(&shell.writes[2]), [LOG_TOPIC, LOG_TOPIC]);
+    // The discovery and the state messages go in the next write, and the
+    // lines go in the write after it.
+    assert_eq!(
+        topics(&shell.writes[2]),
+        [
+            "homeassistant/device/dashboard_hall/config",
+            "dashboard/hall/state"
+        ]
+    );
+    assert_eq!(topics(&shell.writes[3]), [LOG_TOPIC, LOG_TOPIC]);
     assert_eq!(
         published_texts(&shell),
         ["a line before the start", "a second line before the start"]
@@ -476,18 +485,18 @@ fn a_session_that_ends_before_the_puback_sends_the_lines_again_in_order() {
 
 #[test]
 fn a_full_session_keeps_the_line_and_sends_it_after_an_ack() {
-    const _: () = assert!(CAPACITY > LOG_IN_FLIGHT);
+    const _: () = assert!(CAPACITY > IN_FLIGHT);
     let mut shell = online();
     shell.broker.hold_puback = true;
 
-    for at in 0..=LOG_IN_FLIGHT as u64 {
+    for at in 0..=IN_FLIGHT as u64 {
         stamp(&mut shell, at, &format!("line {at}"));
     }
 
     // The log is at its limit of publishes that wait for a PUBACK. The last
     // line waits.
-    assert_eq!(published(&shell).len(), LOG_IN_FLIGHT);
-    assert_eq!(shell.model.logs.lines().len(), LOG_IN_FLIGHT + 1);
+    assert_eq!(published(&shell).len(), IN_FLIGHT);
+    assert_eq!(shell.model.logs.lines().len(), IN_FLIGHT + 1);
 
     // The PUBACKs come. The last line goes.
     shell.broker.hold_puback = false;
@@ -496,8 +505,8 @@ fn a_full_session_keeps_the_line_and_sends_it_after_an_ack() {
     shell.run();
 
     let texts = published_texts(&shell);
-    assert_eq!(texts.len(), LOG_IN_FLIGHT + 1);
-    assert_eq!(texts.last().unwrap(), &format!("line {LOG_IN_FLIGHT}"));
+    assert_eq!(texts.len(), IN_FLIGHT + 1);
+    assert_eq!(texts.last().unwrap(), &format!("line {IN_FLIGHT}"));
     assert_eq!(shell.model.logs.lines().len(), 0);
 }
 
@@ -510,7 +519,9 @@ fn a_log_at_its_limit_does_not_block_asleep_or_a_service_call() {
     for at in 0..CAPACITY as u64 {
         stamp(&mut shell, at, &format!("line {at}"));
     }
-    assert_eq!(published(&shell).len(), LOG_IN_FLIGHT);
+    // The log shares the limit with the discovery and the state messages,
+    // which also wait for their PUBACKs.
+    assert_eq!(published(&shell).len(), IN_FLIGHT - 2);
 
     // A tap on the All lights toggle still sends its service call.
     shell.send(tap_all_lights());

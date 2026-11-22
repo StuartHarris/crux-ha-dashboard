@@ -23,7 +23,7 @@ use core::time::Duration;
 use crux_core::App;
 
 use crate::{
-    Cmd, Control, Dashboard, Effect, EffectTestExt, Model, PowerSource, Settings, Start,
+    Cmd, Control, Dashboard, Effect, EffectTestExt, Firmware, Model, PowerSource, Settings, Start,
     app::Event,
     entities::STATESTREAM,
     fake::FakeRadio,
@@ -50,6 +50,14 @@ pub fn settings() -> Settings {
     }
 }
 
+/// The facts about the firmware in the tests.
+pub fn firmware() -> Firmware {
+    Firmware {
+        version: "0.1.0+test".into(),
+        mac: [0x28, 0x84, 0x85, 0x37, 0xb8, 0xa0],
+    }
+}
+
 pub fn start(power: PowerSource) -> Event {
     start_at(power, None)
 }
@@ -57,6 +65,7 @@ pub fn start(power: PowerSource) -> Event {
 pub fn start_at(power: PowerSource, path: Option<&str>) -> Event {
     Event::Start(Start {
         settings: settings(),
+        firmware: firmware(),
         power,
         path: path.map(String::from),
         last_sync: None,

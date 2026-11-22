@@ -244,6 +244,19 @@ impl Broker {
         }
     }
 
+    /// Gives the bytes of the `Write` requests that wait to the broker, and
+    /// gives its answer to the core at once, before the answers to the
+    /// requests. The requests still wait for [`Broker::release_writes`].
+    pub fn answer_before_sent(&mut self) {
+        for request in &mut self.held {
+            let bytes = core::mem::take(&mut request.operation.bytes);
+            let answer = self.inner.receive(bytes);
+            self.answers.extend(answer);
+        }
+        let answers = core::mem::take(&mut self.answers);
+        self.deliver(answers);
+    }
+
     /// Gives the bytes that wait in the broker to the core.
     pub fn flush(&mut self) {
         let bytes = self.inner.take();

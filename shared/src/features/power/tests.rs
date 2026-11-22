@@ -223,11 +223,14 @@ fn on_the_stand_there_is_no_idle_timer() {
 #[test]
 fn off_the_stand_starts_the_idle_timer() {
     let app = Dashboard;
-    let (mut model, _wire) = drive_to_connected(PowerSource::Stand);
+    let (mut model, mut wire) = drive_to_connected(PowerSource::Stand);
 
+    // The core also publishes the new power source.
     app.update(Event::PowerSourceChanged(PowerSource::Battery), &mut model)
         .expect_render()
-        .expect_only_time_notify_after();
+        .expect_time_notify_after()
+        .expect_state(&mut wire, &mut model, r#"{"battery":null,"stand":"OFF"}"#)
+        .expect_only_session_clear(&wire);
     assert_eq!(model.connection.link(), Link::Up);
 }
 
@@ -325,7 +328,10 @@ const fn woke(model: &Model, wake: Wake) -> Event {
 fn asleep_on_battery() -> Model {
     Model {
         power: crate::features::power::State::sleeping_in(0),
-        startup: crate::Startup::Started(crate::tests::settings()),
+        startup: crate::Startup::Started {
+            settings: crate::tests::settings(),
+            firmware: crate::tests::firmware(),
+        },
         ..Model::default()
     }
 }
@@ -375,7 +381,7 @@ fn a_touch_wake_on_a_light_queues_the_service_call() {
     let app = Dashboard;
     for read_only in [false, true] {
         let mut model = asleep_on_battery();
-        if let crate::Startup::Started(settings) = &mut model.startup {
+        if let crate::Startup::Started { settings, .. } = &mut model.startup {
             settings.read_only = read_only;
         }
         model.route = crate::Route::room("living_room");
@@ -427,22 +433,29 @@ fn page_events_while_asleep_do_nothing() {
 #[test]
 fn a_battery_level_draws_once_and_the_same_level_draws_nothing() {
     let app = Dashboard;
-    let (mut model, _wire) = drive_to_connected(PowerSource::Battery);
+    let (mut model, mut wire) = drive_to_connected(PowerSource::Battery);
     let idle = model.power.idle;
     assert_eq!(app.view(&model).battery, None);
 
-    // A partial render, with no timer.
+    // A partial render, with no timer. The core also publishes the level.
     app.update(Event::BatteryChanged(Some(80)), &mut model)
-        .expect_only_render();
+        .expect_render()
+        .expect_state(&mut wire, &mut model, r#"{"battery":80,"stand":"OFF"}"#)
+        .expect_only_session_clear(&wire);
     assert_eq!(app.view(&model).battery, Some(80));
     assert_eq!(model.power.idle, idle);
 
+    // The same level does nothing: no draw, no publish.
+    let packets = wire.packets.len();
     app.update(Event::BatteryChanged(Some(80)), &mut model)
-        .expect_no_effects();
+        .expect_done();
+    assert_eq!(wire.packets.len(), packets);
 
     // The shell cannot read the charge now.
     app.update(Event::BatteryChanged(None), &mut model)
-        .expect_only_render();
+        .expect_render()
+        .expect_state(&mut wire, &mut model, r#"{"battery":null,"stand":"OFF"}"#)
+        .expect_only_session_clear(&wire);
     assert_eq!(app.view(&model).battery, None);
 }
 
@@ -455,8 +468,9 @@ fn a_battery_level_while_asleep_does_not_wake_the_device() {
     // The core keeps the level, but it does not draw, join or start a
     // timer.
     app.update(Event::BatteryChanged(Some(41)), &mut model)
-        .expect_no_effects();
+        .expect_done();
     assert!(model.power.is_asleep());
+    assert_eq!(model.power.battery, Some(41));
     assert_eq!(model.power.idle, idle);
     assert_eq!(model.wifi.phase, Phase::Off);
     assert_eq!(app.view(&model).battery, Some(40));
@@ -503,21 +517,28 @@ fn the_view_rounds_the_battery_level_to_the_nearest_step() {
 #[test]
 fn a_battery_change_that_does_not_change_the_rounded_level_does_not_draw() {
     let app = Dashboard;
-    let (mut model, _wire) = drive_to_connected(PowerSource::Battery);
+    let (mut model, mut wire) = drive_to_connected(PowerSource::Battery);
     app.update(Event::BatteryChanged(Some(80)), &mut model)
-        .expect_only_render();
+        .expect_render()
+        .expect_state(&mut wire, &mut model, r#"{"battery":80,"stand":"OFF"}"#)
+        .expect_only_session_clear(&wire);
 
-    // 79, 78 and 81 all show as 80%. The core keeps the exact value.
+    // 79, 78 and 81 all show as 80%. The core keeps the exact value, and
+    // publishes it, but does not draw.
     for level in [79, 78, 81] {
+        let json = format!(r#"{{"battery":{level},"stand":"OFF"}}"#);
         app.update(Event::BatteryChanged(Some(level)), &mut model)
-            .expect_no_effects();
+            .expect_state(&mut wire, &mut model, &json)
+            .expect_only_session_clear(&wire);
         assert_eq!(model.power.battery, Some(level));
         assert_eq!(app.view(&model).battery, Some(80));
     }
 
     // 77 shows as 75%, so the core draws.
     app.update(Event::BatteryChanged(Some(77)), &mut model)
-        .expect_only_render();
+        .expect_render()
+        .expect_state(&mut wire, &mut model, r#"{"battery":77,"stand":"OFF"}"#)
+        .expect_only_session_clear(&wire);
     assert_eq!(app.view(&model).battery, Some(75));
 }
 
@@ -1234,7 +1255,10 @@ fn an_answer_in_the_steps_or_in_the_hold_does_nothing() {
     // In the steps, no `Sleep` request waits.
     let mut model = Model {
         power: crate::features::power::State::asleep_in(0),
-        startup: crate::Startup::Started(crate::tests::settings()),
+        startup: crate::Startup::Started {
+            settings: crate::tests::settings(),
+            firmware: crate::tests::firmware(),
+        },
         ..Model::default()
     };
     app.update(woke(&model, Wake::Other), &mut model)

@@ -2,7 +2,8 @@
 
 The dashboard and Home Assistant communicate only through the Mosquitto broker on the
 Raspberry Pi (`192.168.1.109`, port 1883). Home Assistant publishes entity states. The
-dashboard publishes service calls, its own status and its log. The Pi setup is in
+dashboard publishes service calls, its own status, its log, and its discovery and state
+as a device of Home Assistant. The Pi setup is in
 `RUNBOOK.md` in the `rpi` notes, in the sections "Mosquitto" and "MQTT for the
 dashboard".
 
@@ -122,11 +123,17 @@ parts, in this order:
 
 1. The service calls that wait (the outbox).
 2. The `online` status.
-3. The SUBSCRIBE packets for all the topic filters.
+3. The SUBSCRIBE packets for all the topic filters: the topics of the entities, and
+   then `homeassistant/status` (refer to "Home Assistant device" below).
 
-The session packs the filters into SUBSCRIBE packets of up to 1024 bytes. The 115
+The session packs the filters into SUBSCRIBE packets of up to 1024 bytes. The 116
 filters need about 7 packets, 7.9 KiB in all. The broker sends the retained state of
 each topic after it accepts the filter.
+
+The write has nothing else. The device publishes (the discovery message, the state
+message and the lines of the log) go in later writes. If the CONNACK arrives before
+the shell confirms the CONNECT write, the CONNACK write waits, and the device
+publishes wait behind it.
 
 The `Subscribe` job of the session ends when the broker acknowledged each packet.
 If the broker refused a filter, the outcome is `Refused`. If the stream closes
@@ -388,10 +395,11 @@ Delivery is at least once:
 - A line leaves the ring only when the broker sends its PUBACK.
 - If the session ends before the PUBACK, the line goes again on the next connection,
   in the same order. Thus Home Assistant can get a line two times.
-- At most 56 messages of the log wait for a PUBACK at a time. The session takes 64, so
-  the log always leaves 8 places for the status and the service calls
-  (`logs::RESERVED`). If the log is at its limit, or the session takes no more
-  publishes, the next line waits for the next PUBACK.
+- The log shares one limit with the discovery and the state messages (refer to "Home Assistant
+  device" below). At most 56 of these messages wait for a PUBACK at a
+  time. The session takes 64, so they always leave 8 places for the status and the
+  service calls (`device::RESERVED`). If the queue is at its limit, or the session
+  takes no more publishes, the next line waits for the next PUBACK.
 
 If the ring is full, a new line removes the oldest line, and the core counts the
 removed lines. Before the next line, the dashboard then publishes the drop message:
@@ -425,6 +433,132 @@ The automation `dashboard_log` writes the lines to the Home Assistant log.
   `dashboard.<device_id>` and the level `warning`, with `[info] ` before the
   message. The Home Assistant log keeps only the level `warning` and higher. A later
   PR moves the `info` lines to `logbook.log` on the status entity of the device.
+
+### Home Assistant device
+
+The dashboard tells Home Assistant about itself with MQTT discovery. Home Assistant
+then shows the dashboard as a device with three entities: the status, the charge of
+the battery, and whether the dashboard is on the stand. Refer to
+`shared/src/features/device/`.
+
+| Topic | Direction | QoS | Retained |
+| --- | --- | --- | --- |
+| `homeassistant/device/dashboard_<device_id>/config` | Dashboard to Home Assistant | 1 | Yes |
+| `dashboard/<device_id>/state` | Dashboard to Home Assistant | 1 | Yes |
+| `dashboard/<device_id>/status` | Dashboard to Home Assistant (refer to "Status") | 1 | Yes |
+| `homeassistant/status` | Home Assistant to the dashboard | 0 (subscribe) | No |
+
+#### The discovery message
+
+The discovery message is one device-based discovery config of Home Assistant
+(2024.11 and later), with abbreviated keys. It has about 940 bytes. For example, for
+the device id `hall`:
+
+```json
+{
+  "dev": {
+    "ids": "dashboard_hall",
+    "name": "Dashboard hall",
+    "mf": "LilyGo",
+    "mdl": "T5 E-Paper S3 Pro",
+    "sw": "0.1.0+1b073946",
+    "cns": [["mac", "28:84:85:37:b8:a0"]]
+  },
+  "o": {"name": "crux-ha-dashboard", "sw": "0.1.0+1b073946"},
+  "cmps": {
+    "status": {
+      "p": "sensor", "name": "Status", "uniq_id": "dashboard_hall_status",
+      "dev_cla": "enum", "ops": ["online", "asleep", "offline"],
+      "stat_t": "dashboard/hall/status"
+    },
+    "battery": {
+      "p": "sensor", "name": "Battery", "uniq_id": "dashboard_hall_battery",
+      "dev_cla": "battery", "unit_of_meas": "%", "stat_cla": "measurement",
+      "stat_t": "dashboard/hall/state", "val_tpl": "{{ value_json.battery }}",
+      "avty_t": "dashboard/hall/status",
+      "avty_tpl": "{{ 'offline' if value == 'offline' else 'online' }}"
+    },
+    "stand": {
+      "p": "binary_sensor", "name": "On stand", "uniq_id": "dashboard_hall_stand",
+      "dev_cla": "plug",
+      "stat_t": "dashboard/hall/state", "val_tpl": "{{ value_json.stand }}",
+      "avty_t": "dashboard/hall/status",
+      "avty_tpl": "{{ 'offline' if value == 'offline' else 'online' }}"
+    }
+  }
+}
+```
+
+The message on the broker has no spaces or new lines.
+
+- `sw` is the version of the firmware: the version of the package and a short commit
+  id, for example `0.1.0+1b073946`, or `0.1.0+1b073946.dirty` for a build with edits
+  that are not in a commit. Refer to `firmware/README.md`. The simulator gives
+  `<version>+sim`.
+- `cns` has the MAC address of the Wi-Fi station interface. The simulator gives
+  `02:00:00:00:00:01`.
+- The config has no shared options at its root. Each component has its own state topic
+  and availability, because a shared availability would apply to the status sensor too.
+
+The dashboard publishes the discovery message at these times:
+
+- Once after each `Start` of the core, on the first connection. A wake from a sleep on
+  battery is not a `Start`, so it sends no discovery. The message is retained, so the
+  broker keeps it.
+- Again when Home Assistant publishes its birth message: `online` on
+  `homeassistant/status`, not retained. Home Assistant publishes it when it starts. The
+  dashboard ignores a retained birth message, because it is from an earlier start.
+  If the discovery message waits for its PUBACK, a birth message changes nothing. The
+  message in flight is retained, so Home Assistant gets it when it subscribes.
+- Again on the next connection, if the session ended before the PUBACK.
+
+During a dry run (`read_only = true` in `cfg.toml`, or the dry run that the user
+starts), the dashboard publishes no discovery message and no state message. The
+bring-up binary of the firmware uses a dry run, so it does not appear in Home
+Assistant as a device. The log still goes. When the dry run stops, the dashboard
+publishes the discovery message (if it did not send it yet) and the state.
+
+#### The state message
+
+The state message has the values of the battery and the stand sensors as one JSON
+object:
+
+```json
+{"battery":95,"stand":"OFF"}
+```
+
+| Key | Value |
+| --- | --- |
+| `battery` | The charge of the battery in percent, from 0 to 100. `null` if the shell did not read it. Home Assistant then shows the sensor as unknown. |
+| `stand` | `ON` if the dashboard is on the stand, `OFF` if it is on battery. These are the default payloads of a binary sensor. |
+
+The message has about 30 bytes. The dashboard publishes it at these times:
+
+- Once on each connection.
+- After each change of a value, while the connection is up. A change of 1% of the
+  battery is a change, also if the panel shows the same rounded level.
+- At most one state message waits for a PUBACK. If a value changes while one waits,
+  the dashboard publishes the new values after the PUBACK.
+
+#### Availability
+
+| Entity | Available |
+| --- | --- |
+| Status | Always. It shows `online`, `asleep` or `offline` from the status topic. |
+| Battery, On stand | Unless the status is `offline`. While the dashboard is asleep, they keep their last value. |
+
+#### When the dashboard publishes
+
+The discovery message, the state message and the lines of the log are the device
+publishes. One queue sends them, in this order: the discovery, the state, the log.
+
+- The queue sends only while the connection is up. It sends nothing in the write of
+  the CONNACK, nothing from the start of a sleep, and nothing during the close for a
+  change of access point. The messages wait for the next connection after the wake.
+- At most 56 device publishes wait for a PUBACK at a time, all together. The session
+  takes 64, so 8 places stay free for the status (`asleep`) and the service calls.
+- If the queue is at its limit, or the session takes no more bytes now, the queue
+  continues after the next confirmed write or PUBACK.
 
 ## Test from a shell
 

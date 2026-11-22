@@ -1049,7 +1049,10 @@ fn the_status_stays_online_while_the_core_changes_access_point() {
 fn sleeping_with(phase: Phase) -> Model {
     let mut model = Model {
         power: power::State::asleep_in(1),
-        startup: crate::Startup::Started(settings()),
+        startup: crate::Startup::Started {
+            settings: settings(),
+            firmware: crate::tests::firmware(),
+        },
         ..Model::default()
     };
     model.wifi.phase = phase;
@@ -1234,7 +1237,10 @@ fn a_better_access_point_found_during_a_sleep_is_for_the_next_wake() {
 #[test]
 fn the_count_of_joins_with_no_new_address_comes_before_the_restart() {
     let mut model = Model {
-        startup: crate::Startup::Started(settings()),
+        startup: crate::Startup::Started {
+            settings: settings(),
+            firmware: crate::tests::firmware(),
+        },
         ..Model::default()
     };
     model.wifi.phase = Phase::Leasing {
@@ -1270,7 +1276,10 @@ fn the_count_of_joins_with_no_new_address_comes_before_the_restart() {
 #[test]
 fn a_stale_address_on_a_link_that_is_not_suspect_writes_no_line() {
     let mut model = Model {
-        startup: crate::Startup::Started(settings()),
+        startup: crate::Startup::Started {
+            settings: settings(),
+            firmware: crate::tests::firmware(),
+        },
         ..Model::default()
     };
     model.wifi.phase = Phase::Leasing {
@@ -1298,7 +1307,10 @@ fn a_stale_address_on_a_link_that_is_not_suspect_writes_no_line() {
 #[test]
 fn a_scan_with_no_signal_for_the_current_access_point_stays() {
     let mut model = Model {
-        startup: crate::Startup::Started(settings()),
+        startup: crate::Startup::Started {
+            settings: settings(),
+            firmware: crate::tests::firmware(),
+        },
         ..Model::default()
     };
     model.wifi.phase = Phase::Scanning(not_ready(HALL));

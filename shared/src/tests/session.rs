@@ -24,6 +24,7 @@ use crate::{
     fake::radio::HALL,
     features::{
         connection::{CLOSE_TIMEOUT, Link, RECONNECT_MAX, RECONNECT_MIN},
+        device::BIRTH_TOPIC,
         light::LIGHT_TIMEOUT,
         pending::{PENDING_TIMEOUT, QUEUED_TIMEOUT, SCENE_TIMEOUT, TARGET_TIMEOUT},
         power::{self, IDLE_TIMEOUT},
@@ -457,7 +458,8 @@ fn the_outbox_the_status_and_the_subscribe_go_in_one_write() {
 
 /// The write after the CONNACK holds the call at `QoS` 1 with the packet id
 /// 1, then the retained `online` status with the id 2, then the SUBSCRIBE
-/// packets with all the topics at `QoS` 0, in order.
+/// packets with all the topics at `QoS` 0, in order. The last topic is the
+/// birth message of Home Assistant.
 #[test]
 fn the_write_after_the_connack_keeps_its_packets_and_their_ids() {
     let mut shell = house();
@@ -506,7 +508,11 @@ fn the_write_after_the_connack_keeps_its_packets_and_their_ids() {
         assert_eq!(*id, expected_id);
         filters.extend(more.iter().cloned());
     }
-    let expected: Vec<(String, u8)> = topics(PAGES).into_iter().map(|topic| (topic, 0)).collect();
+    // The filters of the entities, and then the birth message of Home
+    // Assistant. The write has nothing else.
+    let mut expected: Vec<(String, u8)> =
+        topics(PAGES).into_iter().map(|topic| (topic, 0)).collect();
+    expected.push((BIRTH_TOPIC.into(), 0));
     assert_eq!(filters, expected);
 }
 

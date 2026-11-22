@@ -84,7 +84,7 @@ use crate::{
         power::{Power, PowerSource, Wake, WakeSource},
     },
     features::{
-        connection, light, logs,
+        connection, device, light, logs,
         refresh::redraw,
         rooms,
         timer::{Running, Slot},
@@ -603,6 +603,10 @@ pub fn wake_up(model: &mut Model) -> Cmd {
 }
 
 /// The device moved to the stand or off the stand.
+///
+/// The core publishes the new power source in the state message. On the
+/// stand, [`connection::go_online`] publishes it, or the next connection
+/// does. Refer to [`device::changed`].
 pub fn source_changed(source: PowerSource, model: &mut Model) -> Cmd {
     if source == model.power.source() {
         return Cmd::done();
@@ -625,6 +629,7 @@ pub fn source_changed(source: PowerSource, model: &mut Model) -> Cmd {
             light::source_changed(model)
                 .and(redraw(model, false))
                 .and(restart_idle_timer(model))
+                .and(device::changed(model))
         }
     }
 }
@@ -641,16 +646,22 @@ pub fn source_changed(source: PowerSource, model: &mut Model) -> Cmd {
 /// does not start the idle timer again. While the device sleeps, the core
 /// keeps the level but does not draw, as for a change of the dry run. The
 /// wake draws the level.
+///
+/// The core publishes each change of the exact level in the state message,
+/// while the device is awake. Refer to [`device::changed`]. A reading with
+/// the same level does nothing. While the device sleeps, the next connect
+/// publishes the level.
 pub fn battery_changed(level: Option<u8>, model: &mut Model) -> Cmd {
-    let shown = model.power.battery.map(rounded_level);
+    let before = model.power.battery;
     model.power.battery = level;
-    if level.map(rounded_level) == shown {
+    if level == before || model.power.is_asleep() {
         return Cmd::done();
     }
-    if model.power.is_asleep() {
-        return Cmd::done();
+    let publish = device::changed(model);
+    if level.map(rounded_level) == before.map(rounded_level) {
+        return publish;
     }
-    redraw(model, false)
+    redraw(model, false).and(publish)
 }
 
 /// Clears the idle timer that runs, and starts a new one if the device is

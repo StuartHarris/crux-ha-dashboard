@@ -135,7 +135,7 @@ async fn main(spawner: Spawner) -> ! {
         read_only: true,
         ..config::CONFIG
     };
-    let start = logic::shell::start(&dry_run, PowerSource::Stand, None, None);
+    let start = logic::shell::start(&dry_run, board::firmware(), PowerSource::Stand, None, None);
     let view = shell
         .send(Event::Start(start))
         .into_iter()

@@ -60,7 +60,8 @@ pub const ACK_TIMEOUT: Duration = Duration::from_secs(10);
 ///
 /// The burst after the CONNACK must fit: the outbox, the `online` status
 /// and the SUBSCRIBE packets for all the topics of the dashboard. The
-/// SUBSCRIBE packets for the 115 topics are about 8 KiB (7,855 bytes).
+/// SUBSCRIBE packets for the 116 topics are about 8 KiB (7,878 bytes). The
+/// device publishes go in later writes.
 pub const MAX_OUTGOING: usize = 16 * 1024;
 
 /// Returns the time between two ping packets for a keep-alive interval in

@@ -38,7 +38,7 @@ cannot block each other. This is the pattern of the `cpb` example in Crux.
 
 | Task | Work | Answers |
 | --- | --- | --- |
-| core (`main`) | Owns the shell. Sends `Start` with the power source `Stand`. Sends each warn and error line that the logger keeps as `Event::ShellLogged`. | |
+| core (`main`) | Owns the shell. Sends `Start` with the power source `Stand`, the firmware version and the MAC address of the Wi-Fi station interface (`board::firmware`). Sends each warn and error line that the logger keeps as `Event::ShellLogged`. | |
 | `timers` | Starts and cancels the timers of the core. | `Signal::Timer` |
 | `display` | Draws the newest view model with `ui::draw`, and refreshes the panel as `ui::Refresher` decides. Reads the touch controller every 30 ms between refreshes. Sets the front light. Runs the `Sleep` job. | `Signal::Tap`, `Signal::Event`, `Signal::Woke`, `Signal::Light` |
 | `radio` | Does the radio jobs of the core (`Join`, `Address`, `Leave`, `Scan`, `StopScan` and `Off`) and the `Restart` job. Has no Wi-Fi policy. The core decides which access point to join, when to scan, when to leave and when to restart the chip. | `Signal::Radio` with the token of the job |
@@ -50,7 +50,7 @@ cannot block each other. This is the pattern of the `cpb` example in Crux.
 The core runs MQTT 3.1.1 (`shared/src/mqtt/`). The stream task
 (`src/bin/dashboard/stream.rs`) only moves bytes. The task takes the receive buffer
 and the send buffer of the socket (8 KiB each) from the heap once, so the allocator
-puts them in PSRAM. The 115 topic filters need about 7.9 KiB of SUBSCRIBE packets,
+puts them in PSRAM. The 116 topic filters need about 7.9 KiB of SUBSCRIBE packets,
 and the core gives them to the socket in one `Write`.
 
 A `Write` ends when all its bytes are in the send buffer, and smoltcp sends them from
@@ -396,6 +396,23 @@ binary includes it as a private module. The build
 does not print a value, and an error in the file gives only the line and the key. To
 build with another file, set `DASHBOARD_CONFIG` to its path (relative to `firmware/`).
 CI builds with `DASHBOARD_CONFIG=cfg.toml.example`, which has placeholders.
+
+`build.rs` also gives the firmware its version (`board::VERSION`): the version of the
+package, `+`, and a short commit id, for example `0.1.0+1b073946`. The commit id is
+build metadata of SemVer. It is the jj commit id (8 hex digits) of the nearest change
+that has code: the working copy, or its nearest ancestor that is not empty
+(`latest(heads(::@ & ~empty()))`). If the working copy has edits, the version ends with
+`.dirty`, for example `0.1.0+1b073946.dirty`. If jj is not there, the commit id is the
+git commit of `HEAD`. If neither works, it is `unknown`. The core sends the version
+to Home Assistant in the discovery message (refer to `docs/mqtt.md`).
+
+The script runs jj with `--at-op=@`, so it takes no snapshot of the working copy, and
+it changes nothing in the repository. Thus `.dirty` tells the state of the working
+copy at the last jj command. An edit after the last jj command does not count. Run a
+jj command (for example `jj st`) before the build if the version must show it.
+
+Cargo runs the script again after each jj operation, after a move of a detached git
+`HEAD`, and after each git commit on a branch (`logs/HEAD` in the git directory).
 
 If `cfg.toml` does not exist, the build stops with an error that tells you to copy the
 example. Do not commit `cfg.toml`. Do not put a password in a command line or in a log.

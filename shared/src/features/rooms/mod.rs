@@ -7,7 +7,7 @@ use crate::{
     Cmd, Control, Model, Startup,
     features::{
         connection::{self, Call},
-        light,
+        device, light,
         pending::{self, Confirm},
         power,
         refresh::redraw,
@@ -269,7 +269,7 @@ fn room_tapped(index: usize, model: &mut Model) -> Cmd {
 /// the request ask for one. After `Start`, the core draws the change only
 /// while the device is awake. The next wake shows it.
 pub fn set_read_only(read_only: bool, model: &mut Model) -> Cmd {
-    let Startup::Started(settings) = &mut model.startup else {
+    let Startup::Started { settings, .. } = &mut model.startup else {
         model.startup = Startup::Waiting { read_only };
         return Cmd::done();
     };
@@ -280,7 +280,9 @@ pub fn set_read_only(read_only: bool, model: &mut Model) -> Cmd {
     if model.power.is_asleep() {
         Cmd::done()
     } else {
-        redraw(model, false)
+        // At the end of a dry run, the device publishes go. Refer to
+        // [`device`].
+        redraw(model, false).and(device::changed(model))
     }
 }
 

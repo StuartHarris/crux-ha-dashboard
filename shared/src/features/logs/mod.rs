@@ -35,6 +35,12 @@
 //! retained. The payload has the age of the line in seconds, not its time,
 //! because the device has no wall clock. Refer to `docs/mqtt.md`.
 //!
+//! The log is one publisher of the device publish queue
+//! ([`device::drain`]). The queue asks the log for its next message
+//! ([`next`]), and gives the log the packet id of each message that the
+//! session took ([`taken`]). The queue routes each PUBACK of the log to
+//! [`acked`].
+//!
 //! Each session of the connection has a [`Flight`], in its
 //! [`Live`](crate::features::connection::Live). A session end drops the
 //! flight with the session, so the packet ids of a session never go to the
@@ -58,15 +64,17 @@
 //! - The core publishes only while the connection is up. It publishes
 //!   nothing in the write of the CONNACK, because the clock request comes
 //!   first. It publishes nothing from the start of a sleep, and nothing
-//!   during the close for a change of access point. Refer to [`drain`].
+//!   during the close for a change of access point. Refer to
+//!   [`device::drain`].
 //! - The age of a line can be a little short. A line that waits behind the
 //!   limit of publishes gets its age from the time of the clock answer, or
 //!   the age 0 if it is newer than that time.
-//! - At most [`LOG_IN_FLIGHT`] publishes of the log wait for a PUBACK, so
-//!   the log leaves [`RESERVED`] places for the status and service calls.
-//! - If the log is at that limit, or the session takes no more publishes
-//!   now ([`Refused::Full`]), the core continues after the next `Sent` or
-//!   `Acked`. Refer to
+//! - The log shares the limit of the queue with the other device
+//!   publishes. At most [`device::IN_FLIGHT`] of them wait for a PUBACK, so
+//!   they leave [`device::RESERVED`] places for the status and the service
+//!   calls.
+//! - If the queue is at that limit, or the session takes no more publishes
+//!   now, the core continues after the next `Sent` or `Acked`. Refer to
 //!   [`connection::pump`].
 //! - The core writes no line about the publish of its own log, so the log
 //!   cannot make more log. The shell can write a line about a failed
@@ -81,8 +89,11 @@ use serde::Serialize;
 use crate::{
     Cmd, Model,
     capabilities::log::{self, Area, Level, Uptime},
-    features::connection::{self, Link},
-    mqtt::{MAX_IN_FLIGHT, PacketId, Publish, Qos, Refused, Session},
+    features::{
+        connection::{self, Link},
+        device::{self, Next},
+    },
+    mqtt::{PacketId, Publish, Qos},
 };
 
 /// The number of lines that the ring keeps.
@@ -96,20 +107,6 @@ pub const MAX_SOURCE: usize = 32;
 
 /// The mark at the end of a message that the ring cut.
 pub const CUT_MARK: &str = "…";
-
-/// The number of places for publishes at `QoS` 1 that the log leaves free
-/// in each session.
-///
-/// The session takes at most [`MAX_IN_FLIGHT`] publishes that wait for a
-/// PUBACK. If the log took all of them, a sleep could not publish `asleep`
-/// (the core drops a refused `asleep`), and a service call would wait for
-/// a PUBACK of the log. With these places free, the log never blocks the
-/// status or a few taps.
-pub const RESERVED: usize = 8;
-
-/// The largest number of publishes of the log that wait for a PUBACK in a
-/// session, the drop message included.
-pub const LOG_IN_FLIGHT: usize = MAX_IN_FLIGHT - RESERVED;
 
 /// The `source` of the drop message. The drop message tells Home Assistant
 /// how many lines the ring removed before they went. It has the level
@@ -156,8 +153,9 @@ fn stamped(line: Line, model: &mut Model) -> Cmd {
     publish(model)
 }
 
-/// Starts to publish the lines that wait, if the connection is up.
-/// [`drain`] publishes nothing from the start of a sleep.
+/// Starts to publish the lines that wait, if the connection is up. The
+/// device publish queue publishes nothing from the start of a sleep. Refer
+/// to [`device::drain`].
 fn publish(model: &mut Model) -> Cmd {
     if model.connection.link() == Link::Up {
         connection::pump(model)
@@ -496,101 +494,114 @@ pub struct Sending {
     lines: Vec<(PacketId, u64)>,
 }
 
-/// Publishes the lines that wait, or asks for the time first. Returns the
-/// command of the clock request, and `true` if the session took a publish.
+/// A message of the log that the log offers to the device publish queue.
+/// The queue gives it back to [`taken`] or [`never`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Item {
+    /// The drop message, with the count that it tells.
+    Notice(u32),
+    /// The line with this sequence number.
+    Line(u64),
+}
+
+/// Returns the next message of the log for the device publish queue, or
+/// asks for the time first. Refer to [`device::drain`].
 ///
-/// [`connection::pump`] calls this function while the connection is up,
-/// after the outbox. The session then sends the publishes in the next
-/// write.
+/// The queue calls this function only while the connection is up and the
+/// device is awake. Thus the core asks for no time from the start of a
+/// sleep. The connection can still be up in the first step of a sleep, but
+/// its DISCONNECT soon follows, so the PUBACK of a new line is often lost,
+/// and the line goes two times. The lines wait in the ring until the wake.
+/// The PUBACKs of the lines that went before still count.
 ///
-/// From the start of a sleep, the core publishes no new line, and it asks
-/// for no time. The connection can still be up in the first step of a
-/// sleep, but its DISCONNECT soon follows, so the PUBACK of a new line is
-/// often lost, and the line goes two times. The lines wait in the ring
-/// until the wake. The PUBACKs of the lines that went before still count.
-pub(crate) fn drain(model: &mut Model) -> (Cmd, bool) {
-    if model.connection.link() != Link::Up || model.power.is_asleep() {
-        return (Cmd::done(), false);
-    }
+/// The drop message comes first, if lines were dropped and no drop message
+/// waits for its PUBACK. Then the lines that wait come, from the oldest.
+pub(crate) fn next(model: &mut Model) -> Next {
     let Some(settings) = model.startup.settings() else {
-        return (Cmd::done(), false);
+        return Next::Nothing;
     };
     let id = model.connection.id;
     let Some(live) = model.connection.live_mut() else {
-        return (Cmd::done(), false);
+        return Next::Nothing;
+    };
+    let publish = |payload| Publish {
+        topic: settings.log_topic(),
+        payload,
+        qos: Qos::AtLeastOnce,
+        retain: false,
     };
     match &mut live.log {
         Flight::Idle if model.logs.waits() => {
             live.log = Flight::Clock;
-            let request = log::clock().then_send(move |now| {
+            Next::Wait(log::clock().then_send(move |now| {
                 Event::Clock {
                     connection: id,
                     now,
                 }
                 .into()
-            });
-            (request, false)
+            }))
         }
-        Flight::Idle | Flight::Clock => (Cmd::done(), false),
+        Flight::Idle | Flight::Clock => Next::Nothing,
         Flight::Sending(sending) => {
-            let topic = settings.log_topic();
-            let published = fill(sending, &mut live.session, &mut model.logs, &topic);
-            (Cmd::done(), published)
+            let state = &model.logs;
+            if state.dropped > 0 && sending.notice.is_none() {
+                let count = state.dropped;
+                Next::Offer(
+                    publish(dropped_json(count)),
+                    device::Item::Log(Item::Notice(count)),
+                )
+            } else if let Some(entry) = state.entries.iter().find(|entry| entry.seq >= sending.next)
+            {
+                let payload = Payload::of(&entry.line, sending.now).to_json();
+                Next::Offer(publish(payload), device::Item::Log(Item::Line(entry.seq)))
+            } else {
+                Next::Nothing
+            }
         }
     }
 }
 
-/// Publishes the drop message, if it is due, and then the lines that wait,
-/// from the oldest, until the session takes no more. Returns `true` if the
-/// session took a publish.
-///
-/// The drop message goes first, if lines were dropped and no drop message
-/// waits for its PUBACK. At most [`LOG_IN_FLIGHT`] publishes of the log
-/// wait for a PUBACK, so the core stops at that number.
-///
-/// A line that is too long for a packet can never go, so the core removes
-/// it and counts it as dropped.
-fn fill(sending: &mut Sending, session: &mut Session, state: &mut State, topic: &str) -> bool {
-    let mut published = false;
-    loop {
-        if sending.lines.len() + usize::from(sending.notice.is_some()) >= LOG_IN_FLIGHT {
-            break;
+/// The session took the message `item` of the log with the packet id
+/// `packet`. The message now waits for its PUBACK.
+pub(crate) fn taken(item: Item, packet: PacketId, model: &mut Model) {
+    let Some(Flight::Sending(sending)) = model.connection.live_mut().map(|live| &mut live.log)
+    else {
+        return;
+    };
+    match item {
+        Item::Notice(count) => sending.notice = Some((packet, count)),
+        Item::Line(seq) => {
+            sending.lines.push((packet, seq));
+            sending.next = seq + 1;
         }
-        let publish = |payload| Publish {
-            topic: topic.into(),
-            payload,
-            qos: Qos::AtLeastOnce,
-            retain: false,
-        };
-        if state.dropped > 0 && sending.notice.is_none() {
-            let count = state.dropped;
-            match session.publish(publish(dropped_json(count))) {
-                Ok(Some(id)) => sending.notice = Some((id, count)),
-                // A publish at `QoS` 1 always has a packet id, and the drop
-                // message is short. The core tries again after the next
-                // `Sent` or `Acked`.
-                Ok(None) | Err(_) => break,
-            }
-        } else if let Some(entry) = state.entries.iter().find(|entry| entry.seq >= sending.next) {
-            let seq = entry.seq;
-            match session.publish(publish(Payload::of(&entry.line, sending.now).to_json())) {
-                Ok(Some(id)) => {
-                    sending.lines.push((id, seq));
-                    sending.next = seq + 1;
-                }
-                Err(Refused::TooLong) => {
-                    state.remove(seq);
-                    state.dropped = state.dropped.saturating_add(1);
-                    continue;
-                }
-                Ok(None) | Err(Refused::Full | Refused::NotConnected) => break,
-            }
-        } else {
-            break;
-        }
-        published = true;
     }
-    published
+}
+
+/// The session can never take the message `item` of the log, because it is
+/// too long for a packet.
+///
+/// The core removes such a line and counts it as dropped. The drop message
+/// is short, so this does not occur for it. If it occurs, the core forgets
+/// the drop count, so the queue does not offer the message again.
+pub(crate) fn never(item: Item, model: &mut Model) {
+    match item {
+        Item::Notice(_) => model.logs.dropped = 0,
+        Item::Line(seq) => {
+            model.logs.remove(seq);
+            model.logs.dropped = model.logs.dropped.saturating_add(1);
+        }
+    }
+}
+
+/// Returns the number of publishes of the log that wait for a PUBACK, the
+/// drop message included.
+pub(crate) fn in_flight(model: &mut Model) -> usize {
+    match model.connection.live_mut().map(|live| &live.log) {
+        Some(Flight::Sending(sending)) => {
+            sending.lines.len() + usize::from(sending.notice.is_some())
+        }
+        Some(Flight::Idle | Flight::Clock) | None => 0,
+    }
 }
 
 /// The broker acknowledged the publish with the packet id `id`. If it is a
@@ -598,19 +609,22 @@ fn fill(sending: &mut Sending, session: &mut Session, state: &mut State, topic: 
 /// the core subtracts its count from the drop count. Lines that dropped
 /// after the drop message went stay in the count.
 ///
-/// The core ignores an id that is not a publish of the log, for example the
-/// id of a service call.
-pub(crate) fn acked(id: PacketId, model: &mut Model) {
+/// Returns `false` if the id is not a publish of the log, for example the
+/// id of a service call. The core then ignores it.
+pub(crate) fn acked(id: PacketId, model: &mut Model) -> bool {
     let Some(Flight::Sending(sending)) = model.connection.live_mut().map(|live| &mut live.log)
     else {
-        return;
+        return false;
     };
     if let Some((_, count)) = sending.notice.take_if(|(notice, _)| *notice == id) {
         model.logs.dropped = model.logs.dropped.saturating_sub(count);
     } else if let Some(index) = sending.lines.iter().position(|(line, _)| *line == id) {
         let (_, seq) = sending.lines.remove(index);
         model.logs.remove(seq);
+    } else {
+        return false;
     }
+    true
 }
 
 /// Returns the JSON payload of the drop message for `count` lines.

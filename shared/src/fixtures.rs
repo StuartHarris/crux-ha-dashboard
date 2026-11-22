@@ -21,7 +21,7 @@ use crux_core::{Request, capability::Operation};
 use crux_time::operation::NotifyAfter;
 
 use crate::{
-    Core, Dashboard, Effect, Event, PowerSource, Settings, Start, TileKind, ViewModel,
+    Core, Dashboard, Effect, Event, Firmware, PowerSource, Settings, Start, TileKind, ViewModel,
     capabilities::{
         log::Uptime,
         stream::{Open, StreamItem, Written},
@@ -85,6 +85,10 @@ impl FixedShell {
                 port: 1883,
                 credentials: None,
                 read_only: false,
+            },
+            firmware: Firmware {
+                version: "0.0.0+fixture".into(),
+                mac: [0x02, 0, 0, 0, 0, 0x01],
             },
             power,
             path: Some(path.into()),

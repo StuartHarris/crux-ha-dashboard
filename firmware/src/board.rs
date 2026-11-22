@@ -1,13 +1,16 @@
 //! Starts the chip: the CPU clock, the heap in internal RAM and in PSRAM, the
 //! log and the scheduler.
 
+use alloc::string::String;
+
 use esp_hal::{
     clock::CpuClock,
+    efuse::{self, InterfaceMacAddress},
     peripherals::{FROM_CPU_INTR0, PSRAM, Peripherals, TIMG0},
     psram::{PsramConfig, PsramMode},
     timer::timg::TimerGroup,
 };
-use shared::capabilities::log::Uptime;
+use shared::{Firmware, capabilities::log::Uptime};
 
 /// The size of the heap in internal RAM. The Wi-Fi driver needs internal RAM
 /// for its buffers. With Wi-Fi and MQTT connected, about 29 KiB of it is free
@@ -39,6 +42,24 @@ pub fn uptime() -> Uptime {
             .duration_since_epoch()
             .as_millis(),
     )
+}
+
+/// The version of the firmware: the version of the package and a short
+/// commit id, for example `0.1.0+1b073946` or `0.1.0+1b073946.dirty`.
+/// `build.rs` makes it.
+pub const VERSION: &str = env!("FIRMWARE_VERSION");
+
+/// Returns the facts about the firmware for `Start`: [`VERSION`] and the MAC
+/// address of the Wi-Fi station interface.
+#[must_use]
+pub fn firmware() -> Firmware {
+    let station = efuse::interface_mac_address(InterfaceMacAddress::Station);
+    let mut mac = [0; 6];
+    mac.copy_from_slice(station.as_bytes());
+    Firmware {
+        version: String::from(VERSION),
+        mac,
+    }
 }
 
 /// Starts the heap and the scheduler.
