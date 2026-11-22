@@ -10,6 +10,11 @@
 //!
 //! The core logs a decision of the Wi-Fi policy, a failure, and the start
 //! of each step of a sleep. A start, a join and a connect give no lines.
+//!
+//! Before the core sends the kept lines to Home Assistant, it sends a
+//! [`LogClock`] request. The shell answers with the time on the same clock,
+//! and the core sends the age of each line. Refer to
+//! [`crate::features::logs`].
 
 use alloc::string::String;
 use core::fmt;
@@ -25,12 +30,20 @@ pub enum Level {
     Warn,
 }
 
-impl fmt::Display for Level {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
+impl Level {
+    /// Returns the name of the level, for example `info`.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
             Self::Info => "info",
             Self::Warn => "warn",
-        })
+        }
+    }
+}
+
+impl fmt::Display for Level {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
     }
 }
 
@@ -46,13 +59,21 @@ pub enum Area {
     Power,
 }
 
-impl fmt::Display for Area {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
+impl Area {
+    /// Returns the name of the area, for example `wifi`.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
             Self::Wifi => "wifi",
             Self::Mqtt => "mqtt",
             Self::Power => "power",
-        })
+        }
+    }
+}
+
+impl fmt::Display for Area {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
     }
 }
 
@@ -89,6 +110,15 @@ impl fmt::Display for Log {
     }
 }
 
+/// Asks for the time on the monotonic clock of the shell.
+///
+/// The shell answers at once with its time ([`Uptime`]), from the same
+/// clock as its answers to [`Log`]. The core then knows the age of each
+/// line that it keeps.
+#[derive(Operation, Clone, Copy, Debug, PartialEq, Eq)]
+#[operation(request, output = Uptime)]
+pub struct LogClock;
+
 /// Writes `message` to the log of the shell at `level`. The request ends
 /// with the time of the line.
 ///
@@ -111,13 +141,24 @@ where
     })
 }
 
+/// Asks for the time on the monotonic clock of the shell. The request ends
+/// with the time.
+#[must_use]
+pub fn clock<Effect, Event>() -> RequestBuilder<Effect, Event, impl Future<Output = Uptime>>
+where
+    Effect: From<Request<LogClock>> + Send + 'static,
+    Event: Send + 'static,
+{
+    Command::request_from_shell(LogClock)
+}
+
 #[cfg(test)]
 mod tests {
     use alloc::{string::ToString, vec::Vec};
 
     use crux_core::{Command, Request};
 
-    use super::{Area, Level, Log, Uptime, write};
+    use super::{Area, Level, Log, LogClock, Uptime, clock, write};
 
     /// The one effect of the log capability, for the tests only.
     struct Effect(Request<Log>);
@@ -148,6 +189,30 @@ mod tests {
 
         request.resolve(Uptime(1_500)).expect("one answer");
         assert_eq!(command.events().collect::<Vec<_>>(), [Uptime(1_500)]);
+        assert!(command.is_done());
+    }
+
+    /// The one effect of the clock request, for the tests only.
+    struct ClockEffect(Request<LogClock>);
+
+    impl From<Request<LogClock>> for ClockEffect {
+        fn from(request: Request<LogClock>) -> Self {
+            Self(request)
+        }
+    }
+
+    #[test]
+    fn the_clock_is_a_request_that_ends_with_the_time_of_the_shell() {
+        let mut command: Command<ClockEffect, Uptime> = clock().then_send(|now| now);
+
+        let mut effects: Vec<ClockEffect> = command.effects().collect();
+        assert_eq!(effects.len(), 1, "one effect");
+        let mut request = effects.remove(0).0;
+        assert_eq!(request.operation, LogClock);
+        assert!(!command.is_done(), "the request waits for its answer");
+
+        request.resolve(Uptime(90_000)).expect("one answer");
+        assert_eq!(command.events().collect::<Vec<_>>(), [Uptime(90_000)]);
         assert!(command.is_done());
     }
 

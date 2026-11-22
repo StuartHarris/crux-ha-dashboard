@@ -9,7 +9,7 @@ use embedded_graphics::prelude::Point;
 use shared::{
     Cmd, Connection, Effect, Event, PowerSource,
     capabilities::{
-        log::{Area, Level, Log, Uptime},
+        log::{self, Area, Level, Log, Uptime},
         power::Wake,
         radio::{Joined, Lease, Radio, Restart, Scanned},
         stream::{StreamItem, Written},
@@ -108,15 +108,25 @@ impl Device {
         jobs
     }
 
-    /// Answers each `Log` job in `jobs` at once with [`Device::uptime`], as
-    /// the core task does after it writes the line. Adds the jobs of the
+    /// Answers each `Log` and `Clock` job in `jobs` at once with
+    /// [`Device::uptime`], as the core task does. Adds the jobs of the
     /// answers to `jobs`.
     fn answer_logs(&mut self, jobs: &mut Vec<Job>) {
         let mut index = 0;
         while let Some(job) = jobs.get(index) {
-            if let Job::Log { token, .. } = *job {
-                let at = self.uptime;
-                jobs.extend(self.shell.handle(Signal::Logged { token, at }));
+            let signal = match *job {
+                Job::Log { token, .. } => Some(Signal::Logged {
+                    token,
+                    at: self.uptime,
+                }),
+                Job::Clock { token } => Some(Signal::Clock {
+                    token,
+                    now: self.uptime,
+                }),
+                _ => None,
+            };
+            if let Some(signal) = signal {
+                jobs.extend(self.shell.handle(signal));
             }
             index += 1;
         }
@@ -331,7 +341,7 @@ fn names(jobs: &[Job]) -> Vec<String> {
                 RadioOp::Off(_) => "wifi off".into(),
             }],
             Job::Restart(_) => vec!["restart".into()],
-            Job::Log { .. } => Vec::new(),
+            Job::Log { .. } | Job::Clock { .. } => Vec::new(),
             Job::Sleep(_) => vec!["sleep".into()],
             Job::FrontLight { token, level } => vec![format!("light {level} {token}")],
             Job::Timer {
@@ -1407,6 +1417,13 @@ fn a_change_of_access_point_leaves_only_after_the_end_of_the_stream() {
     let jobs = reconnect(&mut device, FIRST, SECOND);
     let jobs = device.deliver(&jobs);
     assert!(scans(&jobs), "{:?}", names(&jobs));
+    // The line of the reconnect goes to Home Assistant in a later write.
+    assert!(
+        names(&jobs).contains(&format!("publish dashboard/test/log {SECOND}")),
+        "{:?}",
+        names(&jobs)
+    );
+    device.deliver(&jobs);
 
     // The scan finds a better access point. The answer clears the time
     // limit of `Scan`. The core logs the reason, and then it sends a
@@ -1558,6 +1575,45 @@ fn a_line_of_the_log_ends_at_its_answer_with_the_time_of_the_device() {
             area: Area::Power,
             message: Message::new("sleep 1 closes the connection"),
         }))]
+    );
+    assert!(cmd.is_done());
+}
+
+#[test]
+fn a_clock_request_ends_at_its_answer_with_the_time_of_the_device() {
+    let mut shell = Shell::new();
+    let mut cmd: Cmd = log::clock().then_send(|now| {
+        Event::Logs(logs::Event::Clock {
+            connection: FIRST,
+            now,
+        })
+    });
+    let effects: Vec<Effect> = cmd.effects().collect();
+    let jobs = shell.process(effects);
+    let [Job::Clock { token }] = jobs[..] else {
+        panic!("not one Clock job: {jobs:?}");
+    };
+
+    // An answer with a token that no request waits for is dropped.
+    let stale = Signal::Clock {
+        token: token + 1,
+        now: Uptime(1),
+    };
+    assert_eq!(shell.handle(stale), Vec::new());
+    assert_eq!(cmd.events().next(), None);
+
+    // The answer gives the time of the device to the core.
+    let answer = Signal::Clock {
+        token,
+        now: Uptime(42_000),
+    };
+    assert_eq!(shell.handle(answer), Vec::new());
+    assert_eq!(
+        cmd.events().collect::<Vec<_>>(),
+        [Event::Logs(logs::Event::Clock {
+            connection: FIRST,
+            now: Uptime(42_000),
+        })]
     );
     assert!(cmd.is_done());
 }

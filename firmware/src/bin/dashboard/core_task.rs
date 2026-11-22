@@ -96,6 +96,7 @@ fn record(stats: &mut UpdateStats, started: Instant) {
 /// the radio task. The line has the log target `core`, which the printed
 /// line does not show. Then the task answers at once with
 /// `Signal::Logged` and the time of the line ([`uptime`]).
+/// A `Clock` job gets the same answer at once as `Signal::Clock`.
 ///
 /// An `Open` starts new update statistics. The first `Close` of the same
 /// connection logs them. A `Close` of an older connection, or a second
@@ -147,6 +148,10 @@ fn dispatch(jobs: alloc::vec::Vec<Job>, display: bool, stats: &mut Stats) {
                     at: uptime(),
                 });
             }
+            Job::Clock { token } => SIGNALS.push(shell::Signal::Clock {
+                token,
+                now: uptime(),
+            }),
             Job::FrontLight { token, level } if display => LIGHT.push((token, level)),
             Job::FrontLight { token, .. } => SIGNALS.push(shell::Signal::Light { token }),
             Job::Sleep(sleep) => {

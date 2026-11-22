@@ -9,7 +9,8 @@
 //! [`Wire::effects`] and [`Wire::events`]. It ignores the timers of the MQTT
 //! session. It keeps each `Log` request in [`Wire::logs`]. The wire has no
 //! clock, so it answers each `Log` request with [`Wire::UPTIME`], and it
-//! sends the event of the answer to the core at once.
+//! sends the event of the answer to the core at once. It answers each
+//! `LogClock` request with the same time.
 //!
 //! A test checks a `Write` in a command with the [`ExpectWrite`] helpers.
 //! They skip the timers of the session, take the `Write`, answer it, and
@@ -255,6 +256,7 @@ impl Wire {
                 self.logs.push(format!("{} {log}", log.level));
                 request.resolve(Self::UPTIME).unwrap();
             }
+            Effect::LogClock(mut request) => request.resolve(Self::UPTIME).unwrap(),
             Effect::TimeClear(mut request)
                 if self.session_timers.contains(&request.operation.id) =>
             {

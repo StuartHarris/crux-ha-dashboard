@@ -329,6 +329,11 @@ impl State {
         }
     }
 
+    /// Returns the session, if a stream is open.
+    pub(crate) const fn live_mut(&mut self) -> Option<&mut Live> {
+        self.phase.live_mut()
+    }
+
     /// Returns `true` if a stream is open.
     #[must_use]
     pub const fn has_stream(&self) -> bool {
@@ -351,6 +356,10 @@ pub struct Live {
     /// The handle of the timer of each kind that runs, at the index of its
     /// kind.
     timers: [Option<TimerHandle>; TimerKind::COUNT],
+    /// The publish of the log on this session. It ends with the session,
+    /// so its packet ids never go to the next session. Refer to
+    /// [`logs::Flight`].
+    pub log: logs::Flight,
 }
 
 impl Live {
@@ -360,6 +369,7 @@ impl Live {
             session,
             skip_logged: false,
             timers: Default::default(),
+            log: logs::Flight::Idle,
         }
     }
 
@@ -439,7 +449,10 @@ pub const fn restart(model: &mut Model) {
 /// Refer to [`stream_closed`].
 ///
 /// If the device wakes during the close for a sleep, the core forgets the
-/// sleep and connects again after the close.
+/// sleep and connects again after the close. If the device wakes before the
+/// close starts, the session is still up. The core then sends the lines of
+/// the log that wait ([`pump`]), because the log publishes nothing during a
+/// sleep.
 pub fn go_online(model: &mut Model) -> Cmd {
     // `wants_online` is false while the device sleeps. Thus the core can
     // forget a sleep that waits for a close below.
@@ -455,7 +468,8 @@ pub fn go_online(model: &mut Model) -> Cmd {
             };
             Cmd::done()
         }
-        Phase::Starting(_) | Phase::Up { .. } => Cmd::done(),
+        Phase::Starting(_) => Cmd::done(),
+        Phase::Up { .. } => pump(model),
     }
 }
 
@@ -882,8 +896,11 @@ fn handle(id: u32, input: Input, model: &mut Model) -> Cmd {
 ///   connection. The new stream opens after the answer to the `Close`
 ///   request.
 ///
-/// While the connection is up, the outbox drains after the actions. The
-/// command has the timers first, then the `Write`, then the other effects.
+/// - `Acked` goes to the logs feature ([`logs::acked`]).
+///
+/// While the connection is up, the outbox drains after the actions, and
+/// then the lines of the log go ([`logs::drain`]). The command has the
+/// timers first, then the `Write`, then the other effects.
 pub fn pump(model: &mut Model) -> Cmd {
     let mut timers = Vec::new();
     let mut writes = Vec::new();
@@ -918,9 +935,9 @@ pub fn pump(model: &mut Model) -> Cmd {
                         live.cancel_timer(kind);
                     }
                 }
-                // The core closes the stream when the session ends, and no
-                // feature waits for a PUBACK yet.
-                Action::Close | Action::Acked(_) => {}
+                // The core closes the stream when the session ends.
+                Action::Close => {}
+                Action::Acked(packet) => logs::acked(packet, model),
                 Action::Connected => rest.push(connected(model)),
                 Action::Message(message) => rest.push(on_message(&message, model)),
                 Action::Skipped { length } => {
@@ -945,12 +962,16 @@ pub fn pump(model: &mut Model) -> Cmd {
                 Action::Ended(end) => rest.push(ended(&end, model)),
             }
         }
-        if model.connection.link() != Link::Up || model.connection.outbox.is_empty() {
+        if model.connection.link() != Link::Up {
             break;
         }
         let before = model.connection.outbox.len();
-        rest.push(drain_outbox(model));
-        if model.connection.outbox.len() == before {
+        if before > 0 {
+            rest.push(drain_outbox(model));
+        }
+        let (log, published) = logs::drain(model);
+        rest.push(log);
+        if model.connection.outbox.len() == before && !published {
             break;
         }
     }

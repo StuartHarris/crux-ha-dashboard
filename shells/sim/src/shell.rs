@@ -698,6 +698,12 @@ impl Shell {
                 self.inspector.effect("Log", line.to_string(), outcome);
                 resolve(&self.core, &mut request, self.uptime())
             }
+            Effect::LogClock(mut request) => {
+                let now = self.uptime();
+                self.inspector
+                    .effect("LogClock", String::new(), format!("{} ms", now.0));
+                resolve(&self.core, &mut request, now)
+            }
             Effect::Sleep(request) => {
                 eprintln!("power: asleep. Click the panel or press W to wake it.");
                 self.inspector.effect(
@@ -1491,7 +1497,10 @@ mod tests {
                 "open 2",
                 "connect 2",
                 "publish dashboard/test/status 2",
-                "subscribe 2"
+                "subscribe 2",
+                // The lines of the sleep go to Home Assistant in a later
+                // write.
+                "publish dashboard/test/log 2"
             ]
         );
         assert_eq!(fixture.net().closed, [1]);
@@ -1973,9 +1982,15 @@ mod tests {
         assert!(!fixture.shell().view().asleep);
         assert_eq!(fixture.take_log(), ["open 2"]);
         fixture.connect();
+        fixture.settle();
         let log = fixture.take_log();
         assert!(
             log.contains(&"publish dashboard/test/cmd 2".into()),
+            "{log:?}"
+        );
+        // The lines of the sleep go to Home Assistant after the wake.
+        assert!(
+            log.contains(&"publish dashboard/test/log 2".into()),
             "{log:?}"
         );
 

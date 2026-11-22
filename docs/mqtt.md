@@ -2,7 +2,7 @@
 
 The dashboard and Home Assistant communicate only through the Mosquitto broker on the
 Raspberry Pi (`192.168.1.109`, port 1883). Home Assistant publishes entity states. The
-dashboard publishes service calls and its own status. The Pi setup is in
+dashboard publishes service calls, its own status and its log. The Pi setup is in
 `RUNBOOK.md` in the `rpi` notes, in the sections "Mosquitto" and "MQTT for the
 dashboard".
 
@@ -289,6 +289,95 @@ has no state, so its button shows the pattern for 2 seconds. Refer to
 | `online` | The dashboard publishes it after it connects. |
 | `asleep` | The dashboard publishes it before it sends DISCONNECT to sleep on battery. |
 | `offline` | The broker publishes it as the last will if the connection stops without a DISCONNECT, for example when the link fails or the power fails. A roam does not do this. |
+
+### Log
+
+The core keeps its lines of the log in a ring of 64 lines, with the time of each line
+on the monotonic clock of the shell. Refer to `shared/src/features/logs/mod.rs`. The
+dashboard publishes each line to Home Assistant.
+
+| Topic | QoS | Retained |
+| --- | --- | --- |
+| `dashboard/<device_id>/log` | 1 | No |
+
+Each message is one line as JSON:
+
+```json
+{"level":"warn","source":"wifi","age":12,"msg":"the scan failed, so stay"}
+```
+
+| Key | Value |
+| --- | --- |
+| `level` | `info` or `warn` |
+| `source` | The part of the core that wrote the line: `wifi`, `mqtt` or `power`. The drop message has `log`. |
+| `age` | The age of the line in whole seconds when the dashboard publishes it |
+| `msg` | The text of the line, with at most 200 bytes. A longer text ends with `…`. |
+
+The dashboard has no wall clock. Home Assistant gets the time of the line as the time
+when the message arrives, minus `age`. The clock of the device counts through a light
+sleep, with a drift of about 1 to 2 %.
+
+The time in Home Assistant can be a little late:
+
+- The core reads the clock of the shell once after each connect. A line that waits
+  behind the limit of publishes (refer to the delivery rules below) gets its age from
+  that time, so its age is short by the time that it waited. A line that is newer
+  than that time gets the age 0.
+- `age` is in whole seconds, so the core rounds it down.
+- Home Assistant reads `now()` when a run of the automation starts, not when the
+  message arrives. A queued run starts later, usually by some milliseconds.
+
+When the dashboard publishes:
+
+- After each connect, the core asks the shell for the time on its clock. Then it
+  publishes the lines that wait, from the oldest. The lines go in a write after the
+  CONNACK write, never in it.
+- While the connection is up, a new line goes at once, with the age 0.
+- From the start of a sleep, while the device sleeps, while it is offline, and while
+  the connection closes for a change of access point, the lines wait in the ring. Thus
+  the lines of a battery sleep go after the next wake. The connection can still be up
+  in the first step of a sleep, but a line from that step waits too. Its PUBACK would
+  race the DISCONNECT, so the line would often go two times.
+
+Delivery is at least once:
+
+- A line leaves the ring only when the broker sends its PUBACK.
+- If the session ends before the PUBACK, the line goes again on the next connection,
+  in the same order. Thus Home Assistant can get a line two times.
+- At most 56 messages of the log wait for a PUBACK at a time. The session takes 64, so
+  the log always leaves 8 places for the status and the service calls
+  (`logs::RESERVED`). If the log is at its limit, or the session takes no more
+  publishes, the next line waits for the next PUBACK.
+
+If the ring is full, a new line removes the oldest line, and the core counts the
+removed lines. Before the next line, the dashboard then publishes the drop message:
+
+```json
+{"level":"warn","source":"log","age":0,"msg":"3 older lines were dropped"}
+```
+
+For one line, the message is `1 older line was dropped`.
+
+The core subtracts the count of the drop message when the broker acknowledges it. The
+core writes no line about the publish of its own log.
+
+#### The Home Assistant automation
+
+The automation `dashboard_log` writes the lines to the Home Assistant log.
+
+- The trigger is an MQTT message on `dashboard/+/log`.
+- The automation has `mode: queued` and `max: 100`. After a connect, the dashboard
+  can send up to 56 lines at once. The default queue of 10 runs would drop the other
+  lines, and the broker has acknowledged them already, so the dashboard does not send
+  them again.
+- The message is `[HH:MM:SS] <source>: <msg>`. The time is the time when the message
+  arrives, minus `age`, in local time.
+- A `warn` line calls `system_log.write` with the logger `dashboard.<device_id>` and
+  the level `warning`.
+- An `info` line also calls `system_log.write` with the logger
+  `dashboard.<device_id>` and the level `warning`, with `[info] ` before the
+  message. The Home Assistant log keeps only the level `warning` and higher. A later
+  PR moves the `info` lines to `logbook.log` on the status entity of the device.
 
 ## Test from a shell
 
