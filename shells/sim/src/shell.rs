@@ -1214,6 +1214,14 @@ mod tests {
     /// The durations of the timers of the features. The timers of the MQTT
     /// session have other durations.
     const FEATURE_TIMERS: [Duration; 3] = [DRAW_DELAY, IDLE_TIMEOUT, FULL_REFRESH_INTERVAL];
+    /// The capacity of the fake stream, and the size of the read buffer of
+    /// the broker. A write of the core has at most `MAX_OUTGOING` bytes,
+    /// which is less. The fake stream takes a full write at one time, and
+    /// the broker then reads it in one read. Thus all the packets of a write
+    /// go in the log together, and a test that waits for one packet of a
+    /// write also gets the packets after it in that write.
+    const PIPE: usize = 64 * 1024;
+    const _: () = assert!(shared::mqtt::MAX_OUTGOING <= PIPE);
 
     /// What the fake opener gives.
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1291,7 +1299,7 @@ mod tests {
     /// Serves the stream `number` with the broker until the stream closes.
     async fn drive(server: DuplexStream, net: Shared, number: usize, nudge: Arc<Notify>) {
         let (mut reader, mut writer) = tokio::io::split(server);
-        let mut buffer = vec![0; 4096];
+        let mut buffer = vec![0; PIPE];
         loop {
             let answer = tokio::select! {
                 read = reader.read(&mut buffer) => match read {
@@ -1360,7 +1368,7 @@ mod tests {
                     guard.current = number;
                     let nudge = Arc::new(Notify::new());
                     guard.nudge = nudge.clone();
-                    let (client, server) = tokio::io::duplex(64 * 1024);
+                    let (client, server) = tokio::io::duplex(PIPE);
                     runtime.spawn(drive(server, net.clone(), number, nudge));
                     client
                 }
