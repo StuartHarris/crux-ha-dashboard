@@ -289,6 +289,12 @@ impl App {
         if pressed(Key::W) {
             self.shell.wake();
         }
+        if pressed(Key::C) {
+            self.shell.check_now();
+        }
+        if pressed(Key::F) {
+            self.shell.toggle_fast_checks();
+        }
         if pressed(Key::Z) {
             self.shell.sleep_now();
         }
@@ -474,6 +480,7 @@ impl App {
             self.sleep_now_control(ui, view);
             self.restart_control(ui);
         });
+        self.check_controls(ui, view);
         ui.label(format!("Connection: {:?}", view.connection));
 
         ui.separator();
@@ -511,7 +518,7 @@ impl App {
         ui.label(
             RichText::new(
                 "Keys (when no text box has the focus): S stand/battery, [ and ] \
-                 battery −10% and +10%, W wake with no cause, Z sleep now, R restart, \
+                 battery −10% and +10%, W wake with no cause, C check now, F fast checks, Z sleep now, R restart, \
                  L drop the link, B block or unblock the device, A move the strongest \
                  access point, K make the driver stuck or free, D outline, \
                  Left/Right page, Q quit",
@@ -573,6 +580,32 @@ impl App {
                 .clicked()
             {
                 self.shell.toggle_stuck();
+            }
+        });
+    }
+
+    /// Shows the "Check now" button and the "Fast checks" box. Each has a
+    /// key.
+    fn check_controls(&mut self, ui: &mut Ui, view: &ViewModel) {
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(view.asleep, egui::Button::new("Check now (C)"))
+                .on_hover_text(
+                    "Makes a check of the power source happen now, as if the 60 s timer \
+                     ended. The device stays asleep.",
+                )
+                .on_disabled_hover_text("The device is awake. A check needs a sleeping device.")
+                .clicked()
+            {
+                self.shell.check_now();
+            }
+            let mut fast = self.shell.fast_checks();
+            if ui
+                .checkbox(&mut fast, "Fast checks (F)")
+                .on_hover_text("The check timer lasts 1 s, not 60 s.")
+                .changed()
+            {
+                self.shell.toggle_fast_checks();
             }
         });
     }

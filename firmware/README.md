@@ -616,8 +616,11 @@ These items stay open:
 
 The display task reads the BQ25896 charger and the BQ27220 fuel gauge each 5 seconds
 while the chip is awake. While the chip sleeps, the check of the power source each 60
-seconds reads only the charger (REG0B). The core publishes nothing while the device
-sleeps, so the first poll after the wake reads the charge and the diagnostics. The
+seconds reads the same registers as the poll: the charger (REG0B), the charge and the
+diagnostics. It sends each change to the core before `Wake::Timer`. The core only keeps
+the values while the device sleeps and publishes nothing, so the state message of the
+next connection (for example an hourly report) carries a fresh charge. The five reads
+take about 1 to 3 ms (6 bytes each on the I2C bus at 400 to 100 kHz, not measured). The
 display task only reads these chips.
 
 | Chip | Register or command | Value | Unit |

@@ -42,7 +42,8 @@
 //! of that length. At its end, the shell answers `Wake::Timer`, as the
 //! firmware does at the check of the power source. Any other answer stops
 //! the check timer. The Wake button answers `Wake::Other`, a wake with no
-//! cause.
+//! cause. The "Check now" key answers `Wake::Timer` at once. "Fast checks"
+//! makes the check timer last 1 s, whatever the length in the request.
 //!
 //! The shell writes each effect to an [`Inspector`], which the window shows.
 //! The inspector also finds the MQTT packets in a copy of the bytes of each
@@ -230,6 +231,11 @@ pub struct Shell {
     /// The check timer of the `Sleep` request that waits, if the request has
     /// a timer.
     check: Option<Timer<()>>,
+    /// The length of the check timer in the `Sleep` request that waits, in
+    /// seconds, or `None` if the request has no timer.
+    check_seconds: Option<u32>,
+    /// If `true`, the check timer lasts [`FAST_CHECK`] seconds.
+    fast_checks: bool,
     /// The level of the front light, in percent. The window shows the
     /// light as a tint over the panel.
     light: u8,
@@ -278,6 +284,8 @@ impl Shell {
             restarting: false,
             sleep: None,
             check: None,
+            check_seconds: None,
+            fast_checks: false,
             light: 0,
             started: Instant::now(),
         }
@@ -525,6 +533,46 @@ impl Shell {
         if !self.answer_sleep(Wake::Other) {
             eprintln!("power: wake, but the device does not sleep");
         }
+    }
+
+    /// Makes a check happen now: answers the `Sleep` request that waits
+    /// with `Wake::Timer`, as if the check timer ended. Returns `false`, and
+    /// does nothing, if no request waits or the request has no timer.
+    pub fn check_now(&mut self) -> bool {
+        if self.sleep.is_none() || self.check_seconds.is_none() {
+            eprintln!("power: check, but no check timer waits");
+            return false;
+        }
+        self.answer_sleep(Wake::Timer)
+    }
+
+    /// Turns the fast checks on or off. With fast checks, the check timer
+    /// lasts [`FAST_CHECK`] seconds, not the length in the `Sleep` request.
+    /// A check timer that runs starts again with the new length. Returns
+    /// `true` if the fast checks are on now.
+    pub fn toggle_fast_checks(&mut self) -> bool {
+        self.fast_checks = !self.fast_checks;
+        let fast = self.fast_checks;
+        eprintln!("power: fast checks: {fast}");
+        self.inspector.effect(
+            "Checks",
+            if fast { "fast" } else { "normal" }.into(),
+            if fast {
+                "the check timer lasts 1 s"
+            } else {
+                "the check timer lasts as long as the core asks"
+            },
+        );
+        if self.check.is_some() {
+            self.stop_check();
+            self.start_check();
+        }
+        fast
+    }
+
+    /// Returns `true` if the fast checks are on.
+    pub const fn fast_checks(&self) -> bool {
+        self.fast_checks
     }
 
     /// Stops the check timer, if it runs.
@@ -1054,15 +1102,25 @@ impl Shell {
             "asleep: click the panel to wake it, or press W for a wake with no cause",
         );
         self.sleep = Some(request);
+        self.check_seconds = check;
         self.stop_check();
-        if let Some(seconds) = check {
-            self.start_check(seconds);
+        if check.is_some() {
+            self.start_check();
         }
     }
 
-    /// Starts the check timer of `seconds`. At its end, the shell answers
-    /// the `Sleep` request with `Wake::Timer`.
-    fn start_check(&mut self, seconds: u32) {
+    /// Starts the check timer. At its end, the shell answers the `Sleep`
+    /// request with `Wake::Timer`. The timer lasts [`FAST_CHECK`] seconds
+    /// with fast checks, and else the length in the request.
+    fn start_check(&mut self) {
+        let Some(seconds) = self.check_seconds else {
+            return;
+        };
+        let seconds = if self.fast_checks {
+            FAST_CHECK
+        } else {
+            seconds
+        };
         self.last_token += 1;
         let token = self.last_token;
         let notifier = self.notifier.clone();
@@ -1077,6 +1135,9 @@ impl Shell {
         });
     }
 }
+
+/// The length of the check timer with fast checks, in seconds.
+const FAST_CHECK: u32 = 1;
 
 /// Returns the shortest timer in the wake sources of `sleep`, in seconds, or
 /// `None` if it has no timer.
@@ -2239,6 +2300,75 @@ mod tests {
         fixture.shell().tap(Point::new(1, 1));
         assert!(fixture.shell().check.is_none());
         assert!(!fixture.shell().view().asleep);
+    }
+
+    #[test]
+    fn check_now_answers_a_timer_wake_at_once_and_the_core_sleeps_again() {
+        let mut fixture = Fixture::new();
+        fixture.start(PowerSource::Battery);
+        fixture.connect();
+
+        // The device is awake, so the key does nothing.
+        assert!(!fixture.shell().check_now());
+
+        assert!(fixture.shell().sleep_now());
+        fixture.sleep();
+        let first = fixture.shell().check.as_ref().expect("a check timer").token;
+        fixture.shell().take_render();
+
+        assert!(fixture.shell().check_now());
+        // The core sends a new `Sleep` request, with a new check timer.
+        assert!(fixture.shell().sleep.is_some());
+        assert!(fixture.shell().view().asleep);
+        let second = fixture.shell().check.as_ref().expect("a check timer").token;
+        assert_ne!(second, first);
+        assert!(
+            fixture.outcomes("Sleep")[1].ends_with("resolved: Timer"),
+            "{:?}",
+            fixture.outcomes("Sleep")
+        );
+        // A check does not draw the panel.
+        assert!(!fixture.shell().take_render());
+    }
+
+    #[test]
+    fn check_now_does_nothing_if_the_sleep_has_no_timer() {
+        let mut fixture = Fixture::new();
+        fixture.start(PowerSource::Battery);
+        fixture.connect();
+        assert!(fixture.shell().sleep_now());
+        fixture.sleep();
+        fixture.shell().check_seconds = None;
+        assert!(!fixture.shell().check_now());
+        assert!(fixture.shell().sleep.is_some());
+    }
+
+    #[test]
+    fn fast_checks_make_the_check_timer_last_one_second() {
+        let mut fixture = Fixture::new();
+        fixture.start(PowerSource::Battery);
+        fixture.connect();
+        assert!(fixture.shell().sleep_now());
+        fixture.sleep();
+        assert!(fixture.shell().check.is_some());
+
+        // The timer that runs starts again, and ends after 1 s, not 60 s.
+        assert!(fixture.shell().toggle_fast_checks());
+        assert!(fixture.shell().fast_checks());
+        assert!(fixture.next(Duration::from_secs(5)), "no check came");
+        assert!(
+            fixture.outcomes("Sleep")[1].ends_with("resolved: Timer"),
+            "{:?}",
+            fixture.outcomes("Sleep")
+        );
+        // The next `Sleep` request also uses the fast timer.
+        assert!(fixture.next(Duration::from_secs(5)), "no second check came");
+        assert!(fixture.outcomes("Sleep")[3].ends_with("resolved: Timer"));
+
+        // Off again: the timer lasts as long as the request says.
+        assert!(!fixture.shell().toggle_fast_checks());
+        assert!(!fixture.next(Duration::from_millis(1500)));
+        assert!(fixture.shell().view().asleep);
     }
 
     #[test]
