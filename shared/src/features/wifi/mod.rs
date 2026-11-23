@@ -869,7 +869,7 @@ fn no_address(target: Target, access_point: AccessPoint, model: &mut Model) -> C
 
 /// Returns the function that writes a line about a failed try to get the
 /// link. In a report, the line is a `Debug` line, so a report that fails
-/// each hour does not fill the ring. Refer to
+/// at each period does not fill the ring. Refer to
 /// [`power::report_failed`](crate::features::power::report_failed).
 /// Otherwise the line is a warning.
 fn retry_line(model: &Model) -> fn(Area, String) -> Cmd {

@@ -15,10 +15,12 @@
 //! - After a wake with no cause ([`Wake::Other`]), the device stays awake
 //!   for [`STRAY_HOLD`], then sends a new `Sleep` request. In that time, a
 //!   tap or the stand wakes the device.
-//! - Once an hour ([`REPORT_PERIOD`]), the device reports to Home
-//!   Assistant while it stays asleep for the user ([`report`]). The core
-//!   counts the checks of the sleep, and the check with the number
-//!   [`REPORT_CHECKS`] starts the report. The radio turns on, the device
+//! - Once in each report period, the device reports to Home Assistant
+//!   while it stays asleep for the user ([`report`]). Home Assistant sets
+//!   the period ([`ReportPeriod`]), and the default is [`REPORT_PERIOD`].
+//!   The core counts the checks of the sleep, and the first check at which
+//!   the count reaches the period starts the report. At the period 0, the
+//!   device does not report. The radio turns on, the device
 //!   connects with the status `reporting`, and the device publish queue
 //!   sends the state message and the lines of the log. When the queue is
 //!   settled, or at [`REPORT_LIMIT`], the steps of a new sleep run. The
@@ -73,8 +75,9 @@
 //! | `Steps { IfChanged }` | the radio is off, and the image changed | `Sleeping { 0, 0 }` | `Render` (partial, or full after the last partial), Sleep |
 //! | `Steps { IfChanged }` | the radio is off, and only the time or nothing changed | `Sleeping { 0, 0 }` | Sleep |
 //! | `Sleeping` | `Wake::Touch(c)` | `Awake` | wake, connect, act on `c` |
-//! | `Sleeping { n, k }` | `Wake::Timer` (the check), before the last check | `Sleeping { n, k + 1 }` | Sleep |
-//! | `Sleeping { n, k }` | `Wake::Timer`, the check with the number [`REPORT_CHECKS`] | `Reporting` | the limit timer, connect, a Debug line, the Info line with `n` if `n > 1` |
+//! | `Sleeping { n, k }` | `Wake::Timer` (the check), the period is `p` checks, and `k + 1 < p` | `Sleeping { n, k + 1 }` | Sleep |
+//! | `Sleeping { n, k }` | `Wake::Timer`, the period is `p` checks, and `k + 1 >= p` | `Reporting` | the limit timer, connect, a Debug line, the Info line with `n` if `n > 1` |
+//! | `Sleeping { n, k }` | `Wake::Timer`, the period is off | `Sleeping { n, k + 1 }` | Sleep |
 //! | `Sleeping { n, k }` | `Wake::Other` | `Held { n + 1, k }` | a timer of [`STRAY_HOLD`], an Info line for the first one |
 //! | `Sleeping` | `Wake::PowerSource` | `Sleeping` (the same `k`) | a warning, Sleep |
 //! | `Held { n, k }` | the hold timer expires | `Sleeping { n, k }` | Sleep |
@@ -97,6 +100,28 @@
 //! the sleep. In a report, the core ignores a light command and the Sleep
 //! now and Full refresh buttons of Home Assistant. The Restart button
 //! restarts the chip.
+//!
+//! # The report period
+//!
+//! Home Assistant sets the period in minutes on `set/report_period`,
+//! retained ([`report_period_set`]). The core applies a retained message
+//! and a live message. `p` is the period as a number of checks. The period
+//! is not in the phase, so a new period changes no phase. The next check
+//! compares the count with the new period.
+//!
+//! | From | Input | To | Effects |
+//! | --- | --- | --- | --- |
+//! | any | the same period as now (the retained message at each connect) | unchanged | nothing |
+//! | `Sleeping { n, k }` or `Held { n, k }` | a new period | unchanged | Debug line. If `k + 1 >= p`, the next check reports. At the period 0, no check reports. |
+//! | `Reporting` | a new period | `Reporting` | Debug line. The report continues. The next sleep counts to the new period. |
+//! | `Stand`, `Awake`, `SleepWaits` or `Steps` | a new period | unchanged | Debug line. The next sleep counts to the new period. |
+//! | any | an empty payload | as the default [`REPORT_PERIOD`] | as the rows above |
+//! | any | a payload that does not parse, or more than [`REPORT_PERIOD_MAX`] | unchanged | Warn line |
+//! | any | `Start` | the default [`REPORT_PERIOD`] | nothing. The retained period comes again at the next connect. |
+//!
+//! The core gets a message only while the session is up. While the device
+//! sleeps, it gets a new period at the next report. After the period 0, no
+//! report runs, so the core gets a new period only at the next wake.
 //!
 //! # The wake reason
 //!
@@ -121,14 +146,19 @@
 //! answer in its time limit, and a link that becomes suspect or stops
 //! being suspect. Only unusual decisions write an Info or Warn line: a
 //! stalled sleep, a wake with no cause, a power source wake on battery, and
-//! a report that stops at its limit. Thus a report that fails each hour
-//! because the Wi-Fi or the broker is down keeps one line in the ring, and
-//! the ring holds about two days of such reports. A fault that is not a
+//! a report that stops at its limit. Thus a report that fails because the
+//! Wi-Fi or the broker is down keeps one line in the ring. The ring holds
+//! 64 such reports, which is about two days at the default period. A fault that is not a
 //! failed try still writes its usual line, for example a `Close` request
 //! with no answer or a topic filter that the broker refused.
 
+mod period;
+
 use alloc::{format, string::String, vec};
 use core::{mem, num::NonZeroU32, time::Duration};
+
+use period::{Checks, Tick};
+pub use period::{REPORT_CHECKS, REPORT_PERIOD, REPORT_PERIOD_MAX, ReportPeriod, report_period};
 
 use crate::{
     Cmd, Model,
@@ -176,6 +206,9 @@ pub enum Event {
     /// The limit timer of the report of the sleep with this id expired.
     /// Refer to [`REPORT_LIMIT`].
     ReportLimit(u32),
+    /// A message on `set/report_period`, retained or live. Refer to
+    /// [`report_period_set`].
+    ReportPeriodSet(ReportPeriod),
 }
 
 impl From<Event> for crate::Event {
@@ -194,6 +227,7 @@ pub fn update(event: Event, model: &mut Model) -> Cmd {
         Event::Woke { sleep, wake } => woke(sleep, wake, model),
         Event::Reported(id) => reported(id, model),
         Event::ReportLimit(id) => report_limit(id, model),
+        Event::ReportPeriodSet(period) => report_period_set(period, model),
     }
 }
 
@@ -213,33 +247,6 @@ pub const CHECK_PERIOD: Duration = Duration::from_secs(60);
 /// After a wake with no cause, the time that the device stays awake before
 /// it sleeps again.
 pub const STRAY_HOLD: Duration = Duration::from_secs(3);
-
-/// While asleep on battery, the time between two reports to Home
-/// Assistant. Refer to [`report`].
-///
-/// The core counts the checks of [`CHECK_PERIOD`], so the period must be a
-/// whole number of checks. The clock of the chip drifts in light sleep, and
-/// each check and each wake with no cause adds a little time. Thus the real
-/// period is a minute or two longer.
-pub const REPORT_PERIOD: Duration = Duration::from_mins(60);
-
-/// The number of checks in one [`REPORT_PERIOD`]. The check with this
-/// number reports.
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "the assert makes sure that the count is in the range of u8"
-)]
-pub const REPORT_CHECKS: u8 = {
-    let period = REPORT_PERIOD.as_secs();
-    let check = CHECK_PERIOD.as_secs();
-    assert!(
-        period.is_multiple_of(check),
-        "the period is a whole number of checks"
-    );
-    let count = period / check;
-    assert!(count > 0 && count <= u8::MAX as u64, "the count is in u8");
-    count as u8
-};
 
 /// The longest time of a report. At this time, the report stops, and the
 /// device sleeps again. Refer to [`report_limit`].
@@ -274,6 +281,9 @@ pub struct State {
     pub sleep: u32,
     /// What woke the device last. Refer to [`WakeReason`].
     wake: WakeReason,
+    /// The period of the report while the device sleeps. Refer to
+    /// [`report_period_set`].
+    report: ReportPeriod,
 }
 
 /// What woke the device last. The core publishes it in the state message.
@@ -370,7 +380,7 @@ enum Rest {
         /// The number of checks in this sleep.
         checks: Checks,
     },
-    /// The hourly report: the radio is on, and the device publishes to Home
+    /// The report: the radio is on, and the device publishes to Home
     /// Assistant. No `Sleep` request waits. Refer to [`report`].
     ///
     /// The report ends the sleep, so it keeps no count of wakes with no
@@ -407,32 +417,6 @@ enum LastImage {
     IfChanged,
 }
 
-/// The number of checks in a sleep. It is always less than
-/// [`REPORT_CHECKS`], because the check with that number reports.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct Checks(u8);
-
-/// The result of one more check. Refer to [`Checks::tick`].
-enum Tick {
-    /// The sleep continues with this count.
-    Again(Checks),
-    /// The check is the check with the number [`REPORT_CHECKS`].
-    Report,
-}
-
-impl Checks {
-    /// Counts one more check. Returns `Report` at the check with the number
-    /// [`REPORT_CHECKS`].
-    const fn tick(self) -> Tick {
-        let next = self.0 + 1;
-        if next >= REPORT_CHECKS {
-            Tick::Report
-        } else {
-            Tick::Again(Self(next))
-        }
-    }
-}
-
 /// The tries to connect that failed in a report. Refer to [`report_failed`].
 #[derive(Debug)]
 struct Failures {
@@ -457,6 +441,12 @@ impl State {
     #[must_use]
     pub const fn wake(&self) -> WakeReason {
         self.wake
+    }
+
+    /// Returns the period of the report while the device sleeps.
+    #[must_use]
+    pub const fn report_period(&self) -> ReportPeriod {
+        self.report
     }
 
     /// Returns `true` if the device is awake on battery, and a sleep waits
@@ -516,6 +506,7 @@ impl State {
             idle: 0,
             sleep,
             wake: WakeReason::Boot,
+            report: ReportPeriod::DEFAULT,
         }
     }
 
@@ -530,12 +521,13 @@ impl State {
                 id: sleep,
                 rest: Rest::Sleeping {
                     strays: 0,
-                    checks: Checks(0),
+                    checks: Checks::of(0),
                 },
             },
             idle: 0,
             sleep,
             wake: WakeReason::Boot,
+            report: ReportPeriod::DEFAULT,
         }
     }
 
@@ -700,11 +692,14 @@ const fn awake_on(source: PowerSource) -> Phase {
 ///
 /// The core clears the idle timer or the hold timer that runs, and ignores
 /// the answers of a sleep that `Start` ended. The wake reason is
-/// [`WakeReason::Boot`]. Returns the line with the number of wakes with no
-/// cause in that sleep, if there was more than one. The caller then starts
-/// the idle timer with [`restart_idle_timer`].
+/// [`WakeReason::Boot`], and the report period is the default
+/// [`REPORT_PERIOD`] until the retained period arrives. Returns the line
+/// with the number of wakes with no cause in that sleep, if there was more
+/// than one. The caller then starts the idle timer with
+/// [`restart_idle_timer`].
 pub fn reset(source: PowerSource, model: &mut Model) -> Cmd {
     model.power.wake = WakeReason::Boot;
+    model.power.report = ReportPeriod::DEFAULT;
     model.power.wake_to(awake_on(source))
 }
 
@@ -714,8 +709,9 @@ pub fn reset(source: PowerSource, model: &mut Model) -> Cmd {
 /// - A touch wakes the device, which connects again. The touch also acts
 ///   as a tap on its control.
 /// - The timer is the check of the power source. The device stays asleep
-///   and sends a new `Sleep` request. The check with the number
-///   [`REPORT_CHECKS`] in the sleep starts a report instead ([`report`]).
+///   and sends a new `Sleep` request. The first check at which the count of
+///   the sleep reaches the report period starts a report instead
+///   ([`report`]).
 /// - After a wake with no cause, the device stays awake for
 ///   [`STRAY_HOLD`]. Only the first one in a sleep writes a line.
 /// - A change of the power source comes first as `PowerSourceChanged`, and
@@ -738,7 +734,7 @@ pub fn woke(id: u32, wake: Wake, model: &mut Model) -> Cmd {
     }
     match wake {
         Wake::Touch(control) => rooms::tapped(control, model),
-        Wake::Timer => match checks.tick() {
+        Wake::Timer => match checks.tick(model.power.report) {
             Tick::Again(checks) => {
                 model.power.phase = Phase::Asleep {
                     id,
@@ -809,7 +805,7 @@ pub fn hold_ended(id: u32, model: &mut Model) -> Cmd {
     sleep_request(id)
 }
 
-/// The check with the number [`REPORT_CHECKS`] in the sleep `id` arrived:
+/// The check of the sleep `id` that reaches the report period arrived:
 /// start the report to Home Assistant. `strays` is the number of wakes with
 /// no cause in the sleep.
 ///
@@ -858,7 +854,7 @@ fn report(id: u32, strays: u32, model: &mut Model) -> Cmd {
 ///
 /// The connection calls this function when it waits to connect again. In a
 /// report, the lines of each try are `Debug` lines, so a report that fails
-/// each hour writes only its line at the limit to the ring. Refer to the
+/// at each period writes only its line at the limit to the ring. Refer to the
 /// [module docs](self).
 pub fn report_failed(reason: &str, model: &mut Model) {
     let Phase::Asleep {
@@ -964,6 +960,33 @@ fn report_limit(id: u32, model: &mut Model) -> Cmd {
         ),
     )
     .and(sleep(LastImage::IfChanged, model))
+}
+
+/// Home Assistant set the report period to `period`. Refer to the table
+/// in the [module docs](self).
+///
+/// The same period again does nothing. The broker sends the retained
+/// period at each connect. A new period applies at the next check, and the
+/// count of the checks of the sleep does not change. In a report, the
+/// report continues, and the next sleep counts to the new period. Nothing
+/// goes to Home Assistant, because the number shows the retained value.
+fn report_period_set(period: ReportPeriod, model: &mut Model) -> Cmd {
+    if model.power.report == period {
+        return Cmd::done();
+    }
+    model.power.report = period;
+    logs::debug(
+        Area::Device,
+        match period {
+            ReportPeriod::Off => String::from(
+                "Home Assistant set the report period to 0, so the device does not report while it sleeps",
+            ),
+            ReportPeriod::Every(_) => format!(
+                "Home Assistant set the report period to {} min",
+                period.minutes()
+            ),
+        },
+    )
 }
 
 /// Asks the shell to sleep until a touch, or until the check of the power

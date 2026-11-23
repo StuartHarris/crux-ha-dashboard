@@ -169,7 +169,9 @@
 //! [`TAP_LEVEL_STAND_SET`] and [`TAP_LEVEL_BATTERY_SET`]. The core ignores
 //! a retained light command, as it does a retained button message. It
 //! applies a retained tap level, because Home Assistant keeps the tap
-//! levels on the broker. Refer to [`light`].
+//! levels on the broker. Refer to [`light`]. The report period has the
+//! `set` topic [`REPORT_PERIOD_SET`], and the core applies a retained
+//! period too. Refer to [`power`].
 //!
 //! A button acts through [`Event::Pressed`], so it acts after the update
 //! that received the message, outside [`connection::pump`]. It is not a
@@ -243,6 +245,9 @@ pub const TAP_LEVEL_STAND_SET: &str = "tap_level_stand";
 
 /// The name of the `set` topic of the tap level on battery.
 pub const TAP_LEVEL_BATTERY_SET: &str = "tap_level_battery";
+
+/// The name of the `set` topic of the report period.
+pub const REPORT_PERIOD_SET: &str = "report_period";
 
 /// The longest text of an unknown button payload in the log, in bytes.
 const PAYLOAD_IN_LOG: usize = 32;
@@ -709,8 +714,9 @@ pub const fn start(model: &mut Model) {
 /// because the core routes each message inside the pump.
 ///
 /// A button message gives [`Event::Pressed`]. A live light command gives
-/// [`light::Event::Commanded`], and a tap level gives
-/// [`light::Event::TapLevelSet`]. Refer to the [module docs](self) for the
+/// [`light::Event::Commanded`], a tap level gives
+/// [`light::Event::TapLevelSet`], and a report period gives
+/// [`power::Event::ReportPeriodSet`]. Refer to the [module docs](self) for the
 /// messages that the core ignores.
 pub(crate) fn route(message: &Message, model: &mut Model) -> Option<Cmd> {
     if message.topic == BIRTH_TOPIC {
@@ -740,6 +746,9 @@ pub(crate) fn route(message: &Message, model: &mut Model) -> Option<Cmd> {
         if message.topic == settings.set_topic(name) {
             return Some(tap_level_message(source, message));
         }
+    }
+    if message.topic == settings.set_topic(REPORT_PERIOD_SET) {
+        return Some(report_period_message(message));
     }
     // Later `set` topics come here. The core ignores them for now.
     message
@@ -813,6 +822,23 @@ fn tap_level_message(source: PowerSource, message: &Message) -> Cmd {
             )
         },
         |level| Cmd::event(light::Event::TapLevelSet { source, level }.into()),
+    )
+}
+
+/// Handles a message on the report period topic, retained or live.
+fn report_period_message(message: &Message) -> Cmd {
+    power::report_period(&message.payload).map_or_else(
+        || {
+            logs::warn(
+                Area::Device,
+                format!(
+                    "the report period {} on {} is not valid, so the core ignored it",
+                    shown(&message.payload),
+                    message.topic
+                ),
+            )
+        },
+        |period| Cmd::event(power::Event::ReportPeriodSet(period).into()),
     )
 }
 

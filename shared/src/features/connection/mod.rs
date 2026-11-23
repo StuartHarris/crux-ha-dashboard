@@ -1634,8 +1634,8 @@ pub fn page_time(model: &Model) -> Option<DateTime<Utc>> {
 ///
 /// In a report, the line is a `Debug` line, and the power feature counts
 /// the try ([`power::report_failed`]). The Wi-Fi lines of the try are
-/// `Debug` lines too. Thus a report that fails each hour writes only its
-/// line at the limit to the ring.
+/// `Debug` lines too. Thus a report that fails at each period writes only
+/// its line at the limit to the ring.
 fn schedule_reconnect(cause: &str, write: fn(Area, String) -> Cmd, model: &mut Model) -> Cmd {
     if model.connection.phase.retry_mut().is_none() {
         return Cmd::done();
