@@ -18,7 +18,7 @@ use crate::{
     Cmd, Dashboard, EffectTestExt, Event, Model, PowerSource, Route, TileState,
     features::{
         connection::{OUTBOX_LIMIT, RECONNECT_MIN},
-        light::STAND_LEVEL,
+        light::DEFAULT_STAND_LEVEL,
         pending::{PENDING_TIMEOUT, QUEUED_TIMEOUT, SCENE_TIMEOUT, TARGET_TIMEOUT},
         power::IDLE_TIMEOUT,
         refresh::{DRAW_DELAY, PARTIALS_PER_FULL, redraw},
@@ -74,7 +74,7 @@ fn a_tap_marks_the_tile_until_a_newer_last_updated_confirms_it() {
 
     // The tap draws the mark at once, and keeps the text of the last state.
     app.update(tap_tile(1), &mut model)
-        .expect_touch_light(STAND_LEVEL)
+        .expect_touch_light(DEFAULT_STAND_LEVEL.get())
         .expect_only_service_call(&mut wire, &mut model);
     let view = app.view(&model);
     assert_eq!(view.tiles()[1].state, TileState::Pending);
@@ -157,7 +157,7 @@ fn a_step_keeps_the_brightness_text_while_it_waits() {
     let _ = send(&mut model, &mut wire, &topic(LAMP, "brightness"), "128");
 
     app.update(tap_plus(1), &mut model)
-        .expect_touch_light(STAND_LEVEL)
+        .expect_touch_light(DEFAULT_STAND_LEVEL.get())
         .expect_only_service_call(&mut wire, &mut model);
     let view = app.view(&model);
     let tile = &view.tiles()[1];
@@ -174,7 +174,7 @@ fn a_scene_mark_ends_after_the_scene_timeout() {
     model.route = Route::room("hall");
 
     app.update(tap_scene(2), &mut model)
-        .expect_touch_light(STAND_LEVEL)
+        .expect_touch_light(DEFAULT_STAND_LEVEL.get())
         .expect_publish(&mut wire, &mut model)
         .expect_time_notify_after_with(|notify| {
             assert_eq!(Duration::from(notify.duration), SCENE_TIMEOUT);
@@ -218,7 +218,7 @@ fn a_dry_run_gives_no_mark() {
     model.route = Route::room("hall");
 
     app.update(tap_tile(0), &mut model)
-        .expect_touch_light(STAND_LEVEL)
+        .expect_touch_light(DEFAULT_STAND_LEVEL.get())
         .expect_no_effects();
     app.update(tap_scene(2), &mut model)
         .expect_light_timer()
@@ -491,7 +491,7 @@ fn a_mark_whose_call_cannot_go_out_ends_after_the_queued_timeout() {
     set_state(&mut model, LAMP, "on");
 
     app.update(tap_tile(1), &mut model)
-        .expect_touch_light(STAND_LEVEL)
+        .expect_touch_light(DEFAULT_STAND_LEVEL.get())
         .expect_time_notify_after_with(|notify| {
             assert_eq!(Duration::from(notify.duration), QUEUED_TIMEOUT);
         })
@@ -560,7 +560,7 @@ fn a_thermostat_step_waits_for_the_new_target_and_not_only_a_newer_time() {
     let (mut model, mut wire) = thermostat_heats();
 
     app.update(tap_plus(4), &mut model)
-        .expect_touch_light(STAND_LEVEL)
+        .expect_touch_light(DEFAULT_STAND_LEVEL.get())
         .expect_only_service_call(&mut wire, &mut model);
     // The tile shows the mark, with the target that Home Assistant gave.
     let view = app.view(&model);
@@ -796,8 +796,10 @@ fn an_issued_call_keeps_the_queued_timer_while_another_call_waits() {
 
     // The broker holds each PUBACK. The calls for the standard lamp (tile 2)
     // fill the session, so the session refuses the next publish as full.
+    // The first tap also publishes the state of the light, which takes one
+    // place.
     shell.broker.hold_puback = true;
-    for _ in 0..MAX_IN_FLIGHT {
+    for _ in 0..MAX_IN_FLIGHT - 1 {
         shell.send(tap_tile(2));
     }
     assert!(shell.model.connection.outbox.is_empty());
@@ -814,7 +816,7 @@ fn an_issued_call_keeps_the_queued_timer_while_another_call_waits() {
     shell.broker.held_pubacks = held;
     shell.broker.flush();
     shell.run();
-    assert_eq!(shell.broker.service_calls.len(), MAX_IN_FLIGHT + 1);
+    assert_eq!(shell.broker.service_calls.len(), MAX_IN_FLIGHT);
     assert_eq!(shell.model.connection.outbox.len(), 1);
     assert_eq!(shell.view().tiles()[1].state, TileState::Pending);
 

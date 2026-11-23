@@ -339,6 +339,50 @@ pub trait ExpectWrite {
         })
     }
 
+    /// Expects a `Write` with the retained state of the light at `level`
+    /// (0 is OFF) for the test settings, at `QoS` 1. Refer to
+    /// [`crate::features::light`].
+    #[track_caller]
+    fn expect_light_publish(&mut self, wire: &mut Wire, model: &mut Model, level: u8) -> &mut Self {
+        self.expect_publish_with(wire, model, |publish| {
+            assert_eq!(publish.topic, "dashboard/hall/light");
+            assert_eq!(
+                String::from_utf8_lossy(&publish.payload),
+                super::light_state(level)
+            );
+            assert!(publish.retain);
+            assert_eq!(publish.qos, Qos::AtLeastOnce);
+        })
+    }
+
+    /// Expects a `Write` with exactly the PUBLISH packets `expected`, each
+    /// one as its topic and its payload, in order.
+    #[track_caller]
+    fn expect_publishes(
+        &mut self,
+        wire: &mut Wire,
+        model: &mut Model,
+        expected: &[(&str, &str)],
+    ) -> &mut Self {
+        self.expect_write_with(wire, model, |packets| {
+            let publishes: Vec<(String, String)> = packets
+                .iter()
+                .filter_map(publish_of)
+                .map(|publish| {
+                    (
+                        publish.topic,
+                        String::from_utf8_lossy(&publish.payload).into_owned(),
+                    )
+                })
+                .collect();
+            let expected: Vec<(String, String)> = expected
+                .iter()
+                .map(|(topic, payload)| (String::from(*topic), String::from(*payload)))
+                .collect();
+            assert_eq!(publishes, expected);
+        })
+    }
+
     /// Expects the `Write` of a sleep: the retained `asleep` status and then
     /// a DISCONNECT packet. After the write, the core closes the stream, and
     /// the wire keeps [`power::Event::Offline`] for the test.

@@ -417,12 +417,13 @@ fn the_connack_write_is_unchanged_and_the_log_goes_in_a_later_write() {
             .iter()
             .all(|packet| matches!(packet, Packet::Publish { .. } | Packet::Subscribe { .. }))
     );
-    // The discovery and the state messages go in the next write, and the
-    // lines go in the write after it.
+    // The discovery, the light and the state messages go in the next
+    // write, and the lines go in the write after it.
     assert_eq!(
         topics(&shell.writes[2]),
         [
             "homeassistant/device/dashboard_hall/config",
+            "dashboard/hall/light",
             "dashboard/hall/state"
         ]
     );
@@ -547,9 +548,9 @@ fn a_log_at_its_limit_does_not_block_asleep_or_a_service_call() {
     for at in 0..CAPACITY as u64 {
         stamp(&mut shell, at, &format!("line {at}"));
     }
-    // The log shares the limit with the discovery and the state messages,
-    // which also wait for their PUBACKs.
-    assert_eq!(published(&shell).len(), IN_FLIGHT - 2);
+    // The log shares the limit with the discovery, the light and the state
+    // messages, which also wait for their PUBACKs.
+    assert_eq!(published(&shell).len(), IN_FLIGHT - 3);
 
     // A tap on the All lights toggle still sends its service call.
     shell.send(tap_all_lights());

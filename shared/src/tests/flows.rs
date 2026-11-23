@@ -248,8 +248,10 @@ fn on_battery_the_dashboard_wakes_syncs_accepts_taps_then_sleeps() {
     assert_eq!(
         shell.take_log(),
         [
-            // The light timer turned the light off before the idle timeout.
+            // The light timer turned the light off before the idle timeout,
+            // and the core published the new state of the light.
             "FrontLight 0",
+            r#"MqttPublish dashboard/hall/light {"state":"OFF"}"#,
             // Each step of the sleep waits for the answer of the shell.
             "MqttPublish dashboard/hall/status asleep",
             "MqttDisconnect",

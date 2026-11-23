@@ -385,10 +385,12 @@ PT4103 LED boost driver. The duty of a PWM signal sets the brightness: 0% is off
 `src/light.rs` uses the LEDC low-speed timer 0 at 1 kHz, with a duty of 10 bits, on
 channel 0.
 
-The core owns the policy (`shared/src/features/light.rs`). A touch turns the light on
-at 60% on the stand or 25% on battery. The light goes off 20 seconds after the last
-touch. If the light is still on at a sleep, the core turns it off before the other
-steps of the sleep. The firmware only sets the level of each `FrontLight` job.
+The core owns the policy (`shared/src/features/light/`). A touch turns the light on
+at the tap level of the power source: by default 60% on the stand or 25% on battery.
+Home Assistant can set each tap level, and it can turn the light on and off (refer to
+"Front light" in `docs/mqtt.md`). The light of a touch goes off 20 seconds after the
+last touch. If the light is still on at a sleep, the core turns it off before the
+other steps of the sleep. The firmware only sets the level of each `FrontLight` job.
 
 The display task owns the light, because it must turn the light off before each light
 sleep. It sets the level at the start of each pass of its loop, before a render. Thus
@@ -724,8 +726,8 @@ For a direct value, put a meter in series with the battery.
    `light: 0%`.
 4. Look for flicker at 1 kHz. Do not increase `FREQUENCY_HZ` in `src/light.rs`
    above 1 kHz, because the PT4103 needs 1 kHz or less.
-5. If the light is too bright or too dim, change `STAND_LEVEL` or `BATTERY_LEVEL`
-   in `shared/src/features/light.rs`.
+5. If the light is too bright or too dim, set the tap levels in Home Assistant (the
+   "Tap light on the stand" and "Tap light on battery" numbers of the device).
 6. Disconnect USB and tap the panel. The light is dimmer (25%).
 7. Do not touch the panel for 30 seconds. The light goes off at 20 seconds, and the
    panel shows "Asleep" at 30 seconds. In a dark room, make sure that the light stays

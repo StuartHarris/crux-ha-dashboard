@@ -41,6 +41,9 @@ const STATUS: &str = "dashboard/hall/status";
 /// The log topic of the test settings.
 const LOG: &str = "dashboard/hall/log";
 
+/// The light topic of the test settings.
+const LIGHT: &str = "dashboard/hall/light";
+
 /// A reading on battery.
 const ON_BATTERY: Reading = Reading {
     charge: Some(Charge::NotCharging),
@@ -173,7 +176,26 @@ const DISCOVERY_JSON: &str = concat!(
     r#""ic":"mdi:refresh","ent_cat":"config","#,
     r#""cmd_t":"dashboard/hall/set/button","pl_prs":"refresh","#,
     r#""avty_t":"dashboard/hall/status","#,
-    r#""avty_tpl":"{{ 'online' if value == 'online' else 'offline' }}"}}}"#,
+    r#""avty_tpl":"{{ 'online' if value == 'online' else 'offline' }}"},"#,
+    r#""light":{"p":"light","name":"Front light","uniq_id":"dashboard_hall_light","#,
+    r#""schema":"json","sup_clrm":["brightness"],"bri_scl":100,"#,
+    r#""stat_t":"dashboard/hall/light","cmd_t":"dashboard/hall/set/light","#,
+    r#""avty_t":"dashboard/hall/status","#,
+    r#""avty_tpl":"{{ 'online' if value == 'online' else 'offline' }}"},"#,
+    r#""tap_level_stand":{"p":"number","name":"Tap light on the stand","#,
+    r#""uniq_id":"dashboard_hall_tap_level_stand","ic":"mdi:gesture-tap","ent_cat":"config","#,
+    r#""cmd_t":"dashboard/hall/set/tap_level_stand","#,
+    r#""stat_t":"dashboard/hall/set/tap_level_stand","#,
+    r#""ret":true,"min":0,"max":100,"step":1,"unit_of_meas":"%","mode":"slider","#,
+    r#""avty_t":"dashboard/hall/status","#,
+    r#""avty_tpl":"{{ 'offline' if value == 'offline' else 'online' }}"},"#,
+    r#""tap_level_battery":{"p":"number","name":"Tap light on battery","#,
+    r#""uniq_id":"dashboard_hall_tap_level_battery","ic":"mdi:gesture-tap","ent_cat":"config","#,
+    r#""cmd_t":"dashboard/hall/set/tap_level_battery","#,
+    r#""stat_t":"dashboard/hall/set/tap_level_battery","#,
+    r#""ret":true,"min":0,"max":100,"step":1,"unit_of_meas":"%","mode":"slider","#,
+    r#""avty_t":"dashboard/hall/status","#,
+    r#""avty_tpl":"{{ 'offline' if value == 'offline' else 'online' }}"}}}"#,
 );
 
 // The payloads.
@@ -186,16 +208,16 @@ fn the_discovery_message_has_the_exact_json() {
 }
 
 #[test]
-fn the_discovery_message_is_json_with_the_keys_and_under_8_kib() {
+fn the_discovery_message_is_json_with_the_keys_and_under_10_kib() {
     let payload = discovery::payload(&settings(), &firmware());
-    assert!(payload.len() < 8 * 1024, "{} bytes", payload.len());
+    assert!(payload.len() < 10 * 1024, "{} bytes", payload.len());
     // A device id of 16 characters has room too.
     let long = Settings {
         device_id: "living_room_wall".into(),
         ..settings()
     };
     let long = discovery::payload(&long, &firmware());
-    assert!(long.len() < 8 * 1024, "{} bytes", long.len());
+    assert!(long.len() < 10 * 1024, "{} bytes", long.len());
     // The discovery and the state go in one write, and each write has at
     // most `MAX_OUTGOING` bytes. The two messages use about a third.
     let state = snapshot(Some(100), true, CHARGING).to_json();
@@ -219,7 +241,7 @@ fn the_discovery_message_is_json_with_the_keys_and_under_8_kib() {
     );
 
     let components = config["cmps"].as_object().expect("components");
-    assert_eq!(components.len(), 18);
+    assert_eq!(components.len(), 21);
     for (key, platform, class) in [
         ("status", "sensor", Some("enum")),
         ("battery", "sensor", Some("battery")),
@@ -239,6 +261,9 @@ fn the_discovery_message_is_json_with_the_keys_and_under_8_kib() {
         ("sleep", "button", None),
         ("restart", "button", Some("restart")),
         ("refresh", "button", None),
+        ("light", "light", None),
+        ("tap_level_stand", "number", None),
+        ("tap_level_battery", "number", None),
     ] {
         let component = &components[key];
         assert_eq!(component["p"], platform, "{key}");
@@ -321,6 +346,53 @@ fn discovery_has_three_buttons_with_the_command_topic_and_payloads() {
 }
 
 #[test]
+fn the_light_has_the_json_schema_and_the_brightness_in_percent() {
+    let payload = discovery::payload(&settings(), &firmware());
+    let config: Value = serde_json::from_slice(&payload).expect("JSON");
+    let light = &config["cmps"]["light"];
+    assert_eq!(light["name"], "Front light");
+    assert_eq!(light["schema"], "json");
+    assert_eq!(light["sup_clrm"], json!(["brightness"]));
+    assert_eq!(light["bri_scl"], 100);
+    assert_eq!(light["stat_t"], "dashboard/hall/light");
+    assert_eq!(light["cmd_t"], "dashboard/hall/set/light");
+    // The light obeys a command only while the device is awake.
+    assert_eq!(light["avty_t"], STATUS);
+    assert_eq!(
+        light["avty_tpl"],
+        "{{ 'online' if value == 'online' else 'offline' }}"
+    );
+}
+
+#[test]
+fn the_tap_levels_are_retained_numbers_from_0_to_100_percent() {
+    let payload = discovery::payload(&settings(), &firmware());
+    let config: Value = serde_json::from_slice(&payload).expect("JSON");
+    for (key, name) in [
+        ("tap_level_stand", "Tap light on the stand"),
+        ("tap_level_battery", "Tap light on battery"),
+    ] {
+        let number = &config["cmps"][key];
+        let topic = format!("dashboard/hall/set/{key}");
+        assert_eq!(number["name"], name, "{key}");
+        assert_eq!(number["cmd_t"], topic, "{key}");
+        assert_eq!(number["stat_t"], topic, "{key}");
+        assert_eq!(number["ret"], true, "{key}");
+        assert_eq!(number["min"], 0, "{key}");
+        assert_eq!(number["max"], 100, "{key}");
+        assert_eq!(number["step"], 1, "{key}");
+        assert_eq!(number["unit_of_meas"], "%", "{key}");
+        assert_eq!(number["ent_cat"], "config", "{key}");
+        // A user can set a tap level while the device sleeps.
+        assert_eq!(number["avty_t"], STATUS, "{key}");
+        assert_eq!(
+            number["avty_tpl"], "{{ 'offline' if value == 'offline' else 'online' }}",
+            "{key}"
+        );
+    }
+}
+
+#[test]
 fn the_buttons_are_available_only_while_online() {
     let payload = discovery::payload(&settings(), &firmware());
     let config: Value = serde_json::from_slice(&payload).expect("JSON");
@@ -368,6 +440,12 @@ fn each_status_gives_the_availability_of_the_sensors_and_the_buttons() {
     let button = components["restart"]["avty_tpl"]
         .as_str()
         .expect("template");
+    // The light works as the buttons do, and the tap levels as the
+    // sensors do.
+    assert_eq!(components["light"]["avty_tpl"], button);
+    for key in ["tap_level_stand", "tap_level_battery"] {
+        assert_eq!(components[key]["avty_tpl"], sensor, "{key}");
+    }
     let options = components["status"]["ops"].as_array().expect("options");
     let mut results = Vec::new();
     for status in options {
@@ -734,6 +812,22 @@ fn a_retained_birth_message_does_not_send_the_discovery_again() {
 }
 
 #[test]
+fn a_birth_message_while_the_state_is_in_flight_sends_the_state_again_after_the_puback() {
+    let mut shell = house();
+    shell.broker.hold_puback = true;
+    shell.send(start(PowerSource::Stand));
+    assert_eq!(on(&shell, STATE).len(), 1);
+
+    birth(&mut shell, BIRTH_ONLINE);
+    assert_eq!(on(&shell, STATE).len(), 1);
+    shell.broker.hold_puback = false;
+    shell.broker.release_pubacks();
+    shell.broker.flush();
+    shell.run();
+    assert_eq!(on(&shell, STATE).len(), 2);
+}
+
+#[test]
 fn a_birth_message_while_the_discovery_is_in_flight_changes_nothing() {
     let mut shell = house();
     shell.broker.hold_puback = true;
@@ -862,15 +956,15 @@ fn nothing_goes_while_the_device_sleeps() {
 }
 
 #[test]
-fn the_queue_sends_the_discovery_then_the_state_then_the_log() {
+fn the_queue_sends_the_discovery_then_the_light_then_the_state_then_the_log() {
     let mut shell = house();
     stamp(&mut shell, 0, "a line before the start");
     shell.send(start(PowerSource::Stand));
 
-    // The CONNECT, the CONNACK write, the discovery and the state, then the
-    // line and the start line after the clock answer.
+    // The CONNECT, the CONNACK write, the discovery, the light and the
+    // state, then the line and the start line after the clock answer.
     assert_eq!(topics(&shell.writes[1]), [STATUS]);
-    assert_eq!(topics(&shell.writes[2]), [CONFIG, STATE]);
+    assert_eq!(topics(&shell.writes[2]), [CONFIG, LIGHT, STATE]);
     assert_eq!(topics(&shell.writes[3]), [LOG, LOG]);
 }
 
@@ -884,9 +978,12 @@ fn all_device_publishes_share_one_limit_that_leaves_the_reserved_places() {
     }
     shell.send(start(PowerSource::Stand));
 
-    // The discovery, the state and the lines wait for their PUBACKs, at
-    // most `IN_FLIGHT` of them together. The lines go in order.
-    let device = discoveries(&shell) + on(&shell, STATE).len() + on(&shell, LOG).len();
+    // The discovery, the light, the state and the lines wait for their
+    // PUBACKs, at most `IN_FLIGHT` of them together. The lines go in order.
+    let device = discoveries(&shell)
+        + on(&shell, LIGHT).len()
+        + on(&shell, STATE).len()
+        + on(&shell, LOG).len();
     assert_eq!(device, IN_FLIGHT);
     // The session takes 64. The status `online` also waits, and 7 places
     // stay free for `asleep` and the service calls.
@@ -899,7 +996,7 @@ fn all_device_publishes_share_one_limit_that_leaves_the_reserved_places() {
             String::from(line["msg"].as_str().unwrap())
         })
         .collect();
-    let expected: Vec<String> = (0..IN_FLIGHT as u64 - 2)
+    let expected: Vec<String> = (0..IN_FLIGHT as u64 - 3)
         .map(|at| format!("line {at}"))
         .collect();
     assert_eq!(texts, expected);
@@ -949,7 +1046,7 @@ fn the_connack_write_waits_for_the_sent_of_the_connect_and_has_no_device_publish
             .all(|packet| matches!(packet, Packet::Publish { .. } | Packet::Subscribe { .. })),
         "{connack:?}"
     );
-    assert_eq!(topics(&shell.writes[2]), [CONFIG, STATE]);
+    assert_eq!(topics(&shell.writes[2]), [CONFIG, LIGHT, STATE]);
 }
 
 #[test]

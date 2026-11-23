@@ -72,6 +72,13 @@ impl Settings {
         format!("dashboard/{}/state", self.device_id)
     }
 
+    /// Returns the topic on which the dashboard publishes the state of its
+    /// front light, for example `dashboard/hall/light`. Refer to [`light`].
+    #[must_use]
+    pub fn light_topic(&self) -> String {
+        format!("dashboard/{}/light", self.device_id)
+    }
+
     /// Returns the topic `dashboard/<id>/set/<name>`, on which Home
     /// Assistant sends a command to the device, for example
     /// `dashboard/hall/set/button`. With the name `+`, it is the topic

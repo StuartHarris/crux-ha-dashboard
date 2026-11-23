@@ -19,7 +19,7 @@ use crate::{
     },
     features::{
         connection::Link,
-        light::BATTERY_LEVEL,
+        light::DEFAULT_BATTERY_LEVEL,
         power::{CHECK_PERIOD, IDLE_TIMEOUT, STRAY_HOLD, SleepStep},
         wifi::{JOIN_TIMEOUT, OFF_TIMEOUT, Phase},
     },
@@ -112,7 +112,7 @@ fn the_idle_timeout_sleeps_in_steps_and_a_touch_wakes() {
         .expect_time_notify_after_with(|notify| {
             assert_eq!(Duration::from(notify.duration), IDLE_TIMEOUT);
         })
-        .expect_touch_light(BATTERY_LEVEL)
+        .expect_touch_light(DEFAULT_BATTERY_LEVEL.get())
         .expect_no_effects();
     assert!(!model.power.is_asleep());
     assert_eq!(model.full_refresh_seq, 3);
@@ -134,7 +134,7 @@ fn a_tap_during_the_steps_wakes_and_the_late_answers_are_ignored() {
         .expect_render()
         .expect_full_refresh_timer()
         .expect_time_notify_after()
-        .expect_touch_light(BATTERY_LEVEL)
+        .expect_touch_light(DEFAULT_BATTERY_LEVEL.get())
         .expect_no_effects();
     assert!(!model.power.is_asleep());
 
@@ -357,7 +357,7 @@ fn a_tap_on_no_control_while_asleep_only_wakes() {
         .expect_time_notify_after_with(|notify| {
             assert_eq!(Duration::from(notify.duration), IDLE_TIMEOUT);
         })
-        .expect_touch_light(BATTERY_LEVEL)
+        .expect_touch_light(DEFAULT_BATTERY_LEVEL.get())
         .expect_no_effects();
     assert!(!model.power.is_asleep());
     assert_eq!(model.route, route);
@@ -406,14 +406,15 @@ fn a_touch_wake_on_a_light_queues_the_service_call() {
 #[test]
 fn a_tap_on_no_control_while_awake_does_not_restart_the_idle_timer() {
     let app = Dashboard;
-    let (mut model, _wire) = drive_to_connected(PowerSource::Battery);
+    let (mut model, mut wire) = drive_to_connected(PowerSource::Battery);
     let idle = model.power.idle;
 
     // A touch by accident turns the light on, but it does not keep the
     // device awake.
     app.update(Event::Tapped(None), &mut model)
-        .expect_touch_light(BATTERY_LEVEL)
-        .expect_no_effects();
+        .expect_touch_light(DEFAULT_BATTERY_LEVEL.get())
+        .expect_light_publish(&mut wire, &mut model, DEFAULT_BATTERY_LEVEL.get())
+        .expect_only_session_clear(&wire);
     assert_eq!(model.power.idle, idle);
 
     let _ = app.update(Event::Power(power::Event::IdleTimeout(idle)), &mut model);
@@ -953,7 +954,7 @@ fn the_sleep_step_follows_each_step_of_a_sleep_and_each_step_writes_one_line() {
     let (mut model, mut wire) = drive_to_connected(PowerSource::Battery);
     assert_eq!(power::sleep_step(&model), None);
     // The tap turns the light on, so the sleep first turns it off.
-    let _ = app.update(Event::Tapped(None), &mut model);
+    wire.settle(app.update(Event::Tapped(None), &mut model), &mut model);
 
     // Step 1: the `FrontLight` request waits.
     let mut sleep = app.update(Event::SleepNow, &mut model);
