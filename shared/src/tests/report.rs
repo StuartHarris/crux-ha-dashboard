@@ -469,6 +469,35 @@ fn a_report_does_not_scan() {
 }
 
 #[test]
+fn a_report_does_not_read_the_signal() {
+    let mut shell = asleep_in_the_living_room();
+    shell.broker.hold_puback = true;
+    report(&mut shell);
+    assert!(shell.model.power.is_reporting());
+    // The join of the report gave the signal. Only the report stops the
+    // read here, so the test takes away the scan that is due.
+    shell.model.wifi.cache.scanned();
+    let reading = shell.model.power.reading;
+    shell.send(Event::PowerRead(crate::Reading {
+        voltage_mv: Some(reading.voltage_mv.unwrap_or(3800) + 10),
+        ..reading
+    }));
+
+    shell.broker.hold_puback = false;
+    shell.broker.release_pubacks();
+    shell.broker.flush();
+    shell.run();
+    let log = shell.take_log();
+    let states = log
+        .iter()
+        .filter(|entry| entry.starts_with("MqttPublish dashboard/hall/state "))
+        .count();
+    assert_eq!(states, 2, "{log:?}");
+    assert!(!log.contains(&"RadioReadSignal".into()), "{log:?}");
+    assert_sleeps(&shell);
+}
+
+#[test]
 fn the_retained_replay_in_a_report_starts_no_draw_timer() {
     let mut shell = asleep_in_the_living_room();
     shell.auto_draw = false;

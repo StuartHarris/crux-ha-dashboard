@@ -9,7 +9,7 @@
 //! | `core` | owns the shell, routes each job, and gives the warn and error lines of the logger to the core | |
 //! | `timers` | `StartTimer`, `CancelTimer` | `Signal::Timer` |
 //! | `display` | draws the latest view model, reads the touch controller, the charger and the fuel gauge, sets the front light, and runs the `Sleep` job | `Signal::Tap`, `Signal::Event`, `Signal::Woke`, `Signal::Light` |
-//! | `radio` | the radio jobs (`Join`, `Address`, `Leave`, `Scan`, `StopScan`, `Off`) and `Restart`, with no Wi-Fi policy | `Signal::Radio` |
+//! | `radio` | the radio jobs (`Join`, `Address`, `Leave`, `Scan`, `StopScan`, `ReadSignal`, `Off`) and `Restart`, with no Wi-Fi policy | `Signal::Radio` |
 //! | `stream` | the TCP stream to the broker, one at a time: `Open`, `Write`, `Close` | `Signal::Stream`, `Signal::Written` |
 //! | `net` | runs the network stack | |
 //!

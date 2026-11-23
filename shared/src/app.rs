@@ -12,7 +12,7 @@ use crate::{
         light::FrontLight,
         log::{Area, Log, LogClock, Uptime},
         power::{PowerSource, Reading, Sleep},
-        radio::{Address, Join, Leave, Off, Restart, Scan, StopScan},
+        radio::{Address, Join, Leave, Off, ReadSignal, Restart, Scan, StopScan},
         stream::{Close, Open, Write},
     },
     entities::Entities,
@@ -472,6 +472,8 @@ pub enum Effect {
     RadioScan(Scan),
     /// Stop a scan that runs, for example at a sleep.
     RadioStopScan(StopScan),
+    /// Read the signal of the current access point before a state message.
+    RadioReadSignal(ReadSignal),
     /// Turn the radio off before a sleep.
     RadioOff(Off),
     /// Restart the chip, if many joins in a row give no new address.

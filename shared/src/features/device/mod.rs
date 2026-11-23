@@ -100,16 +100,19 @@
 //! during a session. A new session publishes the state at once, so only
 //! their urgency in [`Snapshot::is_urgent_after`] keeps them out of the
 //! throttle. The signal changes during a session at a scan that sees the
-//! access point. Refer to [`wifi`](crate::features::wifi).
+//! access point, and at a read of the signal before a change that is not
+//! urgent. Refer to [`wifi`](crate::features::wifi).
 //!
 //! The [`Window`] is the throttle. While it is `Open`, a change that is
-//! not urgent goes at once, and the core starts a timer of
+//! not urgent can go. First the core reads the signal of the access point
+//! ([`wifi::read_signal`]), and the window is then `Fresh`. The change goes
+//! with the new signal, and the core starts a timer of
 //! [`STATE_MIN_INTERVAL`]. The window is then `Throttled`, and each change
 //! that is not urgent waits. When the timer expires, the window is `Open`
-//! again. The snapshot of that time then goes, if it is not equal to the
-//! last one, and the core starts a new timer. An urgent change goes at
-//! once also while the window is `Throttled`, with the values that wait,
-//! and the timer continues.
+//! again. The snapshot of that time then goes after a read, if it is not
+//! equal to the last one, and the core starts a new timer. An urgent change
+//! goes at once also while the window is `Throttled`, with the values that
+//! wait, and the timer continues.
 //!
 //! | `StateSync` | Event | Next | What the core does |
 //! | --- | --- | --- | --- |
@@ -120,10 +123,25 @@
 //! | `Sent` | a birth message of Home Assistant that is not retained | `Unsent` | the queue publishes the snapshot, and the core clears the timer |
 //! | `InFlight` | a birth message | `InFlight`, `again` | after the PUBACK, `Unsent` |
 //! | `Sent` | an urgent change | `InFlight` | the queue publishes it, and the window does not change |
-//! | `Sent`, `Open` | a change that is not urgent | `InFlight`, `Throttled` | the queue publishes it, and the core starts the timer |
+//! | `Sent`, `Open` | a change that is not urgent, and the core can read the signal | `Sent`, `Open` | the core reads the signal, and the change waits |
+//! | `Sent`, `Open` | a change that is not urgent, and the core cannot read the signal | `InFlight`, `Throttled` | the queue publishes it, and the core starts the timer |
+//! | `Open` | the end of the read, or a scan that gives a new signal | `Fresh` | the queue publishes if the snapshot is due |
+//! | `Sent`, `Fresh` | a change that is not urgent | `InFlight`, `Throttled` | the queue publishes it, and the core starts the timer |
+//! | `Sent`, `Fresh` | the snapshot is equal to the last one | `Sent`, `Open` | nothing |
 //! | `Sent`, `Throttled` | a change that is not urgent | `Sent`, `Throttled` | nothing yet |
 //! | `Throttled` | the timer expires | `Open` | the queue publishes if the snapshot is due |
 //! | any | the session ends | (none) | the core clears the timer |
+//!
+//! The read cannot start a loop. Only a change that is not urgent and can
+//! go now starts a read, and the window is then `Fresh` until the change
+//! goes. The new signal is not urgent, so it does not defeat the throttle.
+//! Thus the core reads once for each state message with a change that is
+//! not urgent. If the change goes back during the read, nothing goes, and
+//! the next change reads again. The read ends at its answer, with or
+//! without a signal, or at its time limit. If a newer radio
+//! request stops the read, the window stays `Open`, and the next change
+//! that is not urgent goes with the signal that the link has, or reads
+//! again.
 //!
 //! - At most one state message waits for a PUBACK.
 //! - While the device sleeps, the queue publishes nothing. The next
@@ -170,7 +188,7 @@ use core::{mem, time::Duration};
 use serde::Serialize;
 
 use crate::{
-    Boot, Cmd, Model, PowerSource, ResetReason,
+    Boot, Cmd, Model, PowerSource, ResetReason, Settings,
     capabilities::{
         log::Area,
         power::{Charge, Reading},
@@ -183,6 +201,7 @@ use crate::{
         power::{self, IdleEnd, WakeReason},
         refresh::redraw,
         timer::Running,
+        wifi,
     },
     mqtt::{MAX_IN_FLIGHT, Message, PacketId, Publish, Qos, Refused},
 };
@@ -409,9 +428,13 @@ impl StateSync {
 /// the [module docs](self).
 #[derive(Debug, Default)]
 pub enum Window {
-    /// The next change that is not urgent goes at once.
+    /// The next change that is not urgent can go. It goes after a read of
+    /// the signal, or at once if the core cannot read the signal.
     #[default]
     Open,
+    /// The core read the signal in this window, so the next change that is
+    /// not urgent goes at once.
+    Fresh,
     /// A change that is not urgent went less than [`STATE_MIN_INTERVAL`]
     /// ago. The changes that are not urgent wait for this timer.
     Throttled(Running),
@@ -904,6 +927,21 @@ pub fn changed(model: &mut Model) -> Cmd {
     }
 }
 
+/// A read of the signal ended ([`wifi::read_signal`]), or a scan gave a new
+/// signal. An open window becomes `Fresh`, and the queue publishes the
+/// change that waits. Refer to the [module docs](self).
+pub(crate) fn signal_read(model: &mut Model) -> Cmd {
+    if let Some(window) = model
+        .connection
+        .live_mut()
+        .and_then(|live| live.state.window_mut())
+        && matches!(window, Window::Open)
+    {
+        *window = Window::Fresh;
+    }
+    changed(model)
+}
+
 /// The timer of the window with the id `id` expired. If it is the timer of
 /// the window now, the window opens, and the queue publishes the snapshot
 /// if it changed. The core ignores the expiry of an older timer.
@@ -1158,36 +1196,52 @@ fn next_discovery(model: &Model) -> Next {
 /// last state message and the change is due. An urgent change is always
 /// due. A change that is not urgent is due only while the window is open.
 /// While a state message waits for its PUBACK, returns nothing.
+///
+/// In an `Open` window, a change that is not urgent waits for a read of the
+/// signal first, if the core can read it. If the snapshot did not change in
+/// a `Fresh` window, the window is `Open` again, so the next change reads
+/// the signal again.
 fn next_state(model: &mut Model) -> Next {
     let Some(snapshot) = Snapshot::of(model) else {
         return Next::Nothing;
     };
-    let Some(settings) = model
+    let Some(topic) = model
         .startup
         .settings()
         .filter(|settings| !settings.read_only)
+        .map(Settings::state_topic)
     else {
         return Next::Nothing;
     };
     let Some(live) = model.connection.live_mut() else {
         return Next::Nothing;
     };
-    let throttles = match &live.state {
+    let throttles = match &mut live.state {
         StateSync::Unsent => false,
         StateSync::InFlight { .. } => return Next::Nothing,
         StateSync::Sent { sent, window } => {
             if *sent == snapshot {
+                if matches!(window, Window::Fresh) {
+                    *window = Window::Open;
+                }
                 return Next::Nothing;
             }
-            let urgent = snapshot.is_urgent_after(sent);
-            if !urgent && matches!(window, Window::Throttled(_)) {
-                return Next::Nothing;
+            if snapshot.is_urgent_after(sent) {
+                false
+            } else {
+                match window {
+                    Window::Throttled(_) => return Next::Nothing,
+                    Window::Open => match wifi::read_signal(model) {
+                        Some(read) => return Next::Wait(read),
+                        None => true,
+                    },
+                    Window::Fresh => true,
+                }
             }
-            !urgent
         }
     };
     let publish = Publish {
-        topic: settings.state_topic(),
+        topic,
         payload: snapshot.to_json(),
         qos: Qos::AtLeastOnce,
         retain: true,

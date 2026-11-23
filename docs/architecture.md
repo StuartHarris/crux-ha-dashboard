@@ -101,7 +101,7 @@ Each `Effect` variant wraps one operation. The custom capabilities are in
 | --- | --- | --- |
 | `Render` (Crux) | `Render` | Draws the view model, with a partial or a full refresh. |
 | `stream` | `StreamOpen`, `StreamWrite`, `StreamClose` | Opens one TCP stream to the broker, writes the bytes of the core, gives back the bytes that arrive, and closes it. It knows nothing of MQTT. |
-| `radio` | `RadioJoin`, `RadioAddress`, `RadioLeave`, `RadioScan`, `RadioStopScan`, `RadioOff`, `RadioRestart` | Does the Wi-Fi radio work. The core decides when to join, which access point to join, when to scan and when to restart the chip. |
+| `radio` | `RadioJoin`, `RadioAddress`, `RadioLeave`, `RadioScan`, `RadioStopScan`, `RadioReadSignal`, `RadioOff`, `RadioRestart` | Does the Wi-Fi radio work. The core decides when to join, which access point to join, when to scan, when to read the signal and when to restart the chip. |
 | `power` | `Sleep` | Puts the device to sleep until a touch or a timer, and answers with the `Wake`. |
 | `light` | `FrontLight` | Sets the brightness of the front light. |
 | `log` | `Log`, `LogClock` | Writes a line of the core to the shell log and answers with its monotonic time. |
@@ -143,7 +143,7 @@ the parent `update` would become a large orchestrator.
 | `light` | The front light policy: the tap level, the light timer, the light that Home Assistant holds | `device` (publish the light state) |
 | `refresh` | The choice of a partial or a full refresh, and when to draw | `power` (sleep when the draw is done) |
 | `logs` | The ring of log lines of the core and the shell, and their ages | `connection` (start `connection::pump`) |
-| `device` | The dashboard as a device of Home Assistant: discovery, the state message, the buttons and the device publish queue (`device::drain`) | `logs` and `light` (as publishers in the queue), `power` (Sleep now), `connection` (restart, pump) |
+| `device` | The dashboard as a device of Home Assistant: discovery, the state message, the buttons and the device publish queue (`device::drain`) | `logs` and `light` (as publishers in the queue), `power` (Sleep now), `connection` (restart, pump), `wifi` (read the signal before a state message) |
 
 `shared/src/features/timer.rs` is a helper, not a feature. It gives a timer that the
 core can clear, held in one `Slot`.

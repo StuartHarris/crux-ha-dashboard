@@ -19,7 +19,7 @@ use crate::{
     capabilities::{
         log::Level,
         power::Wake,
-        radio::{AccessPoint, Joined, Lease, Scanned, Seen, Target},
+        radio::{AccessPoint, Joined, Lease, ReadSignal, Scanned, Seen, SignalRead, Target},
     },
     fake::radio::{HALL, IP, LANDING, STRONG_RSSI},
     features::{
@@ -27,8 +27,8 @@ use crate::{
         device,
         power::{self, IDLE_TIMEOUT, SleepStep},
         wifi::{
-            ADDRESS_TIMEOUT, JOIN_TIMEOUT, LEAVE_TIMEOUT, Linked, OFF_TIMEOUT, Phase, SCAN_TIMEOUT,
-            STOP_SCAN_TIMEOUT,
+            ADDRESS_TIMEOUT, JOIN_TIMEOUT, LEAVE_TIMEOUT, Linked, OFF_TIMEOUT, Phase,
+            READ_SIGNAL_TIMEOUT, SCAN_TIMEOUT, STOP_SCAN_TIMEOUT,
             rules::{Health, RESTART_AFTER, Recovery},
         },
     },
@@ -1961,4 +1961,190 @@ fn a_wake_scan_with_no_better_access_point_keeps_no_line() {
         published_lines(&shell),
         [("info".into(), "started after a power-on".into())]
     );
+}
+
+// The read of the signal before a state message.
+
+/// Returns a started model with `phase`, awake and with no scan due.
+fn started_with(phase: Phase) -> Model {
+    let mut model = Model {
+        startup: crate::Startup::Started {
+            settings: settings(),
+            firmware: crate::tests::firmware(),
+            boot: crate::tests::POWER_ON,
+        },
+        ..Model::default()
+    };
+    model.wifi.phase = phase;
+    model.wifi.radio = 9;
+    model
+}
+
+#[test]
+fn a_read_of_the_signal_starts_only_from_up_and_not_while_a_scan_is_due() {
+    let mut model = started_with(Phase::Up(ready(HALL)));
+    let mut read = wifi::read_signal(&mut model).expect("a read from up");
+    read.expect_radio_read_signal_with(|operation| {
+        assert_eq!(*operation, ReadSignal { radio: 10 });
+    })
+    .expect_time_notify_after_with(|operation| {
+        assert_eq!(Duration::from(operation.duration), READ_SIGNAL_TIMEOUT);
+    });
+    assert_eq!(model.wifi.phase, Phase::Reading(ready(HALL)));
+    // The link stays up during the read.
+    assert_eq!(model.wifi.phase.linked(), Some(ready(HALL)));
+
+    // While the read waits, the state message waits, and no other read
+    // starts.
+    wifi::read_signal(&mut model)
+        .expect("the read waits")
+        .expect_done();
+    assert_eq!(model.wifi.radio, 10);
+
+    // A scan or a join that waits, or a scan that is due: no read.
+    for phase in [
+        Phase::Scanning(ready(HALL)),
+        Phase::Joining(Target::Cached(HALL)),
+        Phase::Off,
+    ] {
+        let mut model = started_with(phase);
+        assert!(wifi::read_signal(&mut model).is_none(), "{phase:?}");
+        assert_eq!(model.wifi.phase, phase);
+    }
+    let mut model = started_with(Phase::Up(ready(HALL)));
+    model.wifi.cache.joined(Target::Cached(HALL), HALL);
+    assert!(model.wifi.cache.scan_due());
+    assert!(wifi::read_signal(&mut model).is_none());
+}
+
+#[test]
+fn a_read_with_no_signal_keeps_the_last_signal_and_a_stopped_read_is_ignored() {
+    let mut model = started_with(Phase::Reading(ready(HALL)));
+    Dashboard
+        .update(
+            Event::Wifi(wifi::Event::SignalRead {
+                radio: 9,
+                read: SignalRead::Stopped,
+            }),
+            &mut model,
+        )
+        .expect_done();
+    assert_eq!(model.wifi.phase, Phase::Reading(ready(HALL)));
+
+    Dashboard
+        .update(
+            Event::Wifi(wifi::Event::SignalRead {
+                radio: 9,
+                read: SignalRead::Read(None),
+            }),
+            &mut model,
+        )
+        .expect_only_log_with(|log| {
+            assert_eq!(log.level, Level::Debug);
+            assert_eq!(
+                log.to_string(),
+                "wifi: the signal of 02:00:00:00:00:01 on channel 6 is unknown, so keep -55 dBm"
+            );
+        });
+    assert_eq!(model.wifi.phase, Phase::Up(ready(HALL)));
+
+    // A late answer with the old id changes nothing.
+    model.wifi.phase = Phase::Reading(ready(HALL));
+    Dashboard
+        .update(
+            Event::Wifi(wifi::Event::SignalRead {
+                radio: 9,
+                read: SignalRead::Read(Some(-70)),
+            }),
+            &mut model,
+        )
+        .expect_done();
+    assert_eq!(model.wifi.phase, Phase::Reading(ready(HALL)));
+}
+
+/// Starts on the stand with the radio held, and sends a change that is not
+/// urgent, so a `ReadSignal` request waits. Clears the logs.
+fn reading() -> Shell {
+    let mut shell = online();
+    shell.hold_radio = true;
+    shell.send(Event::BatteryChanged(Some(50)));
+    shell.send(Event::BatteryChanged(Some(51)));
+    assert_eq!(radio(&shell.take_log()), ["RadioReadSignal"]);
+    assert_eq!(shell.held_radio(), 1);
+    assert!(matches!(shell.model.wifi.phase, Phase::Reading(_)));
+    shell.take_logs();
+    shell
+}
+
+/// Returns the battery level in each state message that the broker got.
+fn battery_levels(shell: &Shell) -> Vec<Option<u64>> {
+    shell
+        .broker
+        .published
+        .iter()
+        .filter(|publish| publish.topic == "dashboard/hall/state")
+        .map(|publish| {
+            let state: serde_json::Value = serde_json::from_slice(&publish.payload).expect("JSON");
+            state["battery"].as_u64()
+        })
+        .collect()
+}
+
+#[test]
+fn a_read_with_no_answer_in_its_time_limit_ends_and_the_state_goes() {
+    let mut shell = reading();
+    assert_eq!(battery_levels(&shell).last(), Some(&Some(50)));
+
+    shell.advance(READ_SIGNAL_TIMEOUT);
+    assert_eq!(
+        shell.take_logs(),
+        ["warn wifi: the read signal request got no answer in its time limit"]
+    );
+    assert_eq!(shell.model.wifi.phase, Phase::Up(ready(HALL)));
+    // The state goes with the last signal, and the core does not read
+    // again.
+    assert_eq!(battery_levels(&shell).last(), Some(&Some(51)));
+    assert_eq!(radio(&shell.take_log()), Vec::<&str>::new());
+
+    // The late answer is ignored.
+    shell.radio.access_points[0].rssi = -70;
+    shell.answer_radio();
+    assert_eq!(shell.model.wifi.phase.linked().unwrap().rssi, Some(-55));
+}
+
+#[test]
+fn a_session_that_fails_during_a_read_stops_it_and_joins_again() {
+    let mut shell = reading();
+
+    // The failure makes the link suspect, so the reconnect leaves. The
+    // leave stops the read.
+    fail_the_session(&mut shell);
+    shell.advance(RECONNECT_MIN);
+    assert_eq!(radio(&shell.take_log()), ["RadioLeave"]);
+    assert!(matches!(shell.model.wifi.phase, Phase::Leaving(_)));
+    shell.hold_radio = false;
+    shell.answer_radio();
+    assert_eq!(shell.view().connection, Connection::Online);
+    // The new session sends the state with the level that waited.
+    assert_eq!(battery_levels(&shell).last(), Some(&Some(51)));
+}
+
+#[test]
+fn a_sleep_during_a_read_stops_it_and_turns_the_radio_off() {
+    let mut shell = house();
+    shell.send(start(PowerSource::Battery));
+    shell.hold_radio = true;
+    shell.send(Event::BatteryChanged(Some(50)));
+    shell.send(Event::BatteryChanged(Some(51)));
+    assert!(matches!(shell.model.wifi.phase, Phase::Reading(_)));
+    shell.take_log();
+
+    // `Off` stops the read. The test shell checks that no timer of the core
+    // waits at the `Sleep` request, so the time limit of the read is gone.
+    shell.send(Event::SleepNow);
+    assert_eq!(radio(&shell.take_log()), ["WifiOff"]);
+    shell.answer_radio();
+    assert!(shell.sleep.is_some());
+    assert_eq!(shell.timers_at_sleep.last(), Some(&Vec::new()));
+    assert_eq!(shell.model.wifi.phase, Phase::Off);
 }
