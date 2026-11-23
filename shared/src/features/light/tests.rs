@@ -2,13 +2,13 @@
 //! the power source and the sleep.
 
 use crate::features::{light, power};
-use alloc::format;
+use alloc::{format, string::String, vec::Vec};
 
 use crux_core::App;
 
 use crate::tests::{
-    ExpectLight, ExpectServiceCall, ExpectStep, drive_to_connected, light_state, shell::Shell,
-    start, state, tap_tile, wire::ExpectWrite,
+    ExpectLight, ExpectServiceCall, ExpectStep, broker::publish_of, drive_to_connected,
+    drive_to_connecting, light_state, shell::Shell, start, state, tap_tile, wire::ExpectWrite,
 };
 use crate::{
     Cmd, Dashboard, Effect, EffectTestExt, Event, Model, PowerSource, Route,
@@ -92,6 +92,65 @@ fn start_turns_the_light_off() {
     let mut cmd = app.update(start(PowerSource::Stand), &mut model);
     cmd.expect_light(0);
     assert_eq!(model.light.level(), 0);
+}
+
+/// The discovery topic of the test settings.
+const CONFIG: &str = "homeassistant/device/dashboard_hall/config";
+
+#[test]
+fn a_live_birth_message_publishes_the_discovery_the_light_and_the_state_again() {
+    let (mut model, mut wire) = drive_to_connected(PowerSource::Stand);
+
+    // Home Assistant restarts. The queue publishes in its order: the
+    // discovery, the light and the state, in one write.
+    wire.send(&mut model, device::BIRTH_TOPIC, device::BIRTH_ONLINE)
+        .expect_write_with(&mut wire, &mut model, |packets| {
+            let publishes: Vec<_> = packets.iter().filter_map(publish_of).collect();
+            let topics: Vec<&str> = publishes.iter().map(|p| p.topic.as_str()).collect();
+            assert_eq!(topics, [CONFIG, LIGHT, STATE]);
+            assert_eq!(
+                String::from_utf8_lossy(&publishes[1].payload),
+                light_state(0)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&publishes[2].payload),
+                state("null", "ON")
+            );
+        })
+        .expect_only_session_clear(&wire);
+
+    // A message that is not a birth changes nothing.
+    wire.send(&mut model, device::BIRTH_TOPIC, "offline")
+        .expect_no_effects();
+}
+
+#[test]
+fn a_retained_birth_message_publishes_nothing_more() {
+    let (mut model, mut wire) = drive_to_connecting(PowerSource::Stand);
+    // The broker keeps the birth message, so it sends it with the retain
+    // flag when the core subscribes.
+    wire.broker
+        .retain(device::BIRTH_TOPIC, device::BIRTH_ONLINE.as_bytes());
+    let connected = wire.connect(&mut model);
+    wire.settle(connected, &mut model);
+    assert!(
+        wire.broker
+            .delivered
+            .iter()
+            .any(|topic| topic == device::BIRTH_TOPIC)
+    );
+
+    // The connection publishes each message once, and the birth message
+    // adds no second one.
+    let topics: Vec<String> = wire
+        .packets
+        .iter()
+        .filter_map(publish_of)
+        .map(|publish| publish.topic)
+        .collect();
+    for topic in [CONFIG, LIGHT, STATE] {
+        assert_eq!(topics.iter().filter(|t| *t == topic).count(), 1, "{topic}");
+    }
 }
 
 #[test]

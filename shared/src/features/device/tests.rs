@@ -812,6 +812,22 @@ fn a_retained_birth_message_does_not_send_the_discovery_again() {
 }
 
 #[test]
+fn a_birth_message_while_the_state_is_in_flight_sends_the_state_again_after_the_puback() {
+    let mut shell = house();
+    shell.broker.hold_puback = true;
+    shell.send(start(PowerSource::Stand));
+    assert_eq!(on(&shell, STATE).len(), 1);
+
+    birth(&mut shell, BIRTH_ONLINE);
+    assert_eq!(on(&shell, STATE).len(), 1);
+    shell.broker.hold_puback = false;
+    shell.broker.release_pubacks();
+    shell.broker.flush();
+    shell.run();
+    assert_eq!(on(&shell, STATE).len(), 2);
+}
+
+#[test]
 fn a_birth_message_while_the_discovery_is_in_flight_changes_nothing() {
     let mut shell = house();
     shell.broker.hold_puback = true;

@@ -11,6 +11,10 @@
 //!   the device. A light that Home Assistant turned on stays on: a touch and
 //!   the light timer do not change it. Only Home Assistant, a sleep or
 //!   `Start` turns it off.
+//! - A `light.turn_on` without brightness, for example from an automation, a
+//!   scene or the toggle, turns a tap light into a held light. The light
+//!   then stays on until Home Assistant turns it off, and on the stand the
+//!   device does not sleep.
 //! - If the light is still on when the device sleeps, it goes off before the
 //!   other steps of the sleep.
 //! - Each light timer has an id. A touch clears the light timer that runs
@@ -90,6 +94,7 @@
 //! | any | `Start` | `Off`, tap levels `Default` | clear the timer, `FrontLight 0` always |
 //! | any | a restart waits | unchanged | the chip reset turns the light off, then `Start` |
 //! | any | a new session | unchanged | [`Sync::Due`]: the queue publishes the state |
+//! | any | a live birth message of Home Assistant | unchanged | [`Sync::again`]: the queue publishes the state again |
 //! | `Held` on battery | the idle timer expires | `Off` (through the sleep) | as a sleep |
 //!
 //! An `Event::Commanded` acts in the update after the message, outside
@@ -359,7 +364,9 @@ impl Light {
 /// | `InFlight { again: false }` | its PUBACK | `Sent(sent)` | the queue publishes if the light is not `sent` |
 /// | `InFlight { again: true }` | its PUBACK | `Due` | the queue publishes again |
 /// | `Sent(s)` | the light is not `s` | (offer) | the queue publishes it |
+/// | `InFlight` | a live birth message of Home Assistant | `InFlight { again: true }` | nothing yet |
 /// | `Sent(s)` | a command of Home Assistant | `Due` | the queue publishes it |
+/// | `Sent(s)` | a live birth message of Home Assistant | `Due` | the queue publishes it |
 /// | any | the session ends | (none) | nothing |
 ///
 /// The sync is in the [`Live`](crate::features::connection::Live) of the
@@ -387,9 +394,10 @@ pub enum Sync {
 }
 
 impl Sync {
-    /// A command of Home Assistant came: the state goes again, also if it
-    /// did not change. Home Assistant then gets a state for each command.
-    const fn commanded(&mut self) {
+    /// A command or a birth message of Home Assistant came: the state goes
+    /// again, also if it did not change. Home Assistant then gets a state
+    /// for each command.
+    pub(crate) const fn again(&mut self) {
         match self {
             Self::Due => {}
             Self::InFlight { again, .. } => *again = true,
@@ -557,7 +565,7 @@ fn commanded(command: Command, model: &mut Model) -> Cmd {
         ),
     );
     if let Some(live) = model.connection.live_mut() {
-        live.light.commanded();
+        live.light.again();
     }
     line.and(light).and(device::changed(model))
 }

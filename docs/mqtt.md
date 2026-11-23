@@ -132,9 +132,9 @@ filters need about 7 packets, 7.9 KiB in all. The broker sends the retained stat
 each topic after it accepts the filter.
 
 The write has nothing else. The device publishes (the discovery message, the state
-of the front light, the state message and the lines of the log) go in later writes. If the CONNACK arrives before
-the shell confirms the CONNECT write, the CONNACK write waits, and the device
-publishes wait behind it.
+of the front light, the state message and the lines of the log) go in later writes.
+If the CONNACK arrives before the shell confirms the CONNECT write, the CONNACK write
+waits, and the device publishes wait behind it.
 
 The `Subscribe` job of the session ends when the broker acknowledged each packet.
 If the broker refused a filter, the outcome is `Refused`. If the stream closes
@@ -759,6 +759,9 @@ The dashboard publishes the discovery message at these times:
   dashboard ignores a retained birth message, because it is from an earlier start.
   If the discovery message waits for its PUBACK, a birth message changes nothing. The
   message in flight is retained, so Home Assistant gets it when it subscribes.
+  The same birth message also makes the state of the front light and the state message
+  due again, so the dashboard publishes them after the discovery message. If one of
+  them waits for its PUBACK, the dashboard publishes it again after the PUBACK.
 - Again on the next connection, if the session ended before the PUBACK.
 
 During a dry run (`read_only = true` in `cfg.toml`, or the dry run that the user
@@ -913,6 +916,9 @@ topics.
   front light on at 40%`.
 - A command is not a touch. It does not start the idle time again, so on battery the
   dashboard still sleeps 30 seconds after the last tap. The sleep turns the light off.
+- A `light.turn_on` without a brightness, for example from an automation, a scene or the
+  toggle, while a tap has the light on makes the light held. The light then stays on
+  until Home Assistant turns it off, and on the stand the dashboard does not sleep.
 - A light that Home Assistant holds stays on until Home Assistant turns it off, the
   dashboard sleeps, or the core starts again. A change of the power source does not
   change its level.

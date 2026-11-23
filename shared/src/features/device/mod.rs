@@ -5,13 +5,13 @@
 //!
 //! The device publishes are the messages that the dashboard sends about
 //! itself: the discovery message, the state of its front light, the state
-//! of its sensors and the lines of its log. Each one is a publisher. [`drain`] is the queue.
-//! [`connection::pump`] calls it after the outbox, while the connection is
-//! up.
+//! of its sensors and the lines of its log. Each one is a publisher.
+//! [`drain`] is the queue. [`connection::pump`] calls it after the outbox,
+//! while the connection is up.
 //!
 //! The queue asks each publisher for its next message, in this order:
-//! discovery, light, state, log. It gives each message to the session, and tells
-//! the publisher the packet id. It stops when one of these is true:
+//! discovery, light, state, log. It gives each message to the session, and
+//! tells the publisher the packet id. It stops when one of these is true:
 //!
 //! - Each publisher has no message now.
 //! - [`IN_FLIGHT`] device publishes wait for a PUBACK. The queue then
@@ -59,6 +59,10 @@
 //!   message, because it is from an earlier start of Home Assistant.
 //! - A birth message during `InFlight` changes nothing. The message in
 //!   flight is retained, so Home Assistant gets it when it subscribes.
+//! - The same birth message also makes the state of the light and the state
+//!   message due again in the session that is live. Refer to
+//!   [`light::Sync::again`] and [`StateSync`]. The broker can have
+//!   restarted with Home Assistant, and then it lost both retained messages.
 //!
 //! # Dry run
 //!
@@ -111,6 +115,8 @@
 //! | `Unsent` | the session takes it | `InFlight`, `Open` | nothing |
 //! | `InFlight` | a value changes | `InFlight` | nothing yet |
 //! | `InFlight` | its PUBACK | `Sent` | the queue publishes if the snapshot is due |
+//! | `Sent` | a birth message of Home Assistant that is not retained | `Unsent` | the queue publishes the snapshot, and the core clears the timer |
+//! | `InFlight` | a birth message | `InFlight`, `again` | after the PUBACK, `Unsent` |
 //! | `Sent` | an urgent change | `InFlight` | the queue publishes it, and the window does not change |
 //! | `Sent`, `Open` | a change that is not urgent | `InFlight`, `Throttled` | the queue publishes it, and the core starts the timer |
 //! | `Sent`, `Throttled` | a change that is not urgent | `Sent`, `Throttled` | nothing yet |
@@ -341,6 +347,9 @@ pub enum StateSync {
         sent: Snapshot,
         /// The throttle of the changes that are not urgent.
         window: Window,
+        /// A birth message of Home Assistant came while the message waits,
+        /// so the state goes again after the PUBACK.
+        again: bool,
     },
     /// The broker acknowledged the state message with this snapshot.
     Sent {
@@ -360,6 +369,20 @@ impl StateSync {
             && let Window::Throttled(timer) = mem::take(window)
         {
             timer.clear();
+        }
+    }
+
+    /// A birth message of Home Assistant came: the state goes again, also
+    /// if it did not change. A message in flight goes again after its
+    /// PUBACK. A sent state becomes `Unsent`, and the window closes.
+    fn again(&mut self) {
+        match self {
+            Self::Unsent => {}
+            Self::InFlight { again, .. } => *again = true,
+            Self::Sent { .. } => {
+                self.clear_timer();
+                *self = Self::Unsent;
+            }
         }
     }
 
@@ -656,8 +679,9 @@ pub const fn start(model: &mut Model) {
 /// which goes to the entities.
 ///
 /// A birth message that is not retained makes a sent discovery message due
-/// again. [`connection::pump`] then publishes it, because the core routes
-/// each message inside the pump.
+/// again. It does the same for the state of the light and for the state
+/// message of the session. [`connection::pump`] then publishes them,
+/// because the core routes each message inside the pump.
 ///
 /// A button message gives [`Event::Pressed`]. A live light command gives
 /// [`light::Event::Commanded`], and a tap level gives
@@ -666,8 +690,14 @@ pub const fn start(model: &mut Model) {
 pub(crate) fn route(message: &Message, model: &mut Model) -> Option<Cmd> {
     if message.topic == BIRTH_TOPIC {
         let birth = !message.retain && message.payload == BIRTH_ONLINE.as_bytes();
-        if birth && model.device.discovery == Discovery::Sent {
-            model.device.discovery = Discovery::Due;
+        if birth {
+            if model.device.discovery == Discovery::Sent {
+                model.device.discovery = Discovery::Due;
+            }
+            if let Some(live) = model.connection.live_mut() {
+                live.light.again();
+                live.state.again();
+            }
         }
         return Some(Cmd::done());
     }
@@ -964,8 +994,17 @@ pub(crate) fn acked(id: PacketId, model: &mut Model) {
     if let Some(live) = model.connection.live_mut()
         && matches!(live.state, StateSync::InFlight { packet, .. } if packet == id)
     {
-        if let StateSync::InFlight { sent, window, .. } = mem::take(&mut live.state) {
+        if let StateSync::InFlight {
+            sent,
+            window,
+            again,
+            ..
+        } = mem::take(&mut live.state)
+        {
             live.state = StateSync::Sent { sent, window };
+            if again {
+                live.state.again();
+            }
         }
         return;
     }
@@ -1019,6 +1058,7 @@ fn taken(item: Item, packet: PacketId, model: &mut Model) -> Cmd {
                 packet,
                 sent: snapshot,
                 window,
+                again: false,
             };
             return timer;
         }
@@ -1030,9 +1070,9 @@ fn taken(item: Item, packet: PacketId, model: &mut Model) -> Cmd {
 /// The session can never take the message `item`, because it is too long
 /// for a packet.
 ///
-/// The discovery, the light and the state messages are short, so this does not occur
-/// for them. If it occurs, the core does not offer the message again, so
-/// the queue cannot repeat it without end.
+/// The discovery, the light and the state messages are short, so this does
+/// not occur for them. If it occurs, the core does not offer the message
+/// again, so the queue cannot repeat it without end.
 fn never(item: Item, model: &mut Model) {
     match item {
         Item::Discovery => model.device.discovery = Discovery::Sent,

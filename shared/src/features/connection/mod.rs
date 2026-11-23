@@ -431,12 +431,13 @@ pub struct Live {
     /// [`logs::Flight`].
     pub log: logs::Flight,
     /// The publish of the state message on this session. Each session
-    /// publishes the state once, and then each change. Refer to
-    /// [`device::StateSync`].
+    /// publishes the state once, and then each change and each live birth
+    /// message of Home Assistant. Refer to [`device::StateSync`].
     pub state: device::StateSync,
     /// The publish of the state of the front light on this session. Each
-    /// session publishes it once, and then each change and each command of
-    /// Home Assistant. Refer to [`light::Sync`].
+    /// session publishes it once, and then each change, each command of
+    /// Home Assistant and each live birth message of Home Assistant. Refer to
+    /// [`light::Sync`].
     pub light: light::Sync,
     /// The write of the CONNACK: the outbox, `online` and the SUBSCRIBE
     /// packets. Refer to [`ConnackWrite`].
