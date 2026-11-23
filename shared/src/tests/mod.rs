@@ -6,6 +6,7 @@
 //! fake radio and timers.
 
 pub mod broker;
+mod buttons;
 mod diagnostics;
 pub mod flows;
 mod session;

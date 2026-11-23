@@ -1,13 +1,13 @@
 //! The discovery message: one device-based discovery config of Home
 //! Assistant (2024.11 and later), with abbreviated keys.
 //!
-//! The config has the device (`dev`), the origin (`o`) and fifteen
+//! The config has the device (`dev`), the origin (`o`) and eighteen
 //! components (`cmps`). Each component has the platform `p` and a
 //! `uniq_id` of `dashboard_<id>_<key>`. Refer to `docs/mqtt.md`.
 //!
 //! | Component | Platform | Device class | State topic |
 //! | --- | --- | --- | --- |
-//! | `status` | `sensor` | `enum`: `online`, `asleep`, `offline`, icon `mdi:tablet-dashboard` | the status topic |
+//! | `status` | `sensor` | `enum`: `online`, `asleep`, `offline`, `restarting`, icon `mdi:tablet-dashboard` | the status topic |
 //! | `battery` | `sensor` | `battery`, in `%` | the state topic, key `battery` |
 //! | `stand` | `binary_sensor` | `plug` | the state topic, key `stand` |
 //! | `charging` | `binary_sensor` | `battery_charging`, diagnostic | the state topic, key `charging` |
@@ -22,10 +22,21 @@
 //! | `restarts` | `sensor` | none, `total_increasing`, icon `mdi:restart`, diagnostic | the state topic, key `restarts` |
 //! | `reset` | `sensor` | `enum`: [`RESET_LABELS`], icon `mdi:power-cycle`, diagnostic | the state topic, key `reset` |
 //! | `wake` | `sensor` | `enum`: [`WAKE_LABELS`], icon `mdi:sleep-off`, diagnostic | the state topic, key `wake` |
+//! | `sleep` | `button` | none, icon `mdi:sleep` | command topic `dashboard/<id>/set/button`, payload `sleep` |
+//! | `restart` | `button` | `restart`, config | the command topic, payload `restart` |
+//! | `refresh` | `button` | none, icon `mdi:refresh`, config | the command topic, payload `refresh` |
 //!
 //! The status sensor has no availability, so it shows `offline` too. The
-//! other components are available unless the status is `offline`. Thus
-//! they keep their last value while the device is asleep.
+//! sensors are available unless the status is `offline`. Thus they keep
+//! their last value while the device is asleep or restarts.
+//!
+//! The buttons are available only while the status is `online`. Home
+//! Assistant compares the result of the availability template with
+//! `online` and `offline`, and ignores each other result. So the template
+//! must turn `asleep` and `restarting` into `offline`. The Sleep now button also needs the
+//! device on battery: it has a second availability on the `stand` key of
+//! the state topic, with the mode `all`. On the stand, a sleep does
+//! nothing, so Home Assistant does not show the button as available.
 //!
 //! The state message keeps the `snake_case` values of
 //! [`CHARGE_OPTIONS`](super::CHARGE_OPTIONS),
@@ -48,10 +59,11 @@ use alloc::{format, string::String, vec::Vec};
 
 use serde::Serialize;
 
+use super::{BUTTON_SET, Button};
 use crate::{
     Firmware, Settings,
     capabilities::radio::mac_text,
-    features::connection::{STATUS_ASLEEP, STATUS_OFFLINE, STATUS_ONLINE},
+    features::connection::{STATUS_ASLEEP, STATUS_OFFLINE, STATUS_ONLINE, STATUS_RESTARTING},
 };
 
 /// The manufacturer of the board.
@@ -61,9 +73,22 @@ const MODEL: &str = "T5 E-Paper S3 Pro";
 /// The name of the software in the origin.
 const ORIGIN: &str = "crux-ha-dashboard";
 
-/// The availability template of each component except the status: it is
-/// available unless the status is `offline`.
+/// The availability template of each sensor except the status: it is
+/// available unless the status is `offline`. It gives `online` for
+/// `online`, `asleep` and `restarting`.
 const AVAILABLE_UNLESS_OFFLINE: &str = "{{ 'offline' if value == 'offline' else 'online' }}";
+
+/// The availability template of each button: it is available only while
+/// the status is `online`. It gives `offline` for `asleep`, `offline` and
+/// `restarting`.
+const AVAILABLE_WHILE_ONLINE: &str = "{{ 'online' if value == 'online' else 'offline' }}";
+
+/// The availability template on the state topic of the Sleep now button:
+/// it is available only while the device is on battery.
+const AVAILABLE_ON_BATTERY: &str = "{{ 'online' if value_json.stand == 'OFF' else 'offline' }}";
+
+/// The entity category of the buttons for maintenance.
+const CONFIG: &str = "config";
 
 /// The labels of the charge options that Home Assistant shows, in the order
 /// of [`CHARGE_OPTIONS`](super::CHARGE_OPTIONS).
@@ -107,6 +132,7 @@ pub fn payload(settings: &Settings, firmware: &Firmware) -> Vec<u8> {
     let id = settings.unique_id();
     let status_topic = settings.status_topic();
     let state_topic = settings.state_topic();
+    let button_topic = settings.set_topic(BUTTON_SET);
     let mac = mac_text(firmware.mac);
     let config = Config {
         dev: Device {
@@ -121,23 +147,51 @@ pub fn payload(settings: &Settings, firmware: &Firmware) -> Vec<u8> {
             name: ORIGIN,
             sw: &firmware.version,
         },
-        cmps: components(&id, &status_topic, &state_topic),
+        cmps: components(&Make {
+            id: &id,
+            status_topic: &status_topic,
+            state_topic: &state_topic,
+            button_topic: &button_topic,
+        }),
     };
     // The fields are text, and the writer is a `Vec`, so the serialization
     // cannot fail.
     serde_json::to_vec(&config).expect("a payload of text serializes")
 }
 
-/// Returns the components of the device with the unique id `id`.
-fn components<'a>(id: &'a str, status_topic: &'a str, state_topic: &'a str) -> Components<'a> {
-    let make = Make {
-        id,
-        status_topic,
-        state_topic,
-    };
+/// Returns the components of the device.
+fn components<'a>(make: &Make<'a>) -> Components<'a> {
     Components {
-        power: power_components(&make),
-        diagnostics: diagnostic_components(&make),
+        power: power_components(make),
+        diagnostics: diagnostic_components(make),
+        buttons: button_components(make),
+    }
+}
+
+/// Returns the buttons, in the order of [`Button::ALL`].
+fn button_components<'a>(make: &Make<'a>) -> ButtonComponents<'a> {
+    ButtonComponents {
+        sleep: SleepButton {
+            p: "button",
+            name: "Sleep now",
+            uniq_id: make.unique(Button::Sleep.payload()),
+            ic: "mdi:sleep",
+            cmd_t: make.button_topic,
+            pl_prs: Button::Sleep.payload(),
+            avty: [
+                Availability {
+                    t: make.status_topic,
+                    val_tpl: AVAILABLE_WHILE_ONLINE,
+                },
+                Availability {
+                    t: make.state_topic,
+                    val_tpl: AVAILABLE_ON_BATTERY,
+                },
+            ],
+            avty_mode: "all",
+        },
+        restart: make.button(Button::Restart, "Restart", Some("restart"), None),
+        refresh: make.button(Button::Refresh, "Full refresh", None, Some("mdi:refresh")),
     }
 }
 
@@ -150,7 +204,12 @@ fn power_components<'a>(make: &Make<'a>) -> PowerComponents<'a> {
             uniq_id: make.unique("status"),
             dev_cla: "enum",
             ic: "mdi:tablet-dashboard",
-            ops: [STATUS_ONLINE, STATUS_ASLEEP, STATUS_OFFLINE],
+            ops: [
+                STATUS_ONLINE,
+                STATUS_ASLEEP,
+                STATUS_OFFLINE,
+                STATUS_RESTARTING,
+            ],
             stat_t: make.status_topic,
         },
         battery: make.measurement(("battery", "Battery", "battery", None, "%"), None),
@@ -224,14 +283,15 @@ fn diagnostic_components<'a>(make: &Make<'a>) -> DiagnosticComponents<'a> {
     }
 }
 
-/// Makes the components of one device. Each component except the status
-/// reads its key of the state topic, and is available unless the status
-/// is `offline`.
+/// Makes the components of one device. Each sensor except the status
+/// reads its key of the state topic, and is available unless the status is
+/// `offline`. Each button publishes on the button topic.
 struct Make<'a> {
     /// The unique id of the device.
     id: &'a str,
     status_topic: &'a str,
     state_topic: &'a str,
+    button_topic: &'a str,
 }
 
 /// The key, the name, the device class, the icon and the unit of a
@@ -318,6 +378,29 @@ impl<'a> Make<'a> {
         }
     }
 
+    /// Returns a button for maintenance, in the entity category `config`,
+    /// that is available only while the status is `online`.
+    fn button(
+        &self,
+        button: Button,
+        name: &'static str,
+        dev_cla: Option<&'static str>,
+        ic: Option<&'static str>,
+    ) -> ButtonComponent<'a> {
+        ButtonComponent {
+            p: "button",
+            name,
+            uniq_id: self.unique(button.payload()),
+            dev_cla,
+            ic,
+            ent_cat: CONFIG,
+            cmd_t: self.button_topic,
+            pl_prs: button.payload(),
+            avty_t: self.status_topic,
+            avty_tpl: AVAILABLE_WHILE_ONLINE,
+        }
+    }
+
     /// Returns a diagnostic enum sensor with the labels `ops` and the value
     /// template `val_tpl` that maps the wire values to them.
     fn choice(
@@ -366,7 +449,7 @@ struct Origin<'a> {
     sw: &'a str,
 }
 
-/// The components, in the order of the payload. The two groups are one
+/// The components, in the order of the payload. The three groups are one
 /// map in the JSON.
 #[derive(Serialize)]
 struct Components<'a> {
@@ -374,6 +457,53 @@ struct Components<'a> {
     power: PowerComponents<'a>,
     #[serde(flatten)]
     diagnostics: DiagnosticComponents<'a>,
+    #[serde(flatten)]
+    buttons: ButtonComponents<'a>,
+}
+
+#[derive(Serialize)]
+struct ButtonComponents<'a> {
+    sleep: SleepButton<'a>,
+    restart: ButtonComponent<'a>,
+    refresh: ButtonComponent<'a>,
+}
+
+/// The Sleep now button. It has two availabilities, and both must be
+/// `online`.
+#[derive(Serialize)]
+struct SleepButton<'a> {
+    p: &'static str,
+    name: &'static str,
+    uniq_id: String,
+    ic: &'static str,
+    cmd_t: &'a str,
+    pl_prs: &'static str,
+    avty: [Availability<'a>; 2],
+    avty_mode: &'static str,
+}
+
+/// One availability of a component: a topic and its template.
+#[derive(Serialize)]
+struct Availability<'a> {
+    t: &'a str,
+    val_tpl: &'static str,
+}
+
+/// A button for maintenance.
+#[derive(Serialize)]
+struct ButtonComponent<'a> {
+    p: &'static str,
+    name: &'static str,
+    uniq_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dev_cla: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ic: Option<&'static str>,
+    ent_cat: &'static str,
+    cmd_t: &'a str,
+    pl_prs: &'static str,
+    avty_t: &'a str,
+    avty_tpl: &'static str,
 }
 
 #[derive(Serialize)]
@@ -406,7 +536,7 @@ struct Status<'a> {
     uniq_id: String,
     dev_cla: &'static str,
     ic: &'static str,
-    ops: [&'static str; 3],
+    ops: [&'static str; 4],
     stat_t: &'a str,
 }
 

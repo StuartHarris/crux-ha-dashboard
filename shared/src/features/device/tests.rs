@@ -9,9 +9,11 @@ use core::time::Duration;
 
 use serde_json::{Value, json};
 
-use super::{BIRTH_ONLINE, BIRTH_TOPIC, IN_FLIGHT, STATE_MIN_INTERVAL, Snapshot, Wifi, discovery};
+use super::{
+    BIRTH_ONLINE, BIRTH_TOPIC, Button, IN_FLIGHT, STATE_MIN_INTERVAL, Snapshot, Wifi, discovery,
+};
 use crate::{
-    Charge, Event, PowerSource, Reading,
+    Charge, Event, PowerSource, Reading, Settings,
     capabilities::{
         log::{Area, Uptime},
         power::Wake,
@@ -62,7 +64,8 @@ const DISCOVERY_JSON: &str = concat!(
     r#""o":{"name":"crux-ha-dashboard","sw":"0.1.0+test"},"#,
     r#""cmps":{"#,
     r#""status":{"p":"sensor","name":"Status","uniq_id":"dashboard_hall_status","#,
-    r#""dev_cla":"enum","ic":"mdi:tablet-dashboard","ops":["online","asleep","offline"],"#,
+    r#""dev_cla":"enum","ic":"mdi:tablet-dashboard","#,
+    r#""ops":["online","asleep","offline","restarting"],"#,
     r#""stat_t":"dashboard/hall/status"},"#,
     r#""battery":{"p":"sensor","name":"Battery","uniq_id":"dashboard_hall_battery","#,
     r#""dev_cla":"battery","unit_of_meas":"%","stat_cla":"measurement","#,
@@ -153,7 +156,24 @@ const DISCOVERY_JSON: &str = concat!(
     r#"| default(None) }}","#,
     r#""avty_t":"dashboard/hall/status","#,
     r#""avty_tpl":"{{ 'offline' if value == 'offline' else 'online' }}","#,
-    r#""ent_cat":"diagnostic"}}}"#,
+    r#""ent_cat":"diagnostic"},"#,
+    r#""sleep":{"p":"button","name":"Sleep now","uniq_id":"dashboard_hall_sleep","#,
+    r#""ic":"mdi:sleep","cmd_t":"dashboard/hall/set/button","pl_prs":"sleep","#,
+    r#""avty":[{"t":"dashboard/hall/status","#,
+    r#""val_tpl":"{{ 'online' if value == 'online' else 'offline' }}"},"#,
+    r#"{"t":"dashboard/hall/state","#,
+    r#""val_tpl":"{{ 'online' if value_json.stand == 'OFF' else 'offline' }}"}],"#,
+    r#""avty_mode":"all"},"#,
+    r#""restart":{"p":"button","name":"Restart","uniq_id":"dashboard_hall_restart","#,
+    r#""dev_cla":"restart","ent_cat":"config","#,
+    r#""cmd_t":"dashboard/hall/set/button","pl_prs":"restart","#,
+    r#""avty_t":"dashboard/hall/status","#,
+    r#""avty_tpl":"{{ 'online' if value == 'online' else 'offline' }}"},"#,
+    r#""refresh":{"p":"button","name":"Full refresh","uniq_id":"dashboard_hall_refresh","#,
+    r#""ic":"mdi:refresh","ent_cat":"config","#,
+    r#""cmd_t":"dashboard/hall/set/button","pl_prs":"refresh","#,
+    r#""avty_t":"dashboard/hall/status","#,
+    r#""avty_tpl":"{{ 'online' if value == 'online' else 'offline' }}"}}}"#,
 );
 
 // The payloads.
@@ -166,9 +186,16 @@ fn the_discovery_message_has_the_exact_json() {
 }
 
 #[test]
-fn the_discovery_message_is_json_with_the_keys_and_under_6_kib() {
+fn the_discovery_message_is_json_with_the_keys_and_under_8_kib() {
     let payload = discovery::payload(&settings(), &firmware());
-    assert!(payload.len() < 6 * 1024, "{} bytes", payload.len());
+    assert!(payload.len() < 8 * 1024, "{} bytes", payload.len());
+    // A device id of 16 characters has room too.
+    let long = Settings {
+        device_id: "living_room_wall".into(),
+        ..settings()
+    };
+    let long = discovery::payload(&long, &firmware());
+    assert!(long.len() < 8 * 1024, "{} bytes", long.len());
     // The discovery and the state go in one write, and each write has at
     // most `MAX_OUTGOING` bytes. The two messages use about a third.
     let state = snapshot(Some(100), true, CHARGING).to_json();
@@ -192,7 +219,7 @@ fn the_discovery_message_is_json_with_the_keys_and_under_6_kib() {
     );
 
     let components = config["cmps"].as_object().expect("components");
-    assert_eq!(components.len(), 15);
+    assert_eq!(components.len(), 18);
     for (key, platform, class) in [
         ("status", "sensor", Some("enum")),
         ("battery", "sensor", Some("battery")),
@@ -209,6 +236,9 @@ fn the_discovery_message_is_json_with_the_keys_and_under_6_kib() {
         ("restarts", "sensor", None),
         ("reset", "sensor", Some("enum")),
         ("wake", "sensor", Some("enum")),
+        ("sleep", "button", None),
+        ("restart", "button", Some("restart")),
+        ("refresh", "button", None),
     ] {
         let component = &components[key];
         assert_eq!(component["p"], platform, "{key}");
@@ -220,7 +250,10 @@ fn the_discovery_message_is_json_with_the_keys_and_under_6_kib() {
         assert_eq!(component["uniq_id"], format!("dashboard_hall_{key}"));
     }
     let status = &components["status"];
-    assert_eq!(status["ops"], json!(["online", "asleep", "offline"]));
+    assert_eq!(
+        status["ops"],
+        json!(["online", "asleep", "offline", "restarting"])
+    );
     assert_eq!(status["stat_t"], STATUS);
     assert!(
         status.get("avty_t").is_none(),
@@ -253,6 +286,110 @@ fn the_discovery_message_is_json_with_the_keys_and_under_6_kib() {
             "{{ 'offline' if value == 'offline' else 'online' }}"
         );
     }
+}
+
+#[test]
+fn discovery_has_three_buttons_with_the_command_topic_and_payloads() {
+    let payload = discovery::payload(&settings(), &firmware());
+    let config: Value = serde_json::from_slice(&payload).expect("JSON");
+    let components = &config["cmps"];
+    for (button, name, category, icon) in [
+        (Button::Sleep, "Sleep now", None, Some("mdi:sleep")),
+        (Button::Restart, "Restart", Some("config"), None),
+        (
+            Button::Refresh,
+            "Full refresh",
+            Some("config"),
+            Some("mdi:refresh"),
+        ),
+    ] {
+        let key = button.payload();
+        let component = &components[key];
+        assert_eq!(component["p"], "button", "{key}");
+        assert_eq!(component["name"], name, "{key}");
+        assert_eq!(component["cmd_t"], "dashboard/hall/set/button", "{key}");
+        assert_eq!(component["pl_prs"], key, "{key}");
+        assert_eq!(
+            component.get("ent_cat").and_then(Value::as_str),
+            category,
+            "{key}"
+        );
+        assert_eq!(component.get("ic").and_then(Value::as_str), icon, "{key}");
+        // A button has no state.
+        assert!(component.get("stat_t").is_none(), "{key}");
+    }
+}
+
+#[test]
+fn the_buttons_are_available_only_while_online() {
+    let payload = discovery::payload(&settings(), &firmware());
+    let config: Value = serde_json::from_slice(&payload).expect("JSON");
+    let components = &config["cmps"];
+    let online = "{{ 'online' if value == 'online' else 'offline' }}";
+    for key in ["restart", "refresh"] {
+        assert_eq!(components[key]["avty_t"], STATUS, "{key}");
+        assert_eq!(components[key]["avty_tpl"], online, "{key}");
+    }
+    // Sleep now needs the status `online` and the device on battery.
+    let sleep = &components["sleep"];
+    assert!(sleep.get("avty_t").is_none());
+    assert_eq!(sleep["avty_mode"], "all");
+    assert_eq!(
+        sleep["avty"],
+        json!([
+            {"t": STATUS, "val_tpl": online},
+            {"t": STATE, "val_tpl": "{{ 'online' if value_json.stand == 'OFF' else 'offline' }}"},
+        ])
+    );
+}
+
+/// Gives the result of an availability template of the form
+/// `{{ 'a' if value == 'b' else 'c' }}` for the status `value`.
+fn availability(template: &str, value: &str) -> String {
+    let parts: Vec<&str> = template.split('\'').collect();
+    assert_eq!(parts.len(), 7, "{template}");
+    assert_eq!(
+        [parts[0], parts[2], parts[4], parts[6]],
+        ["{{ ", " if value == ", " else ", " }}"],
+        "{template}"
+    );
+    let (then, test, otherwise) = (parts[1], parts[3], parts[5]);
+    String::from(if value == test { then } else { otherwise })
+}
+
+#[test]
+fn each_status_gives_the_availability_of_the_sensors_and_the_buttons() {
+    let payload = discovery::payload(&settings(), &firmware());
+    let config: Value = serde_json::from_slice(&payload).expect("JSON");
+    let components = &config["cmps"];
+    let sensor = components["battery"]["avty_tpl"]
+        .as_str()
+        .expect("template");
+    let button = components["restart"]["avty_tpl"]
+        .as_str()
+        .expect("template");
+    let options = components["status"]["ops"].as_array().expect("options");
+    let mut results = Vec::new();
+    for status in options {
+        let status = status.as_str().expect("option");
+        results.push((
+            status,
+            availability(sensor, status),
+            availability(button, status),
+        ));
+    }
+    // The sensors keep their last value unless the device is offline. The
+    // buttons work only while it is online.
+    let expected = [
+        ("online", "online", "online"),
+        ("asleep", "online", "offline"),
+        ("offline", "offline", "offline"),
+        ("restarting", "online", "offline"),
+    ];
+    assert_eq!(
+        results,
+        expected.map(|(status, sensor, button)| (status, sensor.into(), button.into()))
+    );
 }
 
 #[test]

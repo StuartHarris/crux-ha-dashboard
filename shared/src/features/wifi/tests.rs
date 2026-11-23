@@ -23,7 +23,8 @@ use crate::{
     },
     fake::radio::{HALL, IP, LANDING, STRONG_RSSI},
     features::{
-        connection::{RECONNECT_MAX, RECONNECT_MIN},
+        connection::{self, RECONNECT_MAX, RECONNECT_MIN},
+        device,
         power::{self, IDLE_TIMEOUT, SleepStep},
         wifi::{
             ADDRESS_TIMEOUT, JOIN_TIMEOUT, LEAVE_TIMEOUT, Linked, OFF_TIMEOUT, Phase, SCAN_TIMEOUT,
@@ -691,6 +692,9 @@ fn a_stuck_driver_restarts_the_chip_after_3_joins_with_no_address() {
     );
     assert_eq!(shell.restarts, ["no address after 3 joins"]);
     assert_eq!(shell.model.wifi.phase, Phase::Restarting);
+    // The connection has no stream at the restart, so the restart needs
+    // no clean close: the session before it already failed.
+    assert!(!shell.model.connection.has_stream());
     assert_eq!(
         shell.take_logs(),
         [
@@ -1746,6 +1750,31 @@ fn a_scan_that_finds_no_better_access_point_keeps_the_link_ready() {
     assert_eq!(shell.radio.associated, Some(HALL));
     // The link is ready, so a link request connects with no radio request.
     wifi::link(&mut shell.model).expect_no_effects();
+}
+
+/// A restart that Home Assistant asks for during a scan does not wait for
+/// the scan. After the core asked for the restart, the answer of the scan
+/// changes nothing.
+#[test]
+fn the_chip_restart_ignores_the_answer_of_a_scan_that_ran() {
+    let mut shell = scanning_with_no_better_access_point();
+    shell.take_logs();
+    shell.send(Event::Device(device::Event::Pressed(
+        device::Button::Restart,
+    )));
+    assert_eq!(shell.restarts, [connection::RESTART_REASON]);
+    assert_eq!(shell.model.wifi.phase, Phase::Restarting);
+    assert_eq!(shell.held_radio(), 1);
+
+    shell.answer_radio();
+    assert_eq!(shell.model.wifi.phase, Phase::Restarting);
+    assert_eq!(shell.take_logs(), Vec::<String>::new());
+    let log = shell.take_log();
+    assert!(
+        !log.iter()
+            .any(|entry| entry.starts_with("Radio") && entry != "RadioRestart"),
+        "{log:?}"
+    );
 }
 
 #[test]

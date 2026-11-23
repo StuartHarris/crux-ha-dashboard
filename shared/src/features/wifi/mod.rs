@@ -535,7 +535,7 @@ pub fn leased(radio: u32, lease: Lease, model: &mut Model) -> Cmd {
             let count = counted(state.health);
             if recovery == Recovery::Restart {
                 let reason = format!("no address after {RESTART_AFTER} joins");
-                return count.and(restart(reason, model));
+                return count.and(restart_chip(Area::Wifi, reason, model));
             }
             return count.and(no_address(target, access_point, model));
         }
@@ -557,7 +557,7 @@ pub fn leased(radio: u32, lease: Lease, model: &mut Model) -> Cmd {
         lines = lines.and(counted(state.health));
         if recovery == Recovery::Restart {
             let reason = format!("a stale address after {RESTART_AFTER} joins");
-            return lines.and(restart(reason, model));
+            return lines.and(restart_chip(Area::Wifi, reason, model));
         }
     } else {
         state.health.leased();
@@ -880,10 +880,17 @@ fn leave(then: Then, model: &mut Model) -> Cmd {
         .and(limit(radio, LEAVE_TIMEOUT, model))
 }
 
-/// Asks the shell to restart the chip, for `reason`.
-fn restart(reason: String, model: &mut Model) -> Cmd {
+/// Asks the shell to restart the chip, for `reason`. `area` is the part of
+/// the core that asks, for the log of the shell.
+///
+/// The phase becomes `Restarting`, so the core does no more radio work. It
+/// ignores each late answer and time limit of a radio request. The
+/// connection calls this function after a clean close for a restart that
+/// Home Assistant asked for. Refer to
+/// [`connection::close_for_restart`].
+pub(crate) fn restart_chip(area: Area, reason: String, model: &mut Model) -> Cmd {
     model.wifi.phase = Phase::Restarting;
-    Radio::restart(reason).build()
+    Radio::restart(area, reason).build()
 }
 
 /// Takes a new id for a radio request, and clears the time limit of the

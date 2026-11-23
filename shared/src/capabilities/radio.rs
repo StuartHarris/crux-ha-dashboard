@@ -41,6 +41,8 @@ use crux_core::{
     macros::Operation,
 };
 
+use super::log::Area;
+
 /// An access point: its BSSID and its channel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AccessPoint {
@@ -241,12 +243,16 @@ pub struct Off {
 /// Restarts the chip.
 ///
 /// The core sends this notification when the radio driver does not
-/// recover. The shell writes `reason` to its log, waits 200 ms for the log
-/// to go, and restarts the chip. A shell that cannot restart the chip
-/// starts a new core.
+/// recover, and when Home Assistant asks for a restart. The shell writes
+/// the warning `{area}: restart the chip: {reason}` to its log, waits
+/// 200 ms for the log to go, and restarts the chip. A shell that cannot
+/// restart the chip starts a new core.
 #[derive(Operation, Clone, Debug, PartialEq, Eq)]
 #[operation(notify)]
 pub struct Restart {
+    /// The part of the core that asks for the restart, for the log of the
+    /// shell.
+    pub area: Area,
     /// Why the core restarts the chip, for the log of the shell.
     pub reason: String,
 }
@@ -337,17 +343,18 @@ impl Radio {
         Command::request_from_shell(Off { radio })
     }
 
-    /// Restarts the chip, and gives `reason` to the log of the shell. Refer
-    /// to [`Restart`].
+    /// Restarts the chip, and gives `area` and `reason` to the log of the
+    /// shell. Refer to [`Restart`].
     #[must_use]
     pub fn restart<Effect, Event>(
+        area: Area,
         reason: String,
     ) -> NotificationBuilder<Effect, Event, impl Future<Output = ()>>
     where
         Effect: From<Request<Restart>> + Send + 'static,
         Event: Send + 'static,
     {
-        super::notify(Restart { reason })
+        super::notify(Restart { area, reason })
     }
 }
 
@@ -362,8 +369,8 @@ mod tests {
     use crux_core::{Command, Request};
 
     use super::{
-        AccessPoint, Address, Join, Joined, Lease, Leave, Off, Radio, Restart, Scan, Scanned, Seen,
-        StopScan, Target, ip_text, mac_text, signal,
+        AccessPoint, Address, Area, Join, Joined, Lease, Leave, Off, Radio, Restart, Scan, Scanned,
+        Seen, StopScan, Target, ip_text, mac_text, signal,
     };
 
     const HALL: AccessPoint = AccessPoint {
@@ -539,15 +546,16 @@ mod tests {
     }
 
     #[test]
-    fn restart_is_a_notification_with_its_reason() {
+    fn restart_is_a_notification_with_its_area_and_reason() {
         let mut command: Command<Effect, Event> =
-            Radio::restart(String::from("no address after 3 joins")).build();
+            Radio::restart(Area::Wifi, String::from("no address after 3 joins")).build();
         let Effect::Restart(request) = effect(&mut command) else {
             panic!("a Restart notification");
         };
         assert_eq!(
             request.operation,
             Restart {
+                area: Area::Wifi,
                 reason: "no address after 3 joins".into(),
             }
         );

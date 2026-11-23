@@ -302,7 +302,7 @@ fn log_job(token: u32, op: &RadioOp) {
 /// Writes the reason to the log, waits [`LOG_DRAIN`] for the log to go, and
 /// restarts the chip.
 async fn restart_chip(restart: &Restart) -> ! {
-    log::warn!("wifi: restart the chip: {}", restart.reason);
+    log::warn!("{}: restart the chip: {}", restart.area, restart.reason);
     Timer::after(LOG_DRAIN).await;
     software_reset()
 }

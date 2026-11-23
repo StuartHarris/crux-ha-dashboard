@@ -21,15 +21,34 @@
 //! 1. `Offline`: no stream is open. A reconnect timer can run.
 //! 2. `Starting`: the stream opens, and the session waits for its CONNACK.
 //! 3. `Up`: the broker accepted the connection.
-//! 4. `Closing`: a DISCONNECT packet waits or is in flight, for a sleep or
-//!    for a change of access point.
+//! 4. `Closing`: a DISCONNECT packet waits or is in flight, for a sleep,
+//!    for a change of access point or for a restart of the chip.
 //! 5. `Draining`: the session ended, and the `Close` request for its stream
 //!    waits for its answer. Then the phase is `Offline` again.
 //!
 //! A sleep waits for the close of the stream, and then gets
 //! [`power::Event::Offline`]. With no stream, the sleep gets it at once.
-//! Refer to [`go_offline`]. The view shows that the core is online only in
-//! the `Up` phase. Refer to [`State::link`].
+//! Refer to [`go_offline`]. A restart that Home Assistant asks for
+//! publishes `restarting` if the connection is up. It waits for the close
+//! too, and then restarts the chip. Refer to [`close_for_restart`]. The
+//! view shows that the core is online only in the `Up` phase. Refer to
+//! [`State::link`].
+//!
+//! # What the core does after a close
+//!
+//! `Closing` holds a [`Then`]: the core started the close, so it always has
+//! a reason. `Draining` holds an `Option<Then>`: `None` after a failure,
+//! while the reconnect timer runs. A request changes the value in this way:
+//!
+//! | Now | A wake, a tap or a reconnect ([`go_online`]) | A link ([`link_up`]) | A sleep ([`go_offline`]) | A restart ([`close_for_restart`]) |
+//! | --- | --- | --- | --- | --- |
+//! | `None` (only `Draining`) | `Connect` | `Connect` | `Sleep` | `Restart` |
+//! | `Connect` | `Connect` | `Connect` | `Sleep` | `Restart` |
+//! | `Sleep` | `Connect` (the wake forgets the sleep) | `Sleep` | the new `Sleep` | `Restart` |
+//! | `Restart` | `Restart` | `Restart` | `Restart` (the sleep stalls) | `Restart` |
+//!
+//! A restart wins over every other request. A wake forgets a sleep, and a
+//! new sleep replaces a sleep or a connect.
 //!
 //! The core writes a line to the log of the shell
 //! ([`crate::capabilities::log`]) for each decision that is not usual, with
@@ -160,6 +179,9 @@ pub const STATUS_ONLINE: &str = "online";
 pub const STATUS_ASLEEP: &str = "asleep";
 /// The status payload that the broker publishes if the connection stops.
 pub const STATUS_OFFLINE: &str = "offline";
+/// The status payload before the dashboard disconnects to restart the chip.
+/// Refer to [`close_for_restart`].
+pub const STATUS_RESTARTING: &str = "restarting";
 
 /// The state of the MQTT connection, as the view shows it. Refer to
 /// [`State::link`].
@@ -229,31 +251,34 @@ enum Phase {
         /// The subscribe job of the connection.
         subscribe: SubscribeId,
     },
-    /// A DISCONNECT packet waits or is in flight, for a sleep or for a
-    /// change of access point. The core drops the messages.
+    /// A DISCONNECT packet waits or is in flight, for a sleep, for a
+    /// change of access point or for a restart of the chip. The core drops
+    /// the messages.
     ///
-    /// When the session ends, the phase is `Draining` with the same
-    /// [`After`].
+    /// When the session ends, the phase is `Draining`. Refer to [`ended`]
+    /// for the [`Then`] that it gets.
     Closing {
         /// The session of the connection.
         live: Live,
-        /// What the core does after the close.
-        after: After,
+        /// What the core does after the close. The core started the close,
+        /// so the close always has a reason.
+        then: Then,
     },
     /// The session ended, and the `Close` request for its stream waits for
     /// its answer. The core opens no stream and asks for no link in this
     /// phase. Refer to [`connect`].
     ///
     /// The answer, or the end of [`CLOSE_TIMEOUT`], makes the phase
-    /// `Offline` and does the steps of `after`. Refer to [`stream_closed`].
+    /// `Offline` and does `then`. Refer to [`stream_closed`].
     Draining {
         /// The timer of [`CLOSE_TIMEOUT`]. Its id is the id of the
         /// connection of the `Close` request.
         close: Running,
         /// The reconnect timer that runs.
         retry: Slot,
-        /// What the core does after the answer.
-        after: After,
+        /// What the core does after the answer. `None`: nothing, because
+        /// the session failed and the reconnect timer runs.
+        then: Option<Then>,
     },
 }
 
@@ -292,7 +317,7 @@ impl Phase {
             Self::Draining {
                 close,
                 mut retry,
-                after: _,
+                then: _,
             } => {
                 close.clear();
                 retry.stop();
@@ -301,15 +326,28 @@ impl Phase {
     }
 }
 
-/// What the core does after the close of a stream: the waiter of a sleep,
-/// and the intent to connect again.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct After {
-    /// The sleep that waits for the close. The answer to the `Close`
-    /// request sends [`power::Event::Offline`] for this sleep.
-    sleep: Option<u32>,
-    /// The core connects again after the close.
-    connect: bool,
+/// What the core does after the close of a stream. Refer to the table in
+/// the [module docs](self).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Then {
+    /// Connect again at once.
+    Connect,
+    /// Send [`power::Event::Offline`] for this sleep.
+    Sleep(u32),
+    /// Restart the chip. Refer to [`close_for_restart`].
+    Restart,
+}
+
+impl Then {
+    /// The core wants the connection again, after a wake, a tap or a
+    /// reconnect timer. A wake forgets the sleep that waits. A restart
+    /// stays.
+    const fn connect(self) -> Self {
+        match self {
+            Self::Connect | Self::Sleep(_) => Self::Connect,
+            Self::Restart => Self::Restart,
+        }
+    }
 }
 
 impl State {
@@ -329,9 +367,36 @@ impl State {
     #[must_use]
     pub const fn sleep_waiter(&self) -> Option<u32> {
         match self.phase {
-            Phase::Closing { after, .. } | Phase::Draining { after, .. } => after.sleep,
-            Phase::Offline { .. } | Phase::Starting(_) | Phase::Up { .. } => None,
+            Phase::Closing {
+                then: Then::Sleep(sleep),
+                ..
+            }
+            | Phase::Draining {
+                then: Some(Then::Sleep(sleep)),
+                ..
+            } => Some(sleep),
+            Phase::Offline { .. }
+            | Phase::Starting(_)
+            | Phase::Up { .. }
+            | Phase::Closing { .. }
+            | Phase::Draining { .. } => None,
         }
+    }
+
+    /// Returns `true` if a restart of the chip waits for the close of the
+    /// stream. Refer to [`close_for_restart`].
+    #[must_use]
+    pub const fn restart_waits(&self) -> bool {
+        matches!(
+            self.phase,
+            Phase::Closing {
+                then: Then::Restart,
+                ..
+            } | Phase::Draining {
+                then: Some(Then::Restart),
+                ..
+            }
+        )
     }
 
     /// Returns the session, if a stream is open.
@@ -476,7 +541,7 @@ pub fn reset(model: &mut Model) {
 
 /// Starts a new online cycle after a wake or a move to the stand. The next
 /// failure waits the shortest time again.
-pub const fn restart(model: &mut Model) {
+pub const fn reset_backoff(model: &mut Model) {
     model.connection.backoff = RECONNECT_MIN;
 }
 
@@ -490,10 +555,10 @@ pub const fn restart(model: &mut Model) {
 /// Refer to [`stream_closed`].
 ///
 /// If the device wakes during the close for a sleep, the core forgets the
-/// sleep and connects again after the close. If the device wakes before the
-/// close starts, the session is still up. The core then sends the lines of
-/// the log that wait ([`pump`]), because the log publishes nothing during a
-/// sleep.
+/// sleep and connects again after the close. If a restart waits for the
+/// close, the restart stays. If the device wakes before the close starts,
+/// the session is still up. The core then sends the lines of the log that
+/// wait ([`pump`]), because the log publishes nothing during a sleep.
 pub fn go_online(model: &mut Model) -> Cmd {
     // `wants_online` is false while the device sleeps. Thus the core can
     // forget a sleep that waits for a close below.
@@ -502,11 +567,12 @@ pub fn go_online(model: &mut Model) -> Cmd {
     }
     match &mut model.connection.phase {
         Phase::Offline { .. } => wifi::link(model),
-        Phase::Closing { after, .. } | Phase::Draining { after, .. } => {
-            *after = After {
-                sleep: None,
-                connect: true,
-            };
+        Phase::Closing { then, .. } => {
+            *then = then.connect();
+            Cmd::done()
+        }
+        Phase::Draining { then, .. } => {
+            *then = Some(then.map_or(Then::Connect, Then::connect));
             Cmd::done()
         }
         Phase::Starting(_) => Cmd::done(),
@@ -554,10 +620,7 @@ pub fn close_for_roam(model: &mut Model) -> Cmd {
             live.session.disconnect();
             state.phase = Phase::Closing {
                 live,
-                after: After {
-                    sleep: None,
-                    connect: true,
-                },
+                then: Then::Connect,
             };
             pump(model)
         }
@@ -588,7 +651,15 @@ pub fn close_for_roam(model: &mut Model) -> Cmd {
 /// The core drops the service calls in the outbox and removes each mark,
 /// also the mark of a call that went out. Refer to
 /// [`pending::end_for_sleep`]. The device sleeps, so the core does not draw.
+///
+/// If a restart waits for the close, the restart wins, and the core does
+/// nothing. It sends no `Offline`, so the sleep stalls until the chip
+/// restarts. The outbox and the marks stay: the restart clears them, and a
+/// wake before the restart finds them unchanged.
 pub fn go_offline(sleep: u32, model: &mut Model) -> Cmd {
+    if model.connection.restart_waits() {
+        return Cmd::done();
+    }
     model.connection.outbox.clear();
     pending::end_for_sleep(model);
     let status = model.startup.settings().map(|settings| Publish {
@@ -598,10 +669,6 @@ pub fn go_offline(sleep: u32, model: &mut Model) -> Cmd {
         retain: true,
     });
     let state = &mut model.connection;
-    let after = After {
-        sleep: Some(sleep),
-        connect: false,
-    };
     let (mut live, up) = match mem::take(&mut state.phase) {
         Phase::Offline { mut retry } => {
             retry.stop();
@@ -611,17 +678,19 @@ pub fn go_offline(sleep: u32, model: &mut Model) -> Cmd {
         Phase::Draining {
             close,
             mut retry,
-            after: _,
+            then: _,
         } => {
             retry.stop();
             state.phase = Phase::Draining {
                 close,
                 retry,
-                after,
+                // The sleep replaces each other value. A restart returned
+                // above.
+                then: Some(Then::Sleep(sleep)),
             };
             return Cmd::done();
         }
-        Phase::Starting(live) | Phase::Closing { live, after: _ } => (live, false),
+        Phase::Starting(live) | Phase::Closing { live, .. } => (live, false),
         Phase::Up { live, subscribe: _ } => (live, true),
     };
     if up && let Some(status) = status {
@@ -630,8 +699,87 @@ pub fn go_offline(sleep: u32, model: &mut Model) -> Cmd {
         let _ = live.session.publish(status);
     }
     live.session.disconnect();
-    state.phase = Phase::Closing { live, after };
+    state.phase = Phase::Closing {
+        live,
+        then: Then::Sleep(sleep),
+    };
     pump(model)
+}
+
+/// The reason of a restart that Home Assistant asks for, for the log of the
+/// shell. Refer to [`close_for_restart`].
+pub const RESTART_REASON: &str = "Home Assistant asked";
+
+/// Closes the connection cleanly, and then restarts the chip, because Home
+/// Assistant asked. Refer to [`wifi::restart_chip`].
+///
+/// If the connection is up, the core publishes `restarting` on the status
+/// topic (retained, `QoS` 1), and then sends a DISCONNECT packet. The end
+/// is clean, so the broker does not publish the last will. If the chip
+/// does not start again, Home Assistant then shows `restarting`, not
+/// `online`. If the session refuses the publish, the restart goes on. The
+/// answer to the `Close` request, or the end of [`CLOSE_TIMEOUT`], restarts
+/// the chip.
+///
+/// - If the connection starts, the session is not up. It ends at once,
+///   with no publish and no DISCONNECT packet.
+/// - If the stream already closes, the restart replaces what the core does
+///   after the close. The core publishes nothing, because the DISCONNECT
+///   packet is already on its way.
+/// - With no stream, the chip restarts at once, with no publish.
+///
+/// While the restart waits, it wins over a wake, a tap, a reconnect and a
+/// sleep. Refer to the table in the [module docs](self).
+pub fn close_for_restart(model: &mut Model) -> Cmd {
+    let status = model.startup.settings().map(|settings| Publish {
+        topic: settings.status_topic(),
+        payload: STATUS_RESTARTING.into(),
+        qos: Qos::AtLeastOnce,
+        retain: true,
+    });
+    let state = &mut model.connection;
+    let up = matches!(state.phase, Phase::Up { .. });
+    match mem::take(&mut state.phase) {
+        Phase::Offline { mut retry } => {
+            retry.stop();
+            state.phase = Phase::Offline { retry };
+            restart_chip(model)
+        }
+        Phase::Starting(mut live)
+        | Phase::Up { mut live, .. }
+        | Phase::Closing { mut live, .. } => {
+            if up && let Some(status) = status {
+                // A publish that the session refuses cannot stop the
+                // restart, so the core drops it.
+                let _ = live.session.publish(status);
+            }
+            // A session that already closes ignores this.
+            live.session.disconnect();
+            state.phase = Phase::Closing {
+                live,
+                then: Then::Restart,
+            };
+            pump(model)
+        }
+        Phase::Draining {
+            close,
+            mut retry,
+            then: _,
+        } => {
+            retry.stop();
+            state.phase = Phase::Draining {
+                close,
+                retry,
+                then: Some(Then::Restart),
+            };
+            Cmd::done()
+        }
+    }
+}
+
+/// Asks the shell to restart the chip, for [`RESTART_REASON`].
+fn restart_chip(model: &mut Model) -> Cmd {
+    wifi::restart_chip(Area::Device, RESTART_REASON.into(), model)
 }
 
 /// Publishes a service call now, or keeps it until the core connects.
@@ -757,8 +905,11 @@ fn connect(model: &mut Model) -> Cmd {
     let state = &mut model.connection;
     match &mut state.phase {
         Phase::Offline { .. } => {}
-        Phase::Draining { after, .. } => {
-            after.connect = true;
+        Phase::Draining { then, .. } => {
+            // A sleep or a restart that waits stays.
+            if then.is_none() {
+                *then = Some(Then::Connect);
+            }
             return Cmd::done();
         }
         Phase::Starting(_) | Phase::Up { .. } | Phase::Closing { .. } => return Cmd::done(),
@@ -847,33 +998,31 @@ pub fn session_timer(id: u32, timer: Timer, model: &mut Model) -> Cmd {
 /// no `Close` request for `id` waits.
 ///
 /// The phase becomes `Offline`, and a reconnect timer that runs continues.
-/// If a sleep waits for the close, the core sends [`power::Event::Offline`]
-/// for the sleep. If the core wanted to connect while the `Close` request
-/// waited, it connects now. Refer to [`connect`].
+/// Then the core does what waited for the close:
+///
+/// - For a sleep, the core sends [`power::Event::Offline`].
+/// - If the core wanted to connect while the `Close` request waited, it
+///   connects now. Refer to [`connect`].
+/// - For a restart, the core asks the shell to restart the chip. Refer to
+///   [`close_for_restart`].
 pub fn stream_closed(id: u32, model: &mut Model) -> Cmd {
     let state = &mut model.connection;
-    let after = match mem::take(&mut state.phase) {
-        Phase::Draining {
-            close,
-            retry,
-            after,
-        } if close.id() == id => {
+    let then = match mem::take(&mut state.phase) {
+        Phase::Draining { close, retry, then } if close.id() == id => {
             close.clear();
             state.phase = Phase::Offline { retry };
-            after
+            then
         }
         phase => {
             state.phase = phase;
             return Cmd::done();
         }
     };
-    let offline = after.sleep.map_or_else(Cmd::done, |sleep| {
-        Cmd::event(power::Event::Offline(sleep).into())
-    });
-    if after.connect {
-        offline.and(go_online(model))
-    } else {
-        offline
+    match then {
+        None => Cmd::done(),
+        Some(Then::Connect) => go_online(model),
+        Some(Then::Sleep(sleep)) => Cmd::event(power::Event::Offline(sleep).into()),
+        Some(Then::Restart) => restart_chip(model),
     }
 }
 
@@ -1065,8 +1214,9 @@ fn start_timer(id: u32, timer: Timer, after: Duration) -> (Cmd, TimerHandle) {
 /// The broker accepted the connection: publish the outbox and `online`,
 /// subscribe to all the topics, and draw.
 ///
-/// The topics are the topics of the entities, and then the birth message
-/// of Home Assistant ([`device::BIRTH_TOPIC`]). The device publishes go in
+/// The topics are the topics of the entities, then the birth message of
+/// Home Assistant ([`device::BIRTH_TOPIC`]), and then the `set` topics of
+/// the device (`dashboard/<id>/set/+`). The device publishes go in
 /// later writes. Refer to [`device::drain`].
 ///
 /// The service calls of the outbox go first, so a tap that waits for the
@@ -1085,6 +1235,7 @@ fn connected(model: &mut Model) -> Cmd {
         qos: Qos::AtLeastOnce,
         retain: true,
     };
+    let set_filter = settings.set_topic(device::ANY_SET);
     if !matches!(model.connection.phase, Phase::Starting(_)) {
         return Cmd::done();
     }
@@ -1093,6 +1244,7 @@ fn connected(model: &mut Model) -> Cmd {
     let marks = drain_outbox(model);
     let mut topics = entities::topics(model.pages);
     topics.push(device::BIRTH_TOPIC.into());
+    topics.push(set_filter);
     let state = &mut model.connection;
     match mem::take(&mut state.phase) {
         Phase::Starting(mut live) => {
@@ -1110,14 +1262,15 @@ fn connected(model: &mut Model) -> Cmd {
 }
 
 /// Handles a message from the broker on a subscribed topic. A birth
-/// message of Home Assistant goes to the device feature
-/// ([`device::route`]), and each other message to the entities.
+/// message of Home Assistant and a message on a `set` topic of the device go
+/// to the device feature ([`device::route`]). Each other message goes to the
+/// entities.
 fn on_message(message: &Message, model: &mut Model) -> Cmd {
     if model.connection.link() != Link::Up {
         return Cmd::done();
     }
-    if device::route(message, model) {
-        return Cmd::done();
+    if let Some(routed) = device::route(message, model) {
+        return routed;
     }
     let Some(topic_entity) = entities::entity_of(&message.topic) else {
         return Cmd::done();
@@ -1167,6 +1320,13 @@ fn subscribed(id: SubscribeId, outcome: SubscribeOutcome, model: &mut Model) -> 
 /// The session ended: close the stream, and connect again if the core wants
 /// a connection. The phase becomes `Draining`.
 ///
+/// | Before | End | `then` of `Draining` |
+/// | --- | --- | --- |
+/// | `Starting`, `Up` (always a failure) | failure | `None`, and the reconnect timer starts |
+/// | `Closing` with `Connect` | clean, while the core wants a connection | `Connect` |
+/// | `Closing` with `Connect` | failure, or while asleep | `None` |
+/// | `Closing` with `Sleep` or `Restart` | any | the same |
+///
 /// After a clean end, the core connects again without a wait. This happens
 /// after a close for a change of access point ([`close_for_roam`]), and if
 /// the device woke during the close for a sleep. The core gets the link
@@ -1177,6 +1337,11 @@ fn subscribed(id: SubscribeId, outcome: SubscribeOutcome, model: &mut Model) -> 
 /// [`connect`]. A sleep that waits for the close of the session waits for
 /// the answer too. During a sleep, the core does not draw.
 ///
+/// While a restart waits, the core does not connect again, does not count
+/// the end as a reconnect, and does not draw: the chip resets soon after
+/// the answer, and a reset can stop a refresh of the panel. A failed end
+/// writes one warning, `<end>, during the restart`.
+///
 /// The Wi-Fi feature records the end. Refer to [`wifi::session_ended`]. A
 /// discovery message in flight becomes due again. Refer to
 /// [`device::session_ended`].
@@ -1184,15 +1349,9 @@ fn ended(end: &End, model: &mut Model) -> Cmd {
     let health = wifi::session_ended(end, model);
     let wants_online = model.wants_online();
     let state = &mut model.connection;
-    let (mut live, after) = match mem::take(&mut state.phase) {
-        Phase::Starting(live) | Phase::Up { live, subscribe: _ } => (
-            live,
-            After {
-                sleep: None,
-                connect: true,
-            },
-        ),
-        Phase::Closing { live, after } => (live, after),
+    let (mut live, then) = match mem::take(&mut state.phase) {
+        Phase::Starting(live) | Phase::Up { live, subscribe: _ } => (live, Then::Connect),
+        Phase::Closing { live, then } => (live, then),
         phase @ (Phase::Offline { .. } | Phase::Draining { .. }) => {
             state.phase = phase;
             return health;
@@ -1205,15 +1364,25 @@ fn ended(end: &End, model: &mut Model) -> Cmd {
     let id = state.id;
     let (close, timer) = close_stream(id, clean, end.to_string());
     state.id = state.id.wrapping_add(1);
+    let then = match then {
+        Then::Connect if clean && wants_online => Some(Then::Connect),
+        // After a failure, the core waits for the backoff.
+        Then::Connect => None,
+        then @ (Then::Sleep(_) | Then::Restart) => Some(then),
+    };
     state.phase = Phase::Draining {
         close: timer,
         retry: Slot::default(),
-        after: After {
-            sleep: after.sleep,
-            // After a failure, the core waits for the backoff.
-            connect: after.connect && clean && wants_online,
-        },
+        then,
     };
+    if then == Some(Then::Restart) {
+        let failure = if clean {
+            Cmd::done()
+        } else {
+            logs::warn(Area::Mqtt, format!("{end}, during the restart"))
+        };
+        return health.and(close).and(failure);
+    }
     if model.power.is_asleep() {
         // The sleep does not connect again. A failed end is the only line
         // of the disconnect step.

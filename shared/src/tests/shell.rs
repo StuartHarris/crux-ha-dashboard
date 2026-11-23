@@ -65,9 +65,11 @@ use crate::{
     Cmd, Dashboard, Effect, Event, Model, ViewModel,
     capabilities::{
         light::FrontLight,
-        log::{Log, LogClock, Uptime},
+        log::{Area, Log, LogClock, Uptime},
         power::{Sleep, Wake},
-        radio::{Address, Join, Joined, Lease, Leave, Off, Scan, Scanned, StopScan, Target},
+        radio::{
+            Address, Join, Joined, Lease, Leave, Off, Restart, Scan, Scanned, StopScan, Target,
+        },
         stream::Close,
     },
     fake::FakeRadio,
@@ -130,6 +132,8 @@ pub struct Shell {
     held: Vec<Held>,
     /// The reason of each `Restart` notification, in order.
     pub restarts: Vec<String>,
+    /// The area of each `Restart` notification, in order.
+    pub restart_areas: Vec<Area>,
     /// Each `Log` request as `{level} {area}: {message}`, in order. For
     /// example `warn wifi: the scan failed, so stay on ...`.
     pub logs: Vec<String>,
@@ -197,6 +201,7 @@ impl Shell {
             hold_radio: false,
             held: Vec::new(),
             restarts: Vec::new(),
+            restart_areas: Vec::new(),
             logs: Vec::new(),
             clocks: 0,
             hold_clock: false,
@@ -544,6 +549,13 @@ impl Shell {
         core::mem::take(&mut self.logs)
     }
 
+    /// Keeps the area and the reason of a `Restart` notification.
+    fn restart(&mut self, restart: Restart) {
+        self.log.push("RadioRestart".into());
+        self.restart_areas.push(restart.area);
+        self.restarts.push(restart.reason);
+    }
+
     fn handle(&mut self, effect: Effect) {
         match effect {
             Effect::Render(_) => {
@@ -595,10 +607,7 @@ impl Shell {
                 self.log.push("WifiOff".into());
                 self.radio_request(Held::Off(request));
             }
-            Effect::RadioRestart(request) => {
-                self.log.push("RadioRestart".into());
-                self.restarts.push(request.operation.reason);
-            }
+            Effect::RadioRestart(request) => self.restart(request.operation),
             Effect::Log(request) => self.log_line(request),
             Effect::LogClock(request) => self.clock(request),
             Effect::Sleep(request) => {

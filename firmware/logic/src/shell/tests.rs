@@ -1543,6 +1543,7 @@ fn a_stuck_driver_gives_a_restart_job_after_3_joins_with_no_address() {
     assert_eq!(
         jobs[2..],
         [Job::Restart(Restart {
+            area: Area::Wifi,
             reason: "no address after 3 joins".into(),
         })]
     );
@@ -1656,7 +1657,7 @@ fn a_join_with_no_answer_is_stopped_by_the_next_join() {
 fn a_line_of_the_log_keeps_its_place_before_a_restart() {
     let mut shell = Shell::new();
     let mut cmd: Cmd = logs::warn(Area::Wifi, "3 of 3 joins got no new address")
-        .and(Radio::restart("no address after 3 joins".into()).build());
+        .and(Radio::restart(Area::Wifi, "no address after 3 joins".into()).build());
     let effects: Vec<Effect> = cmd.effects().collect();
 
     let jobs = shell.process(effects);
@@ -1673,6 +1674,7 @@ fn a_line_of_the_log_keeps_its_place_before_a_restart() {
                 },
             },
             Job::Restart(Restart {
+                area: Area::Wifi,
                 reason: "no address after 3 joins".into(),
             }),
         ]

@@ -121,10 +121,33 @@
 //!   its first `Sleep` request, so no timer of the throttle waits in a
 //!   sleep. A timer of the core cannot wake the chip, and the next
 //!   connection publishes the state at once.
+//!
+//! # Buttons
+//!
+//! Home Assistant shows three buttons of the device: Sleep now, Restart and
+//! Full refresh. A press publishes the payload of the [`Button`] on
+//! `dashboard/<id>/set/button`. The core subscribes to
+//! `dashboard/<id>/set/+` ([`ANY_SET`]), and [`route`] takes each message on
+//! a `set` topic before the entities get it.
+//!
+//! - The core ignores a retained button message, and writes an Info line.
+//!   A retained `restart` would restart the chip at each connect.
+//! - The core ignores a payload that it does not know, and writes a
+//!   warning.
+//! - The core ignores a message on another `set` topic.
+//!
+//! A button acts through [`Event::Pressed`], so it acts after the update
+//! that received the message, outside [`connection::pump`]. It is not a
+//! touch: it does not start the idle timer again, and it does not turn the
+//! front light on. Refer to [`pressed`] for what each button does.
 
 mod discovery;
 
-use alloc::{string::String, vec::Vec};
+use alloc::{
+    format,
+    string::{String, ToString},
+    vec::Vec,
+};
 use core::{mem, time::Duration};
 
 use serde::Serialize;
@@ -132,13 +155,15 @@ use serde::Serialize;
 use crate::{
     Boot, Cmd, Model, PowerSource, ResetReason,
     capabilities::{
+        log::Area,
         power::{Charge, Reading},
         radio::{ip_text, mac_text},
     },
     features::{
         connection::{self, Link},
         logs,
-        power::WakeReason,
+        power::{self, IdleEnd, WakeReason},
+        refresh::redraw,
         timer::Running,
     },
     mqtt::{MAX_IN_FLIGHT, Message, PacketId, Publish, Qos, Refused},
@@ -149,9 +174,10 @@ use crate::{
 ///
 /// The session takes at most [`MAX_IN_FLIGHT`] publishes that wait for a
 /// PUBACK. If the device publishes took all of them, a sleep could not
-/// publish `asleep` (the core drops a refused `asleep`), and a service call
-/// would wait for a PUBACK of the log. With these places free, the device
-/// publishes never block the status or a few taps.
+/// publish `asleep` and a restart could not publish `restarting` (the core
+/// drops a refused status), and a service call would wait for a PUBACK of
+/// the log. With these places free, the device publishes never block the
+/// status or a few taps.
 pub const RESERVED: usize = 8;
 
 /// The largest number of device publishes that wait for a PUBACK in a
@@ -164,6 +190,51 @@ pub const BIRTH_TOPIC: &str = "homeassistant/status";
 
 /// The payload of the birth message when Home Assistant starts.
 pub const BIRTH_ONLINE: &str = "online";
+
+/// The name of the `set` topic filter that matches each `set` topic of the
+/// device. Refer to [`Settings::set_topic`](crate::Settings::set_topic).
+pub const ANY_SET: &str = "+";
+
+/// The name of the `set` topic of the buttons.
+pub const BUTTON_SET: &str = "button";
+
+/// The longest text of an unknown button payload in the log, in bytes.
+const PAYLOAD_IN_LOG: usize = 32;
+
+/// A button of the device in Home Assistant. Refer to the
+/// [module docs](self).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Button {
+    /// Sleep now. The payload is `sleep`.
+    Sleep,
+    /// Restart the chip. The payload is `restart`.
+    Restart,
+    /// A full refresh of the panel. The payload is `refresh`.
+    Refresh,
+}
+
+impl Button {
+    /// Each button, in the order of the discovery message.
+    pub const ALL: [Self; 3] = [Self::Sleep, Self::Restart, Self::Refresh];
+
+    /// Returns the payload that Home Assistant publishes for a press.
+    #[must_use]
+    pub const fn payload(self) -> &'static str {
+        match self {
+            Self::Sleep => "sleep",
+            Self::Restart => "restart",
+            Self::Refresh => "refresh",
+        }
+    }
+
+    /// Returns the button of `payload`, or `None` for a payload that is
+    /// not known.
+    fn of(payload: &[u8]) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|button| button.payload().as_bytes() == payload)
+    }
+}
 
 /// The shortest time between two state messages for changes that are not
 /// urgent. Refer to the [module docs](self).
@@ -181,6 +252,8 @@ pub enum Event {
     /// The timer of the throttle window with this id expired. Refer to
     /// [`Window`].
     WindowEnded(u32),
+    /// Home Assistant pressed a button of the device. Refer to [`route`].
+    Pressed(Button),
 }
 
 impl From<Event> for crate::Event {
@@ -193,6 +266,7 @@ impl From<Event> for crate::Event {
 pub fn update(event: Event, model: &mut Model) -> Cmd {
     match event {
         Event::WindowEnded(id) => window_ended(id, model),
+        Event::Pressed(button) => pressed(button, model),
     }
 }
 
@@ -554,21 +628,155 @@ pub const fn start(model: &mut Model) {
     model.device.discovery = Discovery::Due;
 }
 
-/// Handles a message on [`BIRTH_TOPIC`], and returns `true`. Returns
-/// `false` for a message on another topic.
+/// Handles a message on [`BIRTH_TOPIC`] or on a `set` topic of the device,
+/// and returns its command. Returns `None` for a message on another topic,
+/// which goes to the entities.
 ///
 /// A birth message that is not retained makes a sent discovery message due
 /// again. [`connection::pump`] then publishes it, because the core routes
 /// each message inside the pump.
-pub(crate) fn route(message: &Message, model: &mut Model) -> bool {
-    if message.topic != BIRTH_TOPIC {
-        return false;
+///
+/// A button message gives [`Event::Pressed`]. Refer to the
+/// [module docs](self) for the messages that the core ignores.
+pub(crate) fn route(message: &Message, model: &mut Model) -> Option<Cmd> {
+    if message.topic == BIRTH_TOPIC {
+        let birth = !message.retain && message.payload == BIRTH_ONLINE.as_bytes();
+        if birth && model.device.discovery == Discovery::Sent {
+            model.device.discovery = Discovery::Due;
+        }
+        return Some(Cmd::done());
     }
-    let birth = !message.retain && message.payload == BIRTH_ONLINE.as_bytes();
-    if birth && model.device.discovery == Discovery::Sent {
-        model.device.discovery = Discovery::Due;
+    let settings = model.startup.settings()?;
+    if message.topic == settings.set_topic(BUTTON_SET) {
+        return Some(button_message(message));
     }
-    true
+    // Later `set` topics come here. The core ignores them for now.
+    message
+        .topic
+        .starts_with(&settings.set_topic(""))
+        .then(Cmd::done)
+}
+
+/// Handles a message on the button topic.
+fn button_message(message: &Message) -> Cmd {
+    if message.retain {
+        return logs::info(
+            Area::Device,
+            format!(
+                "the button message on {} is retained, so the core ignored it",
+                message.topic
+            ),
+        );
+    }
+    Button::of(&message.payload).map_or_else(
+        || {
+            logs::warn(
+                Area::Device,
+                format!(
+                    "the button payload {} is not known, so the core ignored it",
+                    shown(&message.payload)
+                ),
+            )
+        },
+        |button| Cmd::event(Event::Pressed(button).into()),
+    )
+}
+
+/// Returns `payload` as text for the log. The core keeps at most
+/// [`PAYLOAD_IN_LOG`] bytes of the payload, and then escapes each control
+/// character, quote and backslash, as Rust does for a string in `{:?}`.
+/// Thus a payload cannot add a line to the log, and it cannot send a
+/// terminal code.
+fn shown(payload: &[u8]) -> String {
+    let text = String::from_utf8_lossy(payload);
+    let mut end = text.len().min(PAYLOAD_IN_LOG);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].escape_debug().to_string()
+}
+
+/// Home Assistant pressed `button`.
+///
+/// | Button | The device | What the core does | Line |
+/// | --- | --- | --- | --- |
+/// | Sleep now | a restart waits | nothing | Debug |
+/// | Sleep now | awake on battery | [`power::sleep_now`]: the sleep starts | Debug |
+/// | Sleep now | awake on battery, open pending marks | [`power::sleep_now`]: the sleep waits for the marks | Debug |
+/// | Sleep now | awake on battery, calls in the outbox | [`power::sleep_now`]: the sleep waits one more idle period | Debug |
+/// | Sleep now | awake on battery, a sleep waits for the marks | nothing | Debug |
+/// | Sleep now | asleep (the first steps of a sleep) | nothing | none |
+/// | Sleep now | on the stand | nothing | Info |
+/// | Restart | any | [`connection::close_for_restart`] | none in the core |
+/// | Full refresh | a restart waits | nothing | Debug |
+/// | Full refresh | awake | [`redraw`] with a full refresh | Debug |
+/// | Full refresh | asleep | nothing, because the last image of the sleep is a full refresh | Debug |
+///
+/// For a restart, the shell writes the warning
+/// `device: restart the chip: Home Assistant asked`.
+fn pressed(button: Button, model: &mut Model) -> Cmd {
+    match button {
+        Button::Sleep => sleep_pressed(model),
+        Button::Restart => connection::close_for_restart(model),
+        Button::Refresh => {
+            if model.connection.restart_waits() {
+                // The reset can stop the refresh with the panel half
+                // drawn, so `redraw` does nothing.
+                logs::debug(
+                    Area::Device,
+                    "Home Assistant asked for a full refresh, but the chip restarts, so the core \
+                     ignored it",
+                )
+            } else if model.power.is_asleep() {
+                logs::debug(
+                    Area::Device,
+                    "the device sleeps, so it skips the full refresh",
+                )
+            } else {
+                logs::debug(Area::Device, "Home Assistant asked for a full refresh")
+                    .and(redraw(model, true))
+            }
+        }
+    }
+}
+
+/// Home Assistant pressed Sleep now. The line tells what the core did.
+fn sleep_pressed(model: &mut Model) -> Cmd {
+    // A restart wins over a sleep. `sleep_now` would also stop the idle
+    // timer, so the core does not call it.
+    if model.connection.restart_waits() {
+        return logs::debug(
+            Area::Device,
+            "Home Assistant asked to sleep, but the chip restarts, so the core ignored it",
+        );
+    }
+    let (outcome, sleep) = power::sleep_now(model);
+    let line = match outcome {
+        IdleEnd::Sleeps => logs::debug(
+            Area::Device,
+            "Home Assistant asked to sleep, so the sleep starts",
+        ),
+        IdleEnd::WaitsForMarks => logs::debug(
+            Area::Device,
+            "Home Assistant asked to sleep, so the sleep waits for the pending marks",
+        ),
+        IdleEnd::WaitsForOutbox => logs::debug(
+            Area::Device,
+            "Home Assistant asked to sleep, but service calls wait in the outbox, so the sleep \
+             waits one more idle period",
+        ),
+        IdleEnd::Nothing if model.power.source() == PowerSource::Stand => logs::info(
+            Area::Device,
+            "Home Assistant asked to sleep, but the device is on the stand, so it stays awake",
+        ),
+        IdleEnd::Nothing if model.power.sleep_waits() => logs::debug(
+            Area::Device,
+            "Home Assistant asked to sleep, and the sleep already waits",
+        ),
+        // The device already sleeps.
+        IdleEnd::Nothing => Cmd::done(),
+    };
+    line.and(sleep)
 }
 
 /// A value in the state message can have changed: publish the state, if

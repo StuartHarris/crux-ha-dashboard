@@ -309,6 +309,13 @@ impl State {
         self.wake
     }
 
+    /// Returns `true` if the device is awake on battery, and a sleep waits
+    /// for the end of each pending mark.
+    #[must_use]
+    pub const fn sleep_waits(&self) -> bool {
+        matches!(self.phase, Phase::SleepWaits)
+    }
+
     /// Returns `true` if the device is asleep, or in the steps before the
     /// sleep.
     #[must_use]
@@ -418,9 +425,9 @@ pub enum SleepStep {
     /// The device woke with no cause. It stays awake until the hold timer
     /// expires, then it sends a new `Sleep` request ([`hold_ended`]).
     Held,
-    /// The core asked the shell to restart the chip, so the radio does not
-    /// turn off. No step waits, and the core stays asleep until a wake or
-    /// `Start`.
+    /// The chip restarts, or a restart waits for the close of the
+    /// connection, so the radio does not turn off. No step of the sleep
+    /// waits, and the core stays asleep until a wake or `Start`.
     Stalled,
 }
 
@@ -438,7 +445,8 @@ pub enum SleepStep {
 /// 3. If the Wi-Fi phase is `StoppingScan` for this sleep, the step is
 ///    `StopScan`.
 /// 4. If the stream closes for this sleep, the step is `Disconnect`.
-/// 5. If the core asked for a restart of the chip, the step is `Stalled`.
+/// 5. If the stream closes for a restart, or the core asked for a restart
+///    of the chip, the step is `Stalled`.
 /// 6. If the radio is off and no stream is open, the step is `Sleep`.
 /// 7. Else, the step is `LightOff`.
 ///
@@ -466,6 +474,7 @@ pub fn sleep_step(model: &Model) -> Option<SleepStep> {
         wifi::Phase::TurningOff { sleep, .. } if sleep == id => SleepStep::RadioOff,
         wifi::Phase::StoppingScan { sleep, .. } if sleep == id => SleepStep::StopScan,
         _ if model.connection.sleep_waiter() == Some(id) => SleepStep::Disconnect,
+        _ if model.connection.restart_waits() => SleepStep::Stalled,
         wifi::Phase::Restarting => SleepStep::Stalled,
         wifi::Phase::Off if !model.connection.has_stream() => SleepStep::Sleep,
         _ => SleepStep::LightOff,
@@ -650,7 +659,7 @@ pub fn wake_up(model: &mut Model) -> Cmd {
     );
     model.power.wake = WakeReason::Touch;
     let summary = model.power.wake_to(awake_on(PowerSource::Battery));
-    connection::restart(model);
+    connection::reset_backoff(model);
     summary
         .and(redraw(model, true))
         .and(connection::go_online(model))
@@ -679,7 +688,7 @@ pub fn source_changed(source: PowerSource, model: &mut Model) -> Cmd {
             // timer. `enter` clears the idle timer or the hold timer that
             // runs.
             let summary = model.power.wake_to(Phase::Stand);
-            connection::restart(model);
+            connection::reset_backoff(model);
             summary
                 .and(light::source_changed(model))
                 .and(redraw(model, was_asleep))
@@ -776,16 +785,33 @@ pub fn idle_timeout(id: u32, model: &mut Model) -> Cmd {
     if !idle.expired(id) {
         return Cmd::done();
     }
-    idle_ended(model)
+    idle_ended(model).1
+}
+
+/// What the end of the idle time did. Refer to [`sleep_now`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IdleEnd {
+    /// The steps of the sleep started.
+    Sleeps,
+    /// The sleep waits for the end of each pending mark
+    /// ([`Phase::SleepWaits`]).
+    WaitsForMarks,
+    /// Service calls wait in the outbox, so the device stays awake for one
+    /// more idle period.
+    WaitsForOutbox,
+    /// Nothing changed: before `Start`, on the stand, while a sleep waits
+    /// for the marks, or while the device sleeps.
+    Nothing,
 }
 
 /// The user asked to sleep now. The idle time ends at once, as if the idle
-/// timer expired ([`idle_ended`]).
+/// timer expired ([`idle_ended`]). Returns what the end of the idle time
+/// did, so the caller can tell it in the log.
 ///
 /// The core clears the idle timer that runs, also if the event does
 /// nothing. Before `Start`, the device then stays `Awake` with no idle
 /// timer. If a sleep already waits for the marks, the event does nothing.
-pub fn sleep_now(model: &mut Model) -> Cmd {
+pub fn sleep_now(model: &mut Model) -> (IdleEnd, Cmd) {
     if let Phase::Awake { idle, .. } = &mut model.power.phase {
         idle.stop();
     }
@@ -807,33 +833,34 @@ pub fn sleep_now(model: &mut Model) -> Cmd {
 ///    and [`DRAW_DELAY`](crate::features::refresh::DRAW_DELAY) after a
 ///    confirmation.
 /// 3. Else, the sleep starts at once.
-fn idle_ended(model: &mut Model) -> Cmd {
+fn idle_ended(model: &mut Model) -> (IdleEnd, Cmd) {
     if !model.startup.is_started() {
-        return Cmd::done();
+        return (IdleEnd::Nothing, Cmd::done());
     }
     let Phase::Awake { extended, .. } = model.power.phase else {
-        return Cmd::done();
+        return (IdleEnd::Nothing, Cmd::done());
     };
     if !model.connection.outbox.is_empty() {
         if extended {
-            return sleep(model);
+            return (IdleEnd::Sleeps, sleep(model));
         }
         let timer = restart_idle_timer(model);
         if let Phase::Awake { extended, .. } = &mut model.power.phase {
             *extended = true;
         }
-        return timer;
+        return (IdleEnd::WaitsForOutbox, timer);
     }
     let open = model.pending.marks.len();
     if open > 0 {
         model.power.enter(Phase::SleepWaits);
         let marks = if open == 1 { "mark" } else { "marks" };
-        return logs::debug(
+        let line = logs::debug(
             Area::Power,
             format!("the sleep waits for {open} pending {marks}"),
         );
+        return (IdleEnd::WaitsForMarks, line);
     }
-    sleep(model)
+    (IdleEnd::Sleeps, sleep(model))
 }
 
 /// A pending mark ended, or the draw timer expired. If a sleep waits for
@@ -908,12 +935,23 @@ pub fn light_off(id: u32, model: &mut Model) -> Cmd {
 ///
 /// The core drops the service calls that wait in the outbox, and the view
 /// shows how many. The last image shows the time of the last state message.
+///
+/// If a restart waits for the close of the connection, the restart wins.
+/// The step is `Stalled`, and the core writes its warning. The calls in the
+/// outbox, the pending marks and the count of dropped calls do not change,
+/// because the restart clears them. A wake before the restart then finds
+/// them unchanged.
 fn disconnect(id: u32, model: &mut Model) -> Cmd {
     if let Some(stop) = wifi::stop_scan(id, model) {
         return step_started(SleepStep::StopScan, id).and(stop);
     }
-    model.unsent += model.connection.outbox.len();
-    step_started(SleepStep::Disconnect, id).and(connection::go_offline(id, model))
+    let step = if model.connection.restart_waits() {
+        SleepStep::Stalled
+    } else {
+        model.unsent += model.connection.outbox.len();
+        SleepStep::Disconnect
+    };
+    step_started(step, id).and(connection::go_offline(id, model))
 }
 
 #[cfg(test)]

@@ -72,6 +72,15 @@ impl Settings {
         format!("dashboard/{}/state", self.device_id)
     }
 
+    /// Returns the topic `dashboard/<id>/set/<name>`, on which Home
+    /// Assistant sends a command to the device, for example
+    /// `dashboard/hall/set/button`. With the name `+`, it is the topic
+    /// filter of all these topics. Refer to [`device::route`].
+    #[must_use]
+    pub fn set_topic(&self, name: &str) -> String {
+        format!("dashboard/{}/set/{name}", self.device_id)
+    }
+
     /// Returns the id of the dashboard as a device of Home Assistant, for
     /// example `dashboard_hall`. Refer to [`device`].
     #[must_use]
@@ -587,7 +596,7 @@ impl Model {
             Event::PreviousPage => rooms::turn_page(self, false),
             Event::Navigate(route) => rooms::navigate(route, self),
             Event::SetReadOnly(read_only) => rooms::set_read_only(read_only, self),
-            Event::SleepNow => power::sleep_now(self),
+            Event::SleepNow => power::sleep_now(self).1,
             Event::PowerRead(reading) => power::read(reading, self),
             Event::ShellLogged {
                 at,
