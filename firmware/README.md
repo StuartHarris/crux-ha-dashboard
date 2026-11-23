@@ -15,6 +15,9 @@ The firmware has two parts:
 ESP32-S3. The hardware binary is its own Cargo workspace, because feature unification
 with the std shells of the root workspace would pull std into it.
 
+For the place of the firmware in the system, and the rule "logic in the core, drivers in
+the shells", refer to [`docs/architecture.md`](../docs/architecture.md).
+
 ## The logic
 
 | Module | What it does |
@@ -50,7 +53,7 @@ cannot block each other. This is the pattern of the `cpb` example in Crux.
 The core runs MQTT 3.1.1 (`shared/src/mqtt/`). The stream task
 (`src/bin/dashboard/stream.rs`) only moves bytes. The task takes the receive buffer
 and the send buffer of the socket (8 KiB each) from the heap once, so the allocator
-puts them in PSRAM. The 116 topic filters need about 7.9 KiB of SUBSCRIBE packets,
+puts them in PSRAM. The 117 topic filters need about 7.9 KiB of SUBSCRIBE packets,
 and the core gives them to the socket in one `Write`.
 
 A `Write` ends when all its bytes are in the send buffer, and smoltcp sends them from

@@ -25,8 +25,8 @@ use crate::{
 /// The data that a shell needs to draw the screen.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ViewModel {
-    /// The path of the current route, for example `/room/kitchen`. The shell
-    /// keeps it during a deep sleep and gives it back in `Start`.
+    /// The path of the current route, for example `/room/kitchen`. A shell
+    /// can keep it through a restart and give it back in `Start`.
     pub path: String,
     /// The title of the current page.
     pub title: String,
@@ -67,8 +67,9 @@ pub struct ViewModel {
     pub read_only: bool,
     /// The footer time of the current page, in seconds since the Unix epoch.
     /// This is the latest `last_updated` time from Home Assistant of the
-    /// entities that the page shows. Refer to [`page_time`](crate::features::connection::page_time). The
-    /// shell keeps it during a deep sleep and gives it back in `Start`.
+    /// entities that the page shows. Refer to
+    /// [`page_time`](crate::features::connection::page_time). A shell can
+    /// keep it through a restart and give it back in `Start`.
     ///
     /// Each page has its own time. After a page turn, the value is the time
     /// of the new page.

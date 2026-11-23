@@ -5,7 +5,8 @@ Raspberry Pi (`192.168.1.109`, port 1883). Home Assistant publishes entity state
 dashboard publishes service calls, its own status, its log, and its discovery and state
 as a device of Home Assistant. The Pi setup is in
 `RUNBOOK.md` in the `rpi` notes, in the sections "Mosquitto" and "MQTT for the
-dashboard".
+dashboard". For the parts of the system and the structure of the core, refer to
+[`architecture.md`](architecture.md).
 
 ## Broker
 
