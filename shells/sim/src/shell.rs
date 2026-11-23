@@ -1638,6 +1638,7 @@ mod tests {
                 "subscribe 1",
                 // The device publishes go in the next write.
                 "publish homeassistant/device/dashboard_test/config 1",
+                "publish dashboard/test/light 1",
                 "publish dashboard/test/state 1",
                 // The start line of the log.
                 "publish dashboard/test/log 1",
@@ -1681,7 +1682,8 @@ mod tests {
                 // The steps of the sleep write `Debug` lines, so no line
                 // goes to Home Assistant.
                 "subscribe 2",
-                // A wake is not a start, so only the state goes.
+                // A wake is not a start, so only the light and the state go.
+                "publish dashboard/test/light 2",
                 "publish dashboard/test/state 2",
             ]
         );
@@ -1940,12 +1942,14 @@ mod tests {
         fixture.settle();
         assert_eq!(fixture.take_log(), Vec::<String>::new());
 
-        // The end of the dry run publishes the discovery and the state.
+        // The end of the dry run publishes the discovery, the light and
+        // the state. The light is on after the tap.
         fixture.shell().send(Event::SetReadOnly(false));
         assert_eq!(
-            fixture.wait_log(2),
+            fixture.wait_log(3),
             [
                 "publish homeassistant/device/dashboard_test/config 1",
+                "publish dashboard/test/light 1",
                 "publish dashboard/test/state 1",
             ]
         );
@@ -2142,7 +2146,7 @@ mod tests {
 
     #[test]
     fn a_tap_turns_the_front_light_on_and_the_sleep_turns_it_off() {
-        use shared::features::light::BATTERY_LEVEL;
+        use shared::features::light::DEFAULT_BATTERY_LEVEL;
 
         let mut fixture = Fixture::new();
         fixture.start(PowerSource::Battery);
@@ -2151,7 +2155,7 @@ mod tests {
 
         // The shell answers `FrontLight` at once.
         fixture.shell().tap(Point::new(1, 1));
-        assert_eq!(fixture.shell().light(), BATTERY_LEVEL);
+        assert_eq!(fixture.shell().light(), DEFAULT_BATTERY_LEVEL.get());
 
         // The sleep turns the light off before it closes the stream.
         assert!(fixture.shell().sleep_now());

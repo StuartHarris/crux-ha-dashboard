@@ -15,7 +15,7 @@ use crate::tests::{
 };
 use crate::{
     Control, Dashboard, EffectTestExt, Event, Model, PowerSource, Route, TileState,
-    features::{connection::Link, light::STAND_LEVEL, pending::QUEUED_TIMEOUT},
+    features::{connection::Link, light::DEFAULT_STAND_LEVEL, pending::QUEUED_TIMEOUT},
     mqtt::{Qos, codec::server::Packet},
     view::LightState,
 };
@@ -95,7 +95,7 @@ fn a_tap_on_a_light_publishes_a_toggle() {
     model.route = Route::room("living_room");
 
     app.update(tap_tile(1), &mut model)
-        .expect_touch_light(STAND_LEVEL)
+        .expect_touch_light(DEFAULT_STAND_LEVEL.get())
         .expect_only_service_call_with(&mut wire, &mut model, |publish| {
             assert_eq!(publish.topic, "dashboard/hall/cmd");
             assert_eq!(
@@ -116,7 +116,7 @@ fn the_plus_and_minus_buttons_of_a_dimmable_light_publish_a_brightness_step() {
     set_state(&mut model, "light.living_room_rocket_lamp", "on");
 
     app.update(tap_plus(1), &mut model)
-        .expect_touch_light(STAND_LEVEL)
+        .expect_touch_light(DEFAULT_STAND_LEVEL.get())
         .expect_only_service_call_with(&mut wire, &mut model, |publish| {
             assert_eq!(publish.topic, "dashboard/hall/cmd");
             assert_eq!(
@@ -153,7 +153,7 @@ fn the_plus_and_minus_buttons_of_a_dimmable_light_publish_a_brightness_step() {
 #[test]
 fn a_brightness_step_on_a_tile_that_is_not_a_dimmable_light_does_nothing() {
     let app = Dashboard;
-    let (mut model, _wire) = drive_to_connected(PowerSource::Stand);
+    let (mut model, mut wire) = drive_to_connected(PowerSource::Stand);
 
     // Each entity is on, so only the kind of the tile can stop the step.
     for entity_id in [
@@ -171,8 +171,9 @@ fn a_brightness_step_on_a_tile_that_is_not_a_dimmable_light_does_nothing() {
 
     // The index page has no tiles.
     app.update(tap_plus(0), &mut model)
-        .expect_touch_light(STAND_LEVEL)
-        .expect_no_effects();
+        .expect_touch_light(DEFAULT_STAND_LEVEL.get())
+        .expect_light_publish(&mut wire, &mut model, DEFAULT_STAND_LEVEL.get())
+        .expect_only_session_clear(&wire);
 
     // The candle lights are on/off lights. The thermostat has no target
     // temperature, the humidity sensor is not a light, and the page has no
@@ -223,8 +224,9 @@ fn a_plus_step_on_a_light_at_full_brightness_does_nothing_and_a_minus_step_dims_
     // Home Assistant does nothing for the step, so the core sends no call
     // and gives no mark.
     app.update(tap_plus(1), &mut model)
-        .expect_touch_light(STAND_LEVEL)
-        .expect_no_effects();
+        .expect_touch_light(DEFAULT_STAND_LEVEL.get())
+        .expect_light_publish(&mut wire, &mut model, DEFAULT_STAND_LEVEL.get())
+        .expect_only_session_clear(&wire);
     assert!(model.pending.marks.is_empty());
     assert_eq!(app.view(&model).tiles()[1].state, TileState::On);
 
@@ -246,8 +248,9 @@ fn a_minus_step_on_a_light_that_is_off_does_nothing_and_a_plus_step_turns_it_on(
     set_state(&mut model, "light.living_room_rocket_lamp", "off");
 
     app.update(tap_minus(1), &mut model)
-        .expect_touch_light(STAND_LEVEL)
-        .expect_no_effects();
+        .expect_touch_light(DEFAULT_STAND_LEVEL.get())
+        .expect_light_publish(&mut wire, &mut model, DEFAULT_STAND_LEVEL.get())
+        .expect_only_session_clear(&wire);
     app.update(tap_plus(1), &mut model)
         .expect_light_timer()
         .expect_only_service_call_with(&mut wire, &mut model, |publish| {
@@ -266,8 +269,9 @@ fn a_brightness_step_on_a_light_with_no_usable_state_does_nothing() {
 
     // The core has no state for the rocket lamp yet.
     app.update(tap_plus(1), &mut model)
-        .expect_touch_light(STAND_LEVEL)
-        .expect_no_effects();
+        .expect_touch_light(DEFAULT_STAND_LEVEL.get())
+        .expect_light_publish(&mut wire, &mut model, DEFAULT_STAND_LEVEL.get())
+        .expect_only_session_clear(&wire);
     app.update(tap_minus(1), &mut model)
         .expect_light_timer()
         .expect_no_effects();
@@ -299,7 +303,7 @@ fn a_toggle_has_no_brightness_step() {
     model.route = Route::room("living_room");
 
     app.update(tap_tile(1), &mut model)
-        .expect_touch_light(STAND_LEVEL)
+        .expect_touch_light(DEFAULT_STAND_LEVEL.get())
         .expect_only_service_call_with(&mut wire, &mut model, |publish| {
             let payload = core::str::from_utf8(&publish.payload).unwrap();
             assert!(!payload.contains("brightness_step_pct"), "{payload}");
@@ -355,7 +359,7 @@ fn the_plus_and_minus_buttons_of_a_thermostat_publish_the_next_half_degree() {
         assert!(app.view(&model).tiles()[4].steps, "{target}");
         let tap = if up { tap_plus(4) } else { tap_minus(4) };
         app.update(tap, &mut model)
-            .expect_touch_light(STAND_LEVEL)
+            .expect_touch_light(DEFAULT_STAND_LEVEL.get())
             .expect_only_service_call_with(&mut wire, &mut model, |publish| {
                 assert_eq!(publish.topic, "dashboard/hall/cmd");
                 assert_eq!(
@@ -375,7 +379,7 @@ fn a_thermostat_step_publishes_set_temperature_with_a_json_number() {
     let (mut model, mut wire) = thermostat_at("19.5");
 
     app.update(tap_plus(4), &mut model)
-        .expect_touch_light(STAND_LEVEL)
+        .expect_touch_light(DEFAULT_STAND_LEVEL.get())
         .expect_only_service_call_with(&mut wire, &mut model, |publish| {
             assert_eq!(
                 publish.payload,
@@ -390,7 +394,7 @@ fn a_second_step_of_a_thermostat_starts_from_the_target_that_waits() {
     let (mut model, mut wire) = thermostat_at("20");
 
     app.update(tap_plus(4), &mut model)
-        .expect_touch_light(STAND_LEVEL)
+        .expect_touch_light(DEFAULT_STAND_LEVEL.get())
         .expect_only_service_call_with(&mut wire, &mut model, |publish| {
             assert_eq!(publish.payload, set_temperature("20.5").as_bytes());
         });
@@ -421,14 +425,15 @@ fn a_second_step_of_a_thermostat_starts_from_the_target_that_waits() {
 #[test]
 fn a_thermostat_with_no_target_temperature_has_no_steps_and_sends_nothing() {
     let app = Dashboard;
-    let (mut model, _wire) = drive_to_connected(PowerSource::Stand);
+    let (mut model, mut wire) = drive_to_connected(PowerSource::Stand);
     model.route = Route::room("dining_room");
 
     // The first touch turns the front light on. The core has no state for
     // the thermostat.
     app.update(tap_plus(4), &mut model)
-        .expect_touch_light(STAND_LEVEL)
-        .expect_no_effects();
+        .expect_touch_light(DEFAULT_STAND_LEVEL.get())
+        .expect_light_publish(&mut wire, &mut model, DEFAULT_STAND_LEVEL.get())
+        .expect_only_session_clear(&wire);
     let assert_no_steps = |model: &mut Model, case: &str| {
         assert!(!app.view(model).tiles()[4].steps, "{case}");
         app.update(tap_plus(4), model)
@@ -472,7 +477,7 @@ fn a_tap_on_a_switch_publishes_a_toggle() {
 
     // Tile 0 is the lights, and tile 1 is the coffee machine.
     app.update(tap_tile(1), &mut model)
-        .expect_touch_light(STAND_LEVEL)
+        .expect_touch_light(DEFAULT_STAND_LEVEL.get())
         .expect_only_service_call_with(&mut wire, &mut model, |publish| {
             assert_eq!(
                 publish.payload,
@@ -488,7 +493,7 @@ fn a_tap_on_a_scene_publishes_scene_turn_on() {
     model.route = Route::room("hall");
 
     app.update(tap_scene(2), &mut model)
-        .expect_touch_light(STAND_LEVEL)
+        .expect_touch_light(DEFAULT_STAND_LEVEL.get())
         .expect_only_service_call_with(&mut wire, &mut model, |publish| {
             assert_eq!(publish.topic, "dashboard/hall/cmd");
             assert_eq!(
@@ -501,12 +506,13 @@ fn a_tap_on_a_scene_publishes_scene_turn_on() {
 #[test]
 fn a_tap_on_a_sensor_climate_or_weather_tile_or_outside_the_grid_does_nothing() {
     let app = Dashboard;
-    let (mut model, _wire) = drive_to_connected(PowerSource::Stand);
+    let (mut model, mut wire) = drive_to_connected(PowerSource::Stand);
 
     // The index page has no tiles and no scenes.
     app.update(tap_tile(0), &mut model)
-        .expect_touch_light(STAND_LEVEL)
-        .expect_no_effects();
+        .expect_touch_light(DEFAULT_STAND_LEVEL.get())
+        .expect_light_publish(&mut wire, &mut model, DEFAULT_STAND_LEVEL.get())
+        .expect_only_session_clear(&wire);
     app.update(tap_tile(1), &mut model)
         .expect_light_timer()
         .expect_no_effects();
@@ -535,7 +541,7 @@ fn a_tap_before_the_connection_opens_waits_in_the_outbox_and_goes_first() {
     // The connection is starting, so the core only starts the timeout of the
     // outbox. The toggle has no state, so it does not show the mark.
     app.update(tap_all_lights(), &mut model)
-        .expect_touch_light(STAND_LEVEL)
+        .expect_touch_light(DEFAULT_STAND_LEVEL.get())
         .expect_only_time_notify_after_with(|notify| {
             assert_eq!(Duration::from(notify.duration), QUEUED_TIMEOUT);
         });
@@ -581,7 +587,7 @@ fn a_tap_in_a_dry_run_sends_no_service_call() {
     assert!(app.view(&model).read_only);
 
     app.update(tap_tile(0), &mut model)
-        .expect_touch_light(STAND_LEVEL)
+        .expect_touch_light(DEFAULT_STAND_LEVEL.get())
         .expect_no_effects();
     app.update(tap_scene(2), &mut model)
         .expect_light_timer()
@@ -602,7 +608,7 @@ fn a_tap_in_a_dry_run_before_the_connection_opens_is_not_kept() {
     let _ = app.update(Event::SetReadOnly(true), &mut model);
 
     app.update(tap_all_lights(), &mut model)
-        .expect_touch_light(STAND_LEVEL)
+        .expect_touch_light(DEFAULT_STAND_LEVEL.get())
         .expect_no_effects();
     assert_eq!(model.connection.outbox.len(), 0);
 }
@@ -620,12 +626,16 @@ fn set_read_only_changes_the_view_and_the_next_tap() {
     // The same value again changes nothing.
     app.update(Event::SetReadOnly(true), &mut model)
         .expect_no_effects();
+    // A dry run publishes no state of the light.
     app.update(tap_all_lights(), &mut model)
-        .expect_touch_light(STAND_LEVEL)
+        .expect_touch_light(DEFAULT_STAND_LEVEL.get())
         .expect_no_effects();
 
+    // The end of the dry run publishes the light that the tap turned on.
     app.update(Event::SetReadOnly(false), &mut model)
-        .expect_only_render();
+        .expect_render()
+        .expect_light_publish(&mut wire, &mut model, DEFAULT_STAND_LEVEL.get())
+        .expect_only_session_clear(&wire);
     assert!(!app.view(&model).read_only);
     app.update(tap_all_lights(), &mut model)
         .expect_light_timer()
@@ -721,7 +731,7 @@ fn a_tap_on_a_navigation_button_turns_the_page() {
     let count = model.pages.len();
 
     app.update(Event::Tapped(Some(Control::NextPage)), &mut model)
-        .expect_touch_light(STAND_LEVEL)
+        .expect_touch_light(DEFAULT_STAND_LEVEL.get())
         .expect_render()
         .expect_full_refresh_timer();
     assert_eq!(app.view(&model).page_index, 1);
@@ -744,10 +754,11 @@ fn a_tap_on_a_navigation_button_turns_the_page() {
 #[test]
 fn a_tap_on_no_control_while_awake_only_turns_the_light_on() {
     let app = Dashboard;
-    let (mut model, _wire) = drive_to_connected(PowerSource::Stand);
+    let (mut model, mut wire) = drive_to_connected(PowerSource::Stand);
     app.update(Event::Tapped(None), &mut model)
-        .expect_touch_light(STAND_LEVEL)
-        .expect_no_effects();
+        .expect_touch_light(DEFAULT_STAND_LEVEL.get())
+        .expect_light_publish(&mut wire, &mut model, DEFAULT_STAND_LEVEL.get())
+        .expect_only_session_clear(&wire);
 }
 
 #[test]
@@ -757,7 +768,7 @@ fn a_tap_on_a_room_button_shows_the_room() {
 
     // The rooms are the pages after the home page, in order.
     app.update(tap_room(7), &mut model)
-        .expect_touch_light(STAND_LEVEL)
+        .expect_touch_light(DEFAULT_STAND_LEVEL.get())
         .expect_render()
         .expect_full_refresh_timer();
     let view = app.view(&model);
@@ -771,10 +782,11 @@ fn a_tap_on_a_room_button_shows_the_room() {
 #[test]
 fn a_room_button_that_the_index_does_not_have_does_nothing() {
     let app = Dashboard;
-    let (mut model, _wire) = drive_to_connected(PowerSource::Stand);
+    let (mut model, mut wire) = drive_to_connected(PowerSource::Stand);
     app.update(tap_room(9), &mut model)
-        .expect_touch_light(STAND_LEVEL)
-        .expect_no_effects();
+        .expect_touch_light(DEFAULT_STAND_LEVEL.get())
+        .expect_light_publish(&mut wire, &mut model, DEFAULT_STAND_LEVEL.get())
+        .expect_only_session_clear(&wire);
     assert_eq!(model.route, Route::Home);
 }
 
@@ -784,7 +796,7 @@ fn a_tap_on_all_lights_publishes_a_toggle() {
     let (mut model, mut wire) = drive_to_connected(PowerSource::Stand);
     set_state(&mut model, "light.all_lights", "on");
     app.update(tap_all_lights(), &mut model)
-        .expect_touch_light(STAND_LEVEL)
+        .expect_touch_light(DEFAULT_STAND_LEVEL.get())
         .expect_only_service_call_with(&mut wire, &mut model, |publish| {
             assert_eq!(publish.topic, "dashboard/hall/cmd");
             assert_eq!(
@@ -854,7 +866,7 @@ fn the_all_lights_toggle_shows_and_toggles_the_same_tile() {
     let shown = &view.index().unwrap().all_lights.as_ref().unwrap().entity_id;
     assert_eq!(shown, "switch.fan");
     app.update(tap_all_lights(), &mut model)
-        .expect_touch_light(STAND_LEVEL)
+        .expect_touch_light(DEFAULT_STAND_LEVEL.get())
         .expect_only_service_call_with(&mut wire, &mut model, |publish| {
             assert_eq!(
                 publish.payload,

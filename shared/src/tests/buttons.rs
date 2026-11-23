@@ -481,7 +481,7 @@ fn a_message_on_another_set_topic_changes_nothing() {
     let mut shell = connected(PowerSource::Stand);
     shell
         .broker
-        .publish("dashboard/hall/set/light", b"ON", false);
+        .publish("dashboard/hall/set/other", b"ON", false);
     shell.run();
     assert_eq!(shell.take_logs(), Vec::<String>::new());
     assert_eq!(shell.take_log(), Vec::<String>::new());

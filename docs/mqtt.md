@@ -132,7 +132,7 @@ filters need about 7 packets, 7.9 KiB in all. The broker sends the retained stat
 each topic after it accepts the filter.
 
 The write has nothing else. The device publishes (the discovery message, the state
-message and the lines of the log) go in later writes. If the CONNACK arrives before
+of the front light, the state message and the lines of the log) go in later writes. If the CONNACK arrives before
 the shell confirms the CONNECT write, the CONNACK write waits, and the device
 publishes wait behind it.
 
@@ -489,12 +489,13 @@ The automation `dashboard_log` writes the lines to the Home Assistant log.
 ### Home Assistant device
 
 The dashboard tells Home Assistant about itself with MQTT discovery. Home Assistant
-then shows the dashboard as a device with eighteen entities: the status, the charge of
+then shows the dashboard as a device with twenty-one entities: the status, the charge of
 the battery, whether the dashboard is on the stand, five power diagnostics (charging,
 the charge state, and the voltage, the current and the temperature of the battery),
 seven Wi-Fi and boot diagnostics (the signal, the access point, the IP address,
-the reconnects, the restarts, the last reset and the wake reason), and three buttons
-(Sleep now, Restart and Full refresh). Refer to
+the reconnects, the restarts, the last reset and the wake reason), three buttons
+(Sleep now, Restart and Full refresh), the front light, and two numbers for the level
+of the light after a tap (on the stand and on battery). Refer to
 `shared/src/features/device/`. The core gets a new signal only at a join or a scan,
 so on the stand the Wi-Fi signal entity can show a value that is hours or days old.
 
@@ -505,14 +506,18 @@ so on the stand the Wi-Fi signal entity can show a value that is hours or days o
 | `dashboard/<device_id>/status` | Dashboard to Home Assistant (refer to "Status") | 1 | Yes |
 | `homeassistant/status` | Home Assistant to the dashboard | 0 (subscribe) | No |
 | `dashboard/<device_id>/set/button` | Home Assistant to the dashboard (refer to "Buttons") | 0 | No |
+| `dashboard/<device_id>/light` | Dashboard to Home Assistant (refer to "Front light") | 1 | Yes |
+| `dashboard/<device_id>/set/light` | Home Assistant to the dashboard | 0 | No |
+| `dashboard/<device_id>/set/tap_level_stand` | Home Assistant to the dashboard | 0 | Yes |
+| `dashboard/<device_id>/set/tap_level_battery` | Home Assistant to the dashboard | 0 | Yes |
 
 #### The discovery message
 
 The discovery message is one device-based discovery config of Home Assistant
-(2024.11 and later), with abbreviated keys. It has 6,283 bytes for the device id
-`hall` (the limit in the tests is 8 KiB, also for a device id of 16 characters). The
-discovery and the state message go in one write, which has about 6.5 KB of the 16 KiB
-that a write can have (`MAX_OUTGOING`).
+(2024.11 and later), with abbreviated keys. It has 7,409 bytes for the device id
+`hall`, and 8,225 bytes for a device id of 16 characters. The limit in the tests is
+10 KiB. The discovery, the state of the light and the state message go in one write,
+which has about 7.7 KB of the 16 KiB that a write can have (`MAX_OUTGOING`).
 For example, for the device id `hall`:
 
 ```json
@@ -673,6 +678,31 @@ For example, for the device id `hall`:
       "cmd_t": "dashboard/hall/set/button", "pl_prs": "refresh",
       "avty_t": "dashboard/hall/status",
       "avty_tpl": "{{ 'online' if value == 'online' else 'offline' }}"
+    },
+    "light": {
+      "p": "light", "name": "Front light", "uniq_id": "dashboard_hall_light",
+      "schema": "json", "sup_clrm": ["brightness"], "bri_scl": 100,
+      "stat_t": "dashboard/hall/light", "cmd_t": "dashboard/hall/set/light",
+      "avty_t": "dashboard/hall/status",
+      "avty_tpl": "{{ 'online' if value == 'online' else 'offline' }}"
+    },
+    "tap_level_stand": {
+      "p": "number", "name": "Tap light on the stand",
+      "uniq_id": "dashboard_hall_tap_level_stand", "ic": "mdi:gesture-tap", "ent_cat": "config",
+      "cmd_t": "dashboard/hall/set/tap_level_stand",
+      "stat_t": "dashboard/hall/set/tap_level_stand",
+      "ret": true, "min": 0, "max": 100, "step": 1, "unit_of_meas": "%", "mode": "slider",
+      "avty_t": "dashboard/hall/status",
+      "avty_tpl": "{{ 'offline' if value == 'offline' else 'online' }}"
+    },
+    "tap_level_battery": {
+      "p": "number", "name": "Tap light on battery",
+      "uniq_id": "dashboard_hall_tap_level_battery", "ic": "mdi:gesture-tap", "ent_cat": "config",
+      "cmd_t": "dashboard/hall/set/tap_level_battery",
+      "stat_t": "dashboard/hall/set/tap_level_battery",
+      "ret": true, "min": 0, "max": 100, "step": 1, "unit_of_meas": "%", "mode": "slider",
+      "avty_t": "dashboard/hall/status",
+      "avty_tpl": "{{ 'offline' if value == 'offline' else 'online' }}"
     }
   }
 }
@@ -692,6 +722,14 @@ The message on the broker has no spaces or new lines.
   state. Restart has the device class `restart`. Restart and Full refresh have the
   entity category `config`, so Home Assistant shows them in the "Configuration" part of
   the device page. Sleep now has no category, so it is a control.
+- The light has the JSON schema (`schema` has no abbreviation), so one message has
+  the state and the brightness. Its only color mode is `brightness`, and the
+  brightness scale (`bri_scl`) is 100, so the brightness is in percent on the wire.
+- Each tap level is a number with `ret: true`, so Home Assistant publishes the value
+  retained on its command topic. The state topic is the command topic, so Home
+  Assistant shows the value that the broker keeps. Until a user sets a value, Home
+  Assistant shows the number as unknown. The minimum is explicit, because the default
+  minimum of Home Assistant is 1, and 0 is a valid tap level.
 - The battery, stand, charging, temperature and signal components keep the default
   icon of their device class. The other components set an icon with `ic`, because
   they have no device class or the icon of the class does not tell what they are.
@@ -724,10 +762,12 @@ The dashboard publishes the discovery message at these times:
 - Again on the next connection, if the session ended before the PUBACK.
 
 During a dry run (`read_only = true` in `cfg.toml`, or the dry run that the user
-starts), the dashboard publishes no discovery message and no state message. The
+starts), the dashboard publishes no discovery message, no state of the light and no
+state message. It still obeys the commands of the light and the tap levels. The
 bring-up binary of the firmware uses a dry run, so it does not appear in Home
 Assistant as a device. The log still goes. When the dry run stops, the dashboard
-publishes the discovery message (if it did not send it yet) and the state.
+publishes the discovery message (if it did not send it yet), the state of the light
+and the state.
 
 #### The state message
 
@@ -785,7 +825,8 @@ The message has about 240 bytes. The dashboard publishes it at these times:
 | --- | --- |
 | Status | Always. It shows `online`, `asleep`, `offline` or `restarting` from the status topic. |
 | Battery, On stand, the power diagnostics, and the Wi-Fi and boot diagnostics | Unless the status is `offline`. While the dashboard is asleep or restarts, they keep their last value. |
-| Restart, Full refresh | Only while the status is `online`. |
+| Restart, Full refresh, Front light | Only while the status is `online`. While the dashboard sleeps, it cannot obey a command. |
+| Tap light on the stand, Tap light on battery | Unless the status is `offline`. A user can set a tap level while the dashboard sleeps. The broker keeps it, and the next connection applies it. |
 | Sleep now | Only while the status is `online` and the dashboard is on battery (`stand` is `OFF`). On the stand, a sleep does nothing. |
 
 Home Assistant compares the result of an availability template with `online` and
@@ -835,10 +876,92 @@ A press publishes one of these payloads:
 - A press arrives only while the connection is up. During the close for a sleep or a
   change of access point, the dashboard drops each message, also a button message.
 
+#### Front light
+
+Home Assistant shows the front light of the panel as a light entity with a
+brightness. Two numbers set the level of the light after a tap.
+
+| Topic | Direction | QoS | Retained |
+| --- | --- | --- | --- |
+| `dashboard/<device_id>/light` | Dashboard to Home Assistant | 1 | Yes |
+| `dashboard/<device_id>/set/light` | Home Assistant to the dashboard | 0 (subscribe) | No. The dashboard ignores a retained command. |
+| `dashboard/<device_id>/set/tap_level_stand` | Home Assistant to the dashboard | 0 (subscribe) | Yes. The dashboard applies a retained value. |
+| `dashboard/<device_id>/set/tap_level_battery` | Home Assistant to the dashboard | 0 (subscribe) | Yes. The dashboard applies a retained value. |
+
+The `dashboard/<device_id>/set/+` subscription of the buttons also gets these
+topics.
+
+**Commands.** Home Assistant publishes one of these payloads on `set/light`:
+
+| Payload | What the dashboard does |
+| --- | --- |
+| `{"state":"ON","brightness":40}` | Turns the light on at 40%, from 1 to 100. Home Assistant holds the light: a tap and the light timer do not change it. |
+| `{"state":"ON"}` | Turns the light on, and Home Assistant holds it. A light that is on keeps its level. A light that is off goes on at the tap level of the power source, or at the default of the source if the tap level is 0. |
+| `{"state":"OFF"}` | Turns the light off. |
+
+- A brightness of 0 is OFF. Home Assistant does not send it, but a raw publish can.
+- The dashboard ignores the keys that it does not use, for example `transition` and
+  `flash`.
+- The dashboard ignores a retained command, and writes the `info` line `device: the
+  light command on dashboard/<device_id>/set/light is retained, so the core ignored it`.
+- The dashboard ignores a payload that is not valid (not JSON, no `state`, a `state`
+  other than `ON` or `OFF`, or a brightness more than 100). It writes a `warn` line
+  with at most 32 bytes of the payload, escaped as for a button.
+- A command acts only while the dashboard is awake. During the first steps of a sleep,
+  and while a restart waits, the dashboard ignores it and writes a `debug` line.
+- Each command writes a `debug` line, for example `device: Home Assistant turned the
+  front light on at 40%`.
+- A command is not a touch. It does not start the idle time again, so on battery the
+  dashboard still sleeps 30 seconds after the last tap. The sleep turns the light off.
+- A light that Home Assistant holds stays on until Home Assistant turns it off, the
+  dashboard sleeps, or the core starts again. A change of the power source does not
+  change its level.
+
+**Tap levels.** A tap turns the light on at the tap level of the power source for 20
+seconds. Home Assistant publishes the tap level of each source as a whole number from
+0 to 100, retained, for example `40`. The dashboard also accepts `40.0`. At the tap
+level 0, a tap does not turn the light on.
+
+- Until Home Assistant sets a tap level, the tap level is 60 on the stand and 25 on
+  battery. An empty payload (a user cleared the retained message) gives the default
+  again. If a user clears the message while the dashboard sleeps, the broker sends
+  nothing at the next connect, so the old value stays until the next start of the core.
+- The broker sends the retained tap levels at each connect. The same value again
+  changes nothing.
+- If a tap lit the light, a new tap level of the power source applies at once, and the
+  light timer continues. A new tap level of 0 turns the light off.
+- The dashboard ignores a payload that is not valid (a fraction, a negative value, a
+  value more than 100, or text), and writes a `warn` line.
+- Each new tap level writes a `debug` line, for example `device: Home Assistant set the
+  tap level on the stand to 40%`.
+
+**State.** The dashboard publishes the state of the light, retained, at QoS 1:
+
+```json
+{"state":"ON","brightness":40}
+```
+
+or `{"state":"OFF"}`. The OFF state has no brightness. The dashboard publishes it at
+these times:
+
+- Once on each connection.
+- After each change of the light: a tap, the light timer, a command, a tap level, and
+  a change of the power source.
+- After each command of Home Assistant, also if the light did not change, so Home
+  Assistant always gets a state for a command.
+- At most one state of the light waits for a PUBACK. If a command arrives while one
+  waits, the dashboard publishes the state again after the PUBACK.
+
+From the start of a sleep, the queue publishes nothing, so the broker keeps the last
+state through the sleep (often ON after a wake tap). Home Assistant shows the light as
+unavailable while the status is `asleep`. The next connection publishes the true
+state.
+
 #### When the dashboard publishes
 
-The discovery message, the state message and the lines of the log are the device
-publishes. One queue sends them, in this order: the discovery, the state, the log.
+The discovery message, the state of the light, the state message and the lines of the
+log are the device publishes. One queue sends them, in this order: the discovery, the
+light, the state, the log.
 
 - The queue sends only while the connection is up. It sends nothing in the write of
   the CONNACK, nothing from the start of a sleep, and nothing during the close for a

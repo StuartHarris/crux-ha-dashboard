@@ -9,6 +9,7 @@ pub mod broker;
 mod buttons;
 mod diagnostics;
 pub mod flows;
+mod light;
 mod session;
 mod subscribe;
 
@@ -68,6 +69,16 @@ pub fn state(battery: &str, stand: &str) -> String {
         battery,
         stand
     )
+}
+
+/// Returns the state message of the light at `level`, for example
+/// `{"state":"ON","brightness":60}`. The level 0 gives `{"state":"OFF"}`.
+pub fn light_state(level: u8) -> String {
+    if level == 0 {
+        String::from(r#"{"state":"OFF"}"#)
+    } else {
+        alloc::format!(r#"{{"state":"ON","brightness":{level}}}"#)
+    }
 }
 
 /// The facts about the firmware in the tests.

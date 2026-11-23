@@ -16,8 +16,11 @@
 //!   for [`STRAY_HOLD`], then sends a new `Sleep` request. In that time, a
 //!   tap or the stand wakes the device.
 //! - If the front light is still on at the sleep, one more step turns it
-//!   off first. Usually the light timer turned it off already. Refer to
-//!   [`LIGHT_TIMEOUT`](crate::features::light::LIGHT_TIMEOUT).
+//!   off first. Usually the light timer turned the light of a tap off
+//!   already. The light is on at the sleep after a tap on no control, or if
+//!   Home Assistant turned it on. Refer to
+//!   [`LIGHT_TIMEOUT`](crate::features::light::LIGHT_TIMEOUT) and
+//!   [`light`](crate::features::light).
 //! - A sleep does not start while a pending mark shows. Refer to
 //!   [`crate::features::pending`]. At the end of the idle time, marks can be
 //!   open while no service call waits in the outbox. The sleep then waits

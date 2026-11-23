@@ -1,7 +1,7 @@
 //! The discovery message: one device-based discovery config of Home
 //! Assistant (2024.11 and later), with abbreviated keys.
 //!
-//! The config has the device (`dev`), the origin (`o`) and eighteen
+//! The config has the device (`dev`), the origin (`o`) and twenty-one
 //! components (`cmps`). Each component has the platform `p` and a
 //! `uniq_id` of `dashboard_<id>_<key>`. Refer to `docs/mqtt.md`.
 //!
@@ -25,6 +25,9 @@
 //! | `sleep` | `button` | none, icon `mdi:sleep` | command topic `dashboard/<id>/set/button`, payload `sleep` |
 //! | `restart` | `button` | `restart`, config | the command topic, payload `restart` |
 //! | `refresh` | `button` | none, icon `mdi:refresh`, config | the command topic, payload `refresh` |
+//! | `light` | `light` | the JSON schema, brightness only, scale 100 | the light topic, command topic `dashboard/<id>/set/light` |
+//! | `tap_level_stand` | `number` | 0 to 100 in `%`, icon `mdi:gesture-tap`, config, retained | `dashboard/<id>/set/tap_level_stand`, also its command topic |
+//! | `tap_level_battery` | `number` | as `tap_level_stand` | `dashboard/<id>/set/tap_level_battery`, also its command topic |
 //!
 //! The status sensor has no availability, so it shows `offline` too. The
 //! sensors are available unless the status is `offline`. Thus they keep
@@ -37,6 +40,21 @@
 //! device on battery: it has a second availability on the `stand` key of
 //! the state topic, with the mode `all`. On the stand, a sleep does
 //! nothing, so Home Assistant does not show the button as available.
+//!
+//! The light is available only while the status is `online`, as the
+//! buttons are. Home Assistant shows it as unavailable while the device
+//! sleeps, because the device cannot obey a command then. The light has
+//! the JSON schema, so one message has the state and the brightness. Its
+//! color mode is `brightness` only, and the brightness scale is 100, so the
+//! brightness is in percent on the wire.
+//!
+//! Each tap level is a number with the retain flag (`ret`). Home Assistant
+//! publishes the value retained on its command topic, and the core reads
+//! it from the broker at each connect. The state topic is the command
+//! topic, so Home Assistant shows the value that the broker keeps. The
+//! numbers are available unless the status is `offline`, so a user can
+//! set a tap level while the device sleeps. The minimum is 0, because 0 is
+//! the tap level at which a tap does not turn the light on.
 //!
 //! The state message keeps the `snake_case` values of
 //! [`CHARGE_OPTIONS`](super::CHARGE_OPTIONS),
@@ -59,7 +77,7 @@ use alloc::{format, string::String, vec::Vec};
 
 use serde::Serialize;
 
-use super::{BUTTON_SET, Button};
+use super::{BUTTON_SET, Button, LIGHT_SET, TAP_LEVEL_BATTERY_SET, TAP_LEVEL_STAND_SET};
 use crate::{
     Firmware, Settings,
     capabilities::radio::mac_text,
@@ -133,6 +151,10 @@ pub fn payload(settings: &Settings, firmware: &Firmware) -> Vec<u8> {
     let status_topic = settings.status_topic();
     let state_topic = settings.state_topic();
     let button_topic = settings.set_topic(BUTTON_SET);
+    let light_topic = settings.light_topic();
+    let light_command = settings.set_topic(LIGHT_SET);
+    let tap_stand = settings.set_topic(TAP_LEVEL_STAND_SET);
+    let tap_battery = settings.set_topic(TAP_LEVEL_BATTERY_SET);
     let mac = mac_text(firmware.mac);
     let config = Config {
         dev: Device {
@@ -152,6 +174,10 @@ pub fn payload(settings: &Settings, firmware: &Firmware) -> Vec<u8> {
             status_topic: &status_topic,
             state_topic: &state_topic,
             button_topic: &button_topic,
+            light_topic: &light_topic,
+            light_command: &light_command,
+            tap_stand: &tap_stand,
+            tap_battery: &tap_battery,
         }),
     };
     // The fields are text, and the writer is a `Vec`, so the serialization
@@ -165,6 +191,19 @@ fn components<'a>(make: &Make<'a>) -> Components<'a> {
         power: power_components(make),
         diagnostics: diagnostic_components(make),
         buttons: button_components(make),
+        light: LightComponents {
+            light: make.light(),
+            tap_level_stand: make.tap_level(
+                TAP_LEVEL_STAND_SET,
+                "Tap light on the stand",
+                make.tap_stand,
+            ),
+            tap_level_battery: make.tap_level(
+                TAP_LEVEL_BATTERY_SET,
+                "Tap light on battery",
+                make.tap_battery,
+            ),
+        },
     }
 }
 
@@ -292,6 +331,14 @@ struct Make<'a> {
     status_topic: &'a str,
     state_topic: &'a str,
     button_topic: &'a str,
+    /// The state topic of the light.
+    light_topic: &'a str,
+    /// The command topic of the light.
+    light_command: &'a str,
+    /// The topic of the tap level on the stand.
+    tap_stand: &'a str,
+    /// The topic of the tap level on battery.
+    tap_battery: &'a str,
 }
 
 /// The key, the name, the device class, the icon and the unit of a
@@ -401,6 +448,47 @@ impl<'a> Make<'a> {
         }
     }
 
+    /// Returns the front light: the JSON schema, with the brightness in
+    /// percent. It is available only while the status is `online`.
+    fn light(&self) -> LightComponent<'a> {
+        LightComponent {
+            p: "light",
+            name: "Front light",
+            uniq_id: self.unique(LIGHT_SET),
+            schema: "json",
+            sup_clrm: ["brightness"],
+            bri_scl: 100,
+            stat_t: self.light_topic,
+            cmd_t: self.light_command,
+            avty_t: self.status_topic,
+            avty_tpl: AVAILABLE_WHILE_ONLINE,
+        }
+    }
+
+    /// Returns the number of the tap level `key` on `topic`, from 0 to 100
+    /// in percent. Home Assistant publishes it retained on `topic`, and
+    /// reads its state from `topic`. It is available unless the status is
+    /// `offline`.
+    fn tap_level(&self, key: &str, name: &'static str, topic: &'a str) -> Number<'a> {
+        Number {
+            p: "number",
+            name,
+            uniq_id: self.unique(key),
+            ic: "mdi:gesture-tap",
+            ent_cat: CONFIG,
+            cmd_t: topic,
+            stat_t: topic,
+            ret: true,
+            min: 0,
+            max: 100,
+            step: 1,
+            unit_of_meas: "%",
+            mode: "slider",
+            avty_t: self.status_topic,
+            avty_tpl: AVAILABLE_UNLESS_OFFLINE,
+        }
+    }
+
     /// Returns a diagnostic enum sensor with the labels `ops` and the value
     /// template `val_tpl` that maps the wire values to them.
     fn choice(
@@ -459,6 +547,50 @@ struct Components<'a> {
     diagnostics: DiagnosticComponents<'a>,
     #[serde(flatten)]
     buttons: ButtonComponents<'a>,
+    #[serde(flatten)]
+    light: LightComponents<'a>,
+}
+
+#[derive(Serialize)]
+struct LightComponents<'a> {
+    light: LightComponent<'a>,
+    tap_level_stand: Number<'a>,
+    tap_level_battery: Number<'a>,
+}
+
+/// The front light, with the JSON schema.
+#[derive(Serialize)]
+struct LightComponent<'a> {
+    p: &'static str,
+    name: &'static str,
+    uniq_id: String,
+    schema: &'static str,
+    sup_clrm: [&'static str; 1],
+    bri_scl: u8,
+    stat_t: &'a str,
+    cmd_t: &'a str,
+    avty_t: &'a str,
+    avty_tpl: &'static str,
+}
+
+/// A number of a tap level, with the retain flag.
+#[derive(Serialize)]
+struct Number<'a> {
+    p: &'static str,
+    name: &'static str,
+    uniq_id: String,
+    ic: &'static str,
+    ent_cat: &'static str,
+    cmd_t: &'a str,
+    stat_t: &'a str,
+    ret: bool,
+    min: u8,
+    max: u8,
+    step: u8,
+    unit_of_meas: &'static str,
+    mode: &'static str,
+    avty_t: &'a str,
+    avty_tpl: &'static str,
 }
 
 #[derive(Serialize)]

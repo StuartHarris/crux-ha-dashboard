@@ -405,7 +405,9 @@ fn a_message_that_is_too_long_is_skipped_and_the_connection_stays() {
 fn a_call_that_the_full_session_refuses_waits_and_goes_after_the_pubacks() {
     let mut shell = connected(PowerSource::Stand);
     shell.broker.hold_puback = true;
-    for _ in 0..MAX_IN_FLIGHT {
+    // The first tap also publishes the state of the light, which takes one
+    // place.
+    for _ in 0..MAX_IN_FLIGHT - 1 {
         shell.send(tap_tile(1));
     }
     assert!(shell.model.connection.outbox.is_empty());
@@ -421,7 +423,7 @@ fn a_call_that_the_full_session_refuses_waits_and_goes_after_the_pubacks() {
     shell.broker.flush();
     shell.run();
     assert!(shell.model.connection.outbox.is_empty());
-    assert_eq!(shell.broker.service_calls.len(), MAX_IN_FLIGHT + 1);
+    assert_eq!(shell.broker.service_calls.len(), MAX_IN_FLIGHT);
 }
 
 #[test]
@@ -719,7 +721,9 @@ fn a_subscribe_that_is_done_during_the_close_for_a_sleep_does_not_make_the_link_
 fn a_call_that_the_full_session_refuses_goes_ahead_of_an_older_call_that_waits() {
     let mut shell = connected(PowerSource::Stand);
     shell.broker.hold_puback = true;
-    for _ in 0..MAX_IN_FLIGHT {
+    // The first tap also publishes the state of the light, which takes one
+    // place.
+    for _ in 0..MAX_IN_FLIGHT - 1 {
         shell.send(tap_tile(1));
     }
     assert!(shell.model.connection.outbox.is_empty());
@@ -745,7 +749,7 @@ fn a_call_that_the_full_session_refuses_goes_ahead_of_an_older_call_that_waits()
     shell.broker.flush();
     shell.run();
     assert!(shell.model.connection.outbox.is_empty());
-    let last: Vec<&str> = shell.broker.service_calls[MAX_IN_FLIGHT..]
+    let last: Vec<&str> = shell.broker.service_calls[MAX_IN_FLIGHT - 1..]
         .iter()
         .map(|call| call.entity_id.as_str())
         .collect();

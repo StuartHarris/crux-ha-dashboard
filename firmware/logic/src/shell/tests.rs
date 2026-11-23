@@ -17,7 +17,7 @@ use shared::{
     fake::{Broker, FakeRadio, radio::HALL, session_timers},
     features::{
         connection::{CLOSE_TIMEOUT, RECONNECT_MIN},
-        light::{BATTERY_LEVEL, LIGHT_TIMEOUT, STAND_LEVEL},
+        light::{DEFAULT_BATTERY_LEVEL, DEFAULT_STAND_LEVEL, LIGHT_TIMEOUT},
         logs::{self, Kept, Line, Message, Source},
         power::IDLE_TIMEOUT,
         refresh::DRAW_DELAY,
@@ -815,8 +815,8 @@ fn a_tap_on_dead_space_while_awake_only_turns_the_light_on() {
     // time limit of the join. On battery, the idle timer has token 3, so
     // the light timer has 4.
     for (power, level, timer) in [
-        (PowerSource::Stand, STAND_LEVEL, 3),
-        (PowerSource::Battery, BATTERY_LEVEL, 4),
+        (PowerSource::Stand, DEFAULT_STAND_LEVEL.get(), 3),
+        (PowerSource::Battery, DEFAULT_BATTERY_LEVEL.get(), 4),
     ] {
         let (mut device, _) = started(power, true);
         let jobs = device.handle(Signal::Tap(Point::new(100, 20)));

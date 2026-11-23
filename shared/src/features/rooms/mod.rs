@@ -57,7 +57,9 @@ pub fn tapped(control: Option<Control>, model: &mut Model) -> Cmd {
         let wake = power::wake_up(model);
         return wake.and(tapped(control, model));
     }
-    // Each touch turns the front light on, also a touch on no control.
+    // Each touch turns the front light on, also a touch on no control. The
+    // touch does not pump, so the service call of the action goes before
+    // the state of the light.
     let light = light::touched(model);
     let action = match control {
         None => Cmd::done(),
@@ -71,7 +73,8 @@ pub fn tapped(control: Option<Control>, model: &mut Model) -> Cmd {
         Some(Control::Plus(index)) => step_tapped(index, true, model),
         Some(Control::Minus(index)) => step_tapped(index, false, model),
     };
-    light.and(action)
+    // One pump publishes the state of the light after the action.
+    light.and(action).and(device::changed(model))
 }
 
 /// Shows the page at `route`. The core ignores a route that has no page,

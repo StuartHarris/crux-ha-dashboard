@@ -4,13 +4,13 @@
 //! # The device publish queue
 //!
 //! The device publishes are the messages that the dashboard sends about
-//! itself: the discovery message, the state of its sensors and the lines of
-//! its log. Each one is a publisher. [`drain`] is the queue.
+//! itself: the discovery message, the state of its front light, the state
+//! of its sensors and the lines of its log. Each one is a publisher. [`drain`] is the queue.
 //! [`connection::pump`] calls it after the outbox, while the connection is
 //! up.
 //!
 //! The queue asks each publisher for its next message, in this order:
-//! discovery, state, log. It gives each message to the session, and tells
+//! discovery, light, state, log. It gives each message to the session, and tells
 //! the publisher the packet id. It stops when one of these is true:
 //!
 //! - Each publisher has no message now.
@@ -33,6 +33,7 @@
 //! | Publisher | Its state | Where the state is |
 //! | --- | --- | --- |
 //! | discovery | [`Discovery`] | [`State`], in the model |
+//! | light | [`light::Sync`] | the [`Live`](connection::Live) of the session |
 //! | state | [`StateSync`] | the [`Live`](connection::Live) of the session |
 //! | log | [`logs::Flight`] | the [`Live`](connection::Live) of the session |
 //!
@@ -62,10 +63,12 @@
 //! # Dry run
 //!
 //! During a dry run ([`Settings::read_only`](crate::Settings::read_only)),
-//! the core publishes no discovery message and no state message. The
+//! the core publishes no discovery message, no state of the light and no
+//! state message. The core still obeys the commands of the light. The
 //! bring-up binary of the firmware uses a dry run, so it does not appear in
 //! Home Assistant as a device. The log still goes. When the dry run stops,
-//! the queue publishes the discovery message (if it is due) and the state.
+//! the queue publishes the discovery message (if it is due), the state of
+//! the light and the state.
 //!
 //! # State
 //!
@@ -136,6 +139,12 @@
 //!   warning.
 //! - The core ignores a message on another `set` topic.
 //!
+//! The light and its two tap levels have `set` topics too: [`LIGHT_SET`],
+//! [`TAP_LEVEL_STAND_SET`] and [`TAP_LEVEL_BATTERY_SET`]. The core ignores
+//! a retained light command, as it does a retained button message. It
+//! applies a retained tap level, because Home Assistant keeps the tap
+//! levels on the broker. Refer to [`light`].
+//!
 //! A button acts through [`Event::Pressed`], so it acts after the update
 //! that received the message, outside [`connection::pump`]. It is not a
 //! touch: it does not start the idle timer again, and it does not turn the
@@ -161,6 +170,7 @@ use crate::{
     },
     features::{
         connection::{self, Link},
+        light::{self, Level},
         logs,
         power::{self, IdleEnd, WakeReason},
         refresh::redraw,
@@ -181,8 +191,8 @@ use crate::{
 pub const RESERVED: usize = 8;
 
 /// The largest number of device publishes that wait for a PUBACK in a
-/// session: the discovery message, the state message and the messages of
-/// the log, all together.
+/// session: the discovery message, the light message, the state message and
+/// the messages of the log, all together.
 pub const IN_FLIGHT: usize = MAX_IN_FLIGHT - RESERVED;
 
 /// The topic of the birth message of Home Assistant.
@@ -197,6 +207,15 @@ pub const ANY_SET: &str = "+";
 
 /// The name of the `set` topic of the buttons.
 pub const BUTTON_SET: &str = "button";
+
+/// The name of the `set` topic of the light.
+pub const LIGHT_SET: &str = "light";
+
+/// The name of the `set` topic of the tap level on the stand.
+pub const TAP_LEVEL_STAND_SET: &str = "tap_level_stand";
+
+/// The name of the `set` topic of the tap level on battery.
+pub const TAP_LEVEL_BATTERY_SET: &str = "tap_level_battery";
 
 /// The longest text of an unknown button payload in the log, in bytes.
 const PAYLOAD_IN_LOG: usize = 32;
@@ -577,6 +596,8 @@ struct StatePayload {
 pub(crate) enum Item {
     /// The discovery message.
     Discovery,
+    /// The state message of the light at this level (`None` is OFF).
+    Light(Option<Level>),
     /// The state message with this snapshot.
     State {
         /// The snapshot in the message.
@@ -605,18 +626,20 @@ pub(crate) enum Next {
 #[derive(Clone, Copy)]
 enum Publisher {
     Discovery,
+    Light,
     State,
     Log,
 }
 
 impl Publisher {
     /// The publishers, in the order in which the queue asks them.
-    const ORDER: [Self; 3] = [Self::Discovery, Self::State, Self::Log];
+    const ORDER: [Self; 4] = [Self::Discovery, Self::Light, Self::State, Self::Log];
 
     /// Returns the next message of the publisher.
     fn next(self, model: &mut Model) -> Next {
         match self {
             Self::Discovery => next_discovery(model),
+            Self::Light => light::next(model),
             Self::State => next_state(model),
             Self::Log => logs::next(model),
         }
@@ -636,8 +659,10 @@ pub const fn start(model: &mut Model) {
 /// again. [`connection::pump`] then publishes it, because the core routes
 /// each message inside the pump.
 ///
-/// A button message gives [`Event::Pressed`]. Refer to the
-/// [module docs](self) for the messages that the core ignores.
+/// A button message gives [`Event::Pressed`]. A live light command gives
+/// [`light::Event::Commanded`], and a tap level gives
+/// [`light::Event::TapLevelSet`]. Refer to the [module docs](self) for the
+/// messages that the core ignores.
 pub(crate) fn route(message: &Message, model: &mut Model) -> Option<Cmd> {
     if message.topic == BIRTH_TOPIC {
         let birth = !message.retain && message.payload == BIRTH_ONLINE.as_bytes();
@@ -649,6 +674,17 @@ pub(crate) fn route(message: &Message, model: &mut Model) -> Option<Cmd> {
     let settings = model.startup.settings()?;
     if message.topic == settings.set_topic(BUTTON_SET) {
         return Some(button_message(message));
+    }
+    if message.topic == settings.set_topic(LIGHT_SET) {
+        return Some(light_message(message));
+    }
+    for (name, source) in [
+        (TAP_LEVEL_STAND_SET, PowerSource::Stand),
+        (TAP_LEVEL_BATTERY_SET, PowerSource::Battery),
+    ] {
+        if message.topic == settings.set_topic(name) {
+            return Some(tap_level_message(source, message));
+        }
     }
     // Later `set` topics come here. The core ignores them for now.
     message
@@ -679,6 +715,49 @@ fn button_message(message: &Message) -> Cmd {
             )
         },
         |button| Cmd::event(Event::Pressed(button).into()),
+    )
+}
+
+/// Handles a message on the light topic. The core ignores a retained
+/// command, because it is not from now. Refer to [`light`].
+fn light_message(message: &Message) -> Cmd {
+    if message.retain {
+        return logs::info(
+            Area::Device,
+            format!(
+                "the light command on {} is retained, so the core ignored it",
+                message.topic
+            ),
+        );
+    }
+    light::command(&message.payload).map_or_else(
+        || {
+            logs::warn(
+                Area::Device,
+                format!(
+                    "the light command {} is not valid, so the core ignored it",
+                    shown(&message.payload)
+                ),
+            )
+        },
+        |command| Cmd::event(light::Event::Commanded(command).into()),
+    )
+}
+
+/// Handles a message on the tap level topic of `source`, retained or live.
+fn tap_level_message(source: PowerSource, message: &Message) -> Cmd {
+    light::tap_level(&message.payload).map_or_else(
+        || {
+            logs::warn(
+                Area::Device,
+                format!(
+                    "the tap level {} on {} is not valid, so the core ignored it",
+                    shown(&message.payload),
+                    message.topic
+                ),
+            )
+        },
+        |level| Cmd::event(light::Event::TapLevelSet { source, level }.into()),
     )
 }
 
@@ -890,6 +969,9 @@ pub(crate) fn acked(id: PacketId, model: &mut Model) {
         }
         return;
     }
+    if light::acked(id, model) {
+        return;
+    }
     logs::acked(id, model);
 }
 
@@ -899,7 +981,7 @@ fn in_flight(model: &mut Model) -> usize {
     let state = model.connection.live_mut().map_or(0, |live| {
         usize::from(matches!(live.state, StateSync::InFlight { .. }))
     });
-    discovery + state + logs::in_flight(model)
+    discovery + light::in_flight(model) + state + logs::in_flight(model)
 }
 
 /// The session took the message `item` with the packet id `packet`.
@@ -908,6 +990,7 @@ fn in_flight(model: &mut Model) -> usize {
 fn taken(item: Item, packet: PacketId, model: &mut Model) -> Cmd {
     match item {
         Item::Discovery => model.device.discovery = Discovery::InFlight(packet),
+        Item::Light(sent) => light::taken(sent, packet, model),
         Item::State {
             snapshot,
             throttles,
@@ -947,12 +1030,13 @@ fn taken(item: Item, packet: PacketId, model: &mut Model) -> Cmd {
 /// The session can never take the message `item`, because it is too long
 /// for a packet.
 ///
-/// The discovery and the state messages are short, so this does not occur
+/// The discovery, the light and the state messages are short, so this does not occur
 /// for them. If it occurs, the core does not offer the message again, so
 /// the queue cannot repeat it without end.
 fn never(item: Item, model: &mut Model) {
     match item {
         Item::Discovery => model.device.discovery = Discovery::Sent,
+        Item::Light(sent) => light::never(sent, model),
         Item::State { snapshot, .. } => {
             if let Some(live) = model.connection.live_mut() {
                 let window = live.state.take_window();

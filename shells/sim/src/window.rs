@@ -857,11 +857,11 @@ fn outline_rect(area: Rectangle, origin: Pos2, scale: u32, pixels_per_point: f32
 mod tests {
     #[test]
     fn the_tint_of_the_front_light_is_stronger_at_a_higher_level() {
-        use shared::features::light::{BATTERY_LEVEL, STAND_LEVEL};
+        use shared::features::light::{DEFAULT_BATTERY_LEVEL, DEFAULT_STAND_LEVEL};
 
         assert_eq!(super::light_tint(0), None);
-        let battery = super::light_tint(BATTERY_LEVEL).unwrap();
-        let stand = super::light_tint(STAND_LEVEL).unwrap();
+        let battery = super::light_tint(DEFAULT_BATTERY_LEVEL.get()).unwrap();
+        let stand = super::light_tint(DEFAULT_STAND_LEVEL.get()).unwrap();
         assert!(battery.a() < stand.a());
         assert!(super::light_tint(100).unwrap().a() >= stand.a());
     }
