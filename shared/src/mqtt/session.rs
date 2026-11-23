@@ -211,6 +211,13 @@ pub enum Action {
         /// The outcome of the job.
         outcome: SubscribeOutcome,
     },
+    /// The PINGRESP of a [`Session::ping`] arrived.
+    ///
+    /// The broker sends a PINGRESP after the packets that it sent for the
+    /// earlier packets of the client, if it handles the packets of a client
+    /// in order. Thus the caller can use the ping as a fence: for example,
+    /// the retained messages of an earlier SUBSCRIBE arrived before it.
+    Pinged,
     /// The session ended. This is the last action of the session.
     Ended(End),
 }
@@ -235,6 +242,7 @@ impl fmt::Debug for Action {
             Self::Message(message) => f.debug_tuple("Message").field(message).finish(),
             Self::Skipped { length } => f.debug_struct("Skipped").field("length", length).finish(),
             Self::Acked(id) => f.debug_tuple("Acked").field(id).finish(),
+            Self::Pinged => f.write_str("Pinged"),
             Self::Subscribed { id, outcome } => f
                 .debug_struct("Subscribed")
                 .field("id", id)
@@ -375,6 +383,15 @@ enum AckWatch {
     Armed { progress: bool },
 }
 
+/// Who sent a PINGREQ packet that waits for its PINGRESP.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ping {
+    /// The `Ping` timer of the keep-alive.
+    KeepAlive,
+    /// The caller, with [`Session::ping`].
+    Caller,
+}
+
 /// A packet from the broker that owns its data, so the framer is free
 /// again.
 enum Packet {
@@ -439,8 +456,9 @@ pub struct Session {
     generations: [u32; TimerKind::COUNT],
     /// `true` if bytes arrived after the last start of the silence timer.
     heard: bool,
-    /// `true` if a PINGREQ packet waits for its PINGRESP.
-    pinging: bool,
+    /// The PINGREQ packets that wait for a PINGRESP, in the order that they
+    /// went. The broker answers them in the same order.
+    pings: VecDeque<Ping>,
     /// `true` if the bytes for the next `Send` hold a packet that waits for
     /// an acknowledgement.
     unsent_acks: bool,
@@ -492,7 +510,7 @@ impl Session {
             flight: Flight::Idle,
             generations: [0; TimerKind::COUNT],
             heard: false,
-            pinging: false,
+            pings: VecDeque::new(),
             unsent_acks: false,
             ack_watch: AckWatch::Off,
             next_id: 0,
@@ -632,6 +650,34 @@ impl Session {
         id
     }
 
+    /// Sends a PINGREQ packet in the next [`Action::Send`]. When its PINGRESP
+    /// arrives, the session gives [`Action::Pinged`].
+    ///
+    /// The PINGREQ goes after all the bytes that wait. A PINGREQ of the
+    /// keep-alive that waits does not stop this PINGREQ. The PINGRESP timer
+    /// is for the first PINGREQ that waits. If no PINGRESP comes in time,
+    /// the session ends with a timeout of [`TimerKind::PingResp`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Refused::NotConnected`] if the broker did not accept the
+    /// connection yet, after [`Session::disconnect`], or if the session
+    /// ended. Returns [`Refused::Full`] if the bytes that wait would go
+    /// above [`Limits::max_outgoing`].
+    pub fn ping(&mut self) -> Result<(), Refused> {
+        if self.state != State::Connected {
+            return Err(Refused::NotConnected);
+        }
+        let before = self.outgoing.len();
+        codec::pingreq(&mut self.outgoing);
+        if self.outgoing.len() > self.limits.max_outgoing {
+            self.outgoing.truncate(before);
+            return Err(Refused::Full);
+        }
+        self.send_ping(Ping::Caller);
+        Ok(())
+    }
+
     /// Closes the connection with a DISCONNECT packet, so the broker does not
     /// publish the last will.
     ///
@@ -713,6 +759,31 @@ impl Session {
         None
     }
 
+    /// Records the PINGREQ that is in the bytes that wait. If no other
+    /// PINGREQ waits, starts the PINGRESP timer.
+    fn send_ping(&mut self, ping: Ping) {
+        if self.pings.is_empty() {
+            self.start(TimerKind::PingResp, self.limits.ping_response);
+        }
+        self.pings.push_back(ping);
+    }
+
+    /// Takes a PINGRESP. It answers the first PINGREQ that waits. A PINGRESP
+    /// that answers no PINGREQ does nothing.
+    fn ping_response(&mut self) {
+        let Some(ping) = self.pings.pop_front() else {
+            return;
+        };
+        if self.pings.is_empty() {
+            self.cancel(TimerKind::PingResp);
+        } else {
+            self.start(TimerKind::PingResp, self.limits.ping_response);
+        }
+        if ping == Ping::Caller {
+            self.actions.push_back(Action::Pinged);
+        }
+    }
+
     /// Starts the `Ack` timer if it does not run.
     fn arm_ack(&mut self) {
         if self.ack_watch == AckWatch::Off {
@@ -765,6 +836,7 @@ impl Session {
         self.state = State::Ended;
         self.outgoing = Vec::new();
         self.publishes.clear();
+        self.pings.clear();
         self.ack_watch = AckWatch::Off;
         self.unsent_acks = false;
         self.framer = Framer::new(0);
@@ -809,11 +881,11 @@ impl Session {
                 if self.state != State::Connected {
                     return;
                 }
-                // If a PINGREQ waits, its PINGRESP timer keeps its deadline.
-                if !self.pinging {
-                    self.pinging = true;
+                // If a PINGREQ waits, its PINGRESP proves that the link
+                // works, and its PINGRESP timer keeps its deadline.
+                if self.pings.is_empty() {
                     codec::pingreq(&mut self.outgoing);
-                    self.start(TimerKind::PingResp, self.limits.ping_response);
+                    self.send_ping(Ping::KeepAlive);
                 }
                 if let Some(interval) = self.ping_interval {
                     self.start(TimerKind::Ping, interval);
@@ -896,10 +968,7 @@ impl Session {
                 }
             }
             (_, Packet::SubAck { id, count, failed }) => self.suback(id, count, failed),
-            (_, Packet::PingResp) => {
-                self.pinging = false;
-                self.cancel(TimerKind::PingResp);
-            }
+            (_, Packet::PingResp) => self.ping_response(),
         }
     }
 

@@ -1161,8 +1161,9 @@ pub fn pump(model: &mut Model) -> Cmd {
                         live.cancel_timer(kind);
                     }
                 }
-                // The core closes the stream when the session ends.
-                Action::Close => {}
+                // The core closes the stream when the session ends. The core
+                // sends no PINGREQ of its own yet.
+                Action::Close | Action::Pinged => {}
                 Action::Acked(packet) => device::acked(packet, model),
                 Action::Connected => rest.push(connected(model)),
                 Action::Message(message) => rest.push(on_message(&message, model)),

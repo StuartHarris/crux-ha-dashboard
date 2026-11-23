@@ -1454,3 +1454,184 @@ fn the_ack_watch_starts_when_the_publish_leaves_not_when_it_is_made() {
     );
     assert!(matches!(wire.session.publish(command("next")), Ok(Some(_))));
 }
+
+#[test]
+fn a_ping_sends_a_pingreq_and_its_pingresp_gives_pinged() {
+    let mut wire = Wire::connected();
+    wire.timers.clear();
+    wire.cancels.clear();
+    wire.session.ping().unwrap();
+    wire.run();
+    assert_eq!(wire.sends, [vec![0xC0, 0x00]]);
+    assert_eq!(wire.broker.packets, [Packet::PingReq]);
+    assert_eq!(wire.log, [Action::Pinged]);
+    assert_eq!(
+        wire.timer_kinds(),
+        [
+            (TimerKind::PingResp, Duration::from_secs(10)),
+            (TimerKind::Send, Duration::from_secs(10)),
+        ]
+    );
+    assert_eq!(wire.cancels, [TimerKind::Send, TimerKind::PingResp]);
+}
+
+#[test]
+fn a_ping_is_refused_unless_the_session_is_connected() {
+    let mut wire = Wire::new();
+    assert_eq!(wire.session.ping(), Err(Refused::NotConnected));
+    wire.open();
+    wire.session.disconnect();
+    assert_eq!(wire.session.ping(), Err(Refused::NotConnected));
+    wire.run();
+    assert_eq!(wire.session.ping(), Err(Refused::NotConnected));
+    assert!(!wire.log.contains(&Action::Pinged), "{:?}", wire.log);
+}
+
+#[test]
+fn a_ping_that_goes_above_the_outgoing_limit_is_refused() {
+    let mut wire = Wire::with(Limits {
+        max_outgoing: 1,
+        ..Limits::default()
+    });
+    wire.open();
+    wire.timers.clear();
+    assert_eq!(wire.session.ping(), Err(Refused::Full));
+    wire.run();
+    assert_eq!(wire.timers, []);
+    assert!(!wire.log.contains(&Action::Pinged), "{:?}", wire.log);
+}
+
+#[test]
+fn the_pingresp_of_a_ping_comes_after_the_retained_messages_of_the_subscribe() {
+    let (mut wire, topics) = house();
+    wire.session.subscribe(&topics);
+    wire.session.ping().unwrap();
+    wire.run();
+
+    // The SUBSCRIBE packets and the PINGREQ go in one write, and the
+    // PINGRESP is the last packet from the broker.
+    assert_eq!(wire.sends.len(), 1);
+    assert_eq!(wire.broker.packets.last(), Some(&Packet::PingReq));
+    assert_eq!(outcomes(&wire.log), [SubscribeOutcome::Done]);
+    assert_eq!(message_topics(&wire.log), topics);
+    assert_eq!(wire.log.last(), Some(&Action::Pinged));
+    assert_eq!(
+        wire.log
+            .iter()
+            .filter(|action| **action == Action::Pinged)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn no_pingresp_for_a_ping_in_time_ends_the_session() {
+    let mut wire = Wire::connected();
+    wire.broker.hold_pingresp = true;
+    wire.session.ping().unwrap();
+    wire.run();
+    assert_eq!(wire.broker.held_pingresps, 1);
+    wire.fire(wire.timer(TimerKind::PingResp));
+    assert_eq!(
+        wire.log,
+        [
+            Action::Close,
+            Action::Ended(End::Timeout(TimerKind::PingResp))
+        ]
+    );
+}
+
+#[test]
+fn a_ping_while_a_keep_alive_pingreq_waits_gets_the_second_pingresp() {
+    let mut wire = Wire::connected();
+    wire.broker.hold_pingresp = true;
+    wire.fire(wire.timer(TimerKind::Ping));
+    let first = wire.timer(TimerKind::PingResp);
+    wire.sends.clear();
+    wire.timers.clear();
+    wire.cancels.clear();
+
+    // The ping sends its own PINGREQ, and the PINGRESP timer of the
+    // keep-alive keeps its deadline.
+    wire.session.ping().unwrap();
+    wire.run();
+    assert_eq!(wire.sends, [vec![0xC0, 0x00]]);
+    assert_eq!(
+        wire.timer_kinds(),
+        [(TimerKind::Send, Duration::from_secs(10))]
+    );
+    assert_eq!(wire.broker.held_pingresps, 2);
+
+    // The first PINGRESP answers the keep-alive and starts the timer again
+    // for the ping. The second answers the ping.
+    wire.timers.clear();
+    wire.broker.release_pingresps();
+    let answers = wire.broker.take();
+    wire.deliver(&answers[..2]);
+    wire.run();
+    assert_eq!(wire.log, []);
+    assert_eq!(
+        wire.timer_kinds(),
+        [(TimerKind::PingResp, Duration::from_secs(10))]
+    );
+    // The timer of the keep-alive PINGREQ has an old generation now.
+    wire.fire(first);
+    assert_eq!(wire.log, []);
+
+    wire.deliver(&answers[2..]);
+    wire.run();
+    assert_eq!(wire.log, [Action::Pinged]);
+    assert_eq!(wire.cancels.last(), Some(&TimerKind::PingResp));
+}
+
+#[test]
+fn a_ping_timer_while_a_ping_waits_sends_no_pingreq() {
+    let mut wire = Wire::connected();
+    wire.broker.hold_pingresp = true;
+    wire.session.ping().unwrap();
+    wire.run();
+    let ping = wire.timer(TimerKind::Ping);
+    wire.sends.clear();
+    wire.timers.clear();
+
+    wire.fire(ping);
+    assert_eq!(wire.sends, [] as [Vec<u8>; 0]);
+    assert_eq!(
+        wire.timer_kinds(),
+        [(TimerKind::Ping, Duration::from_secs(45))]
+    );
+
+    wire.broker.release_pingresps();
+    let answer = wire.broker.take();
+    wire.deliver(&answer);
+    wire.run();
+    assert_eq!(wire.log, [Action::Pinged]);
+}
+
+#[test]
+fn a_pingresp_that_answers_no_pingreq_does_nothing() {
+    let mut wire = Wire::connected();
+    wire.cancels.clear();
+    wire.timers.clear();
+    wire.deliver(&[0xD0, 0x00]);
+    wire.run();
+    assert_eq!(wire.log, []);
+    assert_eq!(wire.cancels, []);
+    assert_eq!(wire.timers, []);
+}
+
+#[test]
+fn a_session_that_ends_forgets_its_pings() {
+    let mut wire = Wire::connected();
+    wire.broker.hold_pingresp = true;
+    wire.session.ping().unwrap();
+    wire.run();
+    wire.session.disconnect();
+    wire.run();
+    assert_eq!(wire.log, [Action::Close, Action::Ended(End::Clean)]);
+
+    // A PINGRESP after the end gives nothing.
+    wire.deliver(&[0xD0, 0x00]);
+    wire.run();
+    assert_eq!(wire.log, [Action::Close, Action::Ended(End::Clean)]);
+}
