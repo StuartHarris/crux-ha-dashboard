@@ -284,14 +284,16 @@ pub struct Start {
     pub before_restart: Vec<BootLine>,
     /// The power source now.
     pub power: PowerSource,
-    /// The path of the page to show, from [`ViewModel::path`]. After a deep
-    /// sleep, the shell gives the path that it kept in RTC memory. If the
-    /// path is `None` or not valid, the core shows the first page.
+    /// The path of the page to show, from [`ViewModel::path`]. After a
+    /// restart, a shell can give the path that it kept. The firmware gives
+    /// `None`. If the path is `None` or not valid, the core shows the first
+    /// page.
     pub path: Option<String>,
     /// The footer time of the page, in seconds since the Unix epoch, from
-    /// [`ViewModel::last_sync`]. After a deep sleep, the shell gives the
-    /// value that it kept in RTC memory. The core shows it until an entity
-    /// on the page has a `last_updated` time from Home Assistant.
+    /// [`ViewModel::last_sync`]. After a restart, a shell can give the value
+    /// that it kept. The firmware gives `None`. The core shows the value
+    /// until an entity on the page has a `last_updated` time from Home
+    /// Assistant.
     pub last_sync: Option<u64>,
 }
 
@@ -515,7 +517,7 @@ pub struct Model {
     pub power: power::State,
     /// The state of the front light. Refer to [`light`].
     pub light: light::State,
-    /// The time that the shell kept through a deep sleep and gave back in
+    /// The time that a shell kept through a restart and gave back in
     /// `Start`. The footer shows this time only if no entity on the page has
     /// a `last_updated` time, for example after a wake, before the first
     /// messages arrive. Refer to [`connection::page_time`].
