@@ -1,7 +1,7 @@
 //! The discovery message: one device-based discovery config of Home
 //! Assistant (2024.11 and later), with abbreviated keys.
 //!
-//! The config has the device (`dev`), the origin (`o`) and twenty-one
+//! The config has the device (`dev`), the origin (`o`) and twenty-two
 //! components (`cmps`). Each component has the platform `p` and a
 //! `uniq_id` of `dashboard_<id>_<key>`. Refer to `docs/mqtt.md`.
 //!
@@ -28,6 +28,7 @@
 //! | `light` | `light` | the JSON schema, brightness only, scale 100 | the light topic, command topic `dashboard/<id>/set/light` |
 //! | `tap_level_stand` | `number` | 0 to 100 in `%`, icon `mdi:gesture-tap`, config, retained | `dashboard/<id>/set/tap_level_stand`, also its command topic |
 //! | `tap_level_battery` | `number` | as `tap_level_stand` | `dashboard/<id>/set/tap_level_battery`, also its command topic |
+//! | `report_period` | `number` | 0 to 720 in `min`, step 1, box, icon `mdi:timer-sync-outline`, config, retained | `dashboard/<id>/set/report_period`, also its command topic |
 //!
 //! The status sensor has no availability, so it shows `offline` too. The
 //! sensors are available unless the status is `offline`. Thus they keep
@@ -57,6 +58,12 @@
 //! set a tap level while the device sleeps. The minimum is 0, because 0 is
 //! the tap level at which a tap does not turn the light on.
 //!
+//! The report period is a number with the same options, in minutes from 0
+//! to [`REPORT_PERIOD_MAX`] in steps of 1. It is a box, not a slider, so a
+//! user can type any whole minute. At 0, the device does not report while it
+//! sleeps. Refer to
+//! [`power`](crate::features::power).
+//!
 //! The state message keeps the `snake_case` values of
 //! [`CHARGE_OPTIONS`](super::CHARGE_OPTIONS),
 //! [`RESET_OPTIONS`](super::RESET_OPTIONS) and
@@ -78,12 +85,17 @@ use alloc::{format, string::String, vec::Vec};
 
 use serde::Serialize;
 
-use super::{BUTTON_SET, Button, LIGHT_SET, TAP_LEVEL_BATTERY_SET, TAP_LEVEL_STAND_SET};
+use super::{
+    BUTTON_SET, Button, LIGHT_SET, REPORT_PERIOD_SET, TAP_LEVEL_BATTERY_SET, TAP_LEVEL_STAND_SET,
+};
 use crate::{
     Firmware, Settings,
     capabilities::radio::mac_text,
-    features::connection::{
-        STATUS_ASLEEP, STATUS_OFFLINE, STATUS_ONLINE, STATUS_REPORTING, STATUS_RESTARTING,
+    features::{
+        connection::{
+            STATUS_ASLEEP, STATUS_OFFLINE, STATUS_ONLINE, STATUS_REPORTING, STATUS_RESTARTING,
+        },
+        power::REPORT_PERIOD_MAX,
     },
 };
 
@@ -158,6 +170,7 @@ pub fn payload(settings: &Settings, firmware: &Firmware) -> Vec<u8> {
     let light_command = settings.set_topic(LIGHT_SET);
     let tap_stand = settings.set_topic(TAP_LEVEL_STAND_SET);
     let tap_battery = settings.set_topic(TAP_LEVEL_BATTERY_SET);
+    let report_period = settings.set_topic(REPORT_PERIOD_SET);
     let mac = mac_text(firmware.mac);
     let config = Config {
         dev: Device {
@@ -181,6 +194,7 @@ pub fn payload(settings: &Settings, firmware: &Firmware) -> Vec<u8> {
             light_command: &light_command,
             tap_stand: &tap_stand,
             tap_battery: &tap_battery,
+            report_period: &report_period,
         }),
     };
     // The fields are text, and the writer is a `Vec`, so the serialization
@@ -207,6 +221,7 @@ fn components<'a>(make: &Make<'a>) -> Components<'a> {
                 make.tap_battery,
             ),
         },
+        report_period: make.report_period(),
     }
 }
 
@@ -343,6 +358,8 @@ struct Make<'a> {
     tap_stand: &'a str,
     /// The topic of the tap level on battery.
     tap_battery: &'a str,
+    /// The topic of the report period.
+    report_period: &'a str,
 }
 
 /// The key, the name, the device class, the icon and the unit of a
@@ -493,6 +510,29 @@ impl<'a> Make<'a> {
         }
     }
 
+    /// Returns the number of the report period, from 0 to
+    /// [`REPORT_PERIOD_MAX`] minutes in steps of 1. It has the options of a
+    /// tap level ([`Make::tap_level`]), but it is a box, not a slider.
+    fn report_period(&self) -> Number<'a> {
+        Number {
+            p: "number",
+            name: "Report period",
+            uniq_id: self.unique(REPORT_PERIOD_SET),
+            ic: "mdi:timer-sync-outline",
+            ent_cat: CONFIG,
+            cmd_t: self.report_period,
+            stat_t: self.report_period,
+            ret: true,
+            min: 0,
+            max: REPORT_PERIOD_MAX,
+            step: 1,
+            unit_of_meas: "min",
+            mode: "box",
+            avty_t: self.status_topic,
+            avty_tpl: AVAILABLE_UNLESS_OFFLINE,
+        }
+    }
+
     /// Returns a diagnostic enum sensor with the labels `ops` and the value
     /// template `val_tpl` that maps the wire values to them.
     fn choice(
@@ -541,8 +581,8 @@ struct Origin<'a> {
     sw: &'a str,
 }
 
-/// The components, in the order of the payload. The three groups are one
-/// map in the JSON.
+/// The components, in the order of the payload. The groups and the report
+/// period are one map in the JSON.
 #[derive(Serialize)]
 struct Components<'a> {
     #[serde(flatten)]
@@ -553,6 +593,7 @@ struct Components<'a> {
     buttons: ButtonComponents<'a>,
     #[serde(flatten)]
     light: LightComponents<'a>,
+    report_period: Number<'a>,
 }
 
 #[derive(Serialize)]
@@ -577,7 +618,7 @@ struct LightComponent<'a> {
     avty_tpl: &'static str,
 }
 
-/// A number of a tap level, with the retain flag.
+/// A number with the retain flag: a tap level or the report period.
 #[derive(Serialize)]
 struct Number<'a> {
     p: &'static str,
@@ -588,9 +629,9 @@ struct Number<'a> {
     cmd_t: &'a str,
     stat_t: &'a str,
     ret: bool,
-    min: u8,
-    max: u8,
-    step: u8,
+    min: u16,
+    max: u16,
+    step: u16,
     unit_of_meas: &'static str,
     mode: &'static str,
     avty_t: &'a str,

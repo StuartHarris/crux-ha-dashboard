@@ -195,6 +195,13 @@ const DISCOVERY_JSON: &str = concat!(
     r#""stat_t":"dashboard/hall/set/tap_level_battery","#,
     r#""ret":true,"min":0,"max":100,"step":1,"unit_of_meas":"%","mode":"slider","#,
     r#""avty_t":"dashboard/hall/status","#,
+    r#""avty_tpl":"{{ 'offline' if value == 'offline' else 'online' }}"},"#,
+    r#""report_period":{"p":"number","name":"Report period","#,
+    r#""uniq_id":"dashboard_hall_report_period","ic":"mdi:timer-sync-outline","ent_cat":"config","#,
+    r#""cmd_t":"dashboard/hall/set/report_period","#,
+    r#""stat_t":"dashboard/hall/set/report_period","#,
+    r#""ret":true,"min":0,"max":720,"step":1,"unit_of_meas":"min","mode":"box","#,
+    r#""avty_t":"dashboard/hall/status","#,
     r#""avty_tpl":"{{ 'offline' if value == 'offline' else 'online' }}"}}}"#,
 );
 
@@ -219,7 +226,8 @@ fn the_discovery_message_is_json_with_the_keys_and_under_10_kib() {
     let long = discovery::payload(&long, &firmware());
     assert!(long.len() < 10 * 1024, "{} bytes", long.len());
     // The discovery and the state go in one write, and each write has at
-    // most `MAX_OUTGOING` bytes. The two messages use about a third.
+    // most `MAX_OUTGOING` bytes. The two messages use about half (8,059
+    // bytes for `hall`), so this assert has little room left.
     let state = snapshot(Some(100), true, CHARGING).to_json();
     assert!(
         (payload.len() + state.len()) * 2 < MAX_OUTGOING,
@@ -241,7 +249,7 @@ fn the_discovery_message_is_json_with_the_keys_and_under_10_kib() {
     );
 
     let components = config["cmps"].as_object().expect("components");
-    assert_eq!(components.len(), 21);
+    assert_eq!(components.len(), 22);
     for (key, platform, class) in [
         ("status", "sensor", Some("enum")),
         ("battery", "sensor", Some("battery")),
@@ -264,6 +272,7 @@ fn the_discovery_message_is_json_with_the_keys_and_under_10_kib() {
         ("light", "light", None),
         ("tap_level_stand", "number", None),
         ("tap_level_battery", "number", None),
+        ("report_period", "number", None),
     ] {
         let component = &components[key];
         assert_eq!(component["p"], platform, "{key}");
@@ -393,6 +402,32 @@ fn the_tap_levels_are_retained_numbers_from_0_to_100_percent() {
 }
 
 #[test]
+fn the_report_period_is_a_retained_number_from_0_to_720_minutes_in_steps_of_1() {
+    let payload = discovery::payload(&settings(), &firmware());
+    let config: Value = serde_json::from_slice(&payload).expect("JSON");
+    let number = &config["cmps"]["report_period"];
+    let topic = "dashboard/hall/set/report_period";
+    assert_eq!(number["p"], "number");
+    assert_eq!(number["name"], "Report period");
+    assert_eq!(number["ic"], "mdi:timer-sync-outline");
+    assert_eq!(number["cmd_t"], topic);
+    assert_eq!(number["stat_t"], topic);
+    assert_eq!(number["ret"], true);
+    assert_eq!(number["min"], 0);
+    assert_eq!(number["max"], 720);
+    assert_eq!(number["step"], 1);
+    assert_eq!(number["mode"], "box");
+    assert_eq!(number["unit_of_meas"], "min");
+    assert_eq!(number["ent_cat"], "config");
+    // A user can set the period while the device sleeps.
+    assert_eq!(number["avty_t"], STATUS);
+    assert_eq!(
+        number["avty_tpl"],
+        "{{ 'offline' if value == 'offline' else 'online' }}"
+    );
+}
+
+#[test]
 fn the_buttons_are_available_only_while_online() {
     let payload = discovery::payload(&settings(), &firmware());
     let config: Value = serde_json::from_slice(&payload).expect("JSON");
@@ -440,10 +475,10 @@ fn each_status_gives_the_availability_of_the_sensors_and_the_buttons() {
     let button = components["restart"]["avty_tpl"]
         .as_str()
         .expect("template");
-    // The light works as the buttons do, and the tap levels as the
-    // sensors do.
+    // The light works as the buttons do, and the tap levels and the report
+    // period as the sensors do.
     assert_eq!(components["light"]["avty_tpl"], button);
-    for key in ["tap_level_stand", "tap_level_battery"] {
+    for key in ["tap_level_stand", "tap_level_battery", "report_period"] {
         assert_eq!(components[key]["avty_tpl"], sensor, "{key}");
     }
     let options = components["status"]["ops"].as_array().expect("options");

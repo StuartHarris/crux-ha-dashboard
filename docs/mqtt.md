@@ -328,17 +328,19 @@ The automation `dashboard_statestream_seed` starts only on `online` (refer to "S
 state stream"). Thus `reporting`, `asleep` and `restarting` do not start it.
 
 While the dashboard sleeps on battery, the status shows `asleep`, then `reporting` for a
-few seconds each hour, then `asleep` again. The history of
+few seconds in each report period (an hour by default), then `asleep` again. The history of
 `sensor.dashboard_<device_id>_status` thus shows each report and how long the radio was
 on (without the time to join and connect).
 
 ### The hourly report
 
-While the dashboard sleeps on battery, it wakes once an hour to report to Home
-Assistant. The core counts the 60 s checks of the power source. The 60th check of a
-sleep starts the report, so a tap or the stand starts the count again. The dashboard
-stays asleep for the user: it does not turn the front light on, and it draws nothing
-while the radio is on.
+While the dashboard sleeps on battery, it wakes once in each report period to report to
+Home Assistant. The period is an hour until Home Assistant sets it (refer to "The report
+period" below). The core counts the 60 s checks of the power source. A period of N
+minutes is N checks. The first check at which the count of a sleep reaches the period
+starts the report. A report, a tap or the stand starts a new sleep, so the count starts
+again. The dashboard stays asleep for the user: it does not turn the front light on, and
+it draws nothing while the radio is on.
 
 1. The core joins the Wi-Fi and connects, as for a wake. It does not scan for a better
    access point.
@@ -390,6 +392,40 @@ too many publishes wait for their PUBACK, `online` goes first when the session h
 room. While
 the status is `reporting`, the buttons and the front light are not available, and the
 sensors are available.
+
+#### The report period
+
+| Topic | Direction | QoS | Retained |
+| --- | --- | --- | --- |
+| `dashboard/<device_id>/set/report_period` | Home Assistant to the dashboard | 0 (subscribe) | Yes. The dashboard applies a retained value. |
+
+The "Report period" number of the device sets the period in minutes. Home Assistant
+publishes it retained as a whole number from 0 to 720 in steps of 1, for example `30`.
+The dashboard also accepts `30.0`. The `dashboard/<device_id>/set/+` subscription of the
+buttons also gets this topic.
+
+- At the period 0, the dashboard does not report while it sleeps. The 60 s checks of
+  the power source still run, so a move to the stand wakes the dashboard.
+- Until Home Assistant sets a period, the period is 60 minutes. An empty payload (a
+  user cleared the retained message) gives 60 minutes again. If a user clears the
+  message while the dashboard sleeps, the broker sends nothing at the next connect, so
+  the old period stays until the next start of the core. Each start of the core sets 60
+  minutes, and the retained period then comes at the first connect.
+- The dashboard applies a retained message and a live message. The broker sends the
+  retained period at each connect. The same value again changes nothing.
+- The dashboard gets a message only while the connection is up. While it sleeps, it
+  gets a new period at the next report, which comes at the old period. After the period
+  0, no report runs, so the dashboard gets a new period only at the next tap, the stand
+  or a start.
+- A new period applies at once, and the count of checks of the sleep does not change.
+  If the count is already at the new period or more, the next check reports. In a
+  report, the report continues, and the next sleep counts to the new period.
+- The dashboard ignores a payload that is not valid (a fraction, a negative value, a
+  value more than 720, or text), and writes a
+  `warn` line, for example `device: the report period 721 on
+  dashboard/hall/set/report_period is not valid, so the core ignored it`.
+- Each new period writes a `debug` line, for example `device: Home Assistant set the
+  report period to 30 min`.
 
 ### Log
 
@@ -562,13 +598,14 @@ The automation `dashboard_log` writes the lines to the Home Assistant log.
 ### Home Assistant device
 
 The dashboard tells Home Assistant about itself with MQTT discovery. Home Assistant
-then shows the dashboard as a device with twenty-one entities: the status, the charge of
+then shows the dashboard as a device with twenty-two entities: the status, the charge of
 the battery, whether the dashboard is on the stand, five power diagnostics (charging,
 the charge state, and the voltage, the current and the temperature of the battery),
 seven Wi-Fi and boot diagnostics (the signal, the access point, the IP address,
 the reconnects, the restarts, the last reset and the wake reason), three buttons
-(Sleep now, Restart and Full refresh), the front light, and two numbers for the level
-of the light after a tap (on the stand and on battery). Refer to
+(Sleep now, Restart and Full refresh), the front light, two numbers for the level
+of the light after a tap (on the stand and on battery), and a number for the report
+period. Refer to
 `shared/src/features/device/`. The core reads the Wi-Fi signal again before a state
 message with a change that is not urgent. Refer to "How new the signal is" below.
 
@@ -583,14 +620,17 @@ message with a change that is not urgent. Refer to "How new the signal is" below
 | `dashboard/<device_id>/set/light` | Home Assistant to the dashboard | 0 | No |
 | `dashboard/<device_id>/set/tap_level_stand` | Home Assistant to the dashboard | 0 | Yes |
 | `dashboard/<device_id>/set/tap_level_battery` | Home Assistant to the dashboard | 0 | Yes |
+| `dashboard/<device_id>/set/report_period` | Home Assistant to the dashboard (refer to "The report period") | 0 | Yes |
 
 #### The discovery message
 
 The discovery message is one device-based discovery config of Home Assistant
-(2024.11 and later), with abbreviated keys. It has 7,409 bytes for the device id
-`hall`, and 8,225 bytes for a device id of 16 characters. The limit in the tests is
+(2024.11 and later), with abbreviated keys. It has 7,822 bytes for the device id
+`hall`, and 8,686 bytes for a device id of 16 characters. The limit in the tests is
 10 KiB. The discovery, the state of the light and the state message go in one write,
-which has about 7.7 KB of the 16 KiB that a write can have (`MAX_OUTGOING`).
+which has about 8.1 KB of the 16 KiB that a write can have (`MAX_OUTGOING`). A test
+requires that the discovery and the state message use less than half of a write. For
+`hall`, they use 8,059 bytes of the 8,192, so a new component must make room first.
 For example, for the device id `hall`:
 
 ```json
@@ -776,6 +816,15 @@ For example, for the device id `hall`:
       "ret": true, "min": 0, "max": 100, "step": 1, "unit_of_meas": "%", "mode": "slider",
       "avty_t": "dashboard/hall/status",
       "avty_tpl": "{{ 'offline' if value == 'offline' else 'online' }}"
+    },
+    "report_period": {
+      "p": "number", "name": "Report period",
+      "uniq_id": "dashboard_hall_report_period", "ic": "mdi:timer-sync-outline", "ent_cat": "config",
+      "cmd_t": "dashboard/hall/set/report_period",
+      "stat_t": "dashboard/hall/set/report_period",
+      "ret": true, "min": 0, "max": 720, "step": 1, "unit_of_meas": "min", "mode": "box",
+      "avty_t": "dashboard/hall/status",
+      "avty_tpl": "{{ 'offline' if value == 'offline' else 'online' }}"
     }
   }
 }
@@ -803,6 +852,9 @@ The message on the broker has no spaces or new lines.
   Assistant shows the value that the broker keeps. Until a user sets a value, Home
   Assistant shows the number as unknown. The minimum is explicit, because the default
   minimum of Home Assistant is 1, and 0 is a valid tap level.
+- The report period is a number with the same options, in minutes from 0 to 720 in
+  steps of 1. It is a box, not a slider, so a user can type any whole minute. Its
+  minimum is explicit too, because 0 is a valid period (no report).
 - The battery, stand, charging, temperature and signal components keep the default
   icon of their device class. The other components set an icon with `ic`, because
   they have no device class or the icon of the class does not tell what they are.
@@ -839,7 +891,8 @@ The dashboard publishes the discovery message at these times:
 
 During a dry run (`read_only = true` in `cfg.toml`, or the dry run that the user
 starts), the dashboard publishes no discovery message, no state of the light and no
-state message. It still obeys the commands of the light and the tap levels. The
+state message. It still obeys the commands of the light, the tap levels and the report
+period. The
 bring-up binary of the firmware uses a dry run, so it does not appear in Home
 Assistant as a device. The log still goes. When the dry run stops, the dashboard
 publishes the discovery message (if it did not send it yet), the state of the light
@@ -923,6 +976,7 @@ How new the signal is:
 | Battery, On stand, the power diagnostics, and the Wi-Fi and boot diagnostics | Unless the status is `offline`. While the dashboard is asleep or restarts, they keep their last value. The hourly report updates them. |
 | Restart, Full refresh, Front light | Only while the status is `online`. While the dashboard sleeps, it cannot obey a command. |
 | Tap light on the stand, Tap light on battery | Unless the status is `offline`. A user can set a tap level while the dashboard sleeps. The broker keeps it, and the next connection applies it. |
+| Report period | Unless the status is `offline`, as the tap levels. The next report or wake applies a new period. |
 | Sleep now | Only while the status is `online` and the dashboard is on battery (`stand` is `OFF`). On the stand, a sleep does nothing. |
 
 Home Assistant compares the result of an availability template with `online` and
@@ -1066,7 +1120,7 @@ light, the state, the log.
 - The queue sends only while the connection is up. It sends nothing in the write of
   the CONNACK, nothing from the start of a sleep, and nothing during the close for a
   change of access point. The messages wait for the next connection after the wake or
-  for the next hourly report.
+  for the next report.
 - At most 56 device publishes wait for a PUBACK at a time, all together. The session
   takes 64, so 8 places stay free for the status (`asleep` or `restarting`) and the
   service calls.

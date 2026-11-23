@@ -20,7 +20,10 @@ use crate::{
     features::{
         connection::Link,
         light::DEFAULT_BATTERY_LEVEL,
-        power::{CHECK_PERIOD, IDLE_TIMEOUT, REPORT_CHECKS, REPORT_LIMIT, STRAY_HOLD, SleepStep},
+        power::{
+            CHECK_PERIOD, IDLE_TIMEOUT, REPORT_CHECKS, REPORT_LIMIT, ReportPeriod, STRAY_HOLD,
+            SleepStep,
+        },
         wifi::{JOIN_TIMEOUT, OFF_TIMEOUT, Phase},
     },
 };
@@ -318,6 +321,71 @@ fn a_power_source_wake_on_battery_sleeps_again_with_a_warning() {
         })
         .expect_only_sleep_with(|sleep| assert_eq!(sleep.wake_on, wake_sources()));
     assert_eq!(power::sleep_step(&model), Some(SleepStep::Sleep));
+}
+
+#[test]
+fn a_report_period_writes_one_line_and_the_same_period_again_does_nothing() {
+    let app = Dashboard;
+    let mut model = asleep_on_battery();
+    let period = ReportPeriod::of_minutes(10).unwrap();
+
+    app.update(
+        Event::Power(power::Event::ReportPeriodSet(period)),
+        &mut model,
+    )
+    .expect_only_log_with(|log| {
+        assert_eq!(log.level, Level::Debug);
+        assert_eq!(
+            log.to_string(),
+            "device: Home Assistant set the report period to 10 min"
+        );
+    });
+    assert_eq!(model.power.report_period(), period);
+    assert_eq!(power::sleep_step(&model), Some(SleepStep::Sleep));
+
+    app.update(
+        Event::Power(power::Event::ReportPeriodSet(period)),
+        &mut model,
+    )
+    .expect_done();
+}
+
+#[test]
+fn a_check_at_the_period_reports_and_at_the_period_0_only_sleeps_again() {
+    let app = Dashboard;
+
+    // At the shortest period, the 5th check starts the report.
+    let mut model = asleep_on_battery();
+    let _ = app.update(
+        Event::Power(power::Event::ReportPeriodSet(
+            ReportPeriod::of_minutes(5).unwrap(),
+        )),
+        &mut model,
+    );
+    for _ in 0..4 {
+        app.update(woke(&model, Wake::Timer), &mut model)
+            .expect_only_sleep_with(|sleep| assert_eq!(sleep.wake_on, wake_sources()));
+    }
+    app.update(woke(&model, Wake::Timer), &mut model)
+        .expect_log_with(|log| {
+            assert_eq!(log.to_string(), "power: sleep 0 reports to Home Assistant");
+        })
+        .expect_time_notify_after_with(|notify| {
+            assert_eq!(Duration::from(notify.duration), REPORT_LIMIT);
+        });
+    assert!(model.power.is_reporting());
+
+    // At the period 0, each check only sleeps again.
+    let mut model = asleep_on_battery();
+    let _ = app.update(
+        Event::Power(power::Event::ReportPeriodSet(ReportPeriod::Off)),
+        &mut model,
+    );
+    for _ in 0..u32::from(REPORT_CHECKS) * 3 {
+        app.update(woke(&model, Wake::Timer), &mut model)
+            .expect_only_sleep_with(|sleep| assert_eq!(sleep.wake_on, wake_sources()));
+    }
+    assert!(!model.power.is_reporting());
 }
 
 /// The answer to the `Sleep` request of the newest sleep.
