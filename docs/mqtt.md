@@ -751,7 +751,7 @@ object:
 | `bssid` | The BSSID of the access point, as lowercase hex with colons. |
 | `ip` | The IPv4 address from DHCP. |
 | `reconnects` | The number of MQTT sessions since the start of the core that failed while the dashboard was awake, so that the core connected again. A link that fails before a session and a sleep do not count. |
-| `restarts` | The number of resets that were not a power-on, since the last power-on. The simulator gives 0. |
+| `restarts` | The number of resets that were not a power-on, since the last power-on. A press of RST is a power-on. A flash or a serial monitor is not, so each one adds 1. Refer to "Which resets are a power-on" in `firmware/README.md`. The simulator gives 0. |
 | `reset` | The reason of the last reset: `power_on`, `software`, `panic`, `watchdog`, `brownout` or `other`. The simulator gives `power_on`. |
 | `wake` | What woke the dashboard last: `boot` (a start, with no sleep since), `touch` or `stand`. The check of the power source every 60 seconds and a wake with no cause keep the dashboard asleep, so they do not change it. |
 

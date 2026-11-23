@@ -190,10 +190,25 @@ watchdog, brownout, a reset from the USB port). `src/boot.rs` holds the statics,
   part). The next start reports `Panic` in place of a software reset.
 
 The memory starts with a magic word with the version of the layout. A reset after a
-new firmware is flashed is not a power-on, so the new firmware can read the memory of
-the old one at other addresses. If the magic word is not there, the firmware clears
-the memory. The level byte of each line goes last, so a reset during a write leaves an
+new firmware is flashed is usually not a power-on (refer to the next part), so the new
+firmware can read the memory of the old one at other addresses. If the magic word is
+not there, the firmware clears the memory. The level byte of each line goes last, so a reset during a write leaves an
 empty place. The read drops a line with a level, a length or UTF-8 that is not valid.
+
+### Which resets are a power-on
+
+The chip, not the firmware, decides the reset reason. Three cases are easy to confuse:
+
+| What you do | The reset reason | The restart facts |
+| --- | --- | --- |
+| Press RST, or remove the power | A power-on, because RST pulls the EN pin of the chip low | Cleared |
+| Run `just flash` while the board is awake | Another reset (`Other`), because espflash resets the chip through the USB port | Kept. The restart count goes up by 1. |
+| Run `just monitor`, or another serial monitor | Another reset (`Other`), because the monitor resets the chip when it opens the port | Kept. The restart count goes up by 1. |
+
+If the board is asleep, espflash cannot reset it. Hold BOOT, press RST and release
+BOOT, then flash. The first start after that flash is a power-on, because of the RST
+press. Thus after a usual flash, the `reset` sensor shows `Other` and the `restarts`
+sensor goes up. A flash does not clear the panic count.
 
 ### A panic restarts the chip
 
@@ -207,7 +222,7 @@ If a panic occurs at each start, each restart causes the next panic, and the res
 empty the battery. So the firmware counts the panic restarts in a row. The count goes
 back to 0 only at these times:
 
-- A power-on, because esp-hal fills the memory with zeros.
+- A power-on (a press of RST is one), because esp-hal fills the memory with zeros.
 - The uptime of one start reaches 10 minutes (`logic::boot::STABLE_AFTER` and
   `logic::boot::Uptime`). The uptime counts through light sleep, so the rule works on
   battery too, where the board is online for only about 30 s at each wake. The core
@@ -216,17 +231,21 @@ back to 0 only at these times:
   does not set the count to 0, because a panic can follow each connect.
 
 Each other reset keeps the count: a software reset, a watchdog reset, a brownout and
-a reset by hand. The third panic in a row (`logic::boot::PANIC_LIMIT`) stops the chip,
-and prints `panic: 3 panics in a row, so the chip stops`. The `restarts` sensor shows
+a reset from the USB port (a flash or a serial monitor). The third panic in a row
+(`logic::boot::PANIC_LIMIT`) stops the chip, and prints
+`panic: 3 panics in a row, so the chip stops`. The `restarts` sensor shows
 the restarts before that.
 
 The stop masks and disables each interrupt, and then waits in `waiti`, so the CPU
 clock stops (`boot::halt`). No watchdog resets the stopped chip, because
 `esp_hal::init` disables each one. The stop does not stop the Wi-Fi radio, because a
 call to the driver is not safe in a panic. A panic that stops the chip does not set
-the panic flag, so the start after a reset by hand does not report `Panic`. That reset
-keeps the count at the limit, so the next panic stops the chip at once. Only a power
-cycle, or 10 minutes of uptime with no panic, clears the count.
+the panic flag, so the next start does not report `Panic`.
+
+To start a stopped chip, press RST. That press is a power-on, so it clears the count.
+If a flash restarts the stopped chip, the flash keeps the count at the limit. The next
+panic then stops the chip at once. Only a power-on, or 10 minutes of uptime with no
+panic, clears the count.
 
 The panic message is not in the ring of lines. The hooks of esp-backtrace 0.20
 (`custom-pre-backtrace`, `custom-halt`) get no `PanicInfo`, and a panic handler of our
