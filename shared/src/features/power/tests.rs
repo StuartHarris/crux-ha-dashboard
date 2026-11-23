@@ -20,7 +20,7 @@ use crate::{
     features::{
         connection::Link,
         light::DEFAULT_BATTERY_LEVEL,
-        power::{CHECK_PERIOD, IDLE_TIMEOUT, STRAY_HOLD, SleepStep},
+        power::{CHECK_PERIOD, IDLE_TIMEOUT, REPORT_CHECKS, REPORT_LIMIT, STRAY_HOLD, SleepStep},
         wifi::{JOIN_TIMEOUT, OFF_TIMEOUT, Phase},
     },
 };
@@ -1124,11 +1124,12 @@ fn the_first_sleep_has_the_check_timer_and_comes_after_the_last_image() {
 }
 
 #[test]
-fn a_hundred_checks_give_a_hundred_sleeps_and_then_a_touch_wakes() {
+fn fifty_nine_checks_give_fifty_nine_sleeps_and_then_a_touch_wakes() {
     let mut shell = at_the_sleep_step();
     let frames = shell.frames.len();
 
-    for _ in 0..100 {
+    // The 60th check would report.
+    for _ in 0..59 {
         shell.check();
         assert_eq!(shell.take_log(), ["Wake Timer", "Sleep"]);
     }
@@ -1167,7 +1168,7 @@ fn fifty_nine_checks_only_sleep_again() {
 }
 
 #[test]
-fn a_stray_wake_keeps_sleeping() {
+fn a_stray_wake_keeps_the_check_count() {
     let mut shell = at_the_sleep_step();
 
     checks_that_only_sleep(&mut shell, 30);
@@ -1181,6 +1182,9 @@ fn a_stray_wake_keeps_sleeping() {
     assert!(!shell.radio.on);
     assert_eq!(power::sleep_step(&shell.model), Some(SleepStep::Sleep));
     assert_no_timer_at_sleep(&shell);
+
+    // The stray kept the count, so the 60th check reports.
+    expect_a_report(&mut shell, 1);
 }
 
 #[test]
@@ -1193,6 +1197,124 @@ fn a_power_source_wake_on_battery_does_not_count() {
     assert!(!shell.radio.on);
     assert_eq!(power::sleep_step(&shell.model), Some(SleepStep::Sleep));
     assert_no_timer_at_sleep(&shell);
+
+    // The power source wake did not count, so the next check is the 60th.
+    expect_a_report(&mut shell, 1);
+}
+
+/// Answers the next check, which must start the report of the sleep `id`.
+/// The report runs to the next `Sleep` request.
+#[track_caller]
+fn expect_a_report(shell: &mut Shell, id: u32) {
+    shell.take_logs();
+    shell.check();
+    let log = shell.take_log();
+    assert!(
+        log.contains(&"MqttPublish dashboard/hall/status reporting".into()),
+        "{log:?}"
+    );
+    assert_eq!(log.last().map(alloc::string::String::as_str), Some("Sleep"));
+    assert_eq!(
+        shell.take_logs().first().map(alloc::string::String::as_str),
+        Some(alloc::format!("debug power: sleep {id} reports to Home Assistant").as_str())
+    );
+    assert_eq!(power::sleep_step(&shell.model), Some(SleepStep::Sleep));
+    assert_no_timer_at_sleep(shell);
+}
+
+#[test]
+fn the_sixtieth_check_reports() {
+    let mut shell = at_the_sleep_step();
+    checks_that_only_sleep(&mut shell, usize::from(REPORT_CHECKS) - 1);
+    shell.hold_radio = true;
+
+    // No `Sleep`, a join, the limit timer and one Debug line.
+    shell.check();
+    assert_eq!(
+        shell.take_log(),
+        [
+            "Wake Timer".into(),
+            alloc::format!("TimeNotifyAfter {}ms", REPORT_LIMIT.as_millis()),
+            "RadioJoin Cached".into(),
+            alloc::format!("TimeNotifyAfter {}ms", JOIN_TIMEOUT.as_millis()),
+        ]
+    );
+    assert_eq!(
+        shell.take_logs(),
+        ["debug power: sleep 1 reports to Home Assistant"]
+    );
+    assert!(shell.sleep.is_none());
+    assert!(shell.model.power.is_reporting());
+    assert!(asleep(&shell.model));
+    assert_eq!(power::sleep_step(&shell.model), None);
+    // The device does not draw in a report, so the view still shows that
+    // it is asleep.
+    assert_eq!(shell.view().status, "Asleep");
+
+    shell.hold_radio = false;
+    shell.answer_radio();
+    assert!(!shell.model.power.is_reporting());
+    assert_eq!(power::sleep_step(&shell.model), Some(SleepStep::Sleep));
+    assert_no_timer_at_sleep(&shell);
+}
+
+#[test]
+fn a_touch_wake_starts_the_count_again() {
+    let mut shell = at_the_sleep_step();
+    checks_that_only_sleep(&mut shell, usize::from(REPORT_CHECKS) - 1);
+
+    shell.send(Event::Tapped(None));
+    assert!(!asleep(&shell.model));
+    shell.advance(IDLE_TIMEOUT);
+    assert_eq!(power::sleep_step(&shell.model), Some(SleepStep::Sleep));
+    shell.take_log();
+
+    checks_that_only_sleep(&mut shell, usize::from(REPORT_CHECKS) - 1);
+    expect_a_report(&mut shell, 2);
+}
+
+#[test]
+fn the_next_report_is_sixty_checks_after_the_last() {
+    let mut shell = at_the_sleep_step();
+    checks_that_only_sleep(&mut shell, usize::from(REPORT_CHECKS) - 1);
+    expect_a_report(&mut shell, 1);
+
+    checks_that_only_sleep(&mut shell, usize::from(REPORT_CHECKS) - 1);
+    expect_a_report(&mut shell, 2);
+}
+
+#[test]
+fn a_late_reported_or_report_limit_does_nothing() {
+    let late = |shell: &mut Shell| {
+        for id in 0..=shell.model.power.sleep {
+            shell.send(Event::Power(power::Event::Reported(id)));
+            shell.send(Event::Power(power::Event::ReportLimit(id)));
+        }
+        assert_eq!(shell.take_log(), Vec::<alloc::string::String>::new());
+        assert_eq!(shell.take_logs(), Vec::<alloc::string::String>::new());
+    };
+    let mut shell = at_the_sleep_step();
+    checks_that_only_sleep(&mut shell, usize::from(REPORT_CHECKS) - 1);
+    expect_a_report(&mut shell, 1);
+    shell.take_logs();
+
+    // Sleeping, after the report.
+    late(&mut shell);
+    assert_eq!(power::sleep_step(&shell.model), Some(SleepStep::Sleep));
+
+    // Held, after a wake with no cause.
+    shell.stray();
+    shell.take_log();
+    shell.take_logs();
+    late(&mut shell);
+    assert_eq!(power::sleep_step(&shell.model), Some(SleepStep::Held));
+
+    // Awake.
+    shell.send(Event::Tapped(None));
+    shell.take_log();
+    shell.take_logs();
+    late(&mut shell);
+    assert!(!asleep(&shell.model));
 }
 
 #[test]

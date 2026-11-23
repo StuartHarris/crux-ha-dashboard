@@ -585,11 +585,20 @@ impl Model {
         pages.iter().filter(|page| page.is_room())
     }
 
-    /// Returns `true` if the core wants a connection: the app started and
-    /// the device is awake.
+    /// Returns `true` if the core wants a connection: the app started, and
+    /// the device is awake or in a report. Refer to
+    /// [`power::report`](crate::features::power).
     #[must_use]
     pub const fn wants_online(&self) -> bool {
-        self.startup.is_started() && !self.power.is_asleep()
+        self.startup.is_started() && (!self.power.is_asleep() || self.power.is_reporting())
+    }
+
+    /// Returns `true` if the core can scan for a better access point: it
+    /// wants a connection, and no report runs. A report keeps the radio time
+    /// short, so the scan stays due for the next wake.
+    #[must_use]
+    pub const fn may_scan(&self) -> bool {
+        self.wants_online() && !self.power.is_reporting()
     }
 
     /// Handles `event`, and returns the command with its effects.

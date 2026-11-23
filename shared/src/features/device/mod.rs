@@ -22,7 +22,9 @@
 //!
 //! The queue publishes nothing while the connection is not up, nothing
 //! while the write of the CONNACK waits to go, and nothing from the start
-//! of a sleep. The connection can still be up in the first
+//! of a sleep, except in the hourly report. In a report, the queue sends
+//! as when the device is awake, and the report ends when the queue is
+//! settled ([`settled`]). The connection can still be up in the first
 //! step of a sleep, but its DISCONNECT soon follows, so a PUBACK is often
 //! lost. Each PUBACK goes to the publisher that owns its packet id
 //! ([`acked`]).
@@ -814,12 +816,12 @@ fn shown(payload: &[u8]) -> String {
 /// | Sleep now | awake on battery, open pending marks | [`power::sleep_now`]: the sleep waits for the marks | Debug |
 /// | Sleep now | awake on battery, calls in the outbox | [`power::sleep_now`]: the sleep waits one more idle period | Debug |
 /// | Sleep now | awake on battery, a sleep waits for the marks | nothing | Debug |
-/// | Sleep now | asleep (the first steps of a sleep) | nothing | none |
+/// | Sleep now | asleep (the first steps of a sleep, or a report) | nothing | none |
 /// | Sleep now | on the stand | nothing | Info |
 /// | Restart | any | [`connection::close_for_restart`] | none in the core |
 /// | Full refresh | a restart waits | nothing | Debug |
 /// | Full refresh | awake | [`redraw`] with a full refresh | Debug |
-/// | Full refresh | asleep | nothing, because the last image of the sleep is a full refresh | Debug |
+/// | Full refresh | asleep, also in a report | nothing, because the last image of the sleep is a full refresh | Debug |
 ///
 /// For a restart, the shell writes the warning
 /// `device: restart the chip: Home Assistant asked`.
@@ -947,7 +949,7 @@ pub(crate) fn drain(model: &mut Model) -> (Cmd, bool) {
         .connection
         .live_mut()
         .is_some_and(|live| live.connack_write_waits());
-    if model.connection.link() != Link::Up || model.power.is_asleep() || connack_write_waits {
+    if model.connection.link() != Link::Up || !model.wants_online() || connack_write_waits {
         return (Cmd::done(), false);
     }
     for publisher in Publisher::ORDER {
@@ -1012,6 +1014,45 @@ pub(crate) fn acked(id: PacketId, model: &mut Model) {
         return;
     }
     logs::acked(id, model);
+}
+
+/// Returns `true` if the device publish queue has nothing more to publish
+/// on this session, and no device publish waits for a PUBACK. A report
+/// then can end. Refer to [`power::report`](crate::features::power).
+///
+/// - Discovery: the broker acknowledged the message, or the message is not
+///   due on this device (a dry run, or no firmware version yet).
+/// - The light: the broker acknowledged its state. In a dry run, the queue
+///   publishes no state of the light.
+/// - The state message: the broker acknowledged it. A change that waits
+///   for the throttle window counts as settled, because the report does
+///   not wait for the window. In a dry run, the queue publishes no state.
+/// - The log: no line and no drop count waits, and no `LogClock` request
+///   waits.
+///
+/// The caller checks the connection: the session is up, and the write of
+/// the CONNACK went.
+pub(crate) fn settled(model: &mut Model) -> bool {
+    let read_only = model
+        .startup
+        .settings()
+        .is_none_or(|settings| settings.read_only);
+    // With no snapshot (before `Start`), the queue publishes no state.
+    let no_state = read_only || Snapshot::of(model).is_none();
+    let discovery = match model.device.discovery {
+        Discovery::Sent => true,
+        Discovery::InFlight(_) => false,
+        Discovery::Due => read_only || model.startup.firmware().is_none(),
+    };
+    if !discovery || in_flight(model) > 0 || !logs::settled(model) {
+        return false;
+    }
+    let Some(live) = model.connection.live_mut() else {
+        return false;
+    };
+    let light = read_only || matches!(live.light, light::Sync::Sent(_));
+    let state = no_state || matches!(live.state, StateSync::Sent { .. });
+    light && state
 }
 
 /// Returns the number of device publishes that wait for a PUBACK.

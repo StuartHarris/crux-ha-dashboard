@@ -430,13 +430,14 @@ pub fn traffic(model: &mut Model) -> Cmd {
 }
 
 /// The link is quiet, because the subscribe is complete. If a scan for a
-/// better access point is due, the core scans now.
+/// better access point is due, the core scans now. In a report, the core
+/// does not scan, and the scan stays due for the next wake.
 pub fn quiet(model: &mut Model) -> Cmd {
     let state = &mut model.wifi;
     let Phase::Up(linked) = state.phase else {
         return Cmd::done();
     };
-    if !state.cache.scan_due() || !model.wants_online() {
+    if !state.cache.scan_due() || !model.may_scan() {
         return Cmd::done();
     }
     model.wifi.phase = Phase::Scanning(linked);
@@ -507,6 +508,11 @@ pub fn joined(radio: u32, joined: &Joined, model: &mut Model) -> Cmd {
 /// Handles the answer to the `Address` request `radio`. The core ignores
 /// `Stopped`.
 ///
+/// In a report, a join with no address or with an old address does not
+/// count toward [`RESTART_AFTER`], and the core writes no line about the
+/// count. The recovery is the same: leave, and join the strongest access
+/// point. Refer to [`power::report_failed`].
+///
 /// If the core no longer wants a connection (a sleep started), the answer
 /// changes no count and cannot restart the chip. The steps of the sleep
 /// continue, and the device keeps the association until `Off`.
@@ -527,8 +533,14 @@ pub fn leased(radio: u32, lease: Lease, model: &mut Model) -> Cmd {
     if !model.wants_online() {
         return associated_during_sleep(access_point, model);
     }
+    // The joins in a report do not count toward a restart. A restart
+    // cannot fix an access point that is down, and it wakes the device.
+    let counts = !model.power.is_reporting();
     let ip = match lease {
         Lease::Leased { ip } => ip,
+        Lease::NoLease | Lease::Stopped if !counts => {
+            return no_address(target, access_point, model);
+        }
         Lease::NoLease | Lease::Stopped => {
             let state = &mut model.wifi;
             let recovery = state.health.no_lease();
@@ -542,11 +554,12 @@ pub fn leased(radio: u32, lease: Lease, model: &mut Model) -> Cmd {
     };
     let state = &mut model.wifi;
     let mut lines = Cmd::done();
-    if had_address {
-        // The stack kept its address through the join, so the address
-        // proves nothing. The line comes only when the address counts: on
-        // a new join while the link is suspect. A join that keeps the
-        // association keeps the address too.
+    // The stack kept its address through the join, so the address proves
+    // nothing. The line comes only when the address counts: on a new join
+    // while the link is suspect. A join that keeps the association keeps
+    // the address too. In a report, the address does not count, and the
+    // count stays as it is.
+    if had_address && counts {
         if !kept && state.health.suspect() {
             lines = logs::warn(
                 Area::Wifi,
@@ -559,7 +572,7 @@ pub fn leased(radio: u32, lease: Lease, model: &mut Model) -> Cmd {
             let reason = format!("a stale address after {RESTART_AFTER} joins");
             return lines.and(restart_chip(Area::Wifi, reason, model));
         }
-    } else {
+    } else if !had_address {
         state.health.leased();
     }
     if !kept {
@@ -692,7 +705,7 @@ fn after_join(joined: &Joined, model: &mut Model) -> Cmd {
         model.wifi.phase = Phase::Idle;
         return match (model.wifi.cache.failed(target), target) {
             (AfterFailure::Rescan, Target::Cached(cached)) if model.wants_online() => {
-                let reason = logs::warn(
+                let reason = retry_line(model)(
                     Area::Wifi,
                     format!(
                         "the join to the cached access point {cached} failed, so join the strongest access point"
@@ -700,9 +713,9 @@ fn after_join(joined: &Joined, model: &mut Model) -> Cmd {
                 );
                 reason.and(join(Target::Strongest, false, model))
             }
-            (AfterFailure::Fail, _) if model.wants_online() => logs::warn(
+            (AfterFailure::Fail, _) if model.wants_online() => retry_line(model)(
                 Area::Wifi,
-                "the join to the strongest access point failed, so the link is down",
+                "the join to the strongest access point failed, so the link is down".into(),
             )
             .and(connection::link_failed(model)),
             (AfterFailure::Rescan | AfterFailure::Fail, _) => connection::link_failed(model),
@@ -752,7 +765,20 @@ fn no_address(target: Target, access_point: AccessPoint, model: &mut Model) -> C
             format!("the strongest access point {access_point} gave no address, so leave it"),
         ),
     };
-    logs::warn(Area::Wifi, message).and(leave(then, model))
+    retry_line(model)(Area::Wifi, message).and(leave(then, model))
+}
+
+/// Returns the function that writes a line about a failed try to get the
+/// link. In a report, the line is a `Debug` line, so a report that fails
+/// each hour does not fill the ring. Refer to
+/// [`power::report_failed`](crate::features::power::report_failed).
+/// Otherwise the line is a warning.
+fn retry_line(model: &Model) -> fn(Area, String) -> Cmd {
+    if model.power.is_reporting() {
+        logs::debug
+    } else {
+        logs::warn
+    }
 }
 
 /// Continues after the answer to a leave.
