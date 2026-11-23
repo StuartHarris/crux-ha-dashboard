@@ -488,6 +488,29 @@ fn a_battery_level_while_asleep_does_not_wake_the_device() {
 }
 
 #[test]
+fn a_power_reading_while_asleep_is_kept_and_does_nothing_else() {
+    let app = Dashboard;
+    let mut model = asleep_on_battery();
+    let before = model.power.idle;
+    let reading = Reading {
+        charge: Some(Charge::NotCharging),
+        voltage_mv: Some(3870),
+        current_ma: Some(-40),
+        tenth_celsius: Some(245),
+    };
+
+    // The check of the power source sends the reading, and then the timer
+    // wake. The core only keeps the reading, and it publishes nothing.
+    app.update(Event::PowerRead(reading), &mut model)
+        .expect_done();
+    assert_eq!(model.power.reading, reading);
+    assert!(model.power.is_asleep());
+    assert_eq!(model.power.idle, before);
+    assert_eq!(model.wifi.phase, Phase::Off);
+    assert_eq!(model.full_refresh_seq, 0);
+}
+
+#[test]
 fn the_status_text_does_not_give_the_power_source() {
     let app = Dashboard;
     for source in [PowerSource::Stand, PowerSource::Battery] {

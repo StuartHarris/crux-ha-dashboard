@@ -293,8 +293,9 @@ impl Sleep {
                 }
             }
             Cause::Timer => {
-                // The check of the power source. A new source comes to the
-                // core before the answer.
+                // The check of the power source. It reads the charger, the
+                // charge and the diagnostics. A change comes to the core
+                // before the answer, and the core only keeps it.
                 log::debug!(
                     "power: check of the power source after {slept} ms, average current {}",
                     Milliamps(current)
@@ -488,6 +489,25 @@ impl Power {
         if now < self.next {
             return;
         }
+        self.read_all(panel, now);
+    }
+
+    /// Reads the charger, the charge and the diagnostics now, as the check
+    /// of the power source during a sleep does, whatever the time of the next
+    /// read. Sends each change to the core.
+    ///
+    /// The core only keeps these values while the device sleeps, so the next
+    /// connection publishes a fresh charge. The check reads five registers
+    /// (one of the charger and four of the fuel gauge). Each read is about 6
+    /// bytes on the I2C bus, so the five reads take about 1 to 3 ms in all, at
+    /// 400 to 100 kHz. We did not measure this time.
+    fn check(&mut self, panel: &mut Panel<'static>) {
+        self.read_all(panel, Instant::now());
+    }
+
+    /// Reads the charger, the charge and the diagnostics, and sends each
+    /// change to the core.
+    fn read_all(&mut self, panel: &mut Panel<'static>, now: Instant) {
         // The task logs only the first failure in a row of each chip.
         let status = read_status(panel, !self.charger_failed);
         let level = read_level(panel, !self.gauge_failed);
@@ -495,18 +515,6 @@ impl Power {
         self.gauge_failed = level.is_none();
         let reading = read_diagnostics(panel, status);
         self.send(status.map(source_from_bq25896), level, Some(reading), now);
-    }
-
-    /// Reads only the charger now, as the check of the power source during
-    /// a sleep does. Sends a change of the source to the core.
-    ///
-    /// The check does not read the charge or the diagnostics. While the
-    /// device sleeps, the core publishes nothing, so the first poll after the
-    /// wake reads them.
-    fn check(&mut self, panel: &mut Panel<'static>) {
-        let status = read_status(panel, !self.charger_failed);
-        self.charger_failed = status.is_none();
-        self.send(status.map(source_from_bq25896), None, None, Instant::now());
     }
 
     /// Returns `true` if a new power source waits for its second read.
