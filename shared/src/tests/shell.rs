@@ -68,7 +68,8 @@ use crate::{
         log::{Area, Log, LogClock, Uptime},
         power::{Sleep, Wake},
         radio::{
-            Address, Join, Joined, Lease, Leave, Off, Restart, Scan, Scanned, StopScan, Target,
+            Address, Join, Joined, Lease, Leave, Off, ReadSignal, Restart, Scan, Scanned,
+            SignalRead, StopScan, Target,
         },
         stream::Close,
     },
@@ -98,7 +99,32 @@ enum Held {
     Leave(Request<Leave>),
     Scan(Request<Scan>),
     StopScan(Request<StopScan>),
+    ReadSignal(Request<ReadSignal>),
     Off(Request<Off>),
+}
+
+/// Splits a radio request of the core into its name for the log and the
+/// request that waits. Returns `None` for another effect. `RadioRestart`
+/// is a notification, so it is not a radio request here.
+fn held(effect: Effect) -> Option<(String, Held)> {
+    Some(match effect {
+        Effect::RadioJoin(request) => {
+            let join = request.operation;
+            let target = match join.target {
+                Target::Cached(_) => "Cached",
+                Target::Strongest => "Strongest",
+            };
+            let keep = if join.keep { " keep" } else { "" };
+            (format!("RadioJoin {target}{keep}"), Held::Join(request))
+        }
+        Effect::RadioAddress(request) => ("RadioAddress".into(), Held::Address(request)),
+        Effect::RadioLeave(request) => ("RadioLeave".into(), Held::Leave(request)),
+        Effect::RadioScan(request) => ("RadioScan".into(), Held::Scan(request)),
+        Effect::RadioStopScan(request) => ("RadioStopScan".into(), Held::StopScan(request)),
+        Effect::RadioReadSignal(request) => ("RadioReadSignal".into(), Held::ReadSignal(request)),
+        Effect::RadioOff(request) => ("WifiOff".into(), Held::Off(request)),
+        _ => return None,
+    })
 }
 
 /// One image on the panel.
@@ -577,35 +603,17 @@ impl Shell {
                 self.closes.push(request.operation.clone());
                 self.broker.close(request);
             }
-            Effect::RadioJoin(request) => {
-                let join = request.operation;
-                let target = match join.target {
-                    Target::Cached(_) => "Cached",
-                    Target::Strongest => "Strongest",
-                };
-                let keep = if join.keep { " keep" } else { "" };
-                self.log.push(format!("RadioJoin {target}{keep}"));
-                self.radio_request(Held::Join(request));
-            }
-            Effect::RadioAddress(request) => {
-                self.log.push("RadioAddress".into());
-                self.radio_request(Held::Address(request));
-            }
-            Effect::RadioLeave(request) => {
-                self.log.push("RadioLeave".into());
-                self.radio_request(Held::Leave(request));
-            }
-            Effect::RadioScan(request) => {
-                self.log.push("RadioScan".into());
-                self.radio_request(Held::Scan(request));
-            }
-            Effect::RadioStopScan(request) => {
-                self.log.push("RadioStopScan".into());
-                self.radio_request(Held::StopScan(request));
-            }
-            Effect::RadioOff(request) => {
-                self.log.push("WifiOff".into());
-                self.radio_request(Held::Off(request));
+            Effect::RadioJoin(_)
+            | Effect::RadioAddress(_)
+            | Effect::RadioLeave(_)
+            | Effect::RadioScan(_)
+            | Effect::RadioStopScan(_)
+            | Effect::RadioReadSignal(_)
+            | Effect::RadioOff(_) => {
+                if let Some((name, request)) = held(effect) {
+                    self.log.push(name);
+                    self.radio_request(request);
+                }
             }
             Effect::RadioRestart(request) => self.restart(request.operation),
             Effect::Log(request) => self.log_line(request),
@@ -684,6 +692,7 @@ impl Shell {
                 Held::Scan(mut scan) => scan.resolve(Scanned::Stopped).expect(ANSWER),
                 Held::Leave(mut leave) => leave.resolve(()).expect(ANSWER),
                 Held::StopScan(mut stop_scan) => stop_scan.resolve(()).expect(ANSWER),
+                Held::ReadSignal(mut read) => read.resolve(SignalRead::Stopped).expect(ANSWER),
                 Held::Off(mut off) => off.resolve(()).expect(ANSWER),
             }
         }
@@ -727,6 +736,10 @@ impl Shell {
             Held::StopScan(mut request) => {
                 self.radio.stop_scan(&request.operation);
                 request.resolve(()).expect(ANSWER);
+            }
+            Held::ReadSignal(mut request) => {
+                let read = self.radio.read_signal(&request.operation);
+                request.resolve(read).expect(ANSWER);
             }
             Held::Off(mut request) => {
                 self.radio.off(&request.operation);

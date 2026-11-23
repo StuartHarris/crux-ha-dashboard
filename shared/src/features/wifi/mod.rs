@@ -50,11 +50,27 @@
 //! - A scan (after a join with the cached access point, for example after
 //!   each wake) that sees the current access point gives a new signal. The
 //!   core then publishes the state, at most once in the throttle window
-//!   ([`device`]).
+//!   ([`device`]). The scan counts as a read of the signal for that window
+//!   ([`device::signal_read`]).
+//! - Before a state message with a change that is not urgent, the device
+//!   feature asks for the signal ([`read_signal`]). The core sends a
+//!   `ReadSignal` request, and the answer gives a new signal. The shell
+//!   reads the signal that the driver has, so the read sends no frame.
 //!
 //! The device on the stand scans only after a join with the cached access
-//! point. A stable link on the stand thus keeps the signal of its last join
-//! or scan, for hours or days.
+//! point. Thus on a stable link, the read before a state message is what
+//! keeps the signal new. The rules of the read:
+//!
+//! - The core reads only from `Up`, so the read never stops a scan or a
+//!   join. While a read waits, the phase is [`Phase::Reading`], and the
+//!   link stays up.
+//! - The core does not read while a scan is due, because the scan gives a
+//!   new signal soon. It does not read in a report, because the join of the
+//!   report gave the signal a few seconds before.
+//! - If the shell cannot read the signal, the link keeps its last signal.
+//! - The read ends at its answer, with or without a signal, or at its time
+//!   limit. Then the core tells the device feature
+//!   ([`device::signal_read`]), which publishes the state that waits.
 //!
 //! Each decision writes a line through the log capability
 //! ([`crate::capabilities::log`]), with the area `wifi`. The core writes only
@@ -71,7 +87,7 @@ use crate::{
     Cmd, Model,
     capabilities::{
         log::Area,
-        radio::{AccessPoint, Joined, Lease, Radio, Scanned, Target, signal},
+        radio::{AccessPoint, Joined, Lease, Radio, Scanned, SignalRead, Target, signal},
     },
     features::{connection, device, logs, power, timer::Slot},
     mqtt::End,
@@ -114,6 +130,14 @@ pub enum Event {
     },
     /// The answer to the `StopScan` request with this id.
     ScanStopped(u32),
+    /// The answer to the `ReadSignal` request with this id.
+    SignalRead {
+        /// The id of the radio request. The core ignores the answer to an
+        /// older request.
+        radio: u32,
+        /// The answer.
+        read: SignalRead,
+    },
     /// The time limit of the radio request with this id expired. Refer to
     /// [`crate::features::wifi`].
     RadioTimeout(u32),
@@ -135,6 +159,7 @@ pub fn update(event: Event, model: &mut Model) -> Cmd {
         Event::Left(radio) => left(radio, model),
         Event::Scanned { radio, scanned } => self::scanned(radio, &scanned, model),
         Event::ScanStopped(radio) => scan_stopped(radio, model),
+        Event::SignalRead { radio, read } => signal_read(radio, read, model),
         Event::RadioTimeout(radio) => timeout(radio, model),
         Event::RadioOff(radio) => radio_off(radio, model),
     }
@@ -160,6 +185,10 @@ pub const SCAN_TIMEOUT: Duration = Duration::from_secs(15);
 /// The time limit of the core for a `StopScan` request. The shell answers
 /// at once.
 pub const STOP_SCAN_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// The time limit of the core for a `ReadSignal` request. The shell
+/// answers at once.
+pub const READ_SIGNAL_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// The time limit of the core for an `Off` request. The shell needs about
 /// 1.1 seconds at most: a disconnect of 1 second, and 100 ms for the last
@@ -206,6 +235,9 @@ pub enum Phase {
     Up(Linked),
     /// A `Scan` request waits for its answer. The link stays up.
     Scanning(Linked),
+    /// A `ReadSignal` request waits for its answer, before a state message.
+    /// The link stays up. Refer to [`read_signal`].
+    Reading(Linked),
     /// A `StopScan` request for a sleep waits for its answer. The answer
     /// starts the next step of the sleep. If the device wakes and a new
     /// sleep starts before the answer, the new sleep takes the request
@@ -234,8 +266,8 @@ impl Phase {
     /// Returns the link of the device with an address, or `None` if the
     /// phase has no link.
     ///
-    /// A scan keeps the link to the access point, so `Scanning` and
-    /// `StoppingScan` have a link too.
+    /// A scan and a read of the signal keep the link to the access point,
+    /// so `Scanning`, `StoppingScan` and `Reading` have a link too.
     #[must_use]
     pub const fn linked(mut self) -> Option<Linked> {
         self.linked_mut().copied()
@@ -246,9 +278,10 @@ impl Phase {
     /// the phases with a link. Refer to [`Phase::linked`].
     pub const fn linked_mut(&mut self) -> Option<&mut Linked> {
         match self {
-            Self::Up(linked) | Self::Scanning(linked) | Self::StoppingScan { linked, .. } => {
-                Some(linked)
-            }
+            Self::Up(linked)
+            | Self::Scanning(linked)
+            | Self::Reading(linked)
+            | Self::StoppingScan { linked, .. } => Some(linked),
             _ => None,
         }
     }
@@ -268,7 +301,8 @@ pub struct Linked {
     pub ip: [u8; 4],
     /// The last signal of the access point, in dBm, if the shell could
     /// read it. The join gives the first value. Each scan that sees the
-    /// access point gives a new value.
+    /// access point and each read of the signal give a new value. Refer to
+    /// the [module docs](self).
     pub rssi: Option<i32>,
     /// The core can connect on this link with no new join. It is `false`
     /// after an MQTT session that did not end cleanly, and after a decision
@@ -325,10 +359,11 @@ pub fn link(model: &mut Model) -> Cmd {
     let state = &mut model.wifi;
     match state.phase {
         Phase::Up(Linked { ready: true, .. }) => connection::link_up(model),
-        // A new request stops the scan.
-        Phase::Up(linked) | Phase::Scanning(linked) | Phase::StoppingScan { linked, .. } => {
-            rejoin(linked.access_point, model)
-        }
+        // A new request stops the scan or the read.
+        Phase::Up(linked)
+        | Phase::Scanning(linked)
+        | Phase::Reading(linked)
+        | Phase::StoppingScan { linked, .. } => rejoin(linked.access_point, model),
         Phase::Associated(access_point) => rejoin(access_point, model),
         Phase::Off | Phase::Idle => {
             let target = state.cache.plan();
@@ -448,6 +483,28 @@ pub fn quiet(model: &mut Model) -> Cmd {
     Radio::scan(radio)
         .then_send(move |scanned| Event::Scanned { radio, scanned }.into())
         .and(limit(radio, SCAN_TIMEOUT, model))
+}
+
+/// Reads the signal of the access point before a state message. The device
+/// feature calls this function when a change that is not urgent can go.
+/// Refer to the [module docs](self).
+///
+/// Returns `None` if the core cannot read the signal now, so the state
+/// message goes with the signal that the link has. Returns a command if the
+/// state message waits for the read: the `ReadSignal` request, or nothing if
+/// a read already waits. The end of the read calls
+/// [`device::signal_read`].
+pub(crate) fn read_signal(model: &mut Model) -> Option<Cmd> {
+    let linked = match model.wifi.phase {
+        Phase::Reading(_) => return Some(Cmd::done()),
+        Phase::Up(linked) if model.may_scan() && !model.wifi.cache.scan_due() => linked,
+        _ => return None,
+    };
+    model.wifi.phase = Phase::Reading(linked);
+    let radio = next_id(model);
+    let read =
+        Radio::read_signal(radio).then_send(move |read| Event::SignalRead { radio, read }.into());
+    Some(read.and(limit(radio, READ_SIGNAL_TIMEOUT, model)))
 }
 
 /// Stops a scan before the sleep `sleep` disconnects. Returns `None` if no
@@ -629,6 +686,32 @@ pub fn scan_stopped(radio: u32, model: &mut Model) -> Cmd {
     after_stop_scan(model)
 }
 
+/// Handles the answer to the `ReadSignal` request `radio`.
+///
+/// The core ignores `Stopped`, because the newer request changed the phase.
+/// An answer with no signal writes a `Debug` line, and the link keeps its
+/// last signal.
+pub fn signal_read(radio: u32, read: SignalRead, model: &mut Model) -> Cmd {
+    let SignalRead::Read(rssi) = read else {
+        return Cmd::done();
+    };
+    if !accept(radio, model) {
+        return Cmd::done();
+    }
+    let line = match (rssi, model.wifi.phase) {
+        (None, Phase::Reading(linked)) => logs::debug(
+            Area::Wifi,
+            format!(
+                "the signal of {} is unknown, so keep {}",
+                linked.access_point,
+                signal(linked.rssi)
+            ),
+        ),
+        _ => Cmd::done(),
+    };
+    line.and(after_read(rssi, model))
+}
+
 /// Handles the answer to the `Off` request `radio`.
 pub fn radio_off(radio: u32, model: &mut Model) -> Cmd {
     if !accept(radio, model) {
@@ -671,6 +754,7 @@ pub fn timeout(radio: u32, model: &mut Model) -> Cmd {
         Phase::Leaving(_) => after_leave(model),
         Phase::Scanning(_) => after_scan(&Scanned::Failed(NO_ANSWER.into()), model),
         Phase::StoppingScan { .. } => after_stop_scan(model),
+        Phase::Reading(_) => after_read(None, model),
         Phase::TurningOff { .. } => after_off(model),
         Phase::Off | Phase::Idle | Phase::Associated(_) | Phase::Up(_) | Phase::Restarting => {
             Cmd::done()
@@ -688,6 +772,7 @@ const fn request_name(phase: Phase) -> Option<&'static str> {
         Phase::Leaving(_) => Some("leave"),
         Phase::Scanning(_) => Some("scan"),
         Phase::StoppingScan { .. } => Some("stop scan"),
+        Phase::Reading(_) => Some("read signal"),
         Phase::TurningOff { .. } => Some("off"),
         Phase::Off | Phase::Idle | Phase::Associated(_) | Phase::Up(_) | Phase::Restarting => None,
     }
@@ -850,14 +935,16 @@ fn after_scan(scanned: &Scanned, model: &mut Model) -> Cmd {
     let now = signal(Some(rssi_now));
     let Some(best) = better_access_point(current, *rssi, seen) else {
         // The state message publishes the new signal, at most once in the
-        // throttle window. Refer to [`device`].
+        // throttle window. The scan counts as a read of the signal, so the
+        // core does not read again before that message. Refer to
+        // [`device`].
         return logs::debug(
             Area::Wifi,
             format!(
                 "the scan found no access point that is {ROAM_MARGIN_DB} dB stronger than {current} ({now}), so stay"
             ),
         )
-        .and(device::changed(model));
+        .and(device::signal_read(model));
     };
     state.cache.roam_to(best.access_point);
     state.phase = Phase::Up(Linked {
@@ -884,6 +971,21 @@ fn after_scan(scanned: &Scanned, model: &mut Model) -> Cmd {
             format!("change to {to} at the next wake, because the signal of {current} is {now}"),
         )
     }
+}
+
+/// Continues after a read of the signal, with the signal `rssi` from the
+/// shell. If `rssi` is `None` (the shell could not read it, or the time
+/// limit expired), the link keeps its last signal. Then the state message
+/// that waits can go. Refer to [`device::signal_read`].
+fn after_read(rssi: Option<i32>, model: &mut Model) -> Cmd {
+    let Phase::Reading(linked) = model.wifi.phase else {
+        return Cmd::done();
+    };
+    model.wifi.phase = Phase::Up(Linked {
+        rssi: rssi.or(linked.rssi),
+        ..linked
+    });
+    device::signal_read(model)
 }
 
 /// Continues after the answer to a stop of a scan, with the next step of

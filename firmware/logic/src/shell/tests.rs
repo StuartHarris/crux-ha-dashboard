@@ -11,7 +11,7 @@ use shared::{
     capabilities::{
         log::{self, Area, Level, Log, Uptime},
         power::Wake,
-        radio::{Joined, Lease, Radio, Restart, Scanned},
+        radio::{Joined, Lease, Radio, Restart, Scanned, SignalRead},
         stream::{StreamItem, Written},
     },
     fake::{Broker, FakeRadio, radio::HALL, session_timers},
@@ -184,6 +184,7 @@ impl Device {
                 self.radio.stop_scan(stop_scan);
                 RadioAnswer::Done
             }
+            RadioOp::ReadSignal(read) => RadioAnswer::Signal(self.radio.read_signal(read)),
             RadioOp::Off(off) => {
                 self.radio.off(off);
                 RadioAnswer::Done
@@ -374,6 +375,7 @@ fn names(jobs: &[Job]) -> Vec<String> {
                 RadioOp::Leave(_) => format!("leave {token}"),
                 RadioOp::Scan(_) => format!("scan {token}"),
                 RadioOp::StopScan(_) => format!("stop scan {token}"),
+                RadioOp::ReadSignal(_) => format!("read signal {token}"),
                 RadioOp::Off(_) => "wifi off".into(),
             }],
             Job::Restart(_) => vec!["restart".into()],
@@ -1505,6 +1507,88 @@ fn a_leave_stops_a_scan_and_the_late_answer_of_the_scan_is_dropped() {
     let late = Signal::Radio {
         token: scan,
         answer: RadioAnswer::Scanned(Scanned::Stopped),
+    };
+    assert_eq!(device.handle(late), Vec::new());
+}
+
+/// Returns the payload of each state message in the writes of `jobs`.
+fn state_payloads(jobs: &[Job]) -> Vec<String> {
+    jobs.iter()
+        .filter_map(|job| match job {
+            Job::Stream {
+                op: StreamOp::Write(write),
+                ..
+            } => Some(packets(&write.bytes)),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|packet| match packet {
+            Packet::Publish { topic, payload, .. } if topic.ends_with("/state") => {
+                Some(String::from_utf8(payload).expect("JSON text"))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_change_that_is_not_urgent_waits_for_a_read_signal_job() {
+    let mut device = online(false);
+    // The first level of the battery is urgent, so it goes at once.
+    let jobs = device.handle(Signal::Event(Event::BatteryChanged(Some(50))));
+    assert!(radio_jobs(&jobs).is_empty(), "{:?}", names(&jobs));
+    assert_eq!(state_payloads(&jobs).len(), 1);
+    device.deliver_all(&jobs);
+
+    // A move of 1% is not urgent. The state message waits for the signal.
+    let jobs = device.handle(Signal::Event(Event::BatteryChanged(Some(51))));
+    let [(token, [], RadioOp::ReadSignal(_))] = radio_jobs(&jobs)[..] else {
+        panic!("not one read signal: {:?}", names(&jobs));
+    };
+    assert!(state_payloads(&jobs).is_empty(), "{:?}", names(&jobs));
+    device.radio_jobs.clear();
+
+    // The answer clears the time limit, and the state message goes with
+    // the new signal.
+    let jobs = device.handle(Signal::Radio {
+        token,
+        answer: RadioAnswer::Signal(SignalRead::Read(Some(-61))),
+    });
+    let [state] = &state_payloads(&jobs)[..] else {
+        panic!("not one state message: {:?}", names(&jobs));
+    };
+    assert!(state.contains(r#""battery":51"#), "{state}");
+    assert!(state.contains(r#""rssi":-61"#), "{state}");
+}
+
+#[test]
+fn a_leave_stops_a_read_signal_job() {
+    let mut device = online(false);
+    let jobs = device.handle(Signal::Event(Event::BatteryChanged(Some(50))));
+    device.deliver_all(&jobs);
+    let jobs = device.handle(Signal::Event(Event::BatteryChanged(Some(51))));
+    let [(read, [], RadioOp::ReadSignal(_))] = radio_jobs(&jobs)[..] else {
+        panic!("not one read signal: {:?}", names(&jobs));
+    };
+    device.radio_jobs.clear();
+
+    // The connection fails before the answer. The failure makes the link
+    // suspect, so the reconnect leaves first. The shell answers the read
+    // with `Stopped`, and the leave job stops it.
+    let jobs = device.closed(FIRST, "connection lost");
+    let [(id, token, _)] = started_timers(&jobs)[..] else {
+        panic!("not one timer: {:?}", names(&jobs));
+    };
+    let jobs = device.handle(Signal::Timer { id, token });
+    let [(_, stop, RadioOp::Leave(_))] = radio_jobs(&jobs)[..] else {
+        panic!("not one leave: {:?}", names(&jobs));
+    };
+    assert_eq!(stop, [read]);
+
+    // The radio task answers the read late. The shell drops the answer.
+    let late = Signal::Radio {
+        token: read,
+        answer: RadioAnswer::Signal(SignalRead::Read(Some(-61))),
     };
     assert_eq!(device.handle(late), Vec::new());
 }

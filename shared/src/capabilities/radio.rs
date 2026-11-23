@@ -20,6 +20,8 @@
 //! - [`Scan`] is a request. The shell scans all the channels and answers with
 //!   [`Scanned`].
 //! - [`StopScan`] is a request. The shell stops a scan and answers.
+//! - [`ReadSignal`] is a request. The shell reads the signal of the current
+//!   access point and answers with [`SignalRead`]. It does no radio work.
 //! - [`Off`] is a request. The shell turns the radio off and answers.
 //! - [`Restart`] is a notification. The shell restarts the chip.
 //!
@@ -228,6 +230,29 @@ pub struct StopScan {
     pub radio: u32,
 }
 
+/// Reads the signal of the access point with which the device is
+/// associated.
+///
+/// The shell reads the signal that the driver has now, and answers at once.
+/// It sends no frame and does no scan.
+#[derive(Operation, Clone, Copy, Debug, PartialEq, Eq)]
+#[operation(request, output = SignalRead)]
+pub struct ReadSignal {
+    /// The id of the request in the core.
+    pub radio: u32,
+}
+
+/// The answer to a [`ReadSignal`] request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignalRead {
+    /// The signal of the current access point, in dBm, or `None` if the
+    /// shell cannot read it, for example because the device is not
+    /// associated.
+    Read(Option<i32>),
+    /// A newer request stopped the read.
+    Stopped,
+}
+
 /// Turns the radio off.
 ///
 /// The shell stops the request that runs, leaves the access point, waits
@@ -332,6 +357,19 @@ impl Radio {
         Command::request_from_shell(StopScan { radio })
     }
 
+    /// Reads the signal of the current access point for the request
+    /// `radio`. The request gives the signal. Refer to [`ReadSignal`].
+    #[must_use]
+    pub fn read_signal<Effect, Event>(
+        radio: u32,
+    ) -> RequestBuilder<Effect, Event, impl Future<Output = SignalRead>>
+    where
+        Effect: From<Request<ReadSignal>> + Send + 'static,
+        Event: Send + 'static,
+    {
+        Command::request_from_shell(ReadSignal { radio })
+    }
+
     /// Turns the radio off for the request `radio`. The request ends when
     /// the radio is off.
     #[must_use]
@@ -369,8 +407,8 @@ mod tests {
     use crux_core::{Command, Request};
 
     use super::{
-        AccessPoint, Address, Area, Join, Joined, Lease, Leave, Off, Radio, Restart, Scan, Scanned,
-        Seen, StopScan, Target, ip_text, mac_text, signal,
+        AccessPoint, Address, Area, Join, Joined, Lease, Leave, Off, Radio, ReadSignal, Restart,
+        Scan, Scanned, Seen, SignalRead, StopScan, Target, ip_text, mac_text, signal,
     };
 
     const HALL: AccessPoint = AccessPoint {
@@ -390,6 +428,7 @@ mod tests {
         Leave(Request<Leave>),
         Scan(Request<Scan>),
         StopScan(Request<StopScan>),
+        ReadSignal(Request<ReadSignal>),
         Off(Request<Off>),
         Restart(Request<Restart>),
     }
@@ -404,13 +443,16 @@ mod tests {
         )*};
     }
 
-    from_request!(Join, Address, Leave, Scan, StopScan, Off, Restart);
+    from_request!(
+        Join, Address, Leave, Scan, StopScan, ReadSignal, Off, Restart
+    );
 
     #[derive(Debug, PartialEq, Eq)]
     enum Event {
         Joined(Joined),
         Lease(Lease),
         Scanned(Scanned),
+        SignalRead(SignalRead),
         Done,
     }
 
@@ -508,6 +550,27 @@ mod tests {
                 .expect("the core waits for the scan");
             let events: Vec<Event> = command.events().collect();
             assert_eq!(events, [Event::Scanned(scanned)]);
+            assert!(command.is_done());
+        }
+    }
+
+    #[test]
+    fn read_signal_gives_the_signal() {
+        for read in [
+            SignalRead::Read(Some(-61)),
+            SignalRead::Read(None),
+            SignalRead::Stopped,
+        ] {
+            let mut command = Radio::read_signal(9).then_send(Event::SignalRead);
+            let Effect::ReadSignal(mut request) = effect(&mut command) else {
+                panic!("a ReadSignal request");
+            };
+            assert_eq!(request.operation, ReadSignal { radio: 9 });
+            request
+                .resolve(read)
+                .expect("the core waits for the signal");
+            let events: Vec<Event> = command.events().collect();
+            assert_eq!(events, [Event::SignalRead(read)]);
             assert!(command.is_done());
         }
     }

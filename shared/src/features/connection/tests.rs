@@ -987,6 +987,7 @@ const fn is_radio(effect: &Effect) -> bool {
             | Effect::RadioLeave(_)
             | Effect::RadioScan(_)
             | Effect::RadioStopScan(_)
+            | Effect::RadioReadSignal(_)
             | Effect::RadioOff(_)
             | Effect::RadioRestart(_)
     )

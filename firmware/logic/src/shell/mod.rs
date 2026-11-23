@@ -71,7 +71,10 @@ use shared::{
         light::FrontLight,
         log::{Log, LogClock, Uptime},
         power::{Sleep, Wake},
-        radio::{Address, Join, Joined, Lease, Leave, Off, Restart, Scan, Scanned, StopScan},
+        radio::{
+            Address, Join, Joined, Lease, Leave, Off, ReadSignal, Restart, Scan, Scanned,
+            SignalRead, StopScan,
+        },
         stream::{Close, Open, StreamItem, Write, Written},
     },
     mqtt::Credentials,
@@ -197,6 +200,9 @@ pub enum RadioOp {
     Scan(Scan),
     /// Stop a scan. Answer with [`RadioAnswer::Done`].
     StopScan(StopScan),
+    /// Read the signal of the current access point. Answer with
+    /// [`RadioAnswer::Signal`].
+    ReadSignal(ReadSignal),
     /// Turn the radio off. Answer with [`RadioAnswer::Done`].
     Off(Off),
 }
@@ -210,6 +216,8 @@ pub enum RadioAnswer {
     Lease(Lease),
     /// The answer to `Scan`.
     Scanned(Scanned),
+    /// The answer to `ReadSignal`.
+    Signal(SignalRead),
     /// The answer to `Leave`, `StopScan` or `Off`.
     Done,
 }
@@ -221,7 +229,45 @@ enum RadioRequest {
     Leave(Request<Leave>),
     Scan(Request<Scan>),
     StopScan(Request<StopScan>),
+    ReadSignal(Request<ReadSignal>),
     Off(Request<Off>),
+}
+
+/// Splits a radio request of the core into the request that waits and the
+/// operation for the radio task. Returns `None` for another effect.
+/// `RadioRestart` is a notification, so it is not a radio request here.
+fn radio_request(effect: Effect) -> Option<(RadioRequest, RadioOp)> {
+    Some(match effect {
+        Effect::RadioJoin(request) => {
+            let op = RadioOp::Join(request.operation);
+            (RadioRequest::Join(request), op)
+        }
+        Effect::RadioAddress(request) => {
+            let op = RadioOp::Address(request.operation);
+            (RadioRequest::Address(request), op)
+        }
+        Effect::RadioLeave(request) => {
+            let op = RadioOp::Leave(request.operation);
+            (RadioRequest::Leave(request), op)
+        }
+        Effect::RadioScan(request) => {
+            let op = RadioOp::Scan(request.operation);
+            (RadioRequest::Scan(request), op)
+        }
+        Effect::RadioStopScan(request) => {
+            let op = RadioOp::StopScan(request.operation);
+            (RadioRequest::StopScan(request), op)
+        }
+        Effect::RadioReadSignal(request) => {
+            let op = RadioOp::ReadSignal(request.operation);
+            (RadioRequest::ReadSignal(request), op)
+        }
+        Effect::RadioOff(request) => {
+            let op = RadioOp::Off(request.operation);
+            (RadioRequest::Off(request), op)
+        }
+        _ => return None,
+    })
 }
 
 /// A timer operation of the core. Each operation holds the id of the timer.
@@ -547,6 +593,9 @@ impl Shell {
             (RadioRequest::Scan(mut request), RadioAnswer::Scanned(scanned)) => {
                 resolve(core, &mut request, scanned)
             }
+            (RadioRequest::ReadSignal(mut request), RadioAnswer::Signal(read)) => {
+                resolve(core, &mut request, read)
+            }
             (RadioRequest::Leave(mut request), RadioAnswer::Done) => {
                 resolve(core, &mut request, ())
             }
@@ -582,6 +631,9 @@ impl Shell {
                 RadioRequest::Scan(mut request) => resolve(core, &mut request, Scanned::Stopped),
                 RadioRequest::Leave(mut request) => resolve(core, &mut request, ()),
                 RadioRequest::StopScan(mut request) => resolve(core, &mut request, ()),
+                RadioRequest::ReadSignal(mut request) => {
+                    resolve(core, &mut request, SignalRead::Stopped)
+                }
                 RadioRequest::Off(mut request) => resolve(core, &mut request, ()),
             });
         }
@@ -680,30 +732,16 @@ impl Shell {
                 self.closes.push((connection, request));
                 Vec::new()
             }
-            Effect::RadioJoin(request) => {
-                let op = RadioOp::Join(request.operation);
-                self.radio(RadioRequest::Join(request), op, jobs)
-            }
-            Effect::RadioAddress(request) => {
-                let op = RadioOp::Address(request.operation);
-                self.radio(RadioRequest::Address(request), op, jobs)
-            }
-            Effect::RadioLeave(request) => {
-                let op = RadioOp::Leave(request.operation);
-                self.radio(RadioRequest::Leave(request), op, jobs)
-            }
-            Effect::RadioScan(request) => {
-                let op = RadioOp::Scan(request.operation);
-                self.radio(RadioRequest::Scan(request), op, jobs)
-            }
-            Effect::RadioStopScan(request) => {
-                let op = RadioOp::StopScan(request.operation);
-                self.radio(RadioRequest::StopScan(request), op, jobs)
-            }
-            Effect::RadioOff(request) => {
-                let op = RadioOp::Off(request.operation);
-                self.radio(RadioRequest::Off(request), op, jobs)
-            }
+            Effect::RadioJoin(_)
+            | Effect::RadioAddress(_)
+            | Effect::RadioLeave(_)
+            | Effect::RadioScan(_)
+            | Effect::RadioStopScan(_)
+            | Effect::RadioReadSignal(_)
+            | Effect::RadioOff(_) => match radio_request(effect) {
+                Some((request, op)) => self.radio(request, op, jobs),
+                None => Vec::new(),
+            },
             Effect::RadioRestart(request) => notification(Job::Restart(request.operation), jobs),
             Effect::Log(request) => self.log(request, jobs),
             Effect::LogClock(request) => self.clock(request, jobs),

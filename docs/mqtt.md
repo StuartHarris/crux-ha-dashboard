@@ -569,8 +569,8 @@ seven Wi-Fi and boot diagnostics (the signal, the access point, the IP address,
 the reconnects, the restarts, the last reset and the wake reason), three buttons
 (Sleep now, Restart and Full refresh), the front light, and two numbers for the level
 of the light after a tap (on the stand and on battery). Refer to
-`shared/src/features/device/`. The core gets a new signal only at a join or a scan,
-so on the stand the Wi-Fi signal entity can show a value that is hours or days old.
+`shared/src/features/device/`. The core reads the Wi-Fi signal again before a state
+message with a change that is not urgent. Refer to "How new the signal is" below.
 
 | Topic | Direction | QoS | Retained |
 | --- | --- | --- | --- |
@@ -863,7 +863,7 @@ object:
 | `voltage` | The voltage of the battery in mV, rounded to 10 mV. |
 | `current` | The average current of the battery in mA, rounded to 10 mA. A positive current charges the battery, and a negative current discharges it. A check on the board is still to do. |
 | `temperature` | The temperature of the fuel gauge in °C, rounded to 0.5 °C. |
-| `rssi` | The signal of the access point in dBm, from the join or from the last scan that saw the access point. On the stand, the core scans only after a join with the cached access point, so the value can be hours old. |
+| `rssi` | The signal of the access point in dBm. It comes from the join, from a scan that saw the access point, or from a read of the signal just before the message. Refer to "How new the signal is" below. |
 | `bssid` | The BSSID of the access point, as lowercase hex with colons. |
 | `ip` | The IPv4 address from DHCP. |
 | `reconnects` | The number of MQTT sessions since the start of the core that failed while the dashboard was awake, so that the core connected again. A link that fails before a session and a sleep do not count. |
@@ -886,7 +886,7 @@ The message has about 240 bytes. The dashboard publishes it at these times:
 - At most once in 60 seconds for each other change: the voltage, the current, the
   temperature, the charge state while `charging` stays the same, a level of the
   battery that moves by 1%, `rssi` and `reconnects`. The gauge can flap between two levels, so a move of 1% is
-  not urgent. The first of these changes goes at once and starts a timer of 60 seconds.
+  not urgent. The first of these changes goes at once (after a read of the signal) and starts a timer of 60 seconds.
   The changes in that time wait. At the end of the time, the dashboard publishes the
   values of that time, if they changed, and starts a new timer. An urgent change in that
   time goes at once with the values that wait.
@@ -894,6 +894,26 @@ The message has about 240 bytes. The dashboard publishes it at these times:
   the dashboard publishes the new values after the PUBACK.
 - The timer ends with the connection. Each sleep closes the connection first, so the
   timer never waits during a sleep. The next connection publishes the state at once.
+
+How new the signal is:
+
+- Before a change that is not urgent goes, the core asks the shell to read the signal
+  of the access point (the `ReadSignal` radio request). The change then goes with the
+  new signal. The shell reads the signal that the Wi-Fi driver has, so the read sends
+  no frame and costs no radio time.
+- The core reads once before each such message, so it reads about once in 60
+  seconds while values change. A new signal by itself does not publish the state and
+  does not start another read. It goes with the next change.
+- The first message on a connection and an urgent change go at once, with the signal
+  from the join or from the last read or scan. After a join, that signal is a few
+  seconds old.
+- The core does not read in the hourly report, because the join of the report gave
+  the signal. It also does not read while a scan for a better access point is due or
+  runs, because the scan gives a new signal.
+- If the shell cannot read the signal, the message keeps the last signal.
+- On the stand, the state goes at most once in 60 seconds while a power diagnostic
+  changes, and each such message has a new signal. If no other value changes, no
+  state goes, and Home Assistant keeps the signal of the last message.
 
 #### Availability
 

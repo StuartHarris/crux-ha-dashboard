@@ -9,8 +9,8 @@ use alloc::{string::String, vec, vec::Vec};
 
 use crate::{
     capabilities::radio::{
-        AccessPoint, Address, Join, Joined, Lease, Leave, Off, Scan, Scanned, Seen, StopScan,
-        Target,
+        AccessPoint, Address, Join, Joined, Lease, Leave, Off, ReadSignal, Scan, Scanned, Seen,
+        SignalRead, StopScan, Target,
     },
     features::wifi::rules::ROAM_MARGIN_DB,
 };
@@ -172,6 +172,18 @@ impl FakeRadio {
     /// Answers a [`StopScan`] request. A scan of the fake radio is always
     /// complete, so there is nothing to stop.
     pub const fn stop_scan(&mut self, _stop_scan: &StopScan) {}
+
+    /// Answers a [`ReadSignal`] request with the signal of the access point
+    /// with which the device is associated. A test changes the signal in
+    /// `access_points`. If the device is not associated, the answer has no
+    /// signal.
+    #[must_use]
+    pub fn read_signal(&self, _read: &ReadSignal) -> SignalRead {
+        SignalRead::Read(
+            self.associated
+                .and_then(|access_point| self.rssi(access_point)),
+        )
+    }
 
     /// Answers an [`Off`] request. The device leaves the access point, and
     /// the radio turns off.

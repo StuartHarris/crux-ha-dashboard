@@ -1353,3 +1353,166 @@ fn a_reading_then_a_source_change_send_two_state_messages() {
         (&json!("OFF"), &json!("OFF"))
     );
 }
+
+// The read of the signal before a change that is not urgent.
+
+/// Returns the number of `ReadSignal` requests in `log`.
+fn reads(log: &[String]) -> usize {
+    log.iter()
+        .filter(|entry| *entry == "RadioReadSignal")
+        .count()
+}
+
+/// Returns the place of the first state message in `log`.
+fn first_state(log: &[String]) -> usize {
+    log.iter()
+        .position(|entry| entry.starts_with(&format!("MqttPublish {STATE} ")))
+        .unwrap_or_else(|| panic!("no state message in {log:?}"))
+}
+
+/// Starts on the stand, and sends the first reading, which is urgent.
+/// Clears the log of the shell.
+fn on_the_stand_with_a_charge() -> Shell {
+    let mut shell = house();
+    shell.send(start(PowerSource::Stand));
+    shell.send(Event::PowerRead(CHARGING));
+    assert_eq!(reads(&shell.take_log()), 0);
+    shell
+}
+
+#[test]
+fn the_first_state_and_an_urgent_change_go_with_no_read_of_the_signal() {
+    let mut shell = house();
+    shell.send(start(PowerSource::Stand));
+    // The join gave the signal a moment ago.
+    assert_eq!(reads(&shell.take_log()), 0);
+
+    // The signal changes, but an urgent change goes at once with the
+    // signal that the link has.
+    shell.radio.access_points[0].rssi = -61;
+    shell.send(Event::PowerRead(CHARGING));
+    shell.send(Event::PowerSourceChanged(PowerSource::Battery));
+    assert_eq!(reads(&shell.take_log()), 0);
+    assert_eq!(
+        state_values(&shell, "rssi"),
+        [json!(-55), json!(-55), json!(-55)]
+    );
+}
+
+#[test]
+fn a_change_that_is_not_urgent_goes_with_the_signal_of_a_read() {
+    let mut shell = on_the_stand_with_a_charge();
+    shell.radio.access_points[0].rssi = -61;
+
+    // The window is open, so the core reads the signal, and then the
+    // change goes with the new signal. The window is then throttled.
+    shell.send(Event::PowerRead(charging_at(4160)));
+    let log = shell.take_log();
+    assert_eq!(reads(&log), 1, "{log:?}");
+    assert!(
+        log.iter()
+            .position(|entry| entry == "RadioReadSignal")
+            .unwrap()
+            < first_state(&log),
+        "{log:?}"
+    );
+    let state = states(&shell).pop().unwrap();
+    assert_eq!(
+        (&state["voltage"], &state["rssi"]),
+        (&json!(4160), &json!(-61))
+    );
+    assert!(window_waits(&shell));
+    assert_eq!(shell.model.wifi.phase.linked().unwrap().rssi, Some(-61));
+
+    // In the window, a change waits, and the core does not read.
+    shell.radio.access_points[0].rssi = -64;
+    shell.send(Event::PowerRead(charging_at(4170)));
+    assert_eq!(reads(&shell.take_log()), 0);
+
+    // The end of the window reads the signal once, and the change that
+    // waits goes with it.
+    let sent = on(&shell, STATE).len();
+    shell.advance(STATE_MIN_INTERVAL);
+    let log = shell.take_log();
+    assert_eq!(reads(&log), 1, "{log:?}");
+    assert_eq!(on(&shell, STATE).len(), sent + 1);
+    let state = states(&shell).pop().unwrap();
+    assert_eq!(
+        (&state["voltage"], &state["rssi"]),
+        (&json!(4170), &json!(-64))
+    );
+
+    // A window with no change reads nothing, also if the signal changed.
+    shell.radio.access_points[0].rssi = -70;
+    shell.advance(STATE_MIN_INTERVAL);
+    let log = shell.take_log();
+    assert_eq!(reads(&log), 0, "{log:?}");
+    assert_eq!(on(&shell, STATE).len(), sent + 1);
+    assert!(!window_waits(&shell));
+}
+
+#[test]
+fn a_new_signal_alone_does_not_start_another_read_or_message() {
+    let mut shell = on_the_stand_with_a_charge();
+    shell.radio.access_points[0].rssi = -61;
+    shell.send(Event::PowerRead(charging_at(4160)));
+    assert_eq!(reads(&shell.take_log()), 1);
+    let sent = on(&shell, STATE).len();
+
+    // The signal changes again. Nothing in the core changed, so nothing
+    // goes, through two windows.
+    shell.radio.access_points[0].rssi = -75;
+    shell.advance(STATE_MIN_INTERVAL * 2);
+    let log = shell.take_log();
+    assert_eq!(reads(&log), 0, "{log:?}");
+    assert_eq!(on(&shell, STATE).len(), sent);
+}
+
+#[test]
+fn a_change_that_goes_back_during_the_read_sends_nothing_and_the_next_change_reads_again() {
+    let mut shell = on_the_stand_with_a_charge();
+    shell.hold_radio = true;
+    let sent = on(&shell, STATE).len();
+
+    // The change waits for the read, and then it goes back.
+    shell.send(Event::PowerRead(charging_at(4160)));
+    assert_eq!(shell.held_radio(), 1);
+    shell.send(Event::PowerRead(CHARGING));
+    // The read gives the same signal, so the snapshot did not change, and
+    // the window is open again.
+    shell.answer_radio();
+    assert_eq!(on(&shell, STATE).len(), sent);
+    assert!(!window_waits(&shell));
+    assert_eq!(reads(&shell.take_log()), 1);
+
+    // The next change reads the signal again.
+    shell.send(Event::PowerRead(charging_at(4170)));
+    assert_eq!(reads(&shell.take_log()), 1);
+    shell.answer_radio();
+    assert_eq!(state_values(&shell, "voltage").pop(), Some(json!(4170)));
+    assert!(window_waits(&shell));
+}
+
+#[test]
+fn an_urgent_change_goes_while_the_read_waits() {
+    let mut shell = on_the_stand_with_a_charge();
+    shell.hold_radio = true;
+    shell.send(Event::PowerRead(charging_at(4160)));
+    assert_eq!(shell.held_radio(), 1);
+
+    // A move off the stand does not wait for the read. It goes with the
+    // voltage that waits.
+    shell.send(Event::PowerSourceChanged(PowerSource::Battery));
+    let state = states(&shell).pop().unwrap();
+    assert_eq!(
+        (&state["stand"], &state["voltage"]),
+        (&json!("OFF"), &json!(4160))
+    );
+    assert!(!window_waits(&shell));
+
+    // The answer ends the read, and the snapshot did not change, so nothing
+    // more goes.
+    let sent = on(&shell, STATE).len();
+    shell.answer_radio();
+    assert_eq!(on(&shell, STATE).len(), sent);
+}

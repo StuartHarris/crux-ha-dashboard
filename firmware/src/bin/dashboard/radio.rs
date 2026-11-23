@@ -38,8 +38,13 @@
 //!   started. A `StopScan` job only answers, because the `Scan` job already
 //!   stopped.
 //!
+//! A `ReadSignal` job reads the signal that the driver has for the current
+//! access point (`WifiController::rssi`). It sends no frame, so it costs no
+//! radio time.
+//!
 //! The log tells each job with its token, the time of each join, its access
-//! point and its signal, the address from DHCP and the result of each scan.
+//! point and its signal, the address from DHCP, the result of each scan and
+//! each signal that a `ReadSignal` job reads.
 
 use alloc::{collections::VecDeque, format, string::ToString, vec::Vec};
 
@@ -52,7 +57,7 @@ use esp_hal::system::software_reset;
 use esp_radio::wifi::WifiController;
 use logic::shell::{RadioAnswer, RadioOp, Signal};
 use shared::capabilities::radio::{
-    AccessPoint, Join, Joined, Lease, Restart, Scanned, Seen, Target,
+    AccessPoint, Join, Joined, Lease, Restart, Scanned, Seen, SignalRead, Target,
 };
 
 use crate::{RADIO, SIGNALS, config::CONFIG};
@@ -185,6 +190,7 @@ pub async fn task(mut wifi: WifiPeripheral<'static>, stack: Stack<'static>) {
                 RadioAnswer::Lease(Lease::NoLease)
             }
             RadioOp::Scan(_) => RadioAnswer::Scanned(Scanned::Failed("the radio is off".into())),
+            RadioOp::ReadSignal(_) => RadioAnswer::Signal(SignalRead::Read(None)),
             // The radio is already off, so the device is not associated and
             // no scan runs.
             RadioOp::Leave(_) | RadioOp::StopScan(_) | RadioOp::Off(_) => RadioAnswer::Done,
@@ -269,6 +275,11 @@ async fn work(controller: &mut WifiController<'_>, stack: Stack<'static>, op: &R
         RadioOp::Scan(_) => RadioAnswer::Scanned(scan(controller).await),
         // The new job stopped the scan, so this job has no more work.
         RadioOp::StopScan(_) => RadioAnswer::Done,
+        RadioOp::ReadSignal(_) => {
+            let rssi = controller.rssi().ok();
+            log::info!("wifi: signal {rssi:?} dBm");
+            RadioAnswer::Signal(SignalRead::Read(rssi))
+        }
         RadioOp::Off(_) => {
             log::info!("wifi: stop, because Wi-Fi is off");
             stop(controller).await;
@@ -295,6 +306,7 @@ fn log_job(token: u32, op: &RadioOp) {
         RadioOp::Leave(_) => log::info!("wifi: radio job {token}: leave the access point"),
         RadioOp::Scan(_) => log::info!("wifi: radio job {token}: scan all the channels"),
         RadioOp::StopScan(_) => log::info!("wifi: radio job {token}: stop the scan"),
+        RadioOp::ReadSignal(_) => log::info!("wifi: radio job {token}: read the signal"),
         RadioOp::Off(_) => log::info!("wifi: radio job {token}: turn the radio off"),
     }
 }

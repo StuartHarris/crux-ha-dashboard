@@ -827,6 +827,7 @@ impl Shell {
             | Effect::RadioLeave(_)
             | Effect::RadioScan(_)
             | Effect::RadioStopScan(_)
+            | Effect::RadioReadSignal(_)
             | Effect::RadioOff(_)
             | Effect::RadioRestart(_) => self.radio(effect),
             Effect::Log(mut request) => {
@@ -953,6 +954,12 @@ impl Shell {
                 self.radio.stop_scan(&request.operation);
                 let effects = resolve(core, &mut request, ());
                 ("RadioStopScan", String::new(), "resolved".into(), effects)
+            }
+            Effect::RadioReadSignal(mut request) => {
+                let read = self.radio.read_signal(&request.operation);
+                let outcome = format!("resolved: {read:?}");
+                let effects = resolve(core, &mut request, read);
+                ("RadioReadSignal", String::new(), outcome, effects)
             }
             Effect::RadioOff(mut request) => {
                 self.radio.off(&request.operation);
@@ -2666,6 +2673,32 @@ mod tests {
         assert!(count(&mut fixture, "RadioLeave") > leaves);
         assert_eq!(fixture.shell().suback_count(), 2);
         assert_eq!(count(&mut fixture, "RadioRestart"), 0);
+    }
+
+    #[test]
+    fn a_change_that_is_not_urgent_reads_the_signal_before_the_state_message() {
+        let mut fixture = Fixture::new();
+        fixture.start(PowerSource::Stand);
+        fixture.connect();
+        // The first level of the battery is urgent, so it goes with no read.
+        let states = fixture.state_publishes();
+        fixture.shell().send(Event::BatteryChanged(Some(50)));
+        fixture.until("the urgent state message", |fixture| {
+            fixture.state_publishes() > states
+        });
+        fixture.settle();
+        assert_eq!(count(&mut fixture, "RadioReadSignal"), 0);
+
+        // A move of 1% is not urgent, so the core reads the signal first.
+        fixture.shell().send(Event::BatteryChanged(Some(51)));
+        fixture.until("the read of the signal", |fixture| {
+            count(fixture, "RadioReadSignal") == 1
+        });
+        let outcome = &fixture.outcomes("RadioReadSignal")[0];
+        assert!(outcome.ends_with("resolved: Read(Some(-55))"), "{outcome}");
+        fixture.until("the state message after the read", |fixture| {
+            fixture.state_publishes() > states + 1
+        });
     }
 
     #[test]

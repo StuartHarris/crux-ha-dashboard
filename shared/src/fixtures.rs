@@ -137,6 +137,10 @@ impl FixedShell {
                     self.radio.stop_scan(&request.operation);
                     self.resolve(&mut request, ())
                 }
+                Effect::RadioReadSignal(mut request) => {
+                    let read = self.radio.read_signal(&request.operation);
+                    self.resolve(&mut request, read)
+                }
                 Effect::RadioOff(mut request) => {
                     self.radio.off(&request.operation);
                     self.resolve(&mut request, ())

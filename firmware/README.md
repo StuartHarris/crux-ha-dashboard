@@ -44,7 +44,7 @@ cannot block each other. This is the pattern of the `cpb` example in Crux.
 | core (`main`) | Owns the shell. Sends `Start` with the power source `Stand`, the firmware version and the MAC address of the Wi-Fi station interface (`board::firmware`). Sends each warn and error line that the logger keeps as `Event::ShellLogged`. | |
 | `timers` | Starts and cancels the timers of the core. | `Signal::Timer` |
 | `display` | Draws the newest view model with `ui::draw`, and refreshes the panel as `ui::Refresher` decides. Reads the touch controller every 30 ms between refreshes. Sets the front light. Runs the `Sleep` job. | `Signal::Tap`, `Signal::Event`, `Signal::Woke`, `Signal::Light` |
-| `radio` | Does the radio jobs of the core (`Join`, `Address`, `Leave`, `Scan`, `StopScan` and `Off`) and the `Restart` job. Has no Wi-Fi policy. The core decides which access point to join, when to scan, when to leave and when to restart the chip. | `Signal::Radio` with the token of the job |
+| `radio` | Does the radio jobs of the core (`Join`, `Address`, `Leave`, `Scan`, `StopScan`, `ReadSignal` and `Off`) and the `Restart` job. Has no Wi-Fi policy. The core decides which access point to join, when to scan, when to leave and when to restart the chip. | `Signal::Radio` with the token of the job |
 | `stream` | Opens one TCP stream at a time. Writes the bytes of the core to it, gives the bytes that arrive to the core, and closes it. Knows nothing of MQTT. | `Signal::Stream`, `Signal::Written` |
 | `net` | Runs the network stack. | |
 
