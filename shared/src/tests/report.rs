@@ -326,6 +326,37 @@ fn a_time_only_change_does_not_render() {
 }
 
 #[test]
+fn a_report_on_the_home_page_draws_a_changed_light() {
+    let mut shell = house();
+    shell.send(start_at(PowerSource::Battery, None));
+    assert_eq!(shell.view().path, "/");
+    shell.advance(IDLE_TIMEOUT);
+    shell.take_log();
+    shell.take_logs();
+    let frames = shell.frames.len();
+    let before = last_frame(&shell).view.clone();
+    // Home Assistant turns the lamp off two minutes later. The home page
+    // shows the lamp as a dot in the summary of the living room.
+    shell.advance(Duration::from_secs(120));
+    shell.broker.set_state(ROCKET_LAMP, "off", &[]);
+
+    report(&mut shell);
+    let log = shell.take_log();
+    assert_eq!(renders(&log), 1, "{log:?}");
+    assert!(place(&log, "WifiOff") < place(&log, "Render"), "{log:?}");
+    assert_eq!(shell.frames.len(), frames + 1);
+    let frame = last_frame(&shell);
+    assert!(!frame.full);
+    assert_ne!(frame.view.page, before.page);
+    assert!(
+        shell
+            .take_logs()
+            .contains(&"debug power: sleep 2 draws the changes and sleeps".into())
+    );
+    assert_sleeps(&shell);
+}
+
+#[test]
 fn a_change_on_another_page_does_not_render_in_a_report() {
     let mut shell = asleep_in_the_living_room();
     let frames = shell.frames.len();
