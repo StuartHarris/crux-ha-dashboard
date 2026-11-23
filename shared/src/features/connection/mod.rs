@@ -458,8 +458,9 @@ enum Presence {
     /// The session published `online`, or the CONNACK did not come yet.
     #[default]
     Online,
-    /// The session published `reporting`. A wake publishes `online` on the
-    /// same session ([`go_online`]).
+    /// The session published `reporting`. After a wake, [`pump`] publishes
+    /// `online` on the same session when the session takes it
+    /// ([`present`]).
     Reporting,
 }
 
@@ -609,7 +610,8 @@ pub const fn reset_backoff(model: &mut Model) {
 ///
 /// If the device wakes during a report and the session is up, the session
 /// published `reporting`. The core then publishes `online` on the same
-/// session, and Home Assistant runs its seed automation.
+/// session, and Home Assistant runs its seed automation. Refer to
+/// [`present`].
 pub fn go_online(model: &mut Model) -> Cmd {
     // `wants_online` is false while the device sleeps, also in the steps
     // after a report. Thus the core can forget a sleep that waits for a
@@ -628,18 +630,28 @@ pub fn go_online(model: &mut Model) -> Cmd {
             Cmd::done()
         }
         Phase::Starting(_) => Cmd::done(),
-        Phase::Up { .. } => present(model).and(pump(model)),
+        // The pump publishes `online` if the session published
+        // `reporting`.
+        Phase::Up { .. } => pump(model),
     }
 }
 
 /// Publishes `online` on a session that published `reporting`, after a
-/// wake during a report. The taps that the last sleep dropped no longer
-/// show, as after a CONNACK. If the subscribe of the session ended, the
-/// link is quiet, and the scan that the report did not do can run now
-/// ([`wifi::quiet`]). In a report, the core does nothing.
-fn present(model: &mut Model) -> Cmd {
-    if model.power.is_reporting() {
-        return Cmd::done();
+/// wake during a report. Returns the command and `true` if the session
+/// took the publish.
+///
+/// The taps that the last sleep dropped no longer show, as after a CONNACK.
+/// If the subscribe of the session ended, the link is quiet, and the scan
+/// that the report did not do can run now ([`wifi::quiet`]).
+///
+/// If the session refuses the publish because too many publishes wait
+/// ([`Refused::Full`]), the session keeps `reporting`, and the count of
+/// dropped taps stays. [`pump`] calls this function again after each
+/// action of the session, so `online` goes when the session has room. In a
+/// report and while the device sleeps, the core does nothing.
+fn present(model: &mut Model) -> (Cmd, bool) {
+    if !model.wants_online() || model.power.is_reporting() {
+        return (Cmd::done(), false);
     }
     let status = model.startup.settings().map(|settings| Publish {
         topic: settings.status_topic(),
@@ -648,25 +660,28 @@ fn present(model: &mut Model) -> Cmd {
         retain: true,
     });
     let Some(live) = model.connection.phase.live_mut() else {
-        return Cmd::done();
+        return (Cmd::done(), false);
     };
     if live.presence == Presence::Online {
-        return Cmd::done();
+        return (Cmd::done(), false);
     }
+    let published = match status.map(|status| live.session.publish(status)) {
+        // A full session takes the publish after the next PUBACK.
+        Some(Err(Refused::Full)) => return (Cmd::done(), false),
+        Some(Ok(_)) => true,
+        // The status cannot go on this session. The next session publishes
+        // `online` at its CONNACK.
+        Some(Err(Refused::TooLong | Refused::NotConnected)) | None => false,
+    };
     live.presence = Presence::Online;
     let quiet = live.fence != Fence::Subscribing;
-    if let Some(status) = status {
-        // A publish that the session refuses waits for the next session,
-        // which publishes `online` at its CONNACK.
-        let _ = live.session.publish(status);
-    }
     model.unsent = 0;
     let scan = if quiet {
         wifi::quiet(model)
     } else {
         Cmd::done()
     };
-    redraw(model, false).and(scan)
+    (redraw(model, false).and(scan), published)
 }
 
 /// The Wi-Fi feature has a link: connect, if the core wants a connection.
@@ -678,16 +693,24 @@ pub fn link_up(model: &mut Model) -> Cmd {
     }
 }
 
-/// The Wi-Fi feature did not get a link: wait for the backoff, and then try
-/// again, if the core wants a connection. With a stream, the core ignores
-/// the failure.
-pub fn link_failed(model: &mut Model) -> Cmd {
-    if model.wants_online() {
-        // The Wi-Fi feature already wrote a warning with the reason.
-        schedule_reconnect("the link is down", logs::info, model)
-    } else {
-        Cmd::done()
+/// The Wi-Fi feature did not get a link because of `reason`: wait for the
+/// backoff, and then try again, if the core wants a connection. With a
+/// stream, the core ignores the failure.
+///
+/// While the device is awake, the Wi-Fi feature already wrote a warning
+/// with the reason, so the line of the reconnect tells only that the link
+/// is down. In a report, the lines of the Wi-Fi feature are `Debug` lines,
+/// so the reason goes to the line at the limit ([`power::report_failed`]).
+pub fn link_failed(reason: &str, model: &mut Model) -> Cmd {
+    if !model.wants_online() {
+        return Cmd::done();
     }
+    let cause = if model.power.is_reporting() {
+        reason
+    } else {
+        "the link is down"
+    };
+    schedule_reconnect(cause, logs::info, model)
 }
 
 /// Closes the session with a DISCONNECT packet, so that the reconnect goes
@@ -1199,9 +1222,11 @@ fn handle(id: u32, input: Input, model: &mut Model) -> Cmd {
 ///   ([`device::acked`]).
 /// - `Pinged` passes the replay fence of a report ([`Fence`]).
 ///
-/// While the connection is up, the outbox drains after the actions, and
-/// then the device publish queue drains ([`device::drain`]): the discovery
-/// message, the state message and the lines of the log. The command has
+/// While the connection is up, the core publishes `online` after the
+/// actions if the device woke during a report ([`present`]). Then the
+/// outbox drains, and then the device publish queue drains
+/// ([`device::drain`]): the discovery message, the state message and the
+/// lines of the log. The command has
 /// the timers first, then the `Write`, then the other effects.
 ///
 /// In a report, when the session has nothing more to do, the core then
@@ -1285,13 +1310,17 @@ pub fn pump(model: &mut Model) -> Cmd {
         if model.connection.link() != Link::Up {
             break;
         }
+        // `online` goes before the outbox and the device publish queue, so
+        // they cannot take each free place in a full session.
+        let (presented, online) = present(model);
+        rest.push(presented);
         let before = model.connection.outbox.len();
         if before > 0 {
             rest.push(drain_outbox(model));
         }
         let (waits, published) = device::drain(model);
         rest.push(waits);
-        if model.connection.outbox.len() == before && !published {
+        if model.connection.outbox.len() == before && !published && !online {
             break;
         }
     }
@@ -1604,8 +1633,9 @@ pub fn page_time(model: &Model) -> Option<DateTime<Utc>> {
 /// seconds, so each wait is.
 ///
 /// In a report, the line is a `Debug` line, and the power feature counts
-/// the try ([`power::report_failed`]). Thus a report that fails each hour
-/// writes only its line at the limit to the ring.
+/// the try ([`power::report_failed`]). The Wi-Fi lines of the try are
+/// `Debug` lines too. Thus a report that fails each hour writes only its
+/// line at the limit to the ring.
 fn schedule_reconnect(cause: &str, write: fn(Area, String) -> Cmd, model: &mut Model) -> Cmd {
     if model.connection.phase.retry_mut().is_none() {
         return Cmd::done();

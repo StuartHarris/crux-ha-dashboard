@@ -24,6 +24,11 @@
 //!   settled, or at [`REPORT_LIMIT`], the steps of a new sleep run. The
 //!   last step draws only if the image changed ([`radio_off`]). A tap or
 //!   the stand during a report wakes the device as from a sleep.
+//! - The state message of a report has the battery level and the power
+//!   diagnostics that the core has when the message goes. The core keeps a
+//!   reading that arrives later in the report, but it does not publish it
+//!   until the next report or wake ([`read`], [`battery_changed`]). The
+//!   shell reads the power before it sends `Wake::Timer`, so this is rare.
 //! - If the front light is still on at the sleep, one more step turns it
 //!   off first. Usually the light timer turned the light of a tap off
 //!   already. The light is on at the sleep after a tap on no control, or if
@@ -77,7 +82,7 @@
 //! | `Held` or `Sleeping` | the stand | `Stand` | clear the hold timer, connect |
 //! | `Reporting` | the session is up | `Reporting` | publish `reporting`, subscribe, then the device publish queue |
 //! | `Reporting` | the subscribe ends | `Reporting` | PINGREQ (the replay fence), no scan |
-//! | `Reporting` | a failed try to connect | `Reporting` | the usual retry with Debug lines, no count of reconnects or of joins for a restart |
+//! | `Reporting` | a failed try to connect | `Reporting` | the usual retry with Debug lines (also the Wi-Fi lines about a suspect link and about a time limit), no count of reconnects or of joins for a restart |
 //! | `Reporting` | the queue is settled and the PINGRESP came | `Steps { IfChanged }` of a new sleep | clear the limit timer, a Debug line, the steps |
 //! | `Reporting` | the limit timer expires | `Steps { IfChanged }` of a new sleep | an Info line with what was not done, the steps |
 //! | `Reporting` | `Tapped(c)` | `Awake` | clear the limit timer, wake, publish `online` on the session, act on `c` |
@@ -109,11 +114,18 @@
 //! The line comes before the effects of the step. The core does not keep a
 //! `Debug` line, so a usual sleep sends no line to Home Assistant. A sleep
 //! that waits for the pending marks also writes a `Debug` line. A report
-//! writes `Debug` lines, also for each try to connect that fails. Only
-//! unusual decisions write an Info or Warn line: a stalled sleep, a wake
-//! with no cause, a power source wake on battery, and a report that stops
-//! at its limit. Thus a report that fails each hour keeps one line in the
-//! ring, and the ring holds about two days of such reports.
+//! writes `Debug` lines, also for each try to connect that fails. In a
+//! report, the lines of the connection and of the Wi-Fi feature about a
+//! try are `Debug` lines too: the failed session, the wait before the next
+//! try, a failed join, a join with no address, a radio request with no
+//! answer in its time limit, and a link that becomes suspect or stops
+//! being suspect. Only unusual decisions write an Info or Warn line: a
+//! stalled sleep, a wake with no cause, a power source wake on battery, and
+//! a report that stops at its limit. Thus a report that fails each hour
+//! because the Wi-Fi or the broker is down keeps one line in the ring, and
+//! the ring holds about two days of such reports. A fault that is not a
+//! failed try still writes its usual line, for example a `Close` request
+//! with no answer or a topic filter that the broker refused.
 
 use alloc::{format, string::String, vec};
 use core::{mem, num::NonZeroU32, time::Duration};
@@ -846,7 +858,8 @@ fn report(id: u32, strays: u32, model: &mut Model) -> Cmd {
 ///
 /// The connection calls this function when it waits to connect again. In a
 /// report, the lines of each try are `Debug` lines, so a report that fails
-/// each hour writes only its line at the limit to the ring.
+/// each hour writes only its line at the limit to the ring. Refer to the
+/// [module docs](self).
 pub fn report_failed(reason: &str, model: &mut Model) {
     let Phase::Asleep {
         rest: Rest::Reporting { failures, .. },
@@ -889,8 +902,17 @@ fn reported(id: u32, model: &mut Model) -> Cmd {
 /// if it changed ([`LastImage::IfChanged`]).
 ///
 /// The core writes one Info line with what was not done. If tries to
-/// connect failed, the line gives their number and the last reason. The
-/// ring keeps each line that got no PUBACK, and the next report or wake
+/// connect failed, the line gives their number and the last reason. If no
+/// try failed, the line tells the phase of the try that still runs:
+///
+/// | Phase at the limit | Text |
+/// | --- | --- |
+/// | The session is up | `the publishes or the retained messages did not end` |
+/// | The stream opens, or the CONNACK waits | `the broker did not answer` |
+/// | No Wi-Fi link (a join, a lease or a leave waits) | `the Wi-Fi link did not come up` |
+/// | A Wi-Fi link, but no stream | `no connection to the broker` |
+///
+/// The ring keeps each line that got no PUBACK, and the next report or wake
 /// sends it. The core ignores a timer of an older sleep, and a timer that a
 /// wake ended.
 fn report_limit(id: u32, model: &mut Model) -> Cmd {
@@ -927,10 +949,12 @@ fn report_limit(id: u32, model: &mut Model) -> Cmd {
             };
             format!("{tries}, the last because {last}")
         }
-        None if model.connection.link() == Link::Up => {
-            String::from("the publishes or the retained messages did not end")
-        }
-        None => String::from("no connection to the broker"),
+        None => String::from(match model.connection.link() {
+            Link::Up => "the publishes or the retained messages did not end",
+            Link::Starting => "the broker did not answer",
+            Link::Down if model.wifi.phase.linked().is_none() => "the Wi-Fi link did not come up",
+            Link::Down => "no connection to the broker",
+        }),
     };
     logs::info(
         Area::Power,
@@ -1086,7 +1110,9 @@ pub fn source_changed(source: PowerSource, model: &mut Model) -> Cmd {
 /// goes at most once in
 /// [`STATE_MIN_INTERVAL`](device::STATE_MIN_INTERVAL). Refer to
 /// [`device::changed`]. A reading with the same level does nothing. While
-/// the device sleeps, the next connect publishes the level.
+/// the device sleeps, the next connect publishes the level. In a report,
+/// the state message has the level only if it arrived before the message
+/// went. A later level waits for the next report or wake.
 pub fn battery_changed(level: Option<u8>, model: &mut Model) -> Cmd {
     let before = model.power.battery;
     model.power.battery = level;
@@ -1105,7 +1131,9 @@ pub fn battery_changed(level: Option<u8>, model: &mut Model) -> Cmd {
 /// The view does not show the reading, so the core does not draw. The
 /// reading is a fact, not a touch, so it does not wake the device and it
 /// does not start the idle timer again. While the device sleeps, the core
-/// only keeps the reading, and the next connection publishes it.
+/// only keeps the reading, and the next connection publishes it. In a
+/// report, the state message has the reading only if it arrived before the
+/// message went. A later reading waits for the next report or wake.
 ///
 /// While the device is awake, the core publishes the reading in the state
 /// message. Refer to [`device::changed`]. A change of the phase of the

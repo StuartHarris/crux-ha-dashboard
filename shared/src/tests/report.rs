@@ -20,7 +20,7 @@ use crate::{
         refresh::PARTIALS_PER_FULL,
         wifi::rules::RESTART_AFTER,
     },
-    mqtt::codec::server::Packet,
+    mqtt::{Publish, Qos, Refused, codec::server::Packet},
 };
 
 /// The status topic of the dashboard.
@@ -544,7 +544,10 @@ fn a_report_ends_at_its_limit_when_the_join_fails() {
         "{kept:?}"
     );
     assert!(
-        kept[0].ends_with("tries failed, the last because the link is down"),
+        kept[0].ends_with(
+            "tries failed, the last because the join to the strongest access point failed: \
+             authentication failed"
+        ),
         "{kept:?}"
     );
     // The ring keeps its line and the line of the limit.
@@ -888,4 +891,174 @@ fn a_wake_after_the_subscribe_of_a_report_scans() {
 
     shell.send(Event::Tapped(None));
     assert!(shell.take_log().contains(&"RadioScan".into()));
+}
+
+#[test]
+fn a_report_retries_when_the_fence_ping_gets_no_answer() {
+    let mut shell = asleep_in_the_living_room();
+    // The broker answers the SUBACK, but never the PINGREQ of the fence.
+    shell.broker.hold_pingresp = true;
+
+    report(&mut shell);
+    assert!(shell.model.power.is_reporting());
+    assert_eq!(pings(&shell), 1);
+    shell.advance_session(REPORT_LIMIT);
+    let log = shell.take_log();
+    let connects = log.iter().filter(|entry| *entry == "MqttConnect").count();
+    assert!(connects > 1, "{log:?}");
+    assert!(place(&log, "WifiOff") < place(&log, "Sleep"));
+    let logs = shell.take_logs();
+    // The lines of each try are `Debug` lines, also the lines about the
+    // suspect link.
+    assert_eq!(
+        kept(&logs),
+        [
+            "info power: the report of sleep 1 stopped after 30 s: 2 tries failed, the last \
+             because the broker did not answer the ping in time"
+        ],
+        "{logs:#?}"
+    );
+    assert_eq!(shell.model.connection.reconnects, 0);
+    assert_sleeps(&shell);
+}
+
+#[test]
+fn the_limit_line_tells_that_dhcp_gave_no_address() {
+    let mut shell = asleep_in_the_living_room();
+    shell.radio.stuck = true;
+
+    report(&mut shell);
+    shell.advance(REPORT_LIMIT);
+    let logs = shell.take_logs();
+    let kept = kept(&logs);
+    assert_eq!(kept.len(), 1, "{logs:#?}");
+    assert!(
+        kept[0].ends_with(
+            "tries failed, the last because the strongest access point \
+             02:00:00:00:00:01 on channel 6 gave no address"
+        ),
+        "{kept:?}"
+    );
+    assert_sleeps(&shell);
+}
+
+#[test]
+fn the_limit_line_tells_that_the_wi_fi_link_did_not_come_up() {
+    let mut shell = asleep_in_the_living_room();
+    // The radio does not answer, so the join to the cached access point
+    // reaches its time limit, and the join to the strongest one waits at
+    // the limit of the report. No try to connect failed.
+    shell.hold_radio = true;
+
+    report(&mut shell);
+    shell.advance(REPORT_LIMIT);
+    let log = shell.take_log();
+    assert!(log.contains(&"RadioJoin Strongest".into()), "{log:?}");
+    // The time limit of the join is a `Debug` line in a report.
+    assert_eq!(
+        kept(&shell.take_logs()),
+        ["info power: the report of sleep 1 stopped after 30 s: the Wi-Fi link did not come up"]
+    );
+    shell.hold_radio = false;
+    shell.answer_radio();
+    assert_sleeps(&shell);
+}
+
+#[test]
+fn the_limit_line_tells_that_the_broker_did_not_answer() {
+    let mut shell = asleep_in_the_living_room();
+    shell.hold_radio = true;
+    // The link to the broker is dead, so the CONNECT packet never arrives.
+    shell.broker.hold_writes = true;
+
+    report(&mut shell);
+    // The link comes up late, so the session still waits for its CONNACK at
+    // the limit.
+    let late = Duration::from_secs(20);
+    shell.advance(late);
+    shell.hold_radio = false;
+    shell.answer_radio();
+    assert!(shell.take_log().contains(&"MqttConnect".into()));
+    shell.advance(REPORT_LIMIT.saturating_sub(late));
+    assert_eq!(
+        kept(&shell.take_logs()),
+        ["info power: the report of sleep 1 stopped after 30 s: the broker did not answer"]
+    );
+    assert_sleeps(&shell);
+}
+
+#[test]
+fn a_tap_publishes_online_when_the_full_session_has_room() {
+    let mut shell = asleep_in_the_living_room();
+    shell.broker.hold_pingresp = true;
+    report(&mut shell);
+    assert!(shell.model.power.is_reporting());
+    // A backlog fills the session, and the broker holds the PUBACKs.
+    shell.broker.hold_puback = true;
+    let live = shell.model.connection.live_mut().expect("a session");
+    loop {
+        let filler = Publish {
+            topic: "dashboard/hall/filler".into(),
+            payload: b"x".to_vec(),
+            qos: Qos::AtLeastOnce,
+            retain: false,
+        };
+        match live.session.publish(filler) {
+            Ok(_) => {}
+            Err(Refused::Full) => break,
+            Err(refused) => panic!("{refused}"),
+        }
+    }
+    shell.model.unsent = 1;
+    let before = statuses(&shell).len();
+
+    // The session cannot take `online` yet, so the status stays.
+    shell.send(Event::Tapped(None));
+    assert!(!shell.model.power.is_asleep());
+    assert_eq!(statuses(&shell).len(), before);
+    assert_eq!(shell.broker.retained(STATUS), Some("reporting"));
+    assert_eq!(shell.model.unsent, 1);
+
+    // The PUBACKs free the session, and `online` goes once.
+    shell.broker.hold_puback = false;
+    shell.broker.release_pubacks();
+    shell.broker.flush();
+    shell.run();
+    assert_eq!(statuses(&shell)[before..], ["online"]);
+    assert_eq!(shell.broker.retained(STATUS), Some("online"));
+    assert_eq!(shell.model.unsent, 0);
+    assert_eq!(shell.view().status, "Online");
+
+    // More room does not publish it again.
+    shell.broker.set_state(ROCKET_LAMP, "off", &[]);
+    shell.run();
+    assert_eq!(statuses(&shell)[before..], ["online"]);
+}
+
+#[test]
+fn a_suspect_link_that_the_broker_host_clears_keeps_only_the_limit_line() {
+    let mut shell = asleep_in_the_living_room();
+    // A session failed before the sleep, so the link is suspect. The broker
+    // is down, so the host ends each stream, which proves the link.
+    shell.model.wifi.health.failed();
+    shell.broker.stop();
+
+    report(&mut shell);
+    shell.advance(REPORT_LIMIT);
+    let logs = shell.take_logs();
+    assert!(
+        logs.contains(
+            &"debug wifi: the broker host ended the session, so the link moves data and is \
+              not suspect"
+                .into()
+        ),
+        "{logs:#?}"
+    );
+    assert_eq!(kept(&logs).len(), 1, "{logs:#?}");
+    assert!(
+        kept(&logs)[0].starts_with("info power: the report of sleep 1 stopped after 30 s: "),
+        "{logs:#?}"
+    );
+    assert!(!shell.model.wifi.health.suspect());
+    assert_sleeps(&shell);
 }

@@ -355,15 +355,38 @@ while the radio is on.
 
 The report stops after 30 s (`REPORT_LIMIT`), also if the Wi-Fi or the broker is down.
 In that time, the core tries to connect again with the usual backoff. The lines of
-these tries are `debug` lines, so they do not go to Home Assistant. At the limit, the
-core writes one `info` line, for example
-`power: the report of sleep 7 stopped after 30 s: 4 tries failed, the last because the link is down`.
+these tries are `debug` lines, so they do not go to Home Assistant. This includes the
+Wi-Fi lines about a failed join, a join with no address, a radio request with no
+answer, and a link that becomes suspect or stops being suspect. At the limit, the core
+writes one `info` line with what was not done:
+
+| The report at the limit | The end of the line |
+| --- | --- |
+| Tries to connect failed | `4 tries failed, the last because <reason>` |
+| The session is up | `the publishes or the retained messages did not end` |
+| The session waits for its CONNACK | `the broker did not answer` |
+| The Wi-Fi join or lease still waits | `the Wi-Fi link did not come up` |
+| A Wi-Fi link, but no stream | `no connection to the broker` |
+
+The reason is the reason of the last failed try, for example
+`the join to the strongest access point failed: authentication failed`,
+`the strongest access point 02:00:00:00:00:01 on channel 6 gave no address`, or
+`the broker did not answer the ping in time`. A full line is
+`power: the report of sleep 7 stopped after 30 s: 4 tries failed, the last because the broker host ended the stream: connection refused`.
 The ring keeps each line that got no PUBACK, and the next report or wake sends it. The
 failures in a report do not count in `reconnects`, and the joins in a report do not
 count toward a restart of the chip.
 
+The state message of a report has the battery level and the power diagnostics that
+the core has when the message goes. The shell reads them before the check that starts
+the report. If a reading arrives after the state message went, the core keeps it, but
+it publishes it only at the next report or wake (or in the next session of the same
+report, if the session fails).
+
 A tap or the stand during a report wakes the dashboard. If the connection is up, the
-dashboard publishes `online` on it, and Home Assistant runs the seed automation. While
+dashboard publishes `online` on it, and Home Assistant runs the seed automation. If
+too many publishes wait for their PUBACK, `online` goes first when the session has
+room. While
 the status is `reporting`, the buttons and the front light are not available, and the
 sensors are available.
 
@@ -392,8 +415,9 @@ unusual decisions and failures go, for example:
   that gives the reason.
 - `mqtt: the close of connection 7 got no answer in 6 s` (`warn`).
 - `power: the report of sleep 7 stopped after 30 s: 4 tries failed, the last because
-  the link is down` (`info`). In a report, the lines of each failed try to connect are
-  `debug` lines, so a report that fails each hour keeps only this line.
+  the broker host ended the stream: connection refused` (`info`). In a report, the
+  lines of each failed try to connect are `debug` lines, so a report that fails each
+  hour because the Wi-Fi or the broker is down keeps only this line.
 
 While the dashboard sleeps on battery, the lines wait in the ring for the hourly report
 (refer to "The hourly report") or the next wake.
