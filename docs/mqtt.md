@@ -122,7 +122,7 @@ session for the dashboard. After the CONNACK, the core sends one write that has 
 parts, in this order:
 
 1. The service calls that wait (the outbox).
-2. The `online` status.
+2. The `online` status (`reporting` in the hourly report).
 3. The SUBSCRIBE packets for all the topic filters: the topics of the entities, then
    `homeassistant/status`, and then `dashboard/<device_id>/set/+` (refer to "Home
    Assistant device" below).
@@ -317,13 +317,78 @@ has no state, so its button shows the pattern for 2 seconds. Refer to
 
 | Payload | When |
 | --- | --- |
-| `online` | The dashboard publishes it after it connects. |
-| `asleep` | The dashboard publishes it before it sends DISCONNECT to sleep on battery. |
+| `online` | The dashboard publishes it after it connects. If a tap or the stand wakes the dashboard during a report, the dashboard publishes it on the same connection. |
+| `reporting` | The dashboard publishes it after it connects for its hourly report while it sleeps on battery (refer to "The hourly report"). |
+| `asleep` | The dashboard publishes it before it sends DISCONNECT to sleep on battery, also after a report. |
 | `restarting` | The dashboard publishes it before it sends DISCONNECT to restart the chip, when Home Assistant asks (the Restart button). The DISCONNECT is clean, so the broker keeps `restarting`. If the chip does not start again, Home Assistant shows `restarting`, not `online`. |
 | `offline` | The broker publishes it as the last will if the connection stops without a DISCONNECT, for example when the link fails or the power fails. A roam and a restart from Home Assistant do not do this. |
 
 The automation `dashboard_statestream_seed` starts only on `online` (refer to "Seed the
-state stream"). Thus `asleep` and `restarting` do not start it.
+state stream"). Thus `reporting`, `asleep` and `restarting` do not start it.
+
+While the dashboard sleeps on battery, the status shows `asleep`, then `reporting` for a
+few seconds each hour, then `asleep` again. The history of
+`sensor.dashboard_<device_id>_status` thus shows each report and how long the radio was
+on (without the time to join and connect).
+
+### The hourly report
+
+While the dashboard sleeps on battery, it wakes once an hour to report to Home
+Assistant. The core counts the 60 s checks of the power source. The 60th check of a
+sleep starts the report, so a tap or the stand starts the count again. The dashboard
+stays asleep for the user: it does not turn the front light on, and it draws nothing
+while the radio is on.
+
+1. The core joins the Wi-Fi and connects, as for a wake. It does not scan for a better
+   access point.
+2. The core publishes `reporting` and subscribes to all the topics, as for a wake.
+3. The device publish queue sends the discovery message if it is due, the state of the
+   light (`OFF`), the state message and the lines of the log.
+4. After the subscribe, the core sends one PINGREQ. The broker answers it after the
+   retained messages of the subscribe, so its PINGRESP shows that the core has each
+   change (the replay fence).
+5. When each message got its PUBACK and the PINGRESP came, the core publishes `asleep`,
+   sends DISCONNECT and turns the radio off, as for a sleep.
+6. If the image on the panel changed, the core draws it with a partial refresh after
+   the radio is off. A change of only the time does not draw. The panel then keeps the
+   time of the last change that it drew.
+
+The report stops after 30 s (`REPORT_LIMIT`), also if the Wi-Fi or the broker is down.
+In that time, the core tries to connect again with the usual backoff. The lines of
+these tries are `debug` lines, so they do not go to Home Assistant. This includes the
+Wi-Fi lines about a failed join, a join with no address, a radio request with no
+answer, and a link that becomes suspect or stops being suspect. At the limit, the core
+writes one `info` line with what was not done:
+
+| The report at the limit | The end of the line |
+| --- | --- |
+| Tries to connect failed | `4 tries failed, the last because <reason>` |
+| The session is up | `the publishes or the retained messages did not end` |
+| The session waits for its CONNACK | `the broker did not answer` |
+| The Wi-Fi join or lease still waits | `the Wi-Fi link did not come up` |
+| A Wi-Fi link, but no stream | `no connection to the broker` |
+
+The reason is the reason of the last failed try, for example
+`the join to the strongest access point failed: authentication failed`,
+`the strongest access point 02:00:00:00:00:01 on channel 6 gave no address`, or
+`the broker did not answer the ping in time`. A full line is
+`power: the report of sleep 7 stopped after 30 s: 4 tries failed, the last because the broker host ended the stream: connection refused`.
+The ring keeps each line that got no PUBACK, and the next report or wake sends it. The
+failures in a report do not count in `reconnects`, and the joins in a report do not
+count toward a restart of the chip.
+
+The state message of a report has the battery level and the power diagnostics that
+the core has when the message goes. The shell reads them before the check that starts
+the report. If a reading arrives after the state message went, the core keeps it, but
+it publishes it only at the next report or wake (or in the next session of the same
+report, if the session fails).
+
+A tap or the stand during a report wakes the dashboard. If the connection is up, the
+dashboard publishes `online` on it, and Home Assistant runs the seed automation. If
+too many publishes wait for their PUBACK, `online` goes first when the session has
+room. While
+the status is `reporting`, the buttons and the front light are not available, and the
+sensors are available.
 
 ### Log
 
@@ -340,8 +405,8 @@ sleep, and a scan after a wake that finds no better access point. The shell prin
 unusual decisions and failures go, for example:
 
 - `power: sleep 3 woke with no cause, so it sleeps again after 3 s` (`info`), for the
-  first wake with no cause in a sleep. If more than one came, the next real wake writes
-  `power: sleep 3 had 5 wakes with no cause` (`info`).
+  first wake with no cause in a sleep. If more than one came, the next real wake or
+  report writes `power: sleep 3 had 5 wakes with no cause` (`info`).
 - `mqtt: the broker host ended the stream: connection reset, so connect again in 4 s`
   (`warn`), one line for each failed session, with the reason and the wait. During
   the steps of a sleep, the line ends with `, during the sleep`, because the sleep
@@ -349,6 +414,13 @@ unusual decisions and failures go, for example:
 - `mqtt: the link is down, so connect again in 2 s` (`info`), after a Wi-Fi warning
   that gives the reason.
 - `mqtt: the close of connection 7 got no answer in 6 s` (`warn`).
+- `power: the report of sleep 7 stopped after 30 s: 4 tries failed, the last because
+  the broker host ended the stream: connection refused` (`info`). In a report, the
+  lines of each failed try to connect are `debug` lines, so a report that fails each
+  hour because the Wi-Fi or the broker is down keeps only this line.
+
+While the dashboard sleeps on battery, the lines wait in the ring for the hourly report
+(refer to "The hourly report") or the next wake.
 
 | Topic | QoS | Retained |
 | --- | --- | --- |
@@ -535,7 +607,7 @@ For example, for the device id `hall`:
     "status": {
       "p": "sensor", "name": "Status", "uniq_id": "dashboard_hall_status",
       "dev_cla": "enum", "ic": "mdi:tablet-dashboard",
-      "ops": ["online", "asleep", "offline", "restarting"],
+      "ops": ["online", "reporting", "asleep", "offline", "restarting"],
       "stat_t": "dashboard/hall/status"
     },
     "battery": {
@@ -796,7 +868,7 @@ object:
 | `reconnects` | The number of MQTT sessions since the start of the core that failed while the dashboard was awake, so that the core connected again. A link that fails before a session and a sleep do not count. |
 | `restarts` | The number of resets that were not a power-on, since the last power-on. A press of RST is a power-on. A flash or a serial monitor is not, so each one adds 1. Refer to "Which resets are a power-on" in `firmware/README.md`. The simulator gives 0. |
 | `reset` | The reason of the last reset: `power_on`, `software`, `panic`, `watchdog`, `brownout` or `other`. The simulator gives `power_on`. |
-| `wake` | What woke the dashboard last: `boot` (a start, with no sleep since), `touch` or `stand`. The check of the power source every 60 seconds and a wake with no cause keep the dashboard asleep, so they do not change it. |
+| `wake` | What woke the dashboard last: `boot` (a start, with no sleep since), `touch` or `stand`. The check of the power source every 60 seconds, the hourly report and a wake with no cause keep the dashboard asleep, so they do not change it. |
 
 A value is `null` if the shell did not read it, and `rssi`, `bssid` and `ip` are `null`
 with no link. Home Assistant then shows the entity as unknown. The shell keeps the last good value of each diagnostic after a read that fails,
@@ -826,20 +898,21 @@ The message has about 240 bytes. The dashboard publishes it at these times:
 
 | Entity | Available |
 | --- | --- |
-| Status | Always. It shows `online`, `asleep`, `offline` or `restarting` from the status topic. |
-| Battery, On stand, the power diagnostics, and the Wi-Fi and boot diagnostics | Unless the status is `offline`. While the dashboard is asleep or restarts, they keep their last value. |
+| Status | Always. It shows `online`, `reporting`, `asleep`, `offline` or `restarting` from the status topic. |
+| Battery, On stand, the power diagnostics, and the Wi-Fi and boot diagnostics | Unless the status is `offline`. While the dashboard is asleep or restarts, they keep their last value. The hourly report updates them. |
 | Restart, Full refresh, Front light | Only while the status is `online`. While the dashboard sleeps, it cannot obey a command. |
 | Tap light on the stand, Tap light on battery | Unless the status is `offline`. A user can set a tap level while the dashboard sleeps. The broker keeps it, and the next connection applies it. |
 | Sleep now | Only while the status is `online` and the dashboard is on battery (`stand` is `OFF`). On the stand, a sleep does nothing. |
 
 Home Assistant compares the result of an availability template with `online` and
 `offline`, and it ignores each other result. So the template of a button must turn
-`asleep` and `restarting` into `offline`:
+`reporting`, `asleep` and `restarting` into `offline`:
 `{{ 'online' if value == 'online' else 'offline' }}`. Each status gives these results:
 
 | Status | Sensor template | Button template |
 | --- | --- | --- |
 | `online` | `online` | `online` |
+| `reporting` | `online` | `offline` |
 | `asleep` | `online` | `offline` |
 | `offline` | `offline` | `offline` |
 | `restarting` | `online` | `offline` |
@@ -960,8 +1033,8 @@ these times:
 
 From the start of a sleep, the queue publishes nothing, so the broker keeps the last
 state through the sleep (often ON after a wake tap). Home Assistant shows the light as
-unavailable while the status is `asleep`. The next connection publishes the true
-state.
+unavailable while the status is `asleep` or `reporting`. The next connection, also a
+report, publishes the true state (`OFF` in a report).
 
 #### When the dashboard publishes
 
@@ -971,7 +1044,8 @@ light, the state, the log.
 
 - The queue sends only while the connection is up. It sends nothing in the write of
   the CONNACK, nothing from the start of a sleep, and nothing during the close for a
-  change of access point. The messages wait for the next connection after the wake.
+  change of access point. The messages wait for the next connection after the wake or
+  for the next hourly report.
 - At most 56 device publishes wait for a PUBACK at a time, all together. The session
   takes 64, so 8 places stay free for the status (`asleep` or `restarting`) and the
   service calls.

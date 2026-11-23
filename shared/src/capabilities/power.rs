@@ -95,10 +95,16 @@ pub enum Wake {
 /// Puts the device to sleep until one of `wake_on` occurs. The panel keeps
 /// its last image.
 ///
-/// The first `Sleep` of a sleep comes together with the `Render` of the last
-/// image. The shell must draw that image on the panel before the device
-/// sleeps. A later `Sleep` of the same sleep has no `Render`, and the panel
-/// keeps its image.
+/// The first `Sleep` of a sleep can come together with a `Render` of the
+/// last image, with a full or a partial refresh. If it does, the shell must
+/// draw that image on the panel before the device sleeps. With no `Render`,
+/// the panel keeps its image. A later `Sleep` of the same sleep has no
+/// `Render`.
+///
+/// After a timer wake, the core can send no new `Sleep` for a time, while
+/// it reports to Home Assistant. The shell then stays awake as after a
+/// wake: it reads touch and the power source, and it does the radio and
+/// stream requests of the core.
 ///
 /// If `wake_on` has more than one timer, the shortest timer wins.
 ///

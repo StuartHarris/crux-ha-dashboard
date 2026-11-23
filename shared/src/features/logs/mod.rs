@@ -649,6 +649,17 @@ pub(crate) fn in_flight(model: &mut Model) -> usize {
     }
 }
 
+/// Returns `true` if no line and no drop count waits in the ring, and no
+/// `LogClock` request waits. Refer to
+/// [`device::settled`](crate::features::device).
+pub(crate) fn settled(model: &mut Model) -> bool {
+    let clock = matches!(
+        model.connection.live_mut().map(|live| &live.log),
+        Some(Flight::Clock)
+    );
+    !clock && !model.logs.waits()
+}
+
 /// The broker acknowledged the publish with the packet id `id`. If it is a
 /// line of the log, the line leaves the ring. If it is the drop message,
 /// the core subtracts its count from the drop count. Lines that dropped

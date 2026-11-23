@@ -68,7 +68,7 @@ const DISCOVERY_JSON: &str = concat!(
     r#""cmps":{"#,
     r#""status":{"p":"sensor","name":"Status","uniq_id":"dashboard_hall_status","#,
     r#""dev_cla":"enum","ic":"mdi:tablet-dashboard","#,
-    r#""ops":["online","asleep","offline","restarting"],"#,
+    r#""ops":["online","reporting","asleep","offline","restarting"],"#,
     r#""stat_t":"dashboard/hall/status"},"#,
     r#""battery":{"p":"sensor","name":"Battery","uniq_id":"dashboard_hall_battery","#,
     r#""dev_cla":"battery","unit_of_meas":"%","stat_cla":"measurement","#,
@@ -277,7 +277,7 @@ fn the_discovery_message_is_json_with_the_keys_and_under_10_kib() {
     let status = &components["status"];
     assert_eq!(
         status["ops"],
-        json!(["online", "asleep", "offline", "restarting"])
+        json!(["online", "reporting", "asleep", "offline", "restarting"])
     );
     assert_eq!(status["stat_t"], STATUS);
     assert!(
@@ -460,6 +460,7 @@ fn each_status_gives_the_availability_of_the_sensors_and_the_buttons() {
     // buttons work only while it is online.
     let expected = [
         ("online", "online", "online"),
+        ("reporting", "online", "offline"),
         ("asleep", "online", "offline"),
         ("offline", "offline", "offline"),
         ("restarting", "online", "offline"),

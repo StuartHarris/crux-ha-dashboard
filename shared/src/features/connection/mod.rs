@@ -179,6 +179,9 @@ pub const STATUS_ONLINE: &str = "online";
 pub const STATUS_ASLEEP: &str = "asleep";
 /// The status payload that the broker publishes if the connection stops.
 pub const STATUS_OFFLINE: &str = "offline";
+/// The status payload while the dashboard is connected for its hourly
+/// report on battery. Refer to [`power::report`](crate::features::power).
+pub const STATUS_REPORTING: &str = "reporting";
 /// The status payload before the dashboard disconnects to restart the chip.
 /// Refer to [`close_for_restart`].
 pub const STATUS_RESTARTING: &str = "restarting";
@@ -442,6 +445,43 @@ pub struct Live {
     /// The write of the CONNACK: the outbox, `online` and the SUBSCRIBE
     /// packets. Refer to [`ConnackWrite`].
     connack_write: ConnackWrite,
+    /// The status that the session published at its CONNACK, or after a
+    /// wake in a report. Refer to [`Presence`].
+    presence: Presence,
+    /// The replay fence of a report. Refer to [`Fence`].
+    fence: Fence,
+}
+
+/// The status that a session published.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Presence {
+    /// The session published `online`, or the CONNACK did not come yet.
+    #[default]
+    Online,
+    /// The session published `reporting`. After a wake, [`pump`] publishes
+    /// `online` on the same session when the session takes it
+    /// ([`present`]).
+    Reporting,
+}
+
+/// The replay fence of a session in a report.
+///
+/// The broker sends the retained messages of a filter after its SUBACK, so
+/// the end of the subscribe does not prove that the retained messages
+/// arrived. After the subscribe, the session of a report sends one PINGREQ.
+/// The broker answers it after the retained messages of the SUBSCRIBE
+/// packets, so its PINGRESP shows that they arrived. The report then has
+/// each change for the image at its end. A new session starts its own
+/// fence.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Fence {
+    /// The subscribe of the session did not end.
+    #[default]
+    Subscribing,
+    /// The PINGREQ went after the subscribe, and its PINGRESP waits.
+    Waits,
+    /// The PINGRESP came, or the session needs no fence.
+    Passed,
 }
 
 /// The write of the CONNACK on a session.
@@ -471,6 +511,8 @@ impl Live {
             state: device::StateSync::Unsent,
             light: light::Sync::Due,
             connack_write: ConnackWrite::NotWaiting,
+            presence: Presence::Online,
+            fence: Fence::Subscribing,
         }
     }
 
@@ -565,9 +607,15 @@ pub const fn reset_backoff(model: &mut Model) {
 /// close, the restart stays. If the device wakes before the close starts,
 /// the session is still up. The core then sends the lines of the log that
 /// wait ([`pump`]), because the log publishes nothing during a sleep.
+///
+/// If the device wakes during a report and the session is up, the session
+/// published `reporting`. The core then publishes `online` on the same
+/// session, and Home Assistant runs its seed automation. Refer to
+/// [`present`].
 pub fn go_online(model: &mut Model) -> Cmd {
-    // `wants_online` is false while the device sleeps. Thus the core can
-    // forget a sleep that waits for a close below.
+    // `wants_online` is false while the device sleeps, also in the steps
+    // after a report. Thus the core can forget a sleep that waits for a
+    // close below.
     if !model.wants_online() {
         return Cmd::done();
     }
@@ -582,8 +630,58 @@ pub fn go_online(model: &mut Model) -> Cmd {
             Cmd::done()
         }
         Phase::Starting(_) => Cmd::done(),
+        // The pump publishes `online` if the session published
+        // `reporting`.
         Phase::Up { .. } => pump(model),
     }
+}
+
+/// Publishes `online` on a session that published `reporting`, after a
+/// wake during a report. Returns the command and `true` if the session
+/// took the publish.
+///
+/// The taps that the last sleep dropped no longer show, as after a CONNACK.
+/// If the subscribe of the session ended, the link is quiet, and the scan
+/// that the report did not do can run now ([`wifi::quiet`]).
+///
+/// If the session refuses the publish because too many publishes wait
+/// ([`Refused::Full`]), the session keeps `reporting`, and the count of
+/// dropped taps stays. [`pump`] calls this function again after each
+/// action of the session, so `online` goes when the session has room. In a
+/// report and while the device sleeps, the core does nothing.
+fn present(model: &mut Model) -> (Cmd, bool) {
+    if !model.wants_online() || model.power.is_reporting() {
+        return (Cmd::done(), false);
+    }
+    let status = model.startup.settings().map(|settings| Publish {
+        topic: settings.status_topic(),
+        payload: STATUS_ONLINE.into(),
+        qos: Qos::AtLeastOnce,
+        retain: true,
+    });
+    let Some(live) = model.connection.phase.live_mut() else {
+        return (Cmd::done(), false);
+    };
+    if live.presence == Presence::Online {
+        return (Cmd::done(), false);
+    }
+    let published = match status.map(|status| live.session.publish(status)) {
+        // A full session takes the publish after the next PUBACK.
+        Some(Err(Refused::Full)) => return (Cmd::done(), false),
+        Some(Ok(_)) => true,
+        // The status cannot go on this session. The next session publishes
+        // `online` at its CONNACK.
+        Some(Err(Refused::TooLong | Refused::NotConnected)) | None => false,
+    };
+    live.presence = Presence::Online;
+    let quiet = live.fence != Fence::Subscribing;
+    model.unsent = 0;
+    let scan = if quiet {
+        wifi::quiet(model)
+    } else {
+        Cmd::done()
+    };
+    (redraw(model, false).and(scan), published)
 }
 
 /// The Wi-Fi feature has a link: connect, if the core wants a connection.
@@ -595,16 +693,24 @@ pub fn link_up(model: &mut Model) -> Cmd {
     }
 }
 
-/// The Wi-Fi feature did not get a link: wait for the backoff, and then try
-/// again, if the core wants a connection. With a stream, the core ignores
-/// the failure.
-pub fn link_failed(model: &mut Model) -> Cmd {
-    if model.wants_online() {
-        // The Wi-Fi feature already wrote a warning with the reason.
-        schedule_reconnect("the link is down", logs::info, model)
-    } else {
-        Cmd::done()
+/// The Wi-Fi feature did not get a link because of `reason`: wait for the
+/// backoff, and then try again, if the core wants a connection. With a
+/// stream, the core ignores the failure.
+///
+/// While the device is awake, the Wi-Fi feature already wrote a warning
+/// with the reason, so the line of the reconnect tells only that the link
+/// is down. In a report, the lines of the Wi-Fi feature are `Debug` lines,
+/// so the reason goes to the line at the limit ([`power::report_failed`]).
+pub fn link_failed(reason: &str, model: &mut Model) -> Cmd {
+    if !model.wants_online() {
+        return Cmd::done();
     }
+    let cause = if model.power.is_reporting() {
+        reason
+    } else {
+        "the link is down"
+    };
+    schedule_reconnect(cause, logs::info, model)
 }
 
 /// Closes the session with a DISCONNECT packet, so that the reconnect goes
@@ -1099,8 +1205,8 @@ fn handle(id: u32, input: Input, model: &mut Model) -> Cmd {
 ///   core clears all the timers of the session. If the expiry of a cleared
 ///   timer still arrives, the session ignores an old timer, and the core
 ///   ignores a timer of an older connection.
-/// - `Connected` publishes the outbox and `online`, and subscribes, so all
-///   three go in one `Write`.
+/// - `Connected` publishes the outbox and `online` (`reporting` in a
+///   report), and subscribes, so all three go in one `Write`.
 /// - `Message` changes the state of an entity.
 /// - `Subscribed` with `Done` or `Refused` for the subscribe of the
 ///   connection makes the link quiet ([`wifi::quiet`]). After `Refused`,
@@ -1114,11 +1220,17 @@ fn handle(id: u32, input: Input, model: &mut Model) -> Cmd {
 ///
 /// - `Acked` goes to the publisher that owns the packet id
 ///   ([`device::acked`]).
+/// - `Pinged` passes the replay fence of a report ([`Fence`]).
 ///
-/// While the connection is up, the outbox drains after the actions, and
-/// then the device publish queue drains ([`device::drain`]): the discovery
-/// message, the state message and the lines of the log. The command has
+/// While the connection is up, the core publishes `online` after the
+/// actions if the device woke during a report ([`present`]). Then the
+/// outbox drains, and then the device publish queue drains
+/// ([`device::drain`]): the discovery message, the state message and the
+/// lines of the log. The command has
 /// the timers first, then the `Write`, then the other effects.
+///
+/// In a report, when the session has nothing more to do, the core then
+/// sends [`power::Event::Reported`]. Refer to [`report_settled`].
 ///
 /// The write of the CONNACK has only the outbox, `online` and the
 /// SUBSCRIBE packets. If the CONNACK arrives before the `Sent` of the
@@ -1163,6 +1275,13 @@ pub fn pump(model: &mut Model) -> Cmd {
                 }
                 // The core closes the stream when the session ends.
                 Action::Close => {}
+                Action::Pinged => {
+                    if let Some(live) = model.connection.phase.live_mut()
+                        && live.fence == Fence::Waits
+                    {
+                        live.fence = Fence::Passed;
+                    }
+                }
                 Action::Acked(packet) => device::acked(packet, model),
                 Action::Connected => rest.push(connected(model)),
                 Action::Message(message) => rest.push(on_message(&message, model)),
@@ -1191,17 +1310,40 @@ pub fn pump(model: &mut Model) -> Cmd {
         if model.connection.link() != Link::Up {
             break;
         }
+        // `online` goes before the outbox and the device publish queue, so
+        // they cannot take each free place in a full session.
+        let (presented, online) = present(model);
+        rest.push(presented);
         let before = model.connection.outbox.len();
         if before > 0 {
             rest.push(drain_outbox(model));
         }
         let (waits, published) = device::drain(model);
         rest.push(waits);
-        if model.connection.outbox.len() == before && !published {
+        if model.connection.outbox.len() == before && !published && !online {
             break;
         }
     }
+    if let Some(sleep) = model.power.reporting()
+        && report_settled(model)
+    {
+        // An event, so the steps of the sleep do not run a pump inside this
+        // pump. The power feature ignores a second event for the sleep.
+        rest.push(Cmd::event(power::Event::Reported(sleep).into()));
+    }
     Cmd::all(timers).and(Cmd::all(writes)).and(Cmd::all(rest))
+}
+
+/// Returns `true` if the report has nothing more to do on the session: the
+/// session is up, the write of the CONNACK went, the replay fence passed,
+/// no service call waits, and the device publish queue is settled
+/// ([`device::settled`]).
+fn report_settled(model: &mut Model) -> bool {
+    let up = match &model.connection.phase {
+        Phase::Up { live, .. } => !live.connack_write_waits() && live.fence == Fence::Passed,
+        _ => false,
+    };
+    up && model.connection.outbox.is_empty() && device::settled(model)
 }
 
 /// Starts the timer `timer` of the session on the connection `id`.
@@ -1218,7 +1360,9 @@ fn start_timer(id: u32, timer: Timer, after: Duration) -> (Cmd, TimerHandle) {
 }
 
 /// The broker accepted the connection: publish the outbox and `online`,
-/// subscribe to all the topics, and draw.
+/// subscribe to all the topics, and draw. In a report, the status is
+/// `reporting`, the core does not draw, and the taps that the last sleep
+/// dropped still show on the image.
 ///
 /// The topics are the topics of the entities, then the birth message of
 /// Home Assistant ([`device::BIRTH_TOPIC`]), and then the `set` topics of
@@ -1235,9 +1379,15 @@ fn connected(model: &mut Model) -> Cmd {
     let Some(settings) = model.startup.settings() else {
         return Cmd::done();
     };
+    let reporting = model.power.is_reporting();
+    let (payload, presence) = if reporting {
+        (STATUS_REPORTING, Presence::Reporting)
+    } else {
+        (STATUS_ONLINE, Presence::Online)
+    };
     let status = Publish {
         topic: settings.status_topic(),
-        payload: STATUS_ONLINE.into(),
+        payload: payload.into(),
         qos: Qos::AtLeastOnce,
         retain: true,
     };
@@ -1246,7 +1396,9 @@ fn connected(model: &mut Model) -> Cmd {
         return Cmd::done();
     }
     model.connection.backoff = RECONNECT_MIN;
-    model.unsent = 0;
+    if !reporting {
+        model.unsent = 0;
+    }
     let marks = drain_outbox(model);
     let mut topics = entities::topics(model.pages);
     topics.push(device::BIRTH_TOPIC.into());
@@ -1260,6 +1412,7 @@ fn connected(model: &mut Model) -> Cmd {
             let subscribe = live.session.subscribe(&topics);
             // The next `Send` of the session takes the bytes.
             live.connack_write = ConnackWrite::Waits;
+            live.presence = presence;
             state.phase = Phase::Up { live, subscribe };
         }
         phase => state.phase = phase,
@@ -1305,6 +1458,10 @@ fn on_message(message: &Message, model: &mut Model) -> Cmd {
 /// `Refused`, the core also writes a line to the log. After `Failed`, the
 /// connection ended or never got the acknowledgements, so the link is not
 /// quiet.
+///
+/// In a report, the session then sends the PINGREQ of the replay fence
+/// ([`Fence`]). If the session refuses it, the report does not wait for
+/// the fence.
 fn subscribed(id: SubscribeId, outcome: SubscribeOutcome, model: &mut Model) -> Cmd {
     let current = matches!(
         model.connection.phase,
@@ -1312,6 +1469,16 @@ fn subscribed(id: SubscribeId, outcome: SubscribeOutcome, model: &mut Model) -> 
     );
     if !current || outcome == SubscribeOutcome::Failed {
         return Cmd::done();
+    }
+    let reporting = model.power.is_reporting();
+    if let Some(live) = model.connection.phase.live_mut()
+        && live.fence == Fence::Subscribing
+    {
+        live.fence = if reporting && live.session.ping().is_ok() {
+            Fence::Waits
+        } else {
+            Fence::Passed
+        };
     }
     if outcome == SubscribeOutcome::Refused {
         let reason = logs::warn(
@@ -1330,7 +1497,7 @@ fn subscribed(id: SubscribeId, outcome: SubscribeOutcome, model: &mut Model) -> 
 /// | --- | --- | --- |
 /// | `Starting`, `Up` (always a failure) | failure | `None`, and the reconnect timer starts |
 /// | `Closing` with `Connect` | clean, while the core wants a connection | `Connect` |
-/// | `Closing` with `Connect` | failure, or while asleep | `None` |
+/// | `Closing` with `Connect` | failure, or while asleep and not in a report | `None` |
 /// | `Closing` with `Sleep` or `Restart` | any | the same |
 ///
 /// After a clean end, the core connects again without a wait. This happens
@@ -1342,6 +1509,9 @@ fn subscribed(id: SubscribeId, outcome: SubscribeOutcome, model: &mut Model) -> 
 /// opens only after the answer to the `Close` request. Refer to
 /// [`connect`]. A sleep that waits for the close of the session waits for
 /// the answer too. During a sleep, the core does not draw.
+///
+/// In a report, a failed end waits for the backoff as when awake, but it
+/// does not count as a reconnect, and the core does not draw.
 ///
 /// While a restart waits, the core does not connect again, does not count
 /// the end as a reconnect, and does not draw: the chip resets soon after
@@ -1388,6 +1558,17 @@ fn ended(end: &End, model: &mut Model) -> Cmd {
             logs::warn(Area::Mqtt, format!("{end}, during the restart"))
         };
         return health.and(close).and(failure);
+    }
+    if model.power.is_reporting() {
+        // The report tries again inside its limit. The failure does not
+        // count as a reconnect, which counts only while awake, and the
+        // device does not draw.
+        let retry = if clean {
+            Cmd::done()
+        } else {
+            schedule_reconnect(&end.to_string(), logs::warn, model)
+        };
+        return health.and(close).and(retry);
     }
     if model.power.is_asleep() {
         // The sleep does not connect again. A failed end is the only line
@@ -1450,7 +1631,21 @@ pub fn page_time(model: &Model) -> Option<DateTime<Utc>> {
 /// then the wait in whole seconds, for example `the stream closed:
 /// connection lost, so connect again in 4 s`. Both limits are whole
 /// seconds, so each wait is.
+///
+/// In a report, the line is a `Debug` line, and the power feature counts
+/// the try ([`power::report_failed`]). The Wi-Fi lines of the try are
+/// `Debug` lines too. Thus a report that fails each hour writes only its
+/// line at the limit to the ring.
 fn schedule_reconnect(cause: &str, write: fn(Area, String) -> Cmd, model: &mut Model) -> Cmd {
+    if model.connection.phase.retry_mut().is_none() {
+        return Cmd::done();
+    }
+    let write: fn(Area, String) -> Cmd = if model.power.is_reporting() {
+        power::report_failed(cause, model);
+        logs::debug
+    } else {
+        write
+    };
     let state = &mut model.connection;
     let Some(retry) = state.phase.retry_mut() else {
         return Cmd::done();

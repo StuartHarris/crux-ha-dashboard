@@ -49,7 +49,19 @@
 //! refresh already drew the newest view. Examples are a page turn, a wake
 //! and the image before sleep. The core clears a stale draw timer. If the
 //! expiry of a stale timer still arrives, the core ignores it. While the
-//! device sleeps, the draw timer draws nothing.
+//! device sleeps, the core starts no draw timer, and a draw timer draws
+//! nothing.
+//!
+//! # The hourly report
+//!
+//! During the hourly report on battery, the core draws nothing, also when
+//! the retained messages change the entities. After the radio turns off,
+//! the core compares the view with the view of the image on the panel, with
+//! the time left out ([`image_changed`]). If they differ, it draws once with
+//! a partial refresh (a full refresh after [`PARTIALS_PER_FULL`] partial
+//! renders). A change of only the time does not draw, so the panel keeps
+//! the time of the last change that it drew. Refer to
+//! [`power::radio_off`].
 //!
 //! # The full-refresh timer and sleep
 //!
@@ -78,6 +90,7 @@
 //! and after the core asked the shell to restart the chip
 //! ([`wifi::Phase::Restarting`]).
 
+use alloc::string::String;
 use core::time::Duration;
 
 use crate::{
@@ -175,10 +188,11 @@ impl State {
 /// sleep. Refer to [`power::sleep_if_settled`]. Thus a caller that cancels
 /// that sleep must do so before the full refresh.
 ///
-/// While the chip waits to restart, the core asks for nothing, and the
-/// counts and timers do not change. Refer to the [module docs](self).
+/// While the chip waits to restart, or while a report runs, the core asks
+/// for nothing, and the counts and timers do not change. Refer to the
+/// [module docs](self).
 pub fn redraw(model: &mut Model, full: bool) -> Cmd {
-    if chip_restarts(model) {
+    if chip_restarts(model) || model.power.is_reporting() {
         return Cmd::done();
     }
     let mut next = ViewModel::from(&*model);
@@ -206,6 +220,36 @@ pub fn redraw(model: &mut Model, full: bool) -> Cmd {
         .and(power::sleep_if_settled(model))
 }
 
+/// Returns `true` if the view, with the time left out, is not the view of
+/// the image on the panel. The core then draws at the end of a report.
+/// Refer to [`power::radio_off`].
+///
+/// The view of the image is the view of the last render that the core
+/// asked for. The compare leaves out the footer time (`updated` and
+/// `last_sync`) and `full_refresh_seq`. Home Assistant moves the time of an
+/// entity also when only an attribute that the page does not show changes,
+/// or when a value changes but shows the same text. Such a change does not
+/// draw, and the panel keeps the time of the last change that it drew. With
+/// no render before, the function returns `true`.
+#[must_use]
+pub fn image_changed(model: &Model) -> bool {
+    let Some(last) = &model.refresh.last else {
+        return true;
+    };
+    let now = ViewModel::from(model);
+    without_time(now) != without_time(last.clone())
+}
+
+/// Returns `view` with no footer time and a `full_refresh_seq` of 0.
+fn without_time(view: ViewModel) -> ViewModel {
+    ViewModel {
+        updated: String::new(),
+        last_sync: None,
+        full_refresh_seq: 0,
+        ..view
+    }
+}
+
 /// Returns `true` if a restart waits for the close of the connection, or if
 /// the core asked the shell to restart the chip.
 fn chip_restarts(model: &Model) -> bool {
@@ -215,9 +259,13 @@ fn chip_restarts(model: &Model) -> bool {
 /// Draws after [`DRAW_DELAY`], for a change from the state stream that the
 /// page shows. If a draw timer already waits, the core does not start
 /// another one. That timer draws this change too.
+///
+/// While the device is asleep, the core starts no draw timer, because no
+/// timer can wait at a `Sleep` request. After a report, the steps of the
+/// sleep draw the changes ([`image_changed`]).
 pub fn redraw_soon(model: &mut Model) -> Cmd {
     let state = &mut model.refresh;
-    if state.draw_timer.is_running() {
+    if state.draw_timer.is_running() || model.power.is_asleep() {
         return Cmd::done();
     }
     state.draw = state.draw.wrapping_add(1);

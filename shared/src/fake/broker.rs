@@ -84,8 +84,11 @@ pub struct Broker {
     /// If `true`, the broker keeps the PUBACK of each publish in
     /// [`Broker::held_pubacks`].
     pub hold_puback: bool,
-    /// If `true`, the broker does not answer a PINGREQ.
+    /// If `true`, the broker does not answer a PINGREQ. It counts the
+    /// PINGRESP packets that it held back in [`Broker::held_pingresps`].
     pub hold_pingresp: bool,
+    /// The number of PINGRESP packets that the broker held back.
+    pub held_pingresps: usize,
     /// The packet ids of the PUBACK packets that the broker held back.
     pub held_pubacks: Vec<u16>,
     /// The packets from the client, in order.
@@ -134,6 +137,7 @@ impl Broker {
             last_will: None,
         });
         self.outgoing.clear();
+        self.held_pingresps = 0;
         Ok(())
     }
 
@@ -203,6 +207,7 @@ impl Broker {
             return;
         };
         self.outgoing.clear();
+        self.held_pingresps = 0;
         if connection.accepted
             && let Some(LastWill {
                 topic,
@@ -262,6 +267,14 @@ impl Broker {
         }
     }
 
+    /// Sends the PINGRESP packets that the broker held back. They wait for
+    /// the client.
+    pub fn release_pingresps(&mut self) {
+        for _ in 0..core::mem::take(&mut self.held_pingresps) {
+            server::pingresp(&mut self.outgoing);
+        }
+    }
+
     /// Takes a message from the client. The broker publishes it, and Home
     /// Assistant does the service call in it, if there is one.
     pub fn publish_from_client(&mut self, publish: Publish) {
@@ -304,9 +317,10 @@ impl Broker {
                 }
             }
             Packet::Subscribe { id, filters } => self.subscribe(*id, filters),
-            Packet::PingReq if !self.hold_pingresp => server::pingresp(&mut self.outgoing),
+            Packet::PingReq if self.hold_pingresp => self.held_pingresps += 1,
+            Packet::PingReq => server::pingresp(&mut self.outgoing),
             Packet::Disconnect => self.connection = None,
-            Packet::PubAck(_) | Packet::PingReq => {}
+            Packet::PubAck(_) => {}
         }
     }
 

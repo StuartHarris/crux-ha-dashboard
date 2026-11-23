@@ -15,6 +15,20 @@
 //! - After a wake with no cause ([`Wake::Other`]), the device stays awake
 //!   for [`STRAY_HOLD`], then sends a new `Sleep` request. In that time, a
 //!   tap or the stand wakes the device.
+//! - Once an hour ([`REPORT_PERIOD`]), the device reports to Home
+//!   Assistant while it stays asleep for the user ([`report`]). The core
+//!   counts the checks of the sleep, and the check with the number
+//!   [`REPORT_CHECKS`] starts the report. The radio turns on, the device
+//!   connects with the status `reporting`, and the device publish queue
+//!   sends the state message and the lines of the log. When the queue is
+//!   settled, or at [`REPORT_LIMIT`], the steps of a new sleep run. The
+//!   last step draws only if the image changed ([`radio_off`]). A tap or
+//!   the stand during a report wakes the device as from a sleep.
+//! - The state message of a report has the battery level and the power
+//!   diagnostics that the core has when the message goes. The core keeps a
+//!   reading that arrives later in the report, but it does not publish it
+//!   until the next report or wake ([`read`], [`battery_changed`]). The
+//!   shell reads the power before it sends `Wake::Timer`, so this is rare.
 //! - If the front light is still on at the sleep, one more step turns it
 //!   off first. Usually the light timer turned the light of a tap off
 //!   already. The light is on at the sleep after a tap on no control, or if
@@ -39,8 +53,9 @@
 //!   of `Sleep`.
 //!
 //! The state is one phase: on the stand, awake on battery with the idle
-//! timer, awake on battery while a sleep waits for the marks, or asleep with the id of the sleep and where the sleep is
-//! ([`Rest`]). The power source comes from the phase. Power does not keep
+//! timer, awake on battery while a sleep waits for the marks, or asleep
+//! with the id of the sleep and where the sleep is ([`Rest`]). A report is
+//! a place of a sleep, because the device stays asleep for the user. The power source comes from the phase. Power does not keep
 //! the step before the first `Sleep` request. Each step waits in the light,
 //! Wi-Fi or connection feature, and [`sleep_step`] reads it from there.
 //!
@@ -48,33 +63,49 @@
 //!
 //! "Sleep" is a `Sleep` request with a touch wake and a timer of
 //! [`CHECK_PERIOD`], with no `Render` and no line, unless the row tells
-//! otherwise.
+//! otherwise. `n` is the number of wakes with no cause, `k` is the number
+//! of checks ([`Checks`]), and `c` is a control. A new sleep starts with
+//! `n` and `k` at 0.
 //!
 //! | From | Input | To | Effects |
 //! | --- | --- | --- | --- |
-//! | `Steps` | the radio is off | `Sleeping { 0 }` | `Render` (full), Sleep |
+//! | `Steps { Draw }` | the radio is off | `Sleeping { 0, 0 }` | `Render` (full), Sleep |
+//! | `Steps { IfChanged }` | the radio is off, and the image changed | `Sleeping { 0, 0 }` | `Render` (partial, or full after the last partial), Sleep |
+//! | `Steps { IfChanged }` | the radio is off, and only the time or nothing changed | `Sleeping { 0, 0 }` | Sleep |
 //! | `Sleeping` | `Wake::Touch(c)` | `Awake` | wake, connect, act on `c` |
-//! | `Sleeping` | `Wake::Timer` (the check) | `Sleeping` | Sleep |
-//! | `Sleeping { n }` | `Wake::Other` | `Held { n + 1 }` | a timer of [`STRAY_HOLD`], an Info line for the first one |
-//! | `Sleeping` | `Wake::PowerSource` | `Sleeping` | a warning, Sleep |
-//! | `Held { n }` | the hold timer expires | `Sleeping { n }` | Sleep |
+//! | `Sleeping { n, k }` | `Wake::Timer` (the check), before the last check | `Sleeping { n, k + 1 }` | Sleep |
+//! | `Sleeping { n, k }` | `Wake::Timer`, the check with the number [`REPORT_CHECKS`] | `Reporting` | the limit timer, connect, a Debug line, the Info line with `n` if `n > 1` |
+//! | `Sleeping { n, k }` | `Wake::Other` | `Held { n + 1, k }` | a timer of [`STRAY_HOLD`], an Info line for the first one |
+//! | `Sleeping` | `Wake::PowerSource` | `Sleeping` (the same `k`) | a warning, Sleep |
+//! | `Held { n, k }` | the hold timer expires | `Sleeping { n, k }` | Sleep |
 //! | `Held` | `Tapped(c)` | `Awake` | clear the hold timer, wake, connect, act on `c` |
 //! | `Held` or `Sleeping` | the stand | `Stand` | clear the hold timer, connect |
-//! | any | `Start` | `Awake` or `Stand` | clear the hold timer |
+//! | `Reporting` | the session is up | `Reporting` | publish `reporting`, subscribe, then the device publish queue |
+//! | `Reporting` | the subscribe ends | `Reporting` | PINGREQ (the replay fence), no scan |
+//! | `Reporting` | a failed try to connect | `Reporting` | the usual retry with Debug lines (also the Wi-Fi lines about a suspect link and about a time limit), no count of reconnects or of joins for a restart |
+//! | `Reporting` | the queue is settled and the PINGRESP came | `Steps { IfChanged }` of a new sleep | clear the limit timer, a Debug line, the steps |
+//! | `Reporting` | the limit timer expires | `Steps { IfChanged }` of a new sleep | an Info line with what was not done, the steps |
+//! | `Reporting` | `Tapped(c)` | `Awake` | clear the limit timer, wake, publish `online` on the session, act on `c` |
+//! | `Reporting` | the stand | `Stand` | clear the limit timer, publish `online` on the session |
+//! | any | `Start` | `Awake` or `Stand` | clear the hold timer or the limit timer |
 //!
 //! A wake (touch, tap, stand or `Start`) after more than one wake with no
-//! cause writes one Info line with the count. The core ignores the answer
-//! or the timer of an older sleep, and an answer in `Steps` or `Held`.
-//! `BatteryChanged`, `PowerRead` and `SleepNow` do not change the sleep.
+//! cause writes one Info line with the count. A report writes that line
+//! too, so a wake from a report writes none. The core ignores the answer or
+//! the timer of an older sleep, and an answer in `Steps`, `Held` or
+//! `Reporting`. `BatteryChanged`, `PowerRead` and `SleepNow` do not change
+//! the sleep. In a report, the core ignores a light command and the Sleep
+//! now and Full refresh buttons of Home Assistant. The Restart button
+//! restarts the chip.
 //!
 //! # The wake reason
 //!
 //! The core keeps what woke the device last ([`WakeReason`]) and publishes
 //! it in the state message. `Start` sets `Boot`. A touch wake, or a tap in
 //! the steps of a sleep or in a hold, sets `Touch` ([`wake_up`]). A move to
-//! the stand while the device is asleep sets `Stand`. The checks of
-//! [`CHECK_PERIOD`] and the wakes with no cause keep the device asleep, so
-//! they do not change it.
+//! the stand while the device is asleep or in a report sets `Stand`. The
+//! checks of [`CHECK_PERIOD`], the reports and the wakes with no cause keep
+//! the device asleep, so they do not change it.
 //!
 //! # Lines of the log
 //!
@@ -82,11 +113,21 @@
 //! log capability ([`crate::capabilities::log`]), with the area `power`.
 //! The line comes before the effects of the step. The core does not keep a
 //! `Debug` line, so a usual sleep sends no line to Home Assistant. A sleep
-//! that waits for the pending marks also writes a `Debug` line. Only
-//! unusual decisions write an Info or Warn line: a stalled sleep, a wake
-//! with no cause, and a power source wake on battery.
+//! that waits for the pending marks also writes a `Debug` line. A report
+//! writes `Debug` lines, also for each try to connect that fails. In a
+//! report, the lines of the connection and of the Wi-Fi feature about a
+//! try are `Debug` lines too: the failed session, the wait before the next
+//! try, a failed join, a join with no address, a radio request with no
+//! answer in its time limit, and a link that becomes suspect or stops
+//! being suspect. Only unusual decisions write an Info or Warn line: a
+//! stalled sleep, a wake with no cause, a power source wake on battery, and
+//! a report that stops at its limit. Thus a report that fails each hour
+//! because the Wi-Fi or the broker is down keeps one line in the ring, and
+//! the ring holds about two days of such reports. A fault that is not a
+//! failed try still writes its usual line, for example a `Close` request
+//! with no answer or a topic filter that the broker refused.
 
-use alloc::{format, vec};
+use alloc::{format, string::String, vec};
 use core::{mem, num::NonZeroU32, time::Duration};
 
 use crate::{
@@ -96,8 +137,9 @@ use crate::{
         power::{Power, PowerSource, Reading, Wake, WakeSource},
     },
     features::{
-        connection, device, light, logs,
-        refresh::redraw,
+        connection::{self, Link},
+        device, light, logs,
+        refresh::{image_changed, redraw},
         rooms,
         timer::{Running, Slot},
         wifi,
@@ -128,6 +170,12 @@ pub enum Event {
         /// What ended the sleep.
         wake: Wake,
     },
+    /// The device publish queue of the report of the sleep with this id is
+    /// settled. Refer to [`reported`].
+    Reported(u32),
+    /// The limit timer of the report of the sleep with this id expired.
+    /// Refer to [`REPORT_LIMIT`].
+    ReportLimit(u32),
 }
 
 impl From<Event> for crate::Event {
@@ -144,6 +192,8 @@ pub fn update(event: Event, model: &mut Model) -> Cmd {
         Event::Offline(id) => offline(id, model),
         Event::HoldEnded(id) => hold_ended(id, model),
         Event::Woke { sleep, wake } => woke(sleep, wake, model),
+        Event::Reported(id) => reported(id, model),
+        Event::ReportLimit(id) => report_limit(id, model),
     }
 }
 
@@ -163,6 +213,37 @@ pub const CHECK_PERIOD: Duration = Duration::from_secs(60);
 /// After a wake with no cause, the time that the device stays awake before
 /// it sleeps again.
 pub const STRAY_HOLD: Duration = Duration::from_secs(3);
+
+/// While asleep on battery, the time between two reports to Home
+/// Assistant. Refer to [`report`].
+///
+/// The core counts the checks of [`CHECK_PERIOD`], so the period must be a
+/// whole number of checks. The clock of the chip drifts in light sleep, and
+/// each check and each wake with no cause adds a little time. Thus the real
+/// period is a minute or two longer.
+pub const REPORT_PERIOD: Duration = Duration::from_mins(60);
+
+/// The number of checks in one [`REPORT_PERIOD`]. The check with this
+/// number reports.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the assert makes sure that the count is in the range of u8"
+)]
+pub const REPORT_CHECKS: u8 = {
+    let period = REPORT_PERIOD.as_secs();
+    let check = CHECK_PERIOD.as_secs();
+    assert!(
+        period.is_multiple_of(check),
+        "the period is a whole number of checks"
+    );
+    let count = period / check;
+    assert!(count > 0 && count <= u8::MAX as u64, "the count is in u8");
+    count as u8
+};
+
+/// The longest time of a report. At this time, the report stops, and the
+/// device sleeps again. Refer to [`report_limit`].
+pub const REPORT_LIMIT: Duration = Duration::from_secs(30);
 
 /// A reading with no values, before the shell reads the diagnostics.
 #[cfg(test)]
@@ -266,11 +347,16 @@ enum Rest {
     /// The steps before the first `Sleep` request run: light off, stop the
     /// scan, disconnect, radio off. [`sleep_step`] reads the step from the
     /// other features.
-    Steps,
+    Steps {
+        /// What the last step draws before the first `Sleep` request.
+        last: LastImage,
+    },
     /// A `Sleep` request waits for its answer.
     Sleeping {
         /// The number of wakes with no cause in this sleep.
         strays: u32,
+        /// The number of checks in this sleep.
+        checks: Checks,
     },
     /// The device woke with no cause. It stays awake until the hold timer
     /// expires, then it sends a new `Sleep` request. No `Sleep` request
@@ -281,6 +367,20 @@ enum Rest {
         /// The number of wakes with no cause in this sleep, this one
         /// included.
         strays: NonZeroU32,
+        /// The number of checks in this sleep.
+        checks: Checks,
+    },
+    /// The hourly report: the radio is on, and the device publishes to Home
+    /// Assistant. No `Sleep` request waits. Refer to [`report`].
+    ///
+    /// The report ends the sleep, so it keeps no count of wakes with no
+    /// cause and no count of checks.
+    Reporting {
+        /// The limit timer of [`REPORT_LIMIT`]. Its id is the id of the
+        /// sleep.
+        limit: Running,
+        /// The tries to connect that failed in this report, or `None`.
+        failures: Option<Failures>,
     },
 }
 
@@ -288,11 +388,58 @@ impl Rest {
     /// Returns the number of wakes with no cause in the sleep.
     const fn strays(&self) -> u32 {
         match self {
-            Self::Steps => 0,
-            Self::Sleeping { strays } => *strays,
+            Self::Steps { .. } | Self::Reporting { .. } => 0,
+            Self::Sleeping { strays, .. } => *strays,
             Self::Held { strays, .. } => strays.get(),
         }
     }
+}
+
+/// What the steps of a sleep draw before the first `Sleep` request. Refer
+/// to [`radio_off`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LastImage {
+    /// A full refresh with the last image: a sleep after the idle time.
+    Draw,
+    /// The sleep after a report: a partial `Render` only if the view, with
+    /// the time left out, is not the image on the panel
+    /// ([`image_changed`]). Otherwise the panel keeps its image.
+    IfChanged,
+}
+
+/// The number of checks in a sleep. It is always less than
+/// [`REPORT_CHECKS`], because the check with that number reports.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Checks(u8);
+
+/// The result of one more check. Refer to [`Checks::tick`].
+enum Tick {
+    /// The sleep continues with this count.
+    Again(Checks),
+    /// The check is the check with the number [`REPORT_CHECKS`].
+    Report,
+}
+
+impl Checks {
+    /// Counts one more check. Returns `Report` at the check with the number
+    /// [`REPORT_CHECKS`].
+    const fn tick(self) -> Tick {
+        let next = self.0 + 1;
+        if next >= REPORT_CHECKS {
+            Tick::Report
+        } else {
+            Tick::Again(Self(next))
+        }
+    }
+}
+
+/// The tries to connect that failed in a report. Refer to [`report_failed`].
+#[derive(Debug)]
+struct Failures {
+    /// The number of tries that failed.
+    tries: NonZeroU32,
+    /// Why the last try failed.
+    last: String,
 }
 
 impl State {
@@ -320,17 +467,37 @@ impl State {
     }
 
     /// Returns `true` if the device is asleep, or in the steps before the
-    /// sleep.
+    /// sleep, or in a report. The device then does not draw, a tap wakes it,
+    /// and the core keeps the readings.
     #[must_use]
     pub const fn is_asleep(&self) -> bool {
         matches!(self.phase, Phase::Asleep { .. })
+    }
+
+    /// Returns the id of the sleep whose report runs, or `None` if no report
+    /// runs. Refer to [`report`].
+    #[must_use]
+    pub const fn reporting(&self) -> Option<u32> {
+        match self.phase {
+            Phase::Asleep {
+                id,
+                rest: Rest::Reporting { .. },
+            } => Some(id),
+            _ => None,
+        }
+    }
+
+    /// Returns `true` if a report runs. Refer to [`report`].
+    #[must_use]
+    pub const fn is_reporting(&self) -> bool {
+        self.reporting().is_some()
     }
 
     /// Returns `true` if the device is in the steps of the sleep `id`. The
     /// core ignores the answers of the steps of an older sleep, and of a
     /// sleep that a wake ended.
     const fn in_steps(&self, id: u32) -> bool {
-        matches!(self.phase, Phase::Asleep { id: current, rest: Rest::Steps } if current == id)
+        matches!(self.phase, Phase::Asleep { id: current, rest: Rest::Steps { .. } } if current == id)
     }
 
     /// Returns the state of a device on battery in the steps of the sleep
@@ -342,7 +509,9 @@ impl State {
             reading: NO_READING,
             phase: Phase::Asleep {
                 id: sleep,
-                rest: Rest::Steps,
+                rest: Rest::Steps {
+                    last: LastImage::Draw,
+                },
             },
             idle: 0,
             sleep,
@@ -359,7 +528,10 @@ impl State {
             reading: NO_READING,
             phase: Phase::Asleep {
                 id: sleep,
-                rest: Rest::Sleeping { strays: 0 },
+                rest: Rest::Sleeping {
+                    strays: 0,
+                    checks: Checks(0),
+                },
             },
             idle: 0,
             sleep,
@@ -376,7 +548,8 @@ impl State {
 
     /// Changes the phase to `next`. If the old phase is `Awake`, the core
     /// clears its idle timer. If the old phase holds the device awake after
-    /// a wake with no cause, the core clears the hold timer.
+    /// a wake with no cause, the core clears the hold timer. If the old
+    /// phase is a report, the core clears the limit timer.
     fn enter(&mut self, next: Phase) {
         match mem::replace(&mut self.phase, next) {
             Phase::Awake { mut idle, .. } => idle.stop(),
@@ -384,6 +557,10 @@ impl State {
                 rest: Rest::Held { hold, .. },
                 ..
             } => hold.clear(),
+            Phase::Asleep {
+                rest: Rest::Reporting { limit, .. },
+                ..
+            } => limit.clear(),
             Phase::Stand | Phase::SleepWaits | Phase::Asleep { .. } => {}
         }
     }
@@ -434,7 +611,9 @@ pub enum SleepStep {
     Stalled,
 }
 
-/// Returns the step of the sleep, or `None` while the device is awake.
+/// Returns the step of the sleep, or `None` while the device is awake or
+/// in a report. A report is not a step of a sleep: it ends the sleep, and
+/// its end starts the steps of a new sleep.
 ///
 /// After the first `Sleep` request, the step is `Sleep` while a request
 /// waits, and `Held` while the device stays awake after a wake with no
@@ -466,9 +645,10 @@ pub fn sleep_step(model: &Model) -> Option<SleepStep> {
         return None;
     };
     match rest {
-        Rest::Steps => {}
+        Rest::Steps { .. } => {}
         Rest::Sleeping { .. } => return Some(SleepStep::Sleep),
         Rest::Held { .. } => return Some(SleepStep::Held),
+        Rest::Reporting { .. } => return None,
     }
     if light::is_on(model) {
         return Some(SleepStep::LightOff);
@@ -534,7 +714,8 @@ pub fn reset(source: PowerSource, model: &mut Model) -> Cmd {
 /// - A touch wakes the device, which connects again. The touch also acts
 ///   as a tap on its control.
 /// - The timer is the check of the power source. The device stays asleep
-///   and sends a new `Sleep` request.
+///   and sends a new `Sleep` request. The check with the number
+///   [`REPORT_CHECKS`] in the sleep starts a report instead ([`report`]).
 /// - After a wake with no cause, the device stays awake for
 ///   [`STRAY_HOLD`]. Only the first one in a sleep writes a line.
 /// - A change of the power source comes first as `PowerSourceChanged`, and
@@ -547,7 +728,7 @@ pub fn reset(source: PowerSource, model: &mut Model) -> Cmd {
 pub fn woke(id: u32, wake: Wake, model: &mut Model) -> Cmd {
     let Phase::Asleep {
         id: current,
-        rest: Rest::Sleeping { strays },
+        rest: Rest::Sleeping { strays, checks },
     } = model.power.phase
     else {
         return Cmd::done();
@@ -557,13 +738,26 @@ pub fn woke(id: u32, wake: Wake, model: &mut Model) -> Cmd {
     }
     match wake {
         Wake::Touch(control) => rooms::tapped(control, model),
-        Wake::Timer => sleep_request(id),
+        Wake::Timer => match checks.tick() {
+            Tick::Again(checks) => {
+                model.power.phase = Phase::Asleep {
+                    id,
+                    rest: Rest::Sleeping { strays, checks },
+                };
+                sleep_request(id)
+            }
+            Tick::Report => report(id, strays, model),
+        },
         Wake::Other => {
             let (timer, hold) = Running::start(id, STRAY_HOLD, Event::HoldEnded(id).into());
             let strays = NonZeroU32::MIN.saturating_add(strays);
             model.power.phase = Phase::Asleep {
                 id,
-                rest: Rest::Held { hold, strays },
+                rest: Rest::Held {
+                    hold,
+                    strays,
+                    checks,
+                },
             };
             let line = if strays == NonZeroU32::MIN {
                 logs::info(
@@ -592,7 +786,11 @@ pub fn woke(id: u32, wake: Wake, model: &mut Model) -> Cmd {
 pub fn hold_ended(id: u32, model: &mut Model) -> Cmd {
     let Phase::Asleep {
         id: current,
-        rest: Rest::Held { ref hold, strays },
+        rest: Rest::Held {
+            ref hold,
+            strays,
+            checks,
+        },
     } = model.power.phase
     else {
         return Cmd::done();
@@ -605,9 +803,167 @@ pub fn hold_ended(id: u32, model: &mut Model) -> Cmd {
         id,
         rest: Rest::Sleeping {
             strays: strays.get(),
+            checks,
         },
     };
     sleep_request(id)
+}
+
+/// The check with the number [`REPORT_CHECKS`] in the sleep `id` arrived:
+/// start the report to Home Assistant. `strays` is the number of wakes with
+/// no cause in the sleep.
+///
+/// The radio turns on, and the core connects as for a wake. The status is
+/// `reporting`, not `online`. The device publish queue publishes the
+/// discovery message if it is due, the state of the light, the state
+/// message and the lines of the log. The device stays asleep for the user:
+/// it does not draw, it does not turn the light on, and it does not scan
+/// for a better access point. A tap or the stand wakes it.
+///
+/// The limit timer of [`REPORT_LIMIT`] starts. The report ends when the
+/// queue is settled ([`reported`]), or at the limit ([`report_limit`]).
+/// If the sleep had more than one wake with no cause, the summary line goes
+/// with this report.
+fn report(id: u32, strays: u32, model: &mut Model) -> Cmd {
+    let (timer, limit) = Running::start(id, REPORT_LIMIT, Event::ReportLimit(id).into());
+    // The `Sleep` request ended, so no timer of the sleep runs.
+    model.power.phase = Phase::Asleep {
+        id,
+        rest: Rest::Reporting {
+            limit,
+            failures: None,
+        },
+    };
+    let summary = if strays > 1 {
+        logs::info(
+            Area::Power,
+            format!("sleep {id} had {strays} wakes with no cause"),
+        )
+    } else {
+        Cmd::done()
+    };
+    connection::reset_backoff(model);
+    summary
+        .and(logs::debug(
+            Area::Power,
+            format!("sleep {id} reports to Home Assistant"),
+        ))
+        .and(timer)
+        .and(connection::go_online(model))
+}
+
+/// A try to connect in the report failed because of `reason`. The core
+/// counts the try for the line at the limit ([`report_limit`]). Outside a
+/// report, the function does nothing.
+///
+/// The connection calls this function when it waits to connect again. In a
+/// report, the lines of each try are `Debug` lines, so a report that fails
+/// each hour writes only its line at the limit to the ring. Refer to the
+/// [module docs](self).
+pub fn report_failed(reason: &str, model: &mut Model) {
+    let Phase::Asleep {
+        rest: Rest::Reporting { failures, .. },
+        ..
+    } = &mut model.power.phase
+    else {
+        return;
+    };
+    match failures {
+        Some(Failures { tries, last }) => {
+            *tries = tries.saturating_add(1);
+            *last = reason.into();
+        }
+        None => {
+            *failures = Some(Failures {
+                tries: NonZeroU32::MIN,
+                last: reason.into(),
+            });
+        }
+    }
+}
+
+/// The device publish queue of the report of the sleep `id` is settled:
+/// end the report, and start the steps of a new sleep. The core clears the
+/// limit timer. The steps draw the image only if it changed
+/// ([`LastImage::IfChanged`]).
+///
+/// The core ignores the event if no report of the sleep `id` runs. The
+/// connection can send it more than once.
+fn reported(id: u32, model: &mut Model) -> Cmd {
+    if model.power.reporting() != Some(id) {
+        return Cmd::done();
+    }
+    logs::debug(Area::Power, format!("the report of sleep {id} is complete"))
+        .and(sleep(LastImage::IfChanged, model))
+}
+
+/// The limit timer of the report of the sleep `id` expired: stop the
+/// report, and start the steps of a new sleep. The steps draw the image only
+/// if it changed ([`LastImage::IfChanged`]).
+///
+/// The core writes one Info line with what was not done. If tries to
+/// connect failed, the line gives their number and the last reason. If no
+/// try failed, the line tells the phase of the try that still runs:
+///
+/// | Phase at the limit | Text |
+/// | --- | --- |
+/// | The session is up | `the publishes or the retained messages did not end` |
+/// | The stream opens, or the CONNACK waits | `the broker did not answer` |
+/// | No Wi-Fi link (a join, a lease or a leave waits) | `the Wi-Fi link did not come up` |
+/// | A Wi-Fi link, but no stream | `no connection to the broker` |
+///
+/// The ring keeps each line that got no PUBACK, and the next report or wake
+/// sends it. The core ignores a timer of an older sleep, and a timer that a
+/// wake ended.
+fn report_limit(id: u32, model: &mut Model) -> Cmd {
+    let matches = matches!(
+        &model.power.phase,
+        Phase::Asleep { id: current, rest: Rest::Reporting { limit, .. } }
+            if *current == id && limit.id() == id
+    );
+    if !matches {
+        return Cmd::done();
+    }
+    // The timer completed, so the core does not clear it.
+    let old = mem::replace(
+        &mut model.power.phase,
+        Phase::Asleep {
+            id,
+            rest: Rest::Steps {
+                last: LastImage::IfChanged,
+            },
+        },
+    );
+    let Phase::Asleep {
+        rest: Rest::Reporting { failures, .. },
+        ..
+    } = old
+    else {
+        return Cmd::done();
+    };
+    let left = match failures {
+        Some(Failures { tries, last }) => {
+            let tries = match tries.get() {
+                1 => String::from("1 try failed"),
+                count => format!("{count} tries failed"),
+            };
+            format!("{tries}, the last because {last}")
+        }
+        None => String::from(match model.connection.link() {
+            Link::Up => "the publishes or the retained messages did not end",
+            Link::Starting => "the broker did not answer",
+            Link::Down if model.wifi.phase.linked().is_none() => "the Wi-Fi link did not come up",
+            Link::Down => "no connection to the broker",
+        }),
+    };
+    logs::info(
+        Area::Power,
+        format!(
+            "the report of sleep {id} stopped after {} s: {left}",
+            REPORT_LIMIT.as_secs()
+        ),
+    )
+    .and(sleep(LastImage::IfChanged, model))
 }
 
 /// Asks the shell to sleep until a touch, or until the check of the power
@@ -637,17 +993,45 @@ pub fn offline(id: u32, model: &mut Model) -> Cmd {
 /// The radio of the sleep `id` is off: draw the last image and send the
 /// first `Sleep` request. The Wi-Fi feature calls this function. Refer to
 /// [`wifi::radio_off`].
+///
+/// After the idle time, the last image is a full refresh. After a report,
+/// the core draws only if the view, with the time left out, is not the
+/// image on the panel ([`image_changed`]). The draw is then a partial
+/// refresh, or a full refresh after
+/// [`PARTIALS_PER_FULL`](crate::features::refresh::PARTIALS_PER_FULL)
+/// partial refreshes. With no change, the panel keeps its image and the
+/// core sends no `Render`.
 pub fn radio_off(id: u32, model: &mut Model) -> Cmd {
-    if !model.power.in_steps(id) {
+    let Phase::Asleep {
+        id: current,
+        rest: Rest::Steps { last },
+    } = model.power.phase
+    else {
+        return Cmd::done();
+    };
+    if current != id {
         return Cmd::done();
     }
     model.power.phase = Phase::Asleep {
         id,
-        rest: Rest::Sleeping { strays: 0 },
+        rest: Rest::Sleeping {
+            strays: 0,
+            checks: Checks::default(),
+        },
     };
-    step_started(SleepStep::Sleep, id)
-        .and(redraw(model, true))
-        .and(sleep_request(id))
+    let image = match last {
+        LastImage::Draw => step_started(SleepStep::Sleep, id).and(redraw(model, true)),
+        LastImage::IfChanged if image_changed(model) => logs::debug(
+            Area::Power,
+            format!("sleep {id} draws the changes and sleeps"),
+        )
+        .and(redraw(model, false)),
+        LastImage::IfChanged => logs::debug(
+            Area::Power,
+            format!("sleep {id} keeps the image and sleeps"),
+        ),
+    };
+    image.and(sleep_request(id))
 }
 
 /// Wakes the device from a sleep, or from the steps before it, after a
@@ -726,7 +1110,9 @@ pub fn source_changed(source: PowerSource, model: &mut Model) -> Cmd {
 /// goes at most once in
 /// [`STATE_MIN_INTERVAL`](device::STATE_MIN_INTERVAL). Refer to
 /// [`device::changed`]. A reading with the same level does nothing. While
-/// the device sleeps, the next connect publishes the level.
+/// the device sleeps, the next connect publishes the level. In a report,
+/// the state message has the level only if it arrived before the message
+/// went. A later level waits for the next report or wake.
 pub fn battery_changed(level: Option<u8>, model: &mut Model) -> Cmd {
     let before = model.power.battery;
     model.power.battery = level;
@@ -745,7 +1131,9 @@ pub fn battery_changed(level: Option<u8>, model: &mut Model) -> Cmd {
 /// The view does not show the reading, so the core does not draw. The
 /// reading is a fact, not a touch, so it does not wake the device and it
 /// does not start the idle timer again. While the device sleeps, the core
-/// only keeps the reading, and the next connection publishes it.
+/// only keeps the reading, and the next connection publishes it. In a
+/// report, the state message has the reading only if it arrived before the
+/// message went. A later reading waits for the next report or wake.
 ///
 /// While the device is awake, the core publishes the reading in the state
 /// message. Refer to [`device::changed`]. A change of the phase of the
@@ -845,7 +1233,7 @@ fn idle_ended(model: &mut Model) -> (IdleEnd, Cmd) {
     };
     if !model.connection.outbox.is_empty() {
         if extended {
-            return (IdleEnd::Sleeps, sleep(model));
+            return (IdleEnd::Sleeps, sleep(LastImage::Draw, model));
         }
         let timer = restart_idle_timer(model);
         if let Phase::Awake { extended, .. } = &mut model.power.phase {
@@ -863,7 +1251,7 @@ fn idle_ended(model: &mut Model) -> (IdleEnd, Cmd) {
         );
         return (IdleEnd::WaitsForMarks, line);
     }
-    (IdleEnd::Sleeps, sleep(model))
+    (IdleEnd::Sleeps, sleep(LastImage::Draw, model))
 }
 
 /// A pending mark ended, or the draw timer expired. If a sleep waits for
@@ -883,18 +1271,19 @@ pub fn sleep_if_settled(model: &mut Model) -> Cmd {
     {
         return Cmd::done();
     }
-    sleep(model)
+    sleep(LastImage::Draw, model)
 }
 
-/// Starts the steps of a sleep. If the front light is on, the first step
-/// turns it off, and the answer to `FrontLight` starts the next step
-/// ([`light_off`]). Otherwise the core starts that step at once.
-fn sleep(model: &mut Model) -> Cmd {
+/// Starts the steps of a new sleep. If the front light is on, the first
+/// step turns it off, and the answer to `FrontLight` starts the next step
+/// ([`light_off`]). Otherwise the core starts that step at once. `last`
+/// tells what the last step draws ([`radio_off`]).
+fn sleep(last: LastImage, model: &mut Model) -> Cmd {
     model.power.sleep = model.power.sleep.wrapping_add(1);
     let id = model.power.sleep;
     model.power.enter(Phase::Asleep {
         id,
-        rest: Rest::Steps,
+        rest: Rest::Steps { last },
     });
     if light::is_on(model) {
         return step_started(SleepStep::LightOff, id)

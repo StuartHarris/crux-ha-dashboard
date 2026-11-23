@@ -7,7 +7,7 @@
 //!
 //! | Component | Platform | Device class | State topic |
 //! | --- | --- | --- | --- |
-//! | `status` | `sensor` | `enum`: `online`, `asleep`, `offline`, `restarting`, icon `mdi:tablet-dashboard` | the status topic |
+//! | `status` | `sensor` | `enum`: `online`, `reporting`, `asleep`, `offline`, `restarting`, icon `mdi:tablet-dashboard` | the status topic |
 //! | `battery` | `sensor` | `battery`, in `%` | the state topic, key `battery` |
 //! | `stand` | `binary_sensor` | `plug` | the state topic, key `stand` |
 //! | `charging` | `binary_sensor` | `battery_charging`, diagnostic | the state topic, key `charging` |
@@ -31,12 +31,13 @@
 //!
 //! The status sensor has no availability, so it shows `offline` too. The
 //! sensors are available unless the status is `offline`. Thus they keep
-//! their last value while the device is asleep or restarts.
+//! their last value while the device is asleep or restarts, and they are
+//! available during the hourly report (`reporting`).
 //!
 //! The buttons are available only while the status is `online`. Home
 //! Assistant compares the result of the availability template with
 //! `online` and `offline`, and ignores each other result. So the template
-//! must turn `asleep` and `restarting` into `offline`. The Sleep now button also needs the
+//! must turn `reporting`, `asleep` and `restarting` into `offline`. The Sleep now button also needs the
 //! device on battery: it has a second availability on the `stand` key of
 //! the state topic, with the mode `all`. On the stand, a sleep does
 //! nothing, so Home Assistant does not show the button as available.
@@ -81,7 +82,9 @@ use super::{BUTTON_SET, Button, LIGHT_SET, TAP_LEVEL_BATTERY_SET, TAP_LEVEL_STAN
 use crate::{
     Firmware, Settings,
     capabilities::radio::mac_text,
-    features::connection::{STATUS_ASLEEP, STATUS_OFFLINE, STATUS_ONLINE, STATUS_RESTARTING},
+    features::connection::{
+        STATUS_ASLEEP, STATUS_OFFLINE, STATUS_ONLINE, STATUS_REPORTING, STATUS_RESTARTING,
+    },
 };
 
 /// The manufacturer of the board.
@@ -93,12 +96,12 @@ const ORIGIN: &str = "crux-ha-dashboard";
 
 /// The availability template of each sensor except the status: it is
 /// available unless the status is `offline`. It gives `online` for
-/// `online`, `asleep` and `restarting`.
+/// `online`, `reporting`, `asleep` and `restarting`.
 const AVAILABLE_UNLESS_OFFLINE: &str = "{{ 'offline' if value == 'offline' else 'online' }}";
 
 /// The availability template of each button: it is available only while
-/// the status is `online`. It gives `offline` for `asleep`, `offline` and
-/// `restarting`.
+/// the status is `online`. It gives `offline` for `reporting`, `asleep`,
+/// `offline` and `restarting`.
 const AVAILABLE_WHILE_ONLINE: &str = "{{ 'online' if value == 'online' else 'offline' }}";
 
 /// The availability template on the state topic of the Sleep now button:
@@ -245,6 +248,7 @@ fn power_components<'a>(make: &Make<'a>) -> PowerComponents<'a> {
             ic: "mdi:tablet-dashboard",
             ops: [
                 STATUS_ONLINE,
+                STATUS_REPORTING,
                 STATUS_ASLEEP,
                 STATUS_OFFLINE,
                 STATUS_RESTARTING,
@@ -668,7 +672,7 @@ struct Status<'a> {
     uniq_id: String,
     dev_cla: &'static str,
     ic: &'static str,
-    ops: [&'static str; 4],
+    ops: [&'static str; 5],
     stat_t: &'a str,
 }
 

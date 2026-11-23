@@ -281,7 +281,9 @@ The log lines that an operator can search for:
 | `power: sleep N <step>` | The start of each step of the sleep N (`debug`). |
 | `panic: restart the chip` | A panic restarts the chip (printed by `boot::custom_halt`). |
 | `power: sleep N woke with no cause, so it sleeps again after 3 s` | The first wake with no cause in the sleep N. |
-| `power: sleep N had K wakes with no cause` | The wake after more than one wake with no cause in the sleep N. |
+| `power: sleep N had K wakes with no cause` | The wake or the report after more than one wake with no cause in the sleep N. |
+| `power: sleep N reports to Home Assistant` | The hourly report of the sleep N starts (`debug`). |
+| `power: the report of sleep N stopped after 30 s: ...` | The hourly report of the sleep N did not end in its limit. The line tells what was not done, or the count of failed tries and the last reason. |
 | `power: sleep N got a power source wake on battery, so it sleeps again` | Not expected: the shell answered `Wake::PowerSource`, but the core is still on battery. |
 | `mqtt: the broker refused one or more topic filters, so some entities get no state` | The broker refused a filter of the subscribe. |
 | `mqtt: a message of N bytes is too long, so the core skipped it` | The core skipped a message that is too long. |
@@ -329,9 +331,14 @@ and each step waits for the answer of the firmware:
      waits until MQTT connects again. If the task cannot read the point, it answers
      `Wake::Touch(None)`. The touch then wakes the device and turns the front light
      on, but it does not act on a control.
-   - After a timer wake, the display task reads only the charger, with no Wi-Fi, and
-     answers `Wake::Timer`. The core sends a new `Sleep` at once, with no image and
-     no line in Home Assistant. If the source is new, the task reads it again after
+   - After a timer wake, the display task reads the charger, the charge and the
+     diagnostics, with no Wi-Fi, and answers `Wake::Timer`. The core usually sends a
+     new `Sleep` at once, with no image and no line in Home Assistant. Each 60th check
+     of a sleep starts the hourly report instead (refer to "The hourly report" in
+     `docs/mqtt.md`): no `Sleep` job waits, so the display task stays awake as after a
+     wake, and the network task joins and connects. The report then ends with the
+     steps 2 to 4 above. Step 4 draws only if the image changed, with a partial
+     refresh, and otherwise sends `Sleep` with no `Render`. If the source is new, the task reads it again after
      1 second, and the chip does not sleep before that read
      (`Blocker::PowerConfirm`). If the second read agrees, the shell sends
      `PowerSourceChanged`, and the core wakes on the stand.
