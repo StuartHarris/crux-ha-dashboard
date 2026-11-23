@@ -10,6 +10,7 @@ mod buttons;
 mod diagnostics;
 pub mod flows;
 mod light;
+mod report;
 mod session;
 mod subscribe;
 

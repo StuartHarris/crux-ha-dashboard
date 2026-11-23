@@ -1141,6 +1141,60 @@ fn a_hundred_checks_give_a_hundred_sleeps_and_then_a_touch_wakes() {
     assert_eq!(shell.view().connection, Connection::Online);
 }
 
+/// Answers `count` checks of the power source. Each one must only send a
+/// new `Sleep` request with the touch wake and the check timer: no `Render`,
+/// no radio request and no line.
+#[track_caller]
+fn checks_that_only_sleep(shell: &mut Shell, count: usize) {
+    for check in 0..count {
+        shell.check();
+        assert_eq!(shell.take_log(), ["Wake Timer", "Sleep"], "check {check}");
+        assert_eq!(shell.sleep.as_ref().unwrap().wake_on, wake_sources());
+    }
+}
+
+#[test]
+fn fifty_nine_checks_only_sleep_again() {
+    let mut shell = at_the_sleep_step();
+    let frames = shell.frames.len();
+
+    checks_that_only_sleep(&mut shell, 59);
+    assert_eq!(shell.take_logs(), Vec::<alloc::string::String>::new());
+    assert_eq!(shell.frames.len(), frames);
+    assert!(!shell.radio.on);
+    assert_eq!(power::sleep_step(&shell.model), Some(SleepStep::Sleep));
+    assert_no_timer_at_sleep(&shell);
+}
+
+#[test]
+fn a_stray_wake_keeps_sleeping() {
+    let mut shell = at_the_sleep_step();
+
+    checks_that_only_sleep(&mut shell, 30);
+    shell.stray();
+    shell.advance(STRAY_HOLD);
+    assert_eq!(
+        shell.take_log(),
+        ["Wake Other".into(), hold_timer(), "Sleep".into()]
+    );
+    checks_that_only_sleep(&mut shell, 29);
+    assert!(!shell.radio.on);
+    assert_eq!(power::sleep_step(&shell.model), Some(SleepStep::Sleep));
+    assert_no_timer_at_sleep(&shell);
+}
+
+#[test]
+fn a_power_source_wake_on_battery_does_not_count() {
+    let mut shell = at_the_sleep_step();
+
+    checks_that_only_sleep(&mut shell, 59);
+    shell.wake(Wake::PowerSource);
+    assert_eq!(shell.take_log(), ["Wake PowerSource", "Sleep"]);
+    assert!(!shell.radio.on);
+    assert_eq!(power::sleep_step(&shell.model), Some(SleepStep::Sleep));
+    assert_no_timer_at_sleep(&shell);
+}
+
 #[test]
 fn a_stray_wake_holds_the_device_awake_then_sleeps_again() {
     let mut shell = at_the_sleep_step();
