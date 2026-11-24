@@ -13,6 +13,12 @@
 //! (0) darkens, and a pixel with the target white (15) lightens. A pixel out
 //! of the area gets the target [`IDLE`], which does nothing.
 //!
+//! The erase before a full refresh (`Panel::erase` in the firmware) uses
+//! the same lookup table. [`erase_line`] gives the target white to each
+//! pixel that is not white in the frame that the panel shows, and the target
+//! [`IDLE`] to the other pixels. The old image thus fades to white, and the
+//! white background is not driven, so the panel does not flash.
+//!
 //! This module has no hardware code, so its tests run on the host.
 
 /// The code that darkens a pixel.
@@ -33,7 +39,7 @@ pub const LUT_LEN: usize = 1 << 16;
 pub const fn clean_code(pixel: u8) -> u8 {
     match pixel >> 4 {
         0 => DARKEN,
-        15 => LIGHTEN,
+        WHITE => LIGHTEN,
         _ => NO_DRIVE,
     }
 }
@@ -67,6 +73,28 @@ pub fn clean_line(next_row: &[u8], x_start: usize, x_end: usize, line: &mut [u8]
     }
 }
 
+/// Builds the line of one row for the erase before a full refresh.
+///
+/// `shown_row` is a row of the `ui::Framebuffer` that the panel shows. Each
+/// pixel that is not white gets the target white. The other pixels get the
+/// target [`IDLE`]. Returns `true` if a pixel gets the target white.
+pub fn erase_line(shown_row: &[u8], line: &mut [u8]) -> bool {
+    let mut dirty = false;
+    for (x, slot) in line.iter_mut().enumerate() {
+        let target = if level(shown_row, x) == WHITE {
+            IDLE
+        } else {
+            dirty = true;
+            WHITE
+        };
+        *slot = target << 4;
+    }
+    dirty
+}
+
+/// The level of a white pixel.
+const WHITE: u8 = 15;
+
 /// Returns the level of pixel `x` in a row of a `ui::Framebuffer`.
 fn level(row: &[u8], x: usize) -> u8 {
     let byte = row.get(x / 2).copied().unwrap_or(0xFF);
@@ -81,7 +109,7 @@ fn level(row: &[u8], x: usize) -> u8 {
 mod tests {
     use alloc::{vec, vec::Vec};
 
-    use super::{DARKEN, IDLE, LIGHTEN, LUT_LEN, NO_DRIVE, clean_line, fill_clean_lut};
+    use super::{DARKEN, IDLE, LIGHTEN, LUT_LEN, NO_DRIVE, clean_line, erase_line, fill_clean_lut};
 
     #[test]
     fn the_lookup_table_darkens_to_black_lightens_to_white_and_leaves_the_rest() {
@@ -114,5 +142,33 @@ mod tests {
         let mut all: Vec<u8> = vec![0; 4];
         clean_line(&row, 0, 4, &mut all);
         assert_eq!(all, [0x00, 0xF0, 0x00, 0xF0]);
+    }
+
+    #[test]
+    fn an_erase_line_lightens_the_pixels_that_are_not_white() {
+        // Four pixels: black, white, grey, white.
+        let row = [0x0F, 0x7F];
+        let mut line = [0xAA; 4];
+        assert!(erase_line(&row, &mut line));
+        assert_eq!(line, [0xF0, IDLE << 4, 0xF0, IDLE << 4]);
+
+        // The lookup table lightens the black and the grey pixel, and does
+        // not drive the white pixels.
+        let mut lut = vec![0; LUT_LEN];
+        fill_clean_lut(&mut lut);
+        let codes: Vec<u8> = line
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| lut[usize::from(u16::from_le_bytes(*pair))])
+            .collect();
+        assert_eq!(codes, [LIGHTEN, LIGHTEN]);
+    }
+
+    #[test]
+    fn an_erase_line_of_a_white_row_drives_nothing() {
+        let mut line = [0xAA; 4];
+        assert!(!erase_line(&[0xFF, 0xFF], &mut line));
+        assert_eq!(line, [IDLE << 4; 4]);
     }
 }
