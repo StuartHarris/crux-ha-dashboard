@@ -70,7 +70,7 @@ xtensa-lx = "0.13.0"
 embassy-futures = "0.1.2"
 embassy-net = { version = "0.9.1", features = ["dhcpv4", "medium-ethernet", "tcp", "dns", "proto-ipv4"] }
 static_cell = "2.1.1"
-log = "0.4.28"
+log = "0.4.35"
 
 [lints.rust]
 # The macros of esp-alloc (`heap_allocator!`, `psram_allocator!`) expand to
