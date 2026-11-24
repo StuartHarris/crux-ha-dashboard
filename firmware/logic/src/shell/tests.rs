@@ -1040,9 +1040,12 @@ fn a_timer_signal_with_an_old_token_is_ignored() {
 
 #[test]
 fn a_timer_that_the_core_clears_cancels_its_task_and_the_count_does_not_grow() {
-    // A page turn draws with a full refresh. The core clears the
-    // full-refresh timer and starts a new one.
-    let mut device = online(true);
+    // On battery, a page turn starts the idle timer again. The core clears
+    // the idle timer and starts a new one.
+    let (mut device, _) = started(PowerSource::Battery, true);
+    device.link();
+    let jobs = device.connect(FIRST);
+    device.deliver_all(&jobs);
     let (_, first, _) = started_timers(&device.send(Event::NextPage))[0];
     let count = device.timer_count();
 

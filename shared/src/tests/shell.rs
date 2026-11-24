@@ -62,7 +62,7 @@ use crux_time::{TimerId, operation::NotifyAfter};
 
 use super::broker::{Broker, publish_of};
 use crate::{
-    Cmd, Dashboard, Effect, Event, Model, ViewModel,
+    Cmd, Dashboard, Depth, Effect, Event, Model, ViewModel,
     capabilities::{
         light::FrontLight,
         log::{Area, Log, LogClock, Uptime},
@@ -131,8 +131,9 @@ fn held(effect: Effect) -> Option<(String, Held)> {
 pub struct Frame {
     /// The view that the shell drew.
     pub view: ViewModel,
-    /// The shell did a full refresh.
-    pub full: bool,
+    /// The depth of the full refresh that the shell did, or `None` for a
+    /// partial refresh.
+    pub full: Option<Depth>,
 }
 
 /// The test shell.
@@ -187,7 +188,7 @@ pub struct Shell {
     pub auto_draw: bool,
     /// The frames that the shell drew, in order.
     pub frames: Vec<Frame>,
-    /// The `full_refresh_seq` of the last full refresh.
+    /// The sequence number of the last full refresh.
     drawn_seq: u32,
     /// The core asked for a render that the shell did not draw yet.
     render_requested: bool,
@@ -372,8 +373,8 @@ impl Shell {
         }
         if core::mem::take(&mut self.render_requested) {
             let view = self.app.view(&self.model);
-            let full = view.full_refresh_seq != self.drawn_seq;
-            self.drawn_seq = view.full_refresh_seq;
+            let full = (view.full_refresh.seq != self.drawn_seq).then_some(view.full_refresh.depth);
+            self.drawn_seq = view.full_refresh.seq;
             self.frames.push(Frame { view, full });
         }
     }

@@ -55,6 +55,6 @@ pub use crux_core::Core;
 pub use layout::TileKind;
 pub use route::Route;
 pub use view::{
-    Connection, Description, IndexView, LightState, PageView, RoomSummary, RoomView, SceneView,
-    TileState, TileView, ViewModel,
+    Connection, Depth, Description, FullRefresh, IndexView, LightState, PageView, RoomSummary,
+    RoomView, SceneView, TileState, TileView, ViewModel,
 };

@@ -7,7 +7,7 @@ use core::time::Duration;
 
 use super::{broker::publish_of, flows::house, shell::Shell, start, tap_all_lights};
 use crate::{
-    Event, PowerSource,
+    Depth, Event, PowerSource,
     capabilities::log::Area,
     features::{
         connection::{CLOSE_TIMEOUT, Link, RECONNECT_MAX, RESTART_REASON},
@@ -360,7 +360,7 @@ fn a_touch_wake_while_a_restart_waits_does_not_draw() {
     shell.send(Event::SleepNow);
     assert!(shell.model.power.is_asleep());
     let frames = shell.frames.len();
-    let seq = shell.model.full_refresh_seq;
+    let seq = shell.model.full_refresh.seq;
     shell.take_log();
 
     // The wake asks for a full refresh, but the reset can stop it with the
@@ -370,7 +370,7 @@ fn a_touch_wake_while_a_restart_waits_does_not_draw() {
     let log = shell.take_log();
     assert!(!log.contains(&"Render".into()), "{log:?}");
     assert_eq!(shell.frames.len(), frames);
-    assert_eq!(shell.model.full_refresh_seq, seq);
+    assert_eq!(shell.model.full_refresh.seq, seq);
 }
 
 #[test]
@@ -628,13 +628,13 @@ fn the_sleep_button_while_the_sleep_waits_changes_nothing() {
 #[test]
 fn the_refresh_button_asks_for_a_full_refresh() {
     let mut shell = connected(PowerSource::Stand);
-    let seq = shell.model.full_refresh_seq;
+    let seq = shell.model.full_refresh.seq;
     let frames = shell.frames.len();
     press(&mut shell, "refresh");
-    assert_eq!(shell.model.full_refresh_seq, seq + 1);
-    assert_eq!(shell.model.refresh.partials, 0);
+    assert_eq!(shell.model.full_refresh.seq, seq + 1);
+    assert_eq!(shell.model.refresh.since_deep, 0);
     assert_eq!(shell.frames.len(), frames + 1);
-    assert!(shell.frames.last().unwrap().full);
+    assert_eq!(shell.frames.last().unwrap().full, Some(Depth::Deep));
     let logs = shell.take_logs();
     assert_eq!(
         logs,
@@ -647,11 +647,11 @@ fn the_refresh_button_while_asleep_does_nothing() {
     let mut shell = connected(PowerSource::Battery);
     shell.send(Event::SleepNow);
     assert!(shell.sleep.is_some());
-    let seq = shell.model.full_refresh_seq;
+    let seq = shell.model.full_refresh.seq;
     shell.take_logs();
 
     pressed(&mut shell, Button::Refresh);
-    assert_eq!(shell.model.full_refresh_seq, seq);
+    assert_eq!(shell.model.full_refresh.seq, seq);
     assert_eq!(
         shell.take_logs(),
         ["debug device: the device sleeps, so it skips the full refresh"]
@@ -663,11 +663,11 @@ fn the_refresh_button_while_a_restart_waits_is_ignored_with_a_line() {
     let mut shell = connected(PowerSource::Stand);
     shell.broker.hold_closes = true;
     press(&mut shell, "restart");
-    let seq = shell.model.full_refresh_seq;
+    let seq = shell.model.full_refresh.seq;
     shell.take_logs();
 
     pressed(&mut shell, Button::Refresh);
-    assert_eq!(shell.model.full_refresh_seq, seq);
+    assert_eq!(shell.model.full_refresh.seq, seq);
     assert_eq!(
         shell.take_logs(),
         [

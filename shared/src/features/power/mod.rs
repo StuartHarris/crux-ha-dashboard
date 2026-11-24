@@ -161,7 +161,7 @@ use period::{Checks, Tick};
 pub use period::{REPORT_CHECKS, REPORT_PERIOD, REPORT_PERIOD_MAX, ReportPeriod, report_period};
 
 use crate::{
-    Cmd, Model,
+    Cmd, Depth, Model,
     capabilities::{
         log::Area,
         power::{Power, PowerSource, Reading, Wake, WakeSource},
@@ -169,7 +169,7 @@ use crate::{
     features::{
         connection::{self, Link},
         device, light, logs,
-        refresh::{image_changed, redraw},
+        refresh::{Draw, image_changed, redraw},
         rooms,
         timer::{Running, Slot},
         wifi,
@@ -1017,13 +1017,14 @@ pub fn offline(id: u32, model: &mut Model) -> Cmd {
 /// first `Sleep` request. The Wi-Fi feature calls this function. Refer to
 /// [`wifi::radio_off`].
 ///
-/// After the idle time, the last image is a full refresh. After a report,
-/// the core draws only if the view, with the time left out, is not the
-/// image on the panel ([`image_changed`]). The draw is then a partial
-/// refresh, or a full refresh after
-/// [`PARTIALS_PER_FULL`](crate::features::refresh::PARTIALS_PER_FULL)
-/// partial refreshes. With no change, the panel keeps its image and the
-/// core sends no `Render`.
+/// After the idle time, the last image is a deep full refresh. Nobody
+/// looks at the flashes, and the image stays on the panel for the longest
+/// time. After a report, the core draws only if the view, with the time
+/// left out, is not the image on the panel ([`image_changed`]). The draw is
+/// then a partial refresh, or a deep full refresh after
+/// [`RENDERS_PER_DEEP`](crate::features::refresh::RENDERS_PER_DEEP)
+/// renders. With no change, the panel keeps its image and the core sends
+/// no `Render`.
 pub fn radio_off(id: u32, model: &mut Model) -> Cmd {
     let Phase::Asleep {
         id: current,
@@ -1043,12 +1044,14 @@ pub fn radio_off(id: u32, model: &mut Model) -> Cmd {
         },
     };
     let image = match last {
-        LastImage::Draw => step_started(SleepStep::Sleep, id).and(redraw(model, true)),
+        LastImage::Draw => {
+            step_started(SleepStep::Sleep, id).and(redraw(model, Draw::Full(Depth::Deep)))
+        }
         LastImage::IfChanged if image_changed(model) => logs::debug(
             Area::Power,
             format!("sleep {id} draws the changes and sleeps"),
         )
-        .and(redraw(model, false)),
+        .and(redraw(model, Draw::Partial)),
         LastImage::IfChanged => logs::debug(
             Area::Power,
             format!("sleep {id} keeps the image and sleeps"),
@@ -1071,7 +1074,7 @@ pub fn wake_up(model: &mut Model) -> Cmd {
     let summary = model.power.wake_to(awake_on(PowerSource::Battery));
     connection::reset_backoff(model);
     summary
-        .and(redraw(model, true))
+        .and(redraw(model, Draw::Full(Depth::Light)))
         .and(connection::go_online(model))
         .and(restart_idle_timer(model))
 }
@@ -1094,6 +1097,13 @@ pub fn source_changed(source: PowerSource, model: &mut Model) -> Cmd {
             if was_asleep {
                 model.power.wake = WakeReason::Stand;
             }
+            // A wake draws the whole screen. Otherwise only the power icon
+            // changes.
+            let wake_draw = if was_asleep {
+                Draw::Full(Depth::Light)
+            } else {
+                Draw::Partial
+            };
             // The device stays awake on the stand, so it needs no idle
             // timer. `enter` clears the idle timer or the hold timer that
             // runs.
@@ -1101,13 +1111,13 @@ pub fn source_changed(source: PowerSource, model: &mut Model) -> Cmd {
             connection::reset_backoff(model);
             summary
                 .and(light::source_changed(model))
-                .and(redraw(model, was_asleep))
+                .and(redraw(model, wake_draw))
                 .and(connection::go_online(model))
         }
         PowerSource::Battery => {
             model.power.enter(awake_on(PowerSource::Battery));
             light::source_changed(model)
-                .and(redraw(model, false))
+                .and(redraw(model, Draw::Partial))
                 .and(restart_idle_timer(model))
                 .and(device::changed(model))
         }
@@ -1146,7 +1156,7 @@ pub fn battery_changed(level: Option<u8>, model: &mut Model) -> Cmd {
     if level.map(rounded_level) == before.map(rounded_level) {
         return publish;
     }
-    redraw(model, false).and(publish)
+    redraw(model, Draw::Partial).and(publish)
 }
 
 /// The shell read the power diagnostics. The core keeps the reading.

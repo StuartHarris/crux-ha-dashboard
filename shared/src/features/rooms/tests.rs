@@ -14,7 +14,7 @@ use crate::tests::{
     wire::{ExpectWrite, Wire},
 };
 use crate::{
-    Control, Dashboard, EffectTestExt, Event, Model, PowerSource, Route, TileState,
+    Control, Dashboard, Depth, EffectTestExt, Event, Model, PowerSource, Route, TileState,
     features::{connection::Link, light::DEFAULT_STAND_LEVEL, pending::QUEUED_TIMEOUT},
     mqtt::{Qos, codec::server::Packet},
     view::LightState,
@@ -26,21 +26,18 @@ fn next_page_and_previous_page_wrap_around() {
     let (mut model, _wire) = drive_to_connected(PowerSource::Stand);
     let count = model.pages.len();
 
-    app.update(Event::PreviousPage, &mut model)
-        .expect_render()
-        .expect_full_refresh_timer();
+    app.update(Event::PreviousPage, &mut model).expect_render();
     let view = app.view(&model);
     assert_eq!(view.title, "Outside");
     assert_eq!(view.page_index, count - 1);
     assert_eq!(view.path, "/room/outside");
-    assert_eq!(view.full_refresh_seq, 2);
+    // A page change is a light full refresh. It keeps the full-refresh
+    // timer that runs.
+    assert_eq!(view.full_refresh.seq, 2);
+    assert_eq!(view.full_refresh.depth, Depth::Light);
 
-    app.update(Event::NextPage, &mut model)
-        .expect_render()
-        .expect_full_refresh_timer();
-    app.update(Event::NextPage, &mut model)
-        .expect_render()
-        .expect_full_refresh_timer();
+    app.update(Event::NextPage, &mut model).expect_render();
+    app.update(Event::NextPage, &mut model).expect_render();
     let view = app.view(&model);
     assert_eq!(view.title, "Living room");
     assert_eq!(view.path, "/room/living_room");
@@ -732,22 +729,18 @@ fn a_tap_on_a_navigation_button_turns_the_page() {
 
     app.update(Event::Tapped(Some(Control::NextPage)), &mut model)
         .expect_touch_light(DEFAULT_STAND_LEVEL.get())
-        .expect_render()
-        .expect_full_refresh_timer();
+        .expect_render();
     assert_eq!(app.view(&model).page_index, 1);
     app.update(Event::Tapped(Some(Control::PreviousPage)), &mut model)
         .expect_light_timer()
-        .expect_render()
-        .expect_full_refresh_timer();
+        .expect_render();
     app.update(Event::Tapped(Some(Control::PreviousPage)), &mut model)
         .expect_light_timer()
-        .expect_render()
-        .expect_full_refresh_timer();
+        .expect_render();
     assert_eq!(app.view(&model).page_index, count - 1);
     app.update(Event::Tapped(Some(Control::Home)), &mut model)
         .expect_light_timer()
-        .expect_render()
-        .expect_full_refresh_timer();
+        .expect_render();
     assert_eq!(app.view(&model).path, "/");
 }
 
@@ -769,12 +762,12 @@ fn a_tap_on_a_room_button_shows_the_room() {
     // The rooms are the pages after the home page, in order.
     app.update(tap_room(7), &mut model)
         .expect_touch_light(DEFAULT_STAND_LEVEL.get())
-        .expect_render()
-        .expect_full_refresh_timer();
+        .expect_render();
     let view = app.view(&model);
     assert_eq!(view.path, "/room/loft");
     assert_eq!(view.title, "Loft");
-    assert_eq!(view.full_refresh_seq, 2);
+    assert_eq!(view.full_refresh.seq, 2);
+    assert_eq!(view.full_refresh.depth, Depth::Light);
     assert_eq!(view.index(), None);
     assert_eq!(view.tiles().len(), 4);
 }

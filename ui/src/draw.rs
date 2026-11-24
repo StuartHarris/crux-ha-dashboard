@@ -1052,7 +1052,7 @@ const fn point(x: u32, y: u32) -> Point {
 pub mod tests {
     use embedded_graphics::{pixelcolor::Gray4, prelude::*};
     use shared::{
-        Connection, IndexView, LightState,
+        Connection, FullRefresh, IndexView, LightState,
         LightState::{Off, On, Unavailable},
         PageView, PowerSource, RoomSummary, RoomView, SceneView, TileKind, TileState, TileView,
         ViewModel,
@@ -1116,7 +1116,7 @@ pub mod tests {
             read_only: false,
             last_sync: None,
             updated: "Last changed 09:41".into(),
-            full_refresh_seq: 1,
+            full_refresh: FullRefresh::NONE,
         }
     }
 

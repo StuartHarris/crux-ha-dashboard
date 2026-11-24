@@ -109,7 +109,7 @@ fn start_on_the_stand_draws_and_joins_the_strongest_access_point() {
         });
 
     let view = app.view(&model);
-    assert_eq!(view.full_refresh_seq, 1);
+    assert_eq!(view.full_refresh.seq, 1);
     assert_eq!(view.connection, Connection::Connecting);
     assert_eq!(view.title, "Home");
 }
@@ -216,7 +216,7 @@ fn a_message_for_a_visible_tile_draws_the_new_state() {
     assert_eq!(all_lights.state, TileState::On);
     assert_eq!(all_lights.text, "On 25%");
     // A partial redraw does not ask for a full refresh.
-    assert_eq!(view.full_refresh_seq, 1);
+    assert_eq!(view.full_refresh.seq, 1);
 }
 
 #[test]
@@ -270,7 +270,7 @@ fn on_the_index_a_message_draws_only_if_a_summary_changes() {
     .unwrap()
     .expect_only_render();
     assert_eq!(lights(&model), [On, Unavailable, Unavailable]);
-    assert_eq!(app.view(&model).full_refresh_seq, 1);
+    assert_eq!(app.view(&model).full_refresh.seq, 1);
 
     // No summary shows the group of the Loft, because the Loft has the
     // members of the group. The core does not draw.

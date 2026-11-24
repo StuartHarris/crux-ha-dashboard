@@ -4,13 +4,13 @@
 use serde::Serialize;
 
 use crate::{
-    Cmd, Control, Model, Startup,
+    Cmd, Control, Depth, Model, Startup,
     features::{
         connection::{self, Call},
         device, light,
         pending::{self, Confirm},
         power,
-        refresh::redraw,
+        refresh::{Draw, redraw},
     },
     layout::{BRIGHTNESS_STEP_PCT, Page, Tile, TileKind},
     mqtt::{Publish, Qos},
@@ -88,7 +88,7 @@ pub fn navigate(route: Route, model: &mut Model) -> Cmd {
         return idle;
     }
     model.route = route;
-    redraw(model, true).and(idle)
+    redraw(model, Draw::Full(Depth::Light)).and(idle)
 }
 
 /// Shows the next or the previous page. The pages wrap around. The core
@@ -107,7 +107,7 @@ pub fn turn_page(model: &mut Model, forward: bool) -> Cmd {
     model.route = model.pages[next].route();
     // The tap cancels a sleep that waits before the full refresh.
     let idle = power::restart_idle_timer(model);
-    redraw(model, true).and(idle)
+    redraw(model, Draw::Full(Depth::Light)).and(idle)
 }
 
 /// Returns the current page if it is the page of a room, or `None` on the
@@ -285,7 +285,7 @@ pub fn set_read_only(read_only: bool, model: &mut Model) -> Cmd {
     } else {
         // At the end of a dry run, the device publishes go. Refer to
         // [`device`].
-        redraw(model, false).and(device::changed(model))
+        redraw(model, Draw::Partial).and(device::changed(model))
     }
 }
 
@@ -318,7 +318,7 @@ fn call_service(model: &mut Model, call: &ServiceCall<'_>, confirm: Confirm) -> 
         publish,
         entity_id: call.entity_id,
     };
-    connection::send(call, Some(tap), model).and(redraw(model, false))
+    connection::send(call, Some(tap), model).and(redraw(model, Draw::Partial))
 }
 
 #[cfg(test)]

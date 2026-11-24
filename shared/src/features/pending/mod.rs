@@ -122,7 +122,7 @@ use crate::{
     entities::EntityState,
     features::{
         power,
-        refresh::{redraw, redraw_soon},
+        refresh::{Draw, redraw, redraw_soon},
         timer::Running,
     },
     temperature::{self, Centi},
@@ -660,7 +660,7 @@ pub fn timeout(id: u32, model: &mut Model) -> Cmd {
     if model.power.is_asleep() {
         return Cmd::done();
     }
-    redraw(model, false).and(power::sleep_if_settled(model))
+    redraw(model, Draw::Partial).and(power::sleep_if_settled(model))
 }
 
 #[cfg(test)]

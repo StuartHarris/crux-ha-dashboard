@@ -37,7 +37,7 @@ use logic::{
     shell::{Job, Shell},
     touch::{Sample, Tapper, TouchMap},
 };
-use shared::{Boot, Event, PowerSource, ResetReason};
+use shared::{Boot, Depth, Event, PowerSource, ResetReason};
 use static_cell::StaticCell;
 use ui::Framebuffer;
 
@@ -110,7 +110,13 @@ async fn main(spawner: Spawner) -> ! {
             .into_styled(PrimitiveStyle::with_fill(Gray4::new(level)))
             .draw(&mut frame);
     }
-    timed("full refresh", panel.full(&frame)).await;
+    // The image on the panel is not known. The erase gets a white frame, so
+    // it drives no pixel.
+    timed(
+        "full refresh",
+        panel.full(&Framebuffer::new(), &frame, Depth::Deep),
+    )
+    .await;
     Timer::after(PAUSE).await;
 
     log::info!("step 4: a black rectangle with a partial refresh");
@@ -160,8 +166,9 @@ async fn main(spawner: Spawner) -> ! {
         })
         .unwrap_or_else(|| shell.view());
     log::info!("the page is {} ({})", view.title, view.path);
+    let shown = frame.clone();
     let Ok(()) = ui::draw(&view, &mut frame);
-    timed("full refresh", panel.full(&frame)).await;
+    timed("full refresh", panel.full(&shown, &frame, Depth::Deep)).await;
     if let Err(error) = panel.power_off() {
         log::error!("panel power off failed: {error:?}");
     }

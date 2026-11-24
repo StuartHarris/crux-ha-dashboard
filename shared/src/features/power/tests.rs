@@ -11,8 +11,8 @@ use crate::tests::{
     drive_to_connecting, shell::Shell, start, state, tap_tile, wire::ExpectWrite,
 };
 use crate::{
-    Charge, Connection, Control, Dashboard, Effect, EffectTestExt, Event, Model, PowerSource,
-    Reading,
+    Charge, Connection, Control, Dashboard, Depth, Effect, EffectTestExt, Event, Model,
+    PowerSource, Reading,
     capabilities::{
         log::Level,
         power::{Wake, WakeSource},
@@ -101,7 +101,7 @@ fn the_idle_timeout_sleeps_in_steps_and_a_touch_wakes() {
     let view = app.view(&model);
     assert!(view.asleep);
     // The start asked for the first full refresh, and the sleep for the second.
-    assert_eq!(view.full_refresh_seq, 2);
+    assert_eq!(view.full_refresh.seq, 2);
     assert_eq!(view.updated, "Last changed 09:41");
     assert_eq!(model.wifi.phase, Phase::Off);
 
@@ -118,7 +118,7 @@ fn the_idle_timeout_sleeps_in_steps_and_a_touch_wakes() {
         .expect_touch_light(DEFAULT_BATTERY_LEVEL.get())
         .expect_no_effects();
     assert!(!model.power.is_asleep());
-    assert_eq!(model.full_refresh_seq, 3);
+    assert_eq!(model.full_refresh.seq, 3);
 }
 
 #[test]
@@ -132,10 +132,10 @@ fn a_tap_during_the_steps_wakes_and_the_late_answers_are_ignored() {
     );
 
     // The user taps before the disconnect ends. The session of the sleep
-    // still closes, so the core does not connect yet.
+    // still closes, so the core does not connect yet. The core drew no last
+    // image, so the full-refresh timer still runs.
     app.update(Event::Tapped(None), &mut model)
         .expect_render()
-        .expect_full_refresh_timer()
         .expect_time_notify_after()
         .expect_touch_light(DEFAULT_BATTERY_LEVEL.get())
         .expect_no_effects();
@@ -201,9 +201,10 @@ fn a_tap_restarts_the_idle_timer_and_the_old_timer_is_ignored() {
     let (mut model, _wire) = drive_to_connected(PowerSource::Battery);
     let old = model.power.idle;
 
+    // The page turn is a light full refresh, so it keeps the full-refresh
+    // timer that runs.
     app.update(Event::NextPage, &mut model)
         .expect_render()
-        .expect_full_refresh_timer()
         .expect_only_time_notify_after_with(|notify| {
             assert_eq!(Duration::from(notify.duration), IDLE_TIMEOUT);
         });
@@ -217,9 +218,7 @@ fn on_the_stand_there_is_no_idle_timer() {
     let app = Dashboard;
     let (mut model, _wire) = drive_to_connected(PowerSource::Stand);
 
-    app.update(Event::NextPage, &mut model)
-        .expect_render()
-        .expect_full_refresh_timer();
+    app.update(Event::NextPage, &mut model).expect_render();
     app.update(
         Event::Power(power::Event::IdleTimeout(model.power.idle)),
         &mut model,
@@ -252,14 +251,15 @@ fn on_the_stand_while_asleep_wakes_and_connects() {
     assert!(model.power.is_asleep());
 
     // The session of the sleep still closes, so the core does not connect
-    // yet.
+    // yet. The idle timeout only started the steps of the sleep, so the
+    // core drew no last image, and the full-refresh timer still runs. The
+    // wake asked for the second full refresh, a light one, and kept the
+    // timer.
     app.update(Event::PowerSourceChanged(PowerSource::Stand), &mut model)
         .expect_render()
-        .expect_full_refresh_timer()
         .expect_no_effects();
-    // The idle timeout only started the steps of the sleep, so the core
-    // drew no last image. The wake asked for the second full refresh.
-    assert_eq!(model.full_refresh_seq, 2);
+    assert_eq!(model.full_refresh.seq, 2);
+    assert_eq!(model.full_refresh.depth, Depth::Light);
     assert!(!model.power.is_asleep());
 
     // The DISCONNECT leaves and the session ends. The link is still up, so
@@ -299,7 +299,7 @@ fn a_timer_wake_is_a_check_that_only_sleeps_again() {
         .expect_only_sleep_with(|sleep| assert_eq!(sleep.wake_on, wake_sources()));
     assert!(model.power.is_asleep());
     assert_eq!(power::sleep_step(&model), Some(SleepStep::Sleep));
-    assert_eq!(model.full_refresh_seq, 0);
+    assert_eq!(model.full_refresh.seq, 0);
     assert_eq!(model.wifi.phase, Phase::Off);
 }
 
@@ -552,7 +552,7 @@ fn a_battery_level_while_asleep_does_not_wake_the_device() {
     // The wake draws the level.
     let _ = app.update(woke(&model, Wake::Touch(None)), &mut model);
     assert_eq!(app.view(&model).battery, Some(40));
-    assert_eq!(model.full_refresh_seq, 1);
+    assert_eq!(model.full_refresh.seq, 1);
 }
 
 #[test]
@@ -575,7 +575,7 @@ fn a_power_reading_while_asleep_is_kept_and_does_nothing_else() {
     assert!(model.power.is_asleep());
     assert_eq!(model.power.idle, before);
     assert_eq!(model.wifi.phase, Phase::Off);
-    assert_eq!(model.full_refresh_seq, 0);
+    assert_eq!(model.full_refresh.seq, 0);
 }
 
 #[test]
@@ -1188,7 +1188,7 @@ fn the_first_sleep_has_the_check_timer_and_comes_after_the_last_image() {
     let sleep = log.iter().position(|entry| entry == "Sleep").unwrap();
     assert!(render < sleep, "{log:?}");
     assert_eq!(shell.sleep.as_ref().unwrap().wake_on, wake_sources());
-    assert!(shell.frames.last().unwrap().full);
+    assert_eq!(shell.frames.last().unwrap().full, Some(Depth::Deep));
 }
 
 #[test]

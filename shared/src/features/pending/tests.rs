@@ -21,7 +21,7 @@ use crate::{
         light::DEFAULT_STAND_LEVEL,
         pending::{PENDING_TIMEOUT, QUEUED_TIMEOUT, SCENE_TIMEOUT, TARGET_TIMEOUT},
         power::IDLE_TIMEOUT,
-        refresh::{DRAW_DELAY, PARTIALS_PER_FULL, redraw},
+        refresh::{DRAW_DELAY, Draw, RENDERS_PER_DEEP, redraw},
     },
     mqtt::{MAX_IN_FLIGHT, codec::server::Packet},
 };
@@ -360,7 +360,7 @@ fn the_flow_of_a_tap_draws_the_new_state() {
     // state, and no timer of a mark waits.
     let frame = shell.frames.last().unwrap();
     assert_eq!(frame.view.tiles()[1].state, TileState::Off);
-    assert!(!frame.full);
+    assert_eq!(frame.full, None);
     let events = shell.advance(PENDING_TIMEOUT);
     assert!(
         !events
@@ -926,7 +926,7 @@ fn an_issued_timeout_removes_a_mark_that_has_no_queued_timer_while_an_old_call_w
     // a tap.
     let tap = pending::tap(&model, LAMP, pending::Confirm::Toggle);
     let _ = pending::issued(LAMP, Some(tap), &mut model);
-    redraw(&mut model, false).expect_only_render();
+    redraw(&mut model, Draw::Partial).expect_only_render();
     assert_eq!(tile_state(&model, 1), TileState::Pending);
 
     // No timer stays after the timeout, so the core removes the mark.
@@ -1157,10 +1157,10 @@ fn a_full_refresh_after_the_confirmation_starts_the_sleep() {
     assert!(shell.sleep.is_none());
 
     // A new battery level draws before the draw timer expires. This draw
-    // comes after the largest number of partial renders, so it is a full
+    // comes after the largest number of renders, so it is a deep full
     // refresh, which clears the draw timer. The full refresh then starts
     // the sleep.
-    shell.model.refresh.partials = PARTIALS_PER_FULL;
+    shell.model.refresh.since_deep = RENDERS_PER_DEEP;
     let level = if shell.model.power.battery == Some(10) {
         90
     } else {

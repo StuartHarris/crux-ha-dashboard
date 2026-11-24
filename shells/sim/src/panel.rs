@@ -44,9 +44,7 @@ impl Panel {
     pub fn draw(&mut self, view: &ViewModel) -> Refresh {
         let mut next = Framebuffer::new();
         let Ok(()) = ui::draw(view, &mut next);
-        let refresh = self
-            .refresher
-            .decide(view.full_refresh_seq, &self.frame, &next);
+        let refresh = self.refresher.decide(view.full_refresh, &self.frame, &next);
         self.frame = next;
         refresh
     }
@@ -144,7 +142,7 @@ impl Viewport {
 #[cfg(test)]
 mod tests {
     use embedded_graphics::{prelude::*, primitives::Rectangle};
-    use shared::{Connection, IndexView, PageView, PowerSource, ViewModel};
+    use shared::{Connection, Depth, FullRefresh, IndexView, PageView, PowerSource, ViewModel};
 
     use ui::Refresh;
 
@@ -178,7 +176,10 @@ mod tests {
             read_only: false,
             last_sync: None,
             updated: "Last changed 09:41".into(),
-            full_refresh_seq: seq,
+            full_refresh: FullRefresh {
+                seq,
+                depth: Depth::Light,
+            },
         }
     }
 
@@ -186,7 +187,7 @@ mod tests {
     fn a_partial_refresh_gives_the_area_that_changed() {
         let mut panel = Panel::new();
         let first = panel.draw(&view("Online", 1));
-        assert_eq!(first, Refresh::Full);
+        assert_eq!(first, Refresh::Full(Depth::Deep));
 
         let same = panel.draw(&view("Online", 1));
         assert_eq!(same, Refresh::None);

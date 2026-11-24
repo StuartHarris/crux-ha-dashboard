@@ -95,7 +95,7 @@ impl Screen {
     /// Draws `view` and simulates the refresh of the panel at `now`.
     pub fn show(&mut self, view: &ViewModel, now: Instant) {
         match self.panel.draw(view) {
-            Refresh::Full => {
+            Refresh::Full(_) => {
                 self.counters.full += 1;
                 self.flash.start(now);
                 self.outline = None;
@@ -159,7 +159,7 @@ pub const fn level(luma: u8, invert: bool) -> u8 {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use shared::{PowerSource, fixtures::FixedShell};
+    use shared::{Depth, PowerSource, fixtures::FixedShell};
 
     use super::{FLASH, Flash, Screen, level};
 
@@ -234,7 +234,7 @@ mod tests {
         assert!(screen.outline().is_some());
 
         let mut view = shell.view();
-        view.full_refresh_seq += 1;
+        view.full_refresh = view.full_refresh.next(Depth::Light);
         screen.show(&view, now);
         assert_eq!(screen.outline(), None);
         // The counter keeps the last partial area.
