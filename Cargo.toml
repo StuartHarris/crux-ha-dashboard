@@ -23,7 +23,8 @@ unsafe_code = "forbid"
 # Crux with no_std support, from the `spike/no-std` branch.
 crux_core = { git = "https://github.com/redbadger/crux", branch = "spike/no-std", default-features = false, features = ["crux_macros"] }
 crux_time = { git = "https://github.com/redbadger/crux", branch = "spike/no-std", default-features = false }
-chrono = { version = "0.4", default-features = false, features = ["alloc"] }
+# Time without std. `static` compiles the Europe/London zone into the binary.
+jiff = { version = "1.0.3", default-features = false, features = ["alloc", "static"] }
 serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
 serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
 futures = { version = "0.3", default-features = false, features = ["alloc"] }

@@ -35,8 +35,8 @@ use crate::{
 };
 
 /// The time `seconds` after the Unix epoch.
-fn at(seconds: u64) -> chrono::DateTime<chrono::Utc> {
-    chrono::DateTime::from_timestamp(seconds.cast_signed(), 0).unwrap()
+fn at(seconds: u64) -> jiff::Timestamp {
+    jiff::Timestamp::from_second(seconds.cast_signed()).unwrap()
 }
 
 /// Expects the command to start only the draw timer. Fires the timer and

@@ -11,7 +11,7 @@ shared = { workspace = true, features = ["std", "fixtures"] }
 ui.workspace = true
 crux_core.workspace = true
 crux_time = { workspace = true, features = ["std"] }
-chrono = { workspace = true, features = ["clock", "std"] }
+jiff = { workspace = true, features = ["std", "tz-system", "tzdb-zoneinfo"] }
 embedded-graphics.workspace = true
 # The simulator uses the display of the simulator crate as the panel, for its
 # `diff` and its PNG output. It does not use SDL.

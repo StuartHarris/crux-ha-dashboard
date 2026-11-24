@@ -13,7 +13,7 @@
 
 use std::collections::VecDeque;
 
-use chrono::{DateTime, Local};
+use jiff::ZonedDateTime;
 use shared::mqtt::{
     MAX_PACKET,
     codec::{self, Inbound, server},
@@ -105,7 +105,7 @@ pub trait Matches {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EffectEntry {
     /// The time of the entry.
-    pub time: DateTime<Local>,
+    pub time: ZonedDateTime,
     /// The name of the effect, for example `StreamWrite`.
     pub effect: &'static str,
     /// The facts of the request, for example the topic. It never contains
@@ -180,7 +180,7 @@ pub enum Packet {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MqttEntry {
     /// The time of the entry.
-    pub time: DateTime<Local>,
+    pub time: ZonedDateTime,
     /// The direction of the packet.
     pub direction: Direction,
     /// The kind of packet.
@@ -255,7 +255,7 @@ impl Inspector {
     /// Adds an entry to the effect log, with the time now.
     pub fn effect(&mut self, effect: &'static str, request: String, outcome: impl Into<String>) {
         self.effects.push(EffectEntry {
-            time: Local::now(),
+            time: ZonedDateTime::now(),
             effect,
             request,
             outcome: outcome.into(),
@@ -272,7 +272,7 @@ impl Inspector {
         retained: bool,
     ) {
         self.mqtt.push(MqttEntry {
-            time: Local::now(),
+            time: ZonedDateTime::now(),
             direction,
             packet,
             topic: topic.into(),
@@ -286,7 +286,7 @@ impl Inspector {
     /// with the time now.
     pub fn subscribe(&mut self, topics: Vec<String>) {
         self.mqtt.push(MqttEntry {
-            time: Local::now(),
+            time: ZonedDateTime::now(),
             direction: Direction::Out,
             packet: Packet::Subscribe,
             topic: format!("{} topics", topics.len()),
@@ -499,8 +499,7 @@ impl Wire {
 
 #[cfg(test)]
 mod tests {
-    use chrono::Local;
-
+    use jiff::ZonedDateTime;
     use shared::mqtt::{
         Connect, Credentials, LastWill, Qos,
         codec::{self, Flags, server},
@@ -512,7 +511,7 @@ mod tests {
 
     fn effect(name: &'static str, request: &str) -> EffectEntry {
         EffectEntry {
-            time: Local::now(),
+            time: ZonedDateTime::now(),
             effect: name,
             request: request.into(),
             outcome: "sent".into(),
@@ -521,7 +520,7 @@ mod tests {
 
     fn message(topic: &str) -> MqttEntry {
         MqttEntry {
-            time: Local::now(),
+            time: ZonedDateTime::now(),
             direction: Direction::In,
             packet: Packet::Publish,
             topic: topic.into(),

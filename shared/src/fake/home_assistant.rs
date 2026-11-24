@@ -158,10 +158,11 @@ impl Broker {
 ///
 /// # Panics
 ///
-/// Panics if the time is out of the range of `chrono`.
+/// Panics if the time is out of the range of `jiff`.
 #[must_use]
 pub fn iso_time(seconds: u64) -> String {
-    chrono::DateTime::from_timestamp(seconds.cast_signed(), 0)
+    jiff::Timestamp::from_second(seconds.cast_signed())
         .expect("a valid time")
-        .to_rfc3339()
+        .display_with_offset(jiff::tz::Offset::UTC)
+        .to_string()
 }
