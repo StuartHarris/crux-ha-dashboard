@@ -1993,7 +1993,16 @@ mod tests {
         fixture.take_log();
         let tile = ui::layout::tile(0).unwrap().center();
         fixture.shell().tap(tile);
-        assert_eq!(fixture.wait_log(1), ["publish dashboard/test/cmd 1"]);
+        // The tap also turns the front light on. The service call goes
+        // before the state of the light, but the two can go in different
+        // writes, so the test waits for both.
+        assert_eq!(
+            fixture.wait_log(2),
+            [
+                "publish dashboard/test/cmd 1",
+                "publish dashboard/test/light 1",
+            ]
+        );
     }
 
     #[test]
