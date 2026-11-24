@@ -127,7 +127,7 @@ use crate::{
     },
     temperature::{self, Centi},
 };
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 
 /// The internal events of the pending marks. The core makes them from its
 /// timers.
@@ -201,7 +201,7 @@ pub struct Tap {
     pub state: Option<String>,
     /// The exact `last_updated` time of the entity at the tap, or `None` if
     /// the core had no time.
-    pub since: Option<DateTime<Utc>>,
+    pub since: Option<Timestamp>,
 }
 
 /// Returns the tap for a service call for `entity_id`, with the state and

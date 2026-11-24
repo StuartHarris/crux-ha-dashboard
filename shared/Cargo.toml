@@ -9,10 +9,10 @@ publish.workspace = true
 default = ["std"]
 # On by default. Turn it off to build the core for the device.
 std = [
-    "chrono/std",
     "crux_core/std",
     "crux_time/std",
     "futures/std",
+    "jiff/std",
     "serde/std",
     "serde_json/std",
 ]
@@ -22,7 +22,7 @@ std = [
 fixtures = ["std"]
 
 [dependencies]
-chrono.workspace = true
+jiff.workspace = true
 crux_core.workspace = true
 crux_time.workspace = true
 futures.workspace = true

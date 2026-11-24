@@ -26,7 +26,7 @@ use alloc::{
     vec::Vec,
 };
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 
 use crate::layout::Page;
 
@@ -51,7 +51,7 @@ pub struct EntityState {
     /// screen ([`EntityState::last_updated_minute`]). Refer to the module
     /// documentation for the reason that the core uses `last_updated` and not
     /// `last_changed`.
-    pub last_updated: Option<DateTime<Utc>>,
+    pub last_updated: Option<Timestamp>,
 }
 
 impl EntityState {
@@ -64,7 +64,7 @@ impl EntityState {
     /// Returns the time of the last update at the start of its minute. Only
     /// the minute shows on the screen.
     #[must_use]
-    pub fn last_updated_minute(&self) -> Option<DateTime<Utc>> {
+    pub fn last_updated_minute(&self) -> Option<Timestamp> {
         self.last_updated.map(start_of_minute)
     }
 }
@@ -91,7 +91,7 @@ impl Entities {
 
     /// Returns each entity id with the time of its last update at the start
     /// of its minute, for the entities that have one.
-    pub fn last_updated_minutes(&self) -> impl Iterator<Item = (&str, DateTime<Utc>)> {
+    pub fn last_updated_minutes(&self) -> impl Iterator<Item = (&str, Timestamp)> {
         self.states.iter().filter_map(|(entity_id, entity)| {
             Some((entity_id.as_str(), entity.last_updated_minute()?))
         })
@@ -118,7 +118,7 @@ impl Entities {
         let text = core::str::from_utf8(payload).ok()?.trim();
 
         if key == LAST_UPDATED {
-            let exact = DateTime::parse_from_rfc3339(text).ok()?.to_utc();
+            let exact = text.parse::<Timestamp>().ok()?;
             let entity = self.states.entry(entity_id.clone()).or_default();
             let changed = entity.last_updated_minute() != Some(start_of_minute(exact));
             entity.last_updated = Some(exact);
@@ -166,9 +166,9 @@ fn parse_topic(topic: &str) -> Option<(String, &str)> {
 /// Returns the start of the minute of `time`. The UTC offset of the UK is a
 /// whole number of minutes, so the start of the minute shows the same
 /// `HH:MM`.
-fn start_of_minute(time: DateTime<Utc>) -> DateTime<Utc> {
-    let seconds = time.timestamp().div_euclid(60) * 60;
-    DateTime::from_timestamp(seconds, 0).unwrap_or(time)
+fn start_of_minute(time: Timestamp) -> Timestamp {
+    let seconds = time.as_second().div_euclid(60) * 60;
+    Timestamp::from_second(seconds).unwrap_or(time)
 }
 
 /// Reads a JSON string or number as text. Returns `None` for `null` and for
@@ -211,6 +211,7 @@ pub fn topics(pages: &[Page]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use alloc::{format, string::String, vec};
+    use jiff::tz::Offset;
 
     use super::{Entities, topics};
     use crate::{
@@ -481,7 +482,7 @@ mod tests {
         entities
             .get("light.lamp")?
             .last_updated_minute()
-            .map(|time| time.to_rfc3339())
+            .map(|time| time.display_with_offset(Offset::UTC).to_string())
     }
 
     #[test]
@@ -504,7 +505,9 @@ mod tests {
         );
         let exact = entities.get("light.lamp").unwrap().last_updated;
         assert_eq!(
-            exact.map(|time| time.to_rfc3339()).as_deref(),
+            exact
+                .map(|time| time.display_with_offset(Offset::UTC).to_string())
+                .as_deref(),
             Some("2026-11-08T14:03:59+00:00")
         );
         // A time in the next minute is a change. Another offset is the same

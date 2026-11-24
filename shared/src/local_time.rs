@@ -1,87 +1,41 @@
 //! The local time of the dashboard: UK time (Europe/London).
 //!
-//! The core shows each time as UK time. It calculates the offset from UTC
-//! with a rule, so it needs no time zone data and no help from the shell:
-//!
-//! - British Summer Time (BST, UTC+1) starts at 01:00 UTC on the last Sunday
-//!   in March.
-//! - Greenwich Mean Time (GMT, UTC+0) starts again at 01:00 UTC on the last
-//!   Sunday in October.
+//! The core shows each time as UK time. The binary contains the time zone
+//! data for Europe/London, so the core needs no help from the shell. The data
+//! comes from the IANA time zone database when the crate compiles.
 
-use chrono::{DateTime, Datelike, FixedOffset, NaiveDate, NaiveDateTime, Offset, Utc};
+use jiff::{Timestamp, civil::DateTime, tz::TimeZone};
 
-/// The offset from UTC during British Summer Time, in seconds.
-const BST_SECONDS: i32 = 3600;
-
-/// The hour (UTC) at which the clocks change, on the last Sunday in March
-/// and on the last Sunday in October.
-const CHANGE_HOUR: u32 = 1;
-
-/// Returns the UK offset from UTC at `time`: UTC+1 during British Summer
-/// Time, and UTC+0 at other times.
-///
-/// Summer time starts at 01:00 UTC on the last Sunday in March. It stops
-/// at 01:00 UTC on the last Sunday in October. The start is part of summer
-/// time, and the end is not.
-#[must_use]
-pub fn uk_offset(time: DateTime<Utc>) -> FixedOffset {
-    let utc = time.naive_utc();
-    let year = utc.year();
-    let summer = match (change(year, 3), change(year, 10)) {
-        (Some(start), Some(end)) => start <= utc && utc < end,
-        _ => false,
-    };
-    let seconds = if summer { BST_SECONDS } else { 0 };
-    FixedOffset::east_opt(seconds).unwrap_or_else(|| Utc.fix())
-}
+/// The UK time zone, from the time zone data in the binary.
+static UK: TimeZone = jiff::tz::get!("Europe/London");
 
 /// Returns `time` as a UK date and time of day.
 #[must_use]
-pub fn uk_time(time: DateTime<Utc>) -> NaiveDateTime {
-    time.with_timezone(&uk_offset(time)).naive_local()
-}
-
-/// Returns the time of the clock change in `month` of `year`: 01:00 UTC on
-/// the last Sunday of the month. Returns `None` if the date is not valid.
-fn change(year: i32, month: u32) -> Option<NaiveDateTime> {
-    let last = last_day(year, month)?;
-    let back = u64::from(last.weekday().num_days_from_sunday());
-    let sunday = last.checked_sub_days(chrono::Days::new(back))?;
-    sunday.and_hms_opt(CHANGE_HOUR, 0, 0)
-}
-
-/// Returns the last day of `month` in `year`.
-fn last_day(year: i32, month: u32) -> Option<NaiveDate> {
-    let (next_year, next_month) = if month == 12 {
-        (year + 1, 1)
-    } else {
-        (year, month + 1)
-    };
-    NaiveDate::from_ymd_opt(next_year, next_month, 1)?.pred_opt()
+pub fn uk_time(time: Timestamp) -> DateTime {
+    UK.to_datetime(time)
 }
 
 #[cfg(test)]
 mod tests {
-    use chrono::{DateTime, NaiveDate, Timelike, Utc};
+    use jiff::{Timestamp, civil::date, tz::TimeZone};
 
-    use super::{change, uk_offset, uk_time};
+    use super::{UK, uk_time};
 
     /// Returns the UTC time at `hour:minute` on the date.
-    fn at(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> DateTime<Utc> {
-        NaiveDate::from_ymd_opt(year, month, day)
-            .and_then(|date| date.and_hms_opt(hour, minute, 0))
-            .map(|time| time.and_utc())
+    fn at(year: i16, month: i8, day: i8, hour: i8, minute: i8) -> Timestamp {
+        TimeZone::UTC
+            .to_timestamp(date(year, month, day).at(hour, minute, 0, 0))
             .unwrap()
     }
 
-    /// Returns the offset at the time, in hours.
-    fn hours(time: DateTime<Utc>) -> i32 {
-        uk_offset(time).local_minus_utc() / 3600
+    /// Returns the UK offset from UTC at the time, in hours.
+    fn hours(time: Timestamp) -> i32 {
+        UK.to_offset(time).seconds() / 3600
     }
 
     /// The days on which summer time starts and stops, from the published
-    /// UK dates.
-    const CHANGES: [(i32, u32, u32); 6] = [
+    /// UK dates. The clocks change at 01:00 UTC on these days.
+    const CHANGES: [(i16, i8, i8); 6] = [
         (2024, 31, 27),
         (2025, 30, 26),
         (2026, 29, 25),
@@ -89,17 +43,6 @@ mod tests {
         (2028, 26, 29),
         (2032, 28, 31),
     ];
-
-    #[test]
-    fn the_clocks_change_on_the_last_sundays_of_march_and_october() {
-        for (year, march, october) in CHANGES {
-            assert_eq!(change(year, 3), Some(at(year, 3, march, 1, 0).naive_utc()));
-            assert_eq!(
-                change(year, 10),
-                Some(at(year, 10, october, 1, 0).naive_utc())
-            );
-        }
-    }
 
     #[test]
     fn summer_time_starts_at_01_00_utc_on_the_last_sunday_in_march() {
@@ -143,7 +86,7 @@ mod tests {
     #[test]
     fn the_local_time_can_be_on_the_next_day() {
         let local = uk_time(at(2026, 6, 30, 23, 30));
-        assert_eq!(local.date(), NaiveDate::from_ymd_opt(2026, 7, 1).unwrap());
+        assert_eq!(local.date(), date(2026, 7, 1));
         assert_eq!((local.hour(), local.minute()), (0, 30));
     }
 }

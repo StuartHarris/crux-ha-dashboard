@@ -7,7 +7,7 @@
 
 use alloc::{format, string::String, vec::Vec};
 
-use chrono::{DateTime, Timelike, Utc};
+use jiff::Timestamp;
 
 use crate::{
     Model,
@@ -306,7 +306,7 @@ impl From<&Model> for ViewModel {
             power: model.power.source(),
             battery: model.power.battery.map(rounded_level),
             status: status(connection, model.power.is_asleep(), model.unsent, read_only),
-            last_sync: time.and_then(|time| u64::try_from(time.timestamp()).ok()),
+            last_sync: time.and_then(|time| u64::try_from(time.as_second()).ok()),
             asleep: model.power.is_asleep(),
             read_only,
             updated,
@@ -389,7 +389,7 @@ fn tile_view(tile: &Tile, model: &Model) -> TileView {
 
 /// Returns the UK time of day of `time` as `HH:MM`. Refer to
 /// [`uk_time`](crate::local_time::uk_time).
-fn local_time(time: DateTime<Utc>) -> String {
+fn local_time(time: Timestamp) -> String {
     let local = uk_time(time);
     format!("{:02}:{:02}", local.hour(), local.minute())
 }
@@ -490,10 +490,9 @@ pub fn describe(kind: TileKind, entity: Option<&EntityState>) -> Description {
         TileKind::Sensor => {
             let text = match entity.attribute("unit_of_measurement") {
                 Some(unit) if !unit.is_empty() => format!("{state} {unit}"),
-                _ => DateTime::parse_from_rfc3339(state).map_or_else(
-                    |_| capitalise(state),
-                    |time| local_time(time.with_timezone(&Utc)),
-                ),
+                _ => state
+                    .parse::<Timestamp>()
+                    .map_or_else(|_| capitalise(state), local_time),
             };
             Description::new(TileState::Value, text)
         }

@@ -57,15 +57,16 @@
 //! is too long, and when the core drops a service call that is too long.
 
 use alloc::{
+    boxed::Box,
     format,
     string::{String, ToString},
     vec::Vec,
 };
 use core::{mem, time::Duration};
 
-use chrono::{DateTime, Utc};
 use crux_time::TimerHandle;
 use futures::StreamExt;
+use jiff::Timestamp;
 
 use crate::{
     Cmd, Model,
@@ -909,7 +910,8 @@ pub fn send(call: Call, tap: Option<Tap>, model: &mut Model) -> Cmd {
     if model.connection.link() == Link::Up {
         return match issue(call, tap, model) {
             Ok(mark) => pump(model).and(mark),
-            Err((call, tap)) => {
+            Err(back) => {
+                let (call, tap) = *back;
                 let entity_id = call.entity_id;
                 model.connection.outbox.insert(0, call);
                 pending::queued(entity_id, tap, model)
@@ -944,9 +946,10 @@ pub fn send(call: Call, tap: Option<Tap>, model: &mut Model) -> Cmd {
 /// # Errors
 ///
 /// Returns the call and the tap if the session cannot take the call now.
-fn issue(call: Call, tap: Option<Tap>, model: &mut Model) -> Result<Cmd, (Call, Option<Tap>)> {
+/// They are in a box, because the session usually takes the call.
+fn issue(call: Call, tap: Option<Tap>, model: &mut Model) -> Result<Cmd, Box<(Call, Option<Tap>)>> {
     let Some(live) = model.connection.phase.live_mut() else {
-        return Err((call, tap));
+        return Err(Box::new((call, tap)));
     };
     match live.session.publish(call.publish.clone()) {
         Ok(_) => Ok(pending::issued(call.entity_id, tap, model)),
@@ -964,7 +967,7 @@ fn issue(call: Call, tap: Option<Tap>, model: &mut Model) -> Result<Cmd, (Call, 
             pending::forget_dropped(model);
             Ok(reason)
         }
-        Err(Refused::Full | Refused::NotConnected) => Err((call, tap)),
+        Err(Refused::Full | Refused::NotConnected) => Err(Box::new((call, tap))),
     }
 }
 
@@ -976,8 +979,8 @@ fn drain_outbox(model: &mut Model) -> Cmd {
         let call = model.connection.outbox.remove(0);
         match issue(call, None, model) {
             Ok(command) => commands.push(command),
-            Err((call, _)) => {
-                model.connection.outbox.insert(0, call);
+            Err(back) => {
+                model.connection.outbox.insert(0, back.0);
                 break;
             }
         }
@@ -1614,7 +1617,7 @@ pub(crate) fn shows(model: &Model, entity_id: &str) -> bool {
 /// Each page has its own time, so a change on another page does not change
 /// the time of this page.
 #[must_use]
-pub fn page_time(model: &Model) -> Option<DateTime<Utc>> {
+pub fn page_time(model: &Model) -> Option<Timestamp> {
     model
         .entities
         .last_updated_minutes()

@@ -3,9 +3,9 @@
 
 use alloc::{format, string::String, vec::Vec};
 
-use chrono::{DateTime, Utc};
 use crux_core::{App, Command, macros::effect, render::RenderOperation};
 use crux_time::operation as time;
+use jiff::Timestamp;
 
 use crate::{
     capabilities::{
@@ -523,7 +523,7 @@ pub struct Model {
     /// `Start`. The footer shows this time only if no entity on the page has
     /// a `last_updated` time, for example after a wake, before the first
     /// messages arrive. Refer to [`connection::page_time`].
-    pub last_sync: Option<DateTime<Utc>>,
+    pub last_sync: Option<Timestamp>,
     /// The number of service calls that the core dropped, because it slept
     /// before it could send them.
     pub unsent: usize,
@@ -690,7 +690,7 @@ fn on_start(start: Start, model: &mut Model) -> Cmd {
     };
     let kept = last_sync
         .and_then(|seconds| i64::try_from(seconds).ok())
-        .and_then(|seconds| DateTime::from_timestamp(seconds, 0));
+        .and_then(|seconds| Timestamp::from_second(seconds).ok());
     model.last_sync = kept.or(model.last_sync);
     model.route = path
         .as_deref()

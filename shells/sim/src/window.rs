@@ -739,7 +739,7 @@ impl App {
             .collect();
         rows(ui, "effect log", entries.len(), |ui, index| {
             let entry = entries[index];
-            ui.monospace(entry.time.format(TIME).to_string());
+            ui.monospace(entry.time.strftime(TIME).to_string());
             ui.monospace(RichText::new(entry.effect).strong());
             if !entry.request.is_empty() {
                 ui.monospace(&entry.request);
@@ -761,7 +761,7 @@ impl App {
         let entries: Vec<_> = inspector.mqtt.filtered(&self.mqtt_filter).collect();
         rows(ui, "mqtt log", entries.len(), |ui, index| {
             let entry = entries[index];
-            ui.monospace(entry.time.format(TIME).to_string());
+            ui.monospace(entry.time.strftime(TIME).to_string());
             ui.monospace(match entry.direction {
                 Direction::In => "in ",
                 Direction::Out => "out",

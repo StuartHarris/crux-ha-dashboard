@@ -52,7 +52,7 @@ fn start_on_battery_also_starts_the_idle_timer() {
 fn the_idle_timeout_sleeps_in_steps_and_a_touch_wakes() {
     let app = Dashboard;
     let (mut model, mut wire) = drive_to_connected(PowerSource::Battery);
-    model.last_sync = chrono::DateTime::from_timestamp(crate::tests::NOW.cast_signed(), 0);
+    model.last_sync = jiff::Timestamp::from_second(crate::tests::NOW.cast_signed()).ok();
 
     // Step 1: publish `asleep`, then disconnect. The core waits for the
     // answer to the close of the stream.
