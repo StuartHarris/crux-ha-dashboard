@@ -20,9 +20,9 @@ nursery = { level = "warn", priority = -1 }
 unsafe_code = "forbid"
 
 [workspace.dependencies]
-# Crux with no_std support. Pinned to a commit on the `spike/no-std` branch.
-crux_core = { git = "https://github.com/redbadger/crux", rev = "890ab0e17e818addb74a5bd70f51db2d606d314a", default-features = false, features = ["crux_macros"] }
-crux_time = { git = "https://github.com/redbadger/crux", rev = "890ab0e17e818addb74a5bd70f51db2d606d314a", default-features = false }
+# Crux with no_std support, from the `spike/no-std` branch.
+crux_core = { git = "https://github.com/redbadger/crux", branch = "spike/no-std", default-features = false, features = ["crux_macros"] }
+crux_time = { git = "https://github.com/redbadger/crux", branch = "spike/no-std", default-features = false }
 chrono = { version = "0.4", default-features = false, features = ["alloc"] }
 serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
 serde_json = { version = "1.0", default-features = false, features = ["alloc"] }

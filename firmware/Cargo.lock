@@ -177,7 +177,7 @@ checksum = "790eea4361631c5e7d22598ecd5723ff611904e3344ce8720784c93e3d83d40b"
 [[package]]
 name = "crux_core"
 version = "0.21.0"
-source = "git+https://github.com/redbadger/crux?rev=890ab0e17e818addb74a5bd70f51db2d606d314a#890ab0e17e818addb74a5bd70f51db2d606d314a"
+source = "git+https://github.com/redbadger/crux?branch=spike%2Fno-std#74a1224ff84232fa23890e540f868229f5399f72"
 dependencies = [
  "critical-section",
  "crux_macros",
@@ -192,7 +192,7 @@ dependencies = [
 [[package]]
 name = "crux_macros"
 version = "0.11.0"
-source = "git+https://github.com/redbadger/crux?rev=890ab0e17e818addb74a5bd70f51db2d606d314a#890ab0e17e818addb74a5bd70f51db2d606d314a"
+source = "git+https://github.com/redbadger/crux?branch=spike%2Fno-std#74a1224ff84232fa23890e540f868229f5399f72"
 dependencies = [
  "darling 0.24.1",
  "heck",
@@ -205,7 +205,7 @@ dependencies = [
 [[package]]
 name = "crux_time"
 version = "0.19.0"
-source = "git+https://github.com/redbadger/crux?rev=890ab0e17e818addb74a5bd70f51db2d606d314a#890ab0e17e818addb74a5bd70f51db2d606d314a"
+source = "git+https://github.com/redbadger/crux?branch=spike%2Fno-std#74a1224ff84232fa23890e540f868229f5399f72"
 dependencies = [
  "crux_core",
  "facet",
