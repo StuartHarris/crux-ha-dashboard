@@ -649,7 +649,10 @@ async fn render(panel: &mut Panel<'static>, frames: &mut Frames, view: &ViewMode
         return;
     }
     let result = match refresh {
-        Refresh::Full => panel.full(&frames.next).await,
+        Refresh::Full => match panel.erase(&frames.shown).await {
+            Ok(()) => panel.full(&frames.next).await,
+            Err(error) => Err(error),
+        },
         Refresh::Partial(area) => {
             panel
                 .partial(&frames.shown, &frames.next, to_area(area))

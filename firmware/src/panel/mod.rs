@@ -134,6 +134,17 @@ const BYTES_PER_LINE: usize = WIDTH as usize / 4;
 const LINE_BYTES_4BPP: usize = WIDTH as usize / 2;
 const LINE_BYTES_DIFFERENCE: usize = WIDTH as usize;
 const DRAW_IMAGE_FRAME_COUNT: usize = 15;
+/// The black-and-white cycles of [`Panel::clear`]. Each cycle drives the
+/// whole panel black, then white, so each cycle is one flash. More cycles
+/// remove more ghost images. Upstream uses 4 cycles. With
+/// [`Panel::erase`] first, 1 cycle is enough. Without the erase, 1 or 2
+/// cycles leave ghost images.
+const CLEAR_CYCLES: u16 = 1;
+/// The frame times of [`Panel::erase`]. The fast waveform drives black to
+/// white in 5 frames of 1000, so the erase alone leaves ghost images. With
+/// the erase, 1 cycle of [`Panel::clear`] removes them. More frames make
+/// the fade too slow.
+const ERASE_FRAME_TIMES: [u16; 2] = [1000; 2];
 const DU_FRAME_TIMES: [u16; 5] = [1000, 1000, 1000, 1000, 1000];
 const DU_LUT_PHASE: [[u8; 4]; 16] = [
     [0x15, 0x55, 0x55, 0x55],
@@ -260,9 +271,25 @@ impl<'a> Panel<'a> {
         self.epd.write_registers(address, payload)
     }
 
-    /// Makes the whole panel white. The panel flashes.
+    /// Makes the whole panel white. The panel flashes once for each of
+    /// [`CLEAR_CYCLES`].
     pub async fn clear(&mut self) -> Result<()> {
-        self.clear_cycles(BOUNDS, 4, 50).await
+        self.clear_cycles(BOUNDS, CLEAR_CYCLES, 50).await
+    }
+
+    /// Drives each pixel that is not white in `shown`, the frame that the
+    /// panel shows now, to white for [`ERASE_FRAME_TIMES`]. The old image
+    /// fades to white, and the panel does not flash. Before
+    /// [`Panel::full`], this gives the pixels of the old image more drive
+    /// than the clear alone, so fewer ghost images stay. Those pixels were
+    /// driven dark, so this drive also keeps the charge of the panel more
+    /// balanced. `logic::waveform` builds the lines and the lookup table.
+    pub async fn erase(&mut self, shown: &Framebuffer) -> Result<()> {
+        waveform::fill_clean_lut(&mut self.lut);
+        self.drive(BOUNDS, &ERASE_FRAME_TIMES, |y, _, line| {
+            waveform::erase_line(row(shown, y), line)
+        })
+        .await
     }
 
     /// Draws `frame` with all 16 grey levels. The panel flashes, and the
