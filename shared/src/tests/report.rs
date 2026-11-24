@@ -12,12 +12,12 @@ use super::{
     start_at, tap_tile,
 };
 use crate::{
-    Event, PowerSource, Settings, Start,
+    Depth, Event, PowerSource, Settings, Start,
     capabilities::power::WakeSource,
     features::{
         connection::{RECONNECT_MIN, RESTART_REASON},
         power::{self, CHECK_PERIOD, IDLE_TIMEOUT, REPORT_CHECKS, REPORT_LIMIT, WakeReason},
-        refresh::PARTIALS_PER_FULL,
+        refresh::RENDERS_PER_DEEP,
         wifi::rules::RESTART_AFTER,
     },
     mqtt::{Publish, Qos, Refused, codec::server::Packet},
@@ -281,8 +281,8 @@ fn a_report_with_a_changed_entity_renders_once() {
 
     assert_eq!(shell.frames.len(), frames + 1);
     let frame = last_frame(&shell);
-    assert!(!frame.full);
-    assert_eq!(frame.view.full_refresh_seq, before.full_refresh_seq);
+    assert_eq!(frame.full, None);
+    assert_eq!(frame.view.full_refresh.seq, before.full_refresh.seq);
     assert_ne!(frame.view.page, before.page);
     assert_eq!(before.updated, "Last changed 09:41");
     assert_eq!(frame.view.updated, "Last changed 09:43");
@@ -346,7 +346,7 @@ fn a_report_on_the_home_page_draws_a_changed_light() {
     assert!(place(&log, "WifiOff") < place(&log, "Render"), "{log:?}");
     assert_eq!(shell.frames.len(), frames + 1);
     let frame = last_frame(&shell);
-    assert!(!frame.full);
+    assert_eq!(frame.full, None);
     assert_ne!(frame.view.page, before.page);
     assert!(
         shell
@@ -391,23 +391,23 @@ fn a_new_rounded_battery_level_renders_also_when_the_report_fails() {
     assert!(place(&log, "WifiOff") < place(&log, "Render"));
     assert_eq!(shell.frames.len(), frames + 1);
     assert_eq!(last_frame(&shell).view.battery, Some(75));
-    assert!(!last_frame(&shell).full);
+    assert_eq!(last_frame(&shell).full, None);
     assert_sleeps(&shell);
 }
 
 #[test]
-fn the_render_after_a_report_is_full_after_the_last_partial() {
+fn the_render_after_a_report_is_deep_after_the_last_counted_render() {
     let mut shell = asleep_in_the_living_room();
-    let seq = last_frame(&shell).view.full_refresh_seq;
-    shell.model.refresh.partials = PARTIALS_PER_FULL;
+    let seq = last_frame(&shell).view.full_refresh.seq;
+    shell.model.refresh.since_deep = RENDERS_PER_DEEP;
     shell.broker.set_state(ROCKET_LAMP, "off", &[]);
 
     report(&mut shell);
     assert_eq!(renders(&shell.take_log()), 1);
     let frame = last_frame(&shell);
-    assert!(frame.full);
-    assert_eq!(frame.view.full_refresh_seq, seq + 1);
-    assert_eq!(shell.model.refresh.partials, 0);
+    assert_eq!(frame.full, Some(Depth::Deep));
+    assert_eq!(frame.view.full_refresh.seq, seq + 1);
+    assert_eq!(shell.model.refresh.since_deep, 0);
     assert_sleeps(&shell);
 }
 
@@ -665,7 +665,7 @@ fn a_tap_during_a_report_wakes_publishes_online_and_acts() {
     );
     assert_eq!(shell.broker.service_calls.len(), 1, "{log:?}");
     assert!(shell.frames.len() > frames);
-    assert!(shell.frames[frames].full);
+    assert_eq!(shell.frames[frames].full, Some(Depth::Light));
     assert!(shell.take_cleared().contains(&REPORT_LIMIT));
     assert!(shell.waiting().contains(&IDLE_TIMEOUT));
     assert_eq!(shell.broker.retained(STATUS), Some("online"));
@@ -701,7 +701,7 @@ fn the_stand_during_a_report_wakes_and_publishes_online() {
     assert_eq!(shell.model.power.wake(), WakeReason::Stand);
     assert_eq!(last_two_statuses(&shell), ["reporting", "online"]);
     assert!(shell.take_cleared().contains(&REPORT_LIMIT));
-    assert!(last_frame(&shell).full);
+    assert_eq!(last_frame(&shell).full, Some(Depth::Light));
 }
 
 #[test]

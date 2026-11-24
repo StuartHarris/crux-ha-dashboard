@@ -190,7 +190,7 @@ use core::{mem, time::Duration};
 use serde::Serialize;
 
 use crate::{
-    Boot, Cmd, Model, PowerSource, ResetReason, Settings,
+    Boot, Cmd, Depth, Model, PowerSource, ResetReason, Settings,
     capabilities::{
         log::Area,
         power::{Charge, Reading},
@@ -201,7 +201,7 @@ use crate::{
         light::{self, Level},
         logs,
         power::{self, IdleEnd, WakeReason},
-        refresh::redraw,
+        refresh::{Draw, redraw},
         timer::Running,
         wifi,
     },
@@ -869,8 +869,8 @@ fn shown(payload: &[u8]) -> String {
 /// | Sleep now | on the stand | nothing | Info |
 /// | Restart | any | [`connection::close_for_restart`] | none in the core |
 /// | Full refresh | a restart waits | nothing | Debug |
-/// | Full refresh | awake | [`redraw`] with a full refresh | Debug |
-/// | Full refresh | asleep, also in a report | nothing, because the last image of the sleep is a full refresh | Debug |
+/// | Full refresh | awake | [`redraw`] with a deep full refresh | Debug |
+/// | Full refresh | asleep, also in a report | nothing, because the last image of the sleep is a deep full refresh | Debug |
 ///
 /// For a restart, the shell writes the warning
 /// `device: restart the chip: Home Assistant asked`.
@@ -894,7 +894,7 @@ fn pressed(button: Button, model: &mut Model) -> Cmd {
                 )
             } else {
                 logs::debug(Area::Device, "Home Assistant asked for a full refresh")
-                    .and(redraw(model, true))
+                    .and(redraw(model, Draw::Full(Depth::Deep)))
             }
         }
     }

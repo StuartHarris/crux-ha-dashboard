@@ -86,20 +86,70 @@ pub struct ViewModel {
     /// change that the page does not show does not change it, so the panel
     /// does not refresh each minute.
     pub updated: String,
-    /// A number that the core increases each time that the panel needs a
-    /// full refresh, to clear ghost images.
+    /// The last full refresh that the core asked for, to clear ghost
+    /// images.
     ///
     /// The core asks for a full refresh when the whole screen changes, after
-    /// a number of partial renders, and after a time. Refer to
+    /// a number of renders, and after a time. Refer to
     /// [`features::refresh`](crate::features::refresh). The shell keeps the
-    /// number of its last full refresh. If the number in the view is
-    /// different, the shell does a full refresh and keeps the new number.
-    /// This works also when the shell draws once for many `Render` requests.
+    /// sequence number of its last full refresh. If the number in the view
+    /// is different, the shell does a full refresh of this depth and keeps
+    /// the new number. This works also when the shell draws once for many
+    /// `Render` requests.
     ///
     /// The shell does not count refreshes. It does a full refresh for
     /// another reason only if the panel cannot draw the change with a
     /// partial refresh, for example grey pixels. Refer to `ui::Refresher`.
-    pub full_refresh_seq: u32,
+    pub full_refresh: FullRefresh,
+}
+
+/// How much a full refresh clears the panel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Depth {
+    /// A short clear. The panel flashes once. Use it when a person looks at
+    /// the panel, for example for a page change or a wake. It can leave
+    /// faint ghost images, which collect over many refreshes.
+    Light,
+    /// A long clear. The panel flashes more than once and shows no ghost
+    /// image. The core uses it to clean the panel after a number of renders
+    /// or a time, and when the shell does not know what the panel shows.
+    Deep,
+}
+
+/// A full refresh that the core asked for.
+///
+/// The sequence number and the depth are one value, so the shell always
+/// knows the depth of a new full refresh.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FullRefresh {
+    /// A number that the core increases for each full refresh.
+    pub seq: u32,
+    /// The depth of the full refresh with this number.
+    pub depth: Depth,
+}
+
+impl FullRefresh {
+    /// The value before the first full refresh. The core does a deep full
+    /// refresh at `Start`, so the depth is [`Depth::Deep`].
+    pub const NONE: Self = Self {
+        seq: 0,
+        depth: Depth::Deep,
+    };
+
+    /// Returns the next full refresh, with `depth`.
+    #[must_use]
+    pub const fn next(self, depth: Depth) -> Self {
+        Self {
+            seq: self.seq.wrapping_add(1),
+            depth,
+        }
+    }
+}
+
+impl Default for FullRefresh {
+    fn default() -> Self {
+        Self::NONE
+    }
 }
 
 impl ViewModel {
@@ -310,7 +360,7 @@ impl From<&Model> for ViewModel {
             asleep: model.power.is_asleep(),
             read_only,
             updated,
-            full_refresh_seq: model.full_refresh_seq,
+            full_refresh: model.full_refresh,
         }
     }
 }

@@ -111,8 +111,9 @@ Each `Effect` variant wraps one operation. The custom capabilities are in
 
 `view()` makes the `ViewModel` from the model (`shared/src/view.rs`). The view model
 has all the text that the panel shows: the page, the tiles, the status text, the
-power icon and the charge. It also has `full_refresh_seq`, which tells the shell to do
-a full refresh of the panel. The `ui` crate only draws it.
+power icon and the charge. It also has `full_refresh`, which tells the shell to do a
+full refresh of the panel, and its depth: light (1 flash) or deep (4 flashes). The `ui`
+crate only draws it.
 
 ### Features over one model
 

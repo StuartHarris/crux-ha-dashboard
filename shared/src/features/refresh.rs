@@ -5,30 +5,55 @@
 //! refresh is fast and does not flash, but it leaves a small ghost image.
 //! The ghost images become worse with each partial refresh and with time.
 //!
-//! The core asks for a full refresh when it increases
-//! [`ViewModel::full_refresh_seq`](crate::ViewModel::full_refresh_seq). It
-//! asks in these cases:
+//! A full refresh has a [`Depth`]. A light full refresh flashes once. It is
+//! clean for one page change, but faint ghost images collect over many
+//! light full refreshes. A deep full refresh flashes more than once and
+//! removes all ghost images.
 //!
-//! - The whole screen changes: at the start, at a wake, on a page change
-//!   and before sleep. The other features ask with [`redraw`].
-//! - After [`PARTIALS_PER_FULL`] partial renders since the last full
-//!   refresh.
-//! - [`FULL_REFRESH_INTERVAL`] after the last full refresh, while the device
-//!   is awake.
+//! The core asks for a full refresh when it sets a new
+//! [`ViewModel::full_refresh`](crate::ViewModel::full_refresh). The other
+//! features ask with [`redraw`] and a [`Draw`]. The core asks in these
+//! cases:
+//!
+//! - A light full refresh when a person looks at a new screen: a page
+//!   change and a wake.
+//! - A deep full refresh at the start and before sleep. After a boot or a
+//!   deep sleep, the shell does not know the image on the panel. The image
+//!   before sleep stays on the panel for the longest time, and nobody looks
+//!   at the flashes.
+//! - A deep full refresh when Home Assistant asks for a full refresh.
+//! - A deep full refresh after [`RENDERS_PER_DEEP`] renders since the last
+//!   deep full refresh.
+//! - A deep full refresh [`FULL_REFRESH_INTERVAL`] after the last deep full
+//!   refresh or the wake, while the device is awake.
+//!
+//! # The count of renders
+//!
+//! The core counts the renders since the last deep full refresh: the
+//! partial renders and the light full refreshes. When the count is
+//! [`RENDERS_PER_DEEP`], the next render is a deep full refresh, also if
+//! the caller asked for a partial render or a light full refresh. A deep
+//! full refresh starts the count again. A light full refresh does not.
+//! Thus a device that only changes pages also gets a deep full refresh.
 //!
 //! The core asks the shell to draw only when the view model changed since
 //! the last render that it asked for. A state message that repeats a value
 //! therefore draws nothing and does not count. The core counts its own
-//! partial renders, not the refreshes of the panel. A shell can draw many
-//! requests as one refresh, so the count is the largest number of partial
-//! refreshes between two full refreshes.
+//! renders, not the refreshes of the panel. A shell can draw many requests
+//! as one refresh, so the count is the largest number of refreshes between
+//! two deep full refreshes.
+//!
+//! A shell that draws many requests as one refresh sees only the last full
+//! refresh. If the core asks for a deep full refresh and then a light full
+//! refresh before the shell draws, the shell does a light full refresh, but
+//! the count already started again. Two full refreshes before one draw are
+//! rare. The next deep full refresh then comes after the interval or the
+//! count.
 //!
 //! The core does not look at pixels. The partial waveform of the panel
-//! cannot draw grey, so a shell also does a full refresh when the area that
-//! changed has grey pixels. Refer to `ui::Refresher`. The core does not know
-//! about such a full refresh, so it does not start its count again. The
-//! next full refresh of the core then comes earlier than necessary. The
-//! panel shows black and white only, so this is rare.
+//! cannot draw grey, so a shell also does a light full refresh when the
+//! area that changed has grey pixels. Refer to `ui::Refresher`. The core
+//! counted that render, so the count is correct.
 //!
 //! # The draw timer
 //!
@@ -58,26 +83,29 @@
 //! the retained messages change the entities. After the radio turns off,
 //! the core compares the view with the view of the image on the panel, with
 //! the time left out ([`image_changed`]). If they differ, it draws once with
-//! a partial refresh (a full refresh after [`PARTIALS_PER_FULL`] partial
+//! a partial refresh (a deep full refresh after [`RENDERS_PER_DEEP`]
 //! renders). A change of only the time does not draw, so the panel keeps
 //! the time of the last change that it drew. Refer to
 //! [`power::radio_off`].
 //!
 //! # The full-refresh timer and sleep
 //!
-//! Each full refresh starts the timer again and clears the timer before it.
-//! Ghost images come only from partial refreshes. If no partial render
-//! occurred since the last full refresh when the timer expires, the core
-//! does not ask for a full refresh. It starts the timer again, so that the
-//! timer always runs while the device is awake. That costs one timer each
-//! [`FULL_REFRESH_INTERVAL`], and the rule stays simple.
+//! The full-refresh timer asks for a deep full refresh. Each deep full
+//! refresh starts the timer again and clears the timer before it. A light
+//! full refresh starts the timer only if no timer runs, so page changes do
+//! not move the next deep full refresh later. If no render occurred since
+//! the last deep full refresh when the timer expires, the panel has no new
+//! ghost image. The core then does not ask for a full refresh. It starts
+//! the timer again, so that the timer always runs while the device is
+//! awake. That costs one timer each [`FULL_REFRESH_INTERVAL`], and the rule
+//! stays simple.
 //!
 //! While the device sleeps, no timer runs. The last image before sleep is a
-//! full refresh, and it clears the timer but does not start a new one. The
-//! panel keeps that image with no power, so the image does not need another
-//! refresh. The wake draws with a full refresh, which starts the timer
-//! again. A deep sleep loses the core and its timers, and the next `Start`
-//! draws with a full refresh.
+//! deep full refresh, and it clears the timer but does not start a new one.
+//! The panel keeps that image with no power, so the image does not need
+//! another refresh. The wake draws with a light full refresh, which starts
+//! the timer again. A deep sleep loses the core and its timers, and the
+//! next `Start` draws with a deep full refresh.
 //!
 //! # No draw before a restart
 //!
@@ -94,7 +122,7 @@ use alloc::string::String;
 use core::time::Duration;
 
 use crate::{
-    Cmd, Model, ViewModel,
+    Cmd, Depth, FullRefresh, Model, ViewModel,
     features::{power, timer::Slot, wifi},
 };
 
@@ -123,17 +151,19 @@ pub fn update(event: Event, model: &mut Model) -> Cmd {
 }
 use crux_core::render::render;
 
-/// The number of partial renders after which the core asks for a full
-/// refresh. The render after this number is a full refresh.
+/// The number of renders since the last deep full refresh after which the
+/// core asks for a deep full refresh. The render after this number is a
+/// deep full refresh.
 ///
-/// The count does not include a full refresh that a shell does for grey
-/// pixels, because the core does not know about it. Refer to the module
-/// documentation.
-pub const PARTIALS_PER_FULL: u32 = 30;
+/// The count includes the partial renders and the light full refreshes.
+/// Refer to the module documentation.
+pub const RENDERS_PER_DEEP: u32 = 30;
 
-/// The time after the last full refresh at which the core asks for another
-/// full refresh, while the device is awake. The core asks only if a partial
-/// render occurred since the last full refresh.
+/// The time after the last deep full refresh at which the core asks for
+/// another deep full refresh, while the device is awake.
+///
+/// After a sleep, the time starts at the wake. The core asks only if a
+/// render occurred since the last deep full refresh.
 pub const FULL_REFRESH_INTERVAL: Duration = Duration::from_mins(30);
 
 /// The wait between a change that the page shows and its draw.
@@ -147,13 +177,14 @@ pub const DRAW_DELAY: Duration = Duration::from_millis(200);
 /// The state of the refresh policy.
 #[derive(Debug, Default)]
 pub struct State {
-    /// The number of partial renders since the last full refresh.
-    pub partials: u32,
+    /// The number of renders since the last deep full refresh: the partial
+    /// renders and the light full refreshes.
+    pub since_deep: u32,
     /// The last id that the core took for a full-refresh timer. Each new
     /// timer takes the next id. The `Slot` `full` decides if an expiry is
     /// stale.
     pub timer: u32,
-    /// The full-refresh timer that runs.
+    /// The full-refresh timer that runs. It asks for a deep full refresh.
     full: Slot,
     /// The view of the last render that the core asked for.
     last: Option<ViewModel>,
@@ -174,14 +205,25 @@ impl State {
     }
 }
 
-/// Asks the shell to draw. If `full` is `true`, the core also asks for a
-/// full refresh of the panel. A later partial render does not cancel it.
+/// What a caller of [`redraw`] asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Draw {
+    /// Draw the changes. The shell uses a partial refresh where it can.
+    Partial,
+    /// Draw the whole screen with a full refresh of this depth.
+    Full(Depth),
+}
+
+/// Asks the shell to draw, as `draw` tells.
 ///
 /// A partial render occurs only if the view model changed since the last
 /// render that the core asked for. Otherwise the core asks for nothing, and
-/// the render does not count. A partial render is a full refresh if
-/// [`PARTIALS_PER_FULL`] partial renders came before it. A full refresh
-/// always renders.
+/// the render does not count. A full refresh always renders. A later
+/// partial render does not cancel it.
+///
+/// After [`RENDERS_PER_DEEP`] renders since the last deep full refresh, the
+/// render is a deep full refresh, also if `draw` is
+/// [`Draw::Partial`] or a light [`Draw::Full`].
 ///
 /// A full refresh clears the draw timer that waits. If a sleep waits for
 /// the pending marks and no mark is open, the full refresh then starts the
@@ -191,33 +233,49 @@ impl State {
 /// While the chip waits to restart, or while a report runs, the core asks
 /// for nothing, and the counts and timers do not change. Refer to the
 /// [module docs](self).
-pub fn redraw(model: &mut Model, full: bool) -> Cmd {
+pub fn redraw(model: &mut Model, draw: Draw) -> Cmd {
     if chip_restarts(model) || model.power.is_reporting() {
         return Cmd::done();
     }
     let mut next = ViewModel::from(&*model);
     let state = &mut model.refresh;
-    if !full && state.last.as_ref() == Some(&next) {
-        return Cmd::done();
-    }
-    if !full && state.partials < PARTIALS_PER_FULL {
-        state.partials += 1;
-        state.last = Some(next);
-        return render();
-    }
-    state.partials = 0;
+    let due = state.since_deep >= RENDERS_PER_DEEP;
+    let depth = match draw {
+        Draw::Partial if state.last.as_ref() == Some(&next) => return Cmd::done(),
+        Draw::Partial if !due => {
+            state.since_deep += 1;
+            state.last = Some(next);
+            return render();
+        }
+        Draw::Full(Depth::Light) if !due => Depth::Light,
+        Draw::Partial | Draw::Full(_) => Depth::Deep,
+    };
     // The full refresh draws the newest view, so the draw timer that waits
     // is stale.
     state.draw_timer.stop();
-    model.full_refresh_seq = model.full_refresh_seq.wrapping_add(1);
-    // The view is the same, except for the new number.
-    next.full_refresh_seq = model.full_refresh_seq;
+    let timer = match depth {
+        Depth::Light => {
+            state.since_deep += 1;
+            // The timer measures the time from the last deep full refresh.
+            // After a sleep, no timer runs, so the wake starts it.
+            if state.full.is_running() {
+                Cmd::done()
+            } else {
+                restart_timer(model)
+            }
+        }
+        Depth::Deep => {
+            state.since_deep = 0;
+            restart_timer(model)
+        }
+    };
+    model.full_refresh = model.full_refresh.next(depth);
+    // The view is the same, except for the new full refresh.
+    next.full_refresh = model.full_refresh;
     model.refresh.last = Some(next);
     // The draw timer can no longer start a sleep that waits for the marks,
     // so the full refresh starts it.
-    render()
-        .and(restart_timer(model))
-        .and(power::sleep_if_settled(model))
+    render().and(timer).and(power::sleep_if_settled(model))
 }
 
 /// Returns `true` if the view, with the time left out, is not the view of
@@ -226,7 +284,7 @@ pub fn redraw(model: &mut Model, full: bool) -> Cmd {
 ///
 /// The view of the image is the view of the last render that the core
 /// asked for. The compare leaves out the footer time (`updated` and
-/// `last_sync`) and `full_refresh_seq`. Home Assistant moves the time of an
+/// `last_sync`) and `full_refresh.seq`. Home Assistant moves the time of an
 /// entity also when only an attribute that the page does not show changes,
 /// or when a value changes but shows the same text. Such a change does not
 /// draw, and the panel keeps the time of the last change that it drew. With
@@ -240,12 +298,12 @@ pub fn image_changed(model: &Model) -> bool {
     without_time(now) != without_time(last.clone())
 }
 
-/// Returns `view` with no footer time and a `full_refresh_seq` of 0.
+/// Returns `view` with no footer time and with [`FullRefresh::NONE`].
 fn without_time(view: ViewModel) -> ViewModel {
     ViewModel {
         updated: String::new(),
         last_sync: None,
-        full_refresh_seq: 0,
+        full_refresh: FullRefresh::NONE,
         ..view
     }
 }
@@ -292,23 +350,23 @@ pub fn draw_due(id: u32, model: &mut Model) -> Cmd {
     if model.power.is_asleep() {
         return Cmd::done();
     }
-    redraw(model, false).and(power::sleep_if_settled(model))
+    redraw(model, Draw::Partial).and(power::sleep_if_settled(model))
 }
 
 /// The full-refresh timer `id` expired. The core ignores an older timer,
 /// and it ignores the timer while the device sleeps.
 ///
-/// If a partial render occurred since the last full refresh, the core asks
-/// for a full refresh. Otherwise, the panel has no new ghost image, so the
-/// core only starts the timer again.
+/// If a render occurred since the last deep full refresh, the core asks
+/// for a deep full refresh. Otherwise, the panel has no new ghost image, so
+/// the core only starts the timer again.
 pub fn timer_expired(id: u32, model: &mut Model) -> Cmd {
     if !model.refresh.full.expired(id) || model.power.is_asleep() {
         return Cmd::done();
     }
-    if model.refresh.partials == 0 {
+    if model.refresh.since_deep == 0 {
         return restart_timer(model);
     }
-    redraw(model, true)
+    redraw(model, Draw::Full(Depth::Deep))
 }
 
 /// Clears the timer that runs. If the device is awake, starts a new timer
@@ -328,8 +386,8 @@ fn restart_timer(model: &mut Model) -> Cmd {
 
 #[cfg(test)]
 mod tests {
-    //! Tests of the refresh feature: the full refresh after a number of partial
-    //! renders and after a time.
+    //! Tests of the refresh feature: the depth of each full refresh, and the
+    //! deep full refresh after a number of renders and after a time.
 
     use crate::features::refresh;
     use core::time::Duration;
@@ -338,11 +396,11 @@ mod tests {
 
     use crate::tests::{ExpectFullRefreshTimer, drive_to_connected, shell::Shell, start};
     use crate::{
-        Dashboard, EffectTestExt, Event, Model, PowerSource,
+        Dashboard, Depth, EffectTestExt, Event, Model, PowerSource,
         capabilities::power::Wake,
         features::power::IDLE_TIMEOUT,
         features::refresh::{
-            DRAW_DELAY, FULL_REFRESH_INTERVAL, PARTIALS_PER_FULL, redraw, redraw_soon,
+            DRAW_DELAY, Draw, FULL_REFRESH_INTERVAL, RENDERS_PER_DEEP, redraw, redraw_soon,
         },
     };
 
@@ -352,43 +410,54 @@ mod tests {
     }
 
     #[test]
-    fn the_render_after_the_last_partial_render_is_a_full_refresh() {
+    fn the_render_after_the_last_counted_render_is_a_deep_full_refresh() {
         let (mut model, _wire) = drive_to_connected(PowerSource::Stand);
-        // The start was a full refresh, and `Connected` drew once.
-        let seq = model.full_refresh_seq;
-        let partials = model.refresh.partials;
+        // The start was a deep full refresh, and `Connected` drew once.
+        let seq = model.full_refresh.seq;
+        let since_deep = model.refresh.since_deep;
 
-        for count in partials..PARTIALS_PER_FULL {
+        for count in since_deep..RENDERS_PER_DEEP {
             change_the_view(&mut model, count as usize + 1);
-            redraw(&mut model, false).expect_only_render();
+            redraw(&mut model, Draw::Partial).expect_only_render();
         }
-        assert_eq!(model.full_refresh_seq, seq);
+        assert_eq!(model.full_refresh.seq, seq);
 
         change_the_view(&mut model, 100);
-        redraw(&mut model, false)
+        redraw(&mut model, Draw::Partial)
             .expect_render()
             .expect_full_refresh_timer();
-        assert_eq!(model.full_refresh_seq, seq + 1);
-        assert_eq!(model.refresh.partials, 0);
+        assert_eq!(model.full_refresh.seq, seq + 1);
+        assert_eq!(model.full_refresh.depth, Depth::Deep);
+        assert_eq!(model.refresh.since_deep, 0);
 
         // The count starts again.
         change_the_view(&mut model, 101);
-        redraw(&mut model, false).expect_only_render();
-        assert_eq!(model.full_refresh_seq, seq + 1);
-        assert_eq!(model.refresh.partials, 1);
+        redraw(&mut model, Draw::Partial).expect_only_render();
+        assert_eq!(model.full_refresh.seq, seq + 1);
+        assert_eq!(model.refresh.since_deep, 1);
     }
 
     #[test]
     fn a_render_with_no_change_to_the_view_does_not_draw_or_count() {
         let (mut model, _wire) = drive_to_connected(PowerSource::Stand);
-        let partials = model.refresh.partials;
-        redraw(&mut model, false).expect_no_effects();
-        assert_eq!(model.refresh.partials, partials);
+        let since_deep = model.refresh.since_deep;
+        redraw(&mut model, Draw::Partial).expect_no_effects();
+        assert_eq!(model.refresh.since_deep, since_deep);
 
-        // A requested full refresh always draws.
-        redraw(&mut model, true)
+        // A full refresh always draws.
+        redraw(&mut model, Draw::Full(Depth::Light)).expect_only_render();
+        redraw(&mut model, Draw::Full(Depth::Deep))
             .expect_render()
             .expect_full_refresh_timer();
+    }
+
+    #[test]
+    fn an_unchanged_view_at_the_limit_does_not_draw() {
+        let (mut model, _wire) = drive_to_connected(PowerSource::Stand);
+        model.refresh.since_deep = RENDERS_PER_DEEP;
+        let seq = model.full_refresh.seq;
+        redraw(&mut model, Draw::Partial).expect_no_effects();
+        assert_eq!(model.full_refresh.seq, seq);
     }
 
     #[test]
@@ -398,36 +467,83 @@ mod tests {
         shell.broker.set_state("light.all_lights", "on", &[]);
         shell.run();
         let frames = shell.frames.len();
-        let partials = shell.model.refresh.partials;
+        let since_deep = shell.model.refresh.since_deep;
 
         // Home Assistant publishes the same state again.
         shell.take_log();
         shell.broker.set_state("light.all_lights", "on", &[]);
         shell.run();
         assert_eq!(shell.frames.len(), frames);
-        assert_eq!(shell.model.refresh.partials, partials);
+        assert_eq!(shell.model.refresh.since_deep, since_deep);
         assert!(!shell.take_log().contains(&"Render".into()));
     }
 
     #[test]
-    fn a_full_refresh_starts_the_count_again() {
+    fn a_light_full_refresh_counts_towards_the_deep_full_refresh() {
         let (mut model, _wire) = drive_to_connected(PowerSource::Stand);
-        for count in 0..10 {
-            change_the_view(&mut model, count + 1);
-            let _ = redraw(&mut model, false);
-        }
-        assert!(model.refresh.partials >= 10);
+        let since_deep = model.refresh.since_deep;
+        let seq = model.full_refresh.seq;
+
         let _ = Dashboard.update(Event::NextPage, &mut model);
-        assert_eq!(model.refresh.partials, 0);
+        assert_eq!(model.full_refresh.seq, seq + 1);
+        assert_eq!(model.full_refresh.depth, Depth::Light);
+        assert_eq!(model.refresh.since_deep, since_deep + 1);
     }
 
     #[test]
-    fn the_timer_asks_for_a_full_refresh_while_the_device_is_awake() {
+    fn a_deep_full_refresh_starts_the_count_again() {
+        let (mut model, _wire) = drive_to_connected(PowerSource::Stand);
+        for count in 0..10 {
+            change_the_view(&mut model, count + 1);
+            let _ = redraw(&mut model, Draw::Partial);
+        }
+        let _ = Dashboard.update(Event::NextPage, &mut model);
+        assert!(model.refresh.since_deep >= 11);
+
+        let _ = redraw(&mut model, Draw::Full(Depth::Deep));
+        assert_eq!(model.full_refresh.depth, Depth::Deep);
+        assert_eq!(model.refresh.since_deep, 0);
+    }
+
+    #[test]
+    fn page_turns_alone_give_a_deep_full_refresh_after_the_limit() {
+        let mut shell = Shell::new();
+        shell.send(start(PowerSource::Stand));
+        let first = shell.frames.len();
+        let since_deep = shell.model.refresh.since_deep;
+
+        let turns = RENDERS_PER_DEEP - since_deep + 1;
+        for _ in 0..turns {
+            shell.send(Event::NextPage);
+        }
+        let depths: alloc::vec::Vec<_> = shell.frames[first..]
+            .iter()
+            .map(|frame| frame.full)
+            .collect();
+        assert_eq!(depths.len(), turns as usize);
+        let (last, lights) = depths.split_last().unwrap();
+        assert!(
+            lights.iter().all(|depth| *depth == Some(Depth::Light)),
+            "{depths:?}"
+        );
+        assert_eq!(*last, Some(Depth::Deep));
+        assert_eq!(shell.model.refresh.since_deep, 0);
+    }
+
+    #[test]
+    fn the_start_is_a_deep_full_refresh() {
+        let mut shell = Shell::new();
+        shell.send(start(PowerSource::Stand));
+        assert_eq!(shell.frames[0].full, Some(Depth::Deep));
+    }
+
+    #[test]
+    fn the_timer_asks_for_a_deep_full_refresh_while_the_device_is_awake() {
         let app = Dashboard;
         let (mut model, _wire) = drive_to_connected(PowerSource::Stand);
-        // `Connected` drew once, so a partial render occurred.
-        assert!(model.refresh.partials > 0);
-        let seq = model.full_refresh_seq;
+        // `Connected` drew once, so a render occurred.
+        assert!(model.refresh.since_deep > 0);
+        let seq = model.full_refresh.seq;
         let id = model.refresh.timer;
 
         app.update(
@@ -436,7 +552,9 @@ mod tests {
         )
         .expect_render()
         .expect_full_refresh_timer();
-        assert_eq!(model.full_refresh_seq, seq + 1);
+        assert_eq!(model.full_refresh.seq, seq + 1);
+        assert_eq!(model.full_refresh.depth, Depth::Deep);
+        assert_eq!(model.refresh.since_deep, 0);
 
         // The old timer is stale.
         app.update(
@@ -447,12 +565,34 @@ mod tests {
     }
 
     #[test]
-    fn the_timer_with_no_partial_render_only_starts_again() {
+    fn the_timer_asks_for_a_deep_full_refresh_after_only_page_turns() {
         let app = Dashboard;
         let (mut model, _wire) = drive_to_connected(PowerSource::Stand);
+        let _ = redraw(&mut model, Draw::Full(Depth::Deep));
+        let id = model.refresh.timer;
+
+        // A page turn is a light full refresh. It keeps the timer that runs.
         let _ = app.update(Event::NextPage, &mut model);
-        assert_eq!(model.refresh.partials, 0);
-        let seq = model.full_refresh_seq;
+        assert_eq!(model.refresh.timer, id);
+        let seq = model.full_refresh.seq;
+
+        app.update(
+            Event::Refresh(refresh::Event::FullRefreshDue(id)),
+            &mut model,
+        )
+        .expect_render()
+        .expect_full_refresh_timer();
+        assert_eq!(model.full_refresh.seq, seq + 1);
+        assert_eq!(model.full_refresh.depth, Depth::Deep);
+    }
+
+    #[test]
+    fn the_timer_with_no_render_since_the_deep_full_refresh_only_starts_again() {
+        let app = Dashboard;
+        let (mut model, _wire) = drive_to_connected(PowerSource::Stand);
+        let _ = redraw(&mut model, Draw::Full(Depth::Deep));
+        assert_eq!(model.refresh.since_deep, 0);
+        let seq = model.full_refresh.seq;
         let id = model.refresh.timer;
 
         app.update(
@@ -462,7 +602,7 @@ mod tests {
         .expect_only_time_notify_after_with(|notify| {
             assert_eq!(Duration::from(notify.duration), FULL_REFRESH_INTERVAL);
         });
-        assert_eq!(model.full_refresh_seq, seq);
+        assert_eq!(model.full_refresh.seq, seq);
         assert_ne!(model.refresh.timer, id);
     }
 
@@ -482,20 +622,20 @@ mod tests {
     }
 
     #[test]
-    fn on_the_stand_the_panel_has_a_full_refresh_each_interval() {
+    fn on_the_stand_the_panel_has_a_deep_full_refresh_each_interval() {
         let mut shell = Shell::new();
         shell.send(start(PowerSource::Stand));
         // A state message draws with a partial refresh.
         shell.broker.set_state("light.all_lights", "on", &[]);
         shell.run();
-        assert!(!shell.frames.last().unwrap().full);
+        assert_eq!(shell.frames.last().unwrap().full, None);
         let frames = shell.frames.len();
 
         assert_eq!(full_refreshes_due(&mut shell), 1);
         assert_eq!(shell.frames.len(), frames + 1);
-        assert!(shell.frames.last().unwrap().full);
+        assert_eq!(shell.frames.last().unwrap().full, Some(Depth::Deep));
 
-        // The full refresh started the next timer. With no partial render
+        // The deep full refresh started the next timer. With no render
         // since, the next interval draws nothing.
         let frames = shell.frames.len();
         assert_eq!(full_refreshes_due(&mut shell), 1);
@@ -513,16 +653,43 @@ mod tests {
     }
 
     #[test]
-    fn each_full_refresh_starts_the_timer_again() {
+    fn each_deep_full_refresh_starts_the_timer_again() {
         let mut shell = Shell::new();
         shell.send(start(PowerSource::Stand));
         shell.take_log();
 
+        // The page turn comes at the limit, so it is a deep full refresh.
+        shell.model.refresh.since_deep = RENDERS_PER_DEEP;
         shell.send(Event::NextPage);
+        assert_eq!(shell.frames.last().unwrap().full, Some(Depth::Deep));
         let log = shell.take_log();
         assert!(log.contains(&"TimeClear".into()), "{log:?}");
         // Only the new timer runs.
         assert_eq!(full_refreshes_due(&mut shell), 1);
+    }
+
+    #[test]
+    fn a_light_full_refresh_keeps_the_timer_that_runs() {
+        let mut shell = Shell::new();
+        shell.send(start(PowerSource::Stand));
+        shell.advance(FULL_REFRESH_INTERVAL / 2);
+        shell.take_log();
+
+        shell.send(Event::NextPage);
+        assert_eq!(shell.frames.last().unwrap().full, Some(Depth::Light));
+        let log = shell.take_log();
+        assert!(!log.contains(&"TimeClear".into()), "{log:?}");
+
+        // The timer of the start expires at its time, and asks for a deep
+        // full refresh.
+        let events = shell.advance(FULL_REFRESH_INTERVAL / 2);
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, Event::Refresh(refresh::Event::FullRefreshDue(_)))),
+            "{events:?}"
+        );
+        assert_eq!(shell.frames.last().unwrap().full, Some(Depth::Deep));
     }
 
     #[test]
@@ -531,34 +698,37 @@ mod tests {
         shell.send(start(PowerSource::Battery));
         shell.advance(IDLE_TIMEOUT);
         assert!(shell.view().asleep);
+        // The last image before sleep is a deep full refresh.
+        assert_eq!(shell.frames.last().unwrap().full, Some(Depth::Deep));
         assert_eq!(full_refreshes_due(&mut shell), 0);
 
-        // The wake draws with a full refresh and starts the timer again.
+        // The wake draws with a light full refresh and starts the timer
+        // again.
         shell.take_log();
         shell.wake(Wake::Touch(None));
-        assert!(shell.frames.last().unwrap().full);
+        assert_eq!(shell.frames.last().unwrap().full, Some(Depth::Light));
         let timer = alloc::format!("TimeNotifyAfter {}ms", FULL_REFRESH_INTERVAL.as_millis());
         assert!(shell.take_log().contains(&timer));
     }
 
     #[test]
-    fn many_state_messages_give_a_full_refresh_after_the_partial_renders() {
+    fn many_state_messages_give_a_deep_full_refresh_after_the_limit() {
         let mut shell = Shell::new();
         shell.send(start(PowerSource::Stand));
         let first = shell.frames.len();
 
         // Each change of a visible tile draws once, with no extra draw for
         // `last_updated`.
-        for index in 0..=PARTIALS_PER_FULL {
+        for index in 0..=RENDERS_PER_DEEP {
             let state = if index % 2 == 0 { "on" } else { "off" };
             shell.broker.set_state("light.all_lights", state, &[]);
             shell.run();
         }
-        let full: usize = shell.frames[first..]
+        let full: alloc::vec::Vec<_> = shell.frames[first..]
             .iter()
-            .filter(|frame| frame.full)
-            .count();
-        assert_eq!(full, 1);
+            .filter_map(|frame| frame.full)
+            .collect();
+        assert_eq!(full, [Depth::Deep]);
     }
 
     #[test]
@@ -667,12 +837,12 @@ mod tests {
         shell.run();
         assert!(shell.model.refresh.draw_waits());
 
-        // The idle timeout puts the device to sleep. The last image is a full
-        // refresh with the change.
+        // The idle timeout puts the device to sleep. The last image is a deep
+        // full refresh with the change.
         shell.advance(IDLE_TIMEOUT.saturating_sub(before));
         assert!(shell.view().asleep);
         let frames = shell.frames.len();
-        assert!(shell.frames.last().unwrap().full);
+        assert_eq!(shell.frames.last().unwrap().full, Some(Depth::Deep));
 
         // The full refresh cleared the draw timer, so the timer does not fire.
         assert!(!shell.model.refresh.draw_waits());
@@ -725,8 +895,9 @@ mod tests {
         assert!(!shell.model.refresh.draw_waits());
         let log = shell.take_log();
         let clears = log.iter().filter(|effect| *effect == "TimeClear").count();
-        // The full-refresh timer and the draw timer.
-        assert_eq!(clears, 2, "{log:?}");
+        // Only the draw timer. A light full refresh keeps the full-refresh
+        // timer that runs.
+        assert_eq!(clears, 1, "{log:?}");
 
         let events = shell.advance(DRAW_DELAY);
         assert!(

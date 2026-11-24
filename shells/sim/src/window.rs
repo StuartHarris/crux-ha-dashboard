@@ -706,7 +706,10 @@ impl App {
                     .map_or_else(|| "none".into(), |id| id.to_string()),
             );
             fact("Timers", self.shell.timer_count().to_string());
-            fact("Full refresh seq", view.full_refresh_seq.to_string());
+            fact(
+                "Full refresh",
+                format!("{} ({:?})", view.full_refresh.seq, view.full_refresh.depth),
+            );
         });
         ui.separator();
         egui::CollapsingHeader::new("View model")

@@ -47,6 +47,7 @@ use esp_alloc::ExternalMemory;
 
 use embassy_futures::yield_now;
 use logic::{touch::Sample, waveform};
+use shared::Depth;
 use ui::Framebuffer;
 
 pub use ed047tc1::{GT911_ADDR_LOW, PCA9535_ADDR, PinConfig, TPS65185_ADDR};
@@ -134,15 +135,20 @@ const BYTES_PER_LINE: usize = WIDTH as usize / 4;
 const LINE_BYTES_4BPP: usize = WIDTH as usize / 2;
 const LINE_BYTES_DIFFERENCE: usize = WIDTH as usize;
 const DRAW_IMAGE_FRAME_COUNT: usize = 15;
-/// The black-and-white cycles of [`Panel::clear`]. Each cycle drives the
-/// whole panel black, then white, so each cycle is one flash. More cycles
-/// remove more ghost images. Upstream uses 4 cycles. With
-/// [`Panel::erase`] first, 1 cycle is enough. Without the erase, 1 or 2
-/// cycles leave ghost images.
-const CLEAR_CYCLES: u16 = 1;
+/// The black-and-white cycles of [`Panel::clear`] for a light full refresh.
+/// Each cycle drives the whole panel black, then white, so each cycle is
+/// one flash. More cycles remove more ghost images. With [`Panel::erase`]
+/// first, 1 cycle is enough for one page change. Without the erase, 1 or 2
+/// cycles leave ghost images. After many light full refreshes, faint ghost
+/// images collect. The core then asks for a deep full refresh.
+const LIGHT_CLEAR_CYCLES: u16 = 1;
+/// The black-and-white cycles of [`Panel::clear`] for a deep full refresh.
+/// Upstream uses 4 cycles. The panel flashes 4 times and shows no ghost
+/// image.
+const DEEP_CLEAR_CYCLES: u16 = 4;
 /// The frame times of [`Panel::erase`]. The fast waveform drives black to
 /// white in 5 frames of 1000, so the erase alone leaves ghost images. With
-/// the erase, 1 cycle of [`Panel::clear`] removes them. More frames make
+/// the erase, [`LIGHT_CLEAR_CYCLES`] of [`Panel::clear`] remove them. More frames make
 /// the fade too slow.
 const ERASE_FRAME_TIMES: [u16; 2] = [1000; 2];
 const DU_FRAME_TIMES: [u16; 5] = [1000, 1000, 1000, 1000, 1000];
@@ -271,17 +277,21 @@ impl<'a> Panel<'a> {
         self.epd.write_registers(address, payload)
     }
 
-    /// Makes the whole panel white. The panel flashes once for each of
-    /// [`CLEAR_CYCLES`].
-    pub async fn clear(&mut self) -> Result<()> {
-        self.clear_cycles(BOUNDS, CLEAR_CYCLES, 50).await
+    /// Makes the whole panel white. The panel flashes once for each cycle:
+    /// [`LIGHT_CLEAR_CYCLES`] or [`DEEP_CLEAR_CYCLES`], by `depth`.
+    pub async fn clear(&mut self, depth: Depth) -> Result<()> {
+        let cycles = match depth {
+            Depth::Light => LIGHT_CLEAR_CYCLES,
+            Depth::Deep => DEEP_CLEAR_CYCLES,
+        };
+        self.clear_cycles(BOUNDS, cycles, 50).await
     }
 
     /// Drives each pixel that is not white in `shown`, the frame that the
     /// panel shows now, to white for [`ERASE_FRAME_TIMES`]. The old image
-    /// fades to white, and the panel does not flash. Before
-    /// [`Panel::full`], this gives the pixels of the old image more drive
-    /// than the clear alone, so fewer ghost images stay. Those pixels were
+    /// fades to white, and the panel does not flash. [`Panel::full`] erases
+    /// before the clear. The erase gives the pixels of the old image more
+    /// drive than the clear alone, so fewer ghost images stay. Those pixels were
     /// driven dark, so this drive also keeps the charge of the panel more
     /// balanced. `logic::waveform` builds the lines and the lookup table.
     pub async fn erase(&mut self, shown: &Framebuffer) -> Result<()> {
@@ -292,10 +302,18 @@ impl<'a> Panel<'a> {
         .await
     }
 
-    /// Draws `frame` with all 16 grey levels. The panel flashes, and the
-    /// refresh clears ghost images.
-    pub async fn full(&mut self, frame: &Framebuffer) -> Result<()> {
-        self.clear().await?;
+    /// Draws `frame` with all 16 grey levels. `shown` is the frame that the
+    /// panel shows now. The panel first erases `shown` ([`Panel::erase`]),
+    /// then clears with the cycles of `depth` ([`Panel::clear`]). The panel
+    /// flashes, and the refresh clears ghost images.
+    pub async fn full(
+        &mut self,
+        shown: &Framebuffer,
+        frame: &Framebuffer,
+        depth: Depth,
+    ) -> Result<()> {
+        self.erase(shown).await?;
+        self.clear(depth).await?;
         self.draw(frame).await
     }
 

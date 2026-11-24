@@ -18,14 +18,14 @@ use crate::{
     entities::Entities,
     features::{
         connection, device, light, logs, pending, power,
-        refresh::{self, redraw},
+        refresh::{self, Draw, redraw},
         rooms, wifi,
     },
     layout::Page,
     mqtt::Credentials,
     pages::PAGES,
     route::Route,
-    view::ViewModel,
+    view::{Depth, FullRefresh, ViewModel},
 };
 
 /// The broker and device settings, which the shell supplies.
@@ -527,9 +527,9 @@ pub struct Model {
     /// The number of service calls that the core dropped, because it slept
     /// before it could send them.
     pub unsent: usize,
-    /// The number of full refreshes that the core asked for. See
-    /// [`ViewModel::full_refresh_seq`].
-    pub full_refresh_seq: u32,
+    /// The last full refresh that the core asked for. Refer to
+    /// [`ViewModel::full_refresh`].
+    pub full_refresh: FullRefresh,
     /// The state of the refresh policy. Refer to [`refresh`].
     pub refresh: refresh::State,
     /// The entities with a service call that Home Assistant did not confirm
@@ -556,7 +556,7 @@ impl Default for Model {
             light: light::State::default(),
             last_sync: None,
             unsent: 0,
-            full_refresh_seq: 0,
+            full_refresh: FullRefresh::NONE,
             refresh: refresh::State::default(),
             pending: pending::State::default(),
             logs: logs::State::default(),
@@ -703,9 +703,11 @@ fn on_start(start: Start, model: &mut Model) -> Cmd {
     device::start(model);
 
     // The state of the light after a reset is not known, so the core turns
-    // it off.
+    // it off. After a boot or a deep sleep, the shell does not know the
+    // image on the panel, so the erase before the clear does nothing. The
+    // first image is thus a deep full refresh.
     light::reset(model)
-        .and(redraw(model, true))
+        .and(redraw(model, Draw::Full(Depth::Deep)))
         .and(connection::go_online(model))
         .and(power::restart_idle_timer(model))
         .and(summary)

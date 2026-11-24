@@ -79,7 +79,7 @@ use crate::{
         device, light, logs,
         pending::{self, Tap},
         power,
-        refresh::{redraw, redraw_soon},
+        refresh::{Draw, redraw, redraw_soon},
         timer::{self, Running, Slot},
         wifi,
     },
@@ -682,7 +682,7 @@ fn present(model: &mut Model) -> (Cmd, bool) {
     } else {
         Cmd::done()
     };
-    (redraw(model, false).and(scan), published)
+    (redraw(model, Draw::Partial).and(scan), published)
 }
 
 /// The Wi-Fi feature has a link: connect, if the core wants a connection.
@@ -1420,7 +1420,7 @@ fn connected(model: &mut Model) -> Cmd {
         }
         phase => state.phase = phase,
     }
-    marks.and(redraw(model, false))
+    marks.and(redraw(model, Draw::Partial))
 }
 
 /// Handles a message from the broker on a subscribed topic. A birth
@@ -1590,7 +1590,10 @@ fn ended(end: &End, model: &mut Model) -> Cmd {
         model.connection.reconnects = model.connection.reconnects.saturating_add(1);
         schedule_reconnect(&end.to_string(), logs::warn, model)
     };
-    health.and(close).and(redraw(model, false)).and(retry)
+    health
+        .and(close)
+        .and(redraw(model, Draw::Partial))
+        .and(retry)
 }
 
 /// Returns `true` if the current page shows the entity `entity_id`. On a

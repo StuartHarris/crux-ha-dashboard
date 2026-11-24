@@ -637,7 +637,7 @@ async fn render(panel: &mut Panel<'static>, frames: &mut Frames, view: &ViewMode
     let Ok(()) = ui::draw(view, &mut frames.next);
     let refresh = frames
         .refresher
-        .decide(view.full_refresh_seq, &frames.shown, &frames.next);
+        .decide(view.full_refresh, &frames.shown, &frames.next);
     if refresh == Refresh::None {
         return;
     }
@@ -649,10 +649,7 @@ async fn render(panel: &mut Panel<'static>, frames: &mut Frames, view: &ViewMode
         return;
     }
     let result = match refresh {
-        Refresh::Full => match panel.erase(&frames.shown).await {
-            Ok(()) => panel.full(&frames.next).await,
-            Err(error) => Err(error),
-        },
+        Refresh::Full(depth) => panel.full(&frames.shown, &frames.next, depth).await,
         Refresh::Partial(area) => {
             panel
                 .partial(&frames.shown, &frames.next, to_area(area))

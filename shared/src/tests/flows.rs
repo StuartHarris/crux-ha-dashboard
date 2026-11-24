@@ -10,7 +10,7 @@ use super::{
     tap_tile,
 };
 use crate::{
-    Connection, Event, LightState,
+    Connection, Depth, Event, LightState,
     LightState::{Off, On, Unavailable},
     PowerSource, RoomSummary, Route, TileState,
     capabilities::power::{Wake, WakeSource},
@@ -189,7 +189,7 @@ fn on_the_stand_the_dashboard_shows_live_state_and_controls_lights() {
         .set_state("light.living_room_rocket_lamp", "off", &[]);
     shell.run();
     assert_eq!(shell.view().tiles()[1].text, "Off");
-    assert!(!shell.frames.last().unwrap().full);
+    assert_eq!(shell.frames.last().unwrap().full, None);
 
     shell.send(tap_scene(1));
     let call = shell.broker.service_calls.last().unwrap();
@@ -285,7 +285,7 @@ fn on_battery_the_dashboard_wakes_syncs_accepts_taps_then_sleeps() {
     );
 
     let frame = shell.frames.last().unwrap();
-    assert!(frame.full);
+    assert_eq!(frame.full, Some(Depth::Deep));
     let last = &frame.view;
     assert!(last.asleep);
     assert_eq!(last.connection, Connection::Offline);
@@ -618,7 +618,7 @@ fn a_full_refresh_is_kept_when_a_partial_redraw_follows_before_the_shell_draws()
     let mut shell = house();
     shell.send(start(PowerSource::Stand));
     shell.send(tap_all_lights());
-    assert!(!shell.frames.last().unwrap().full);
+    assert_eq!(shell.frames.last().unwrap().full, None);
 
     // The page changes, and the connection drops before the shell draws.
     // The drop asks for a partial redraw. The shell draws once, with a full
@@ -630,7 +630,7 @@ fn a_full_refresh_is_kept_when_a_partial_redraw_follows_before_the_shell_draws()
     shell.run();
     assert_eq!(shell.frames.len(), frames + 1);
     let frame = shell.frames.last().unwrap();
-    assert!(frame.full);
+    assert_eq!(frame.full, Some(Depth::Light));
     assert_eq!(frame.view.connection, Connection::Connecting);
     assert_eq!(frame.view.path, "/room/living_room");
 }
@@ -805,7 +805,11 @@ fn on_battery_a_tap_while_asleep_wakes_and_toggles_the_light() {
     // acts on it.
     shell.send(tap_all_lights());
     assert!(!shell.view().asleep);
-    assert!(shell.frames[frames..].iter().any(|frame| frame.full));
+    assert!(
+        shell.frames[frames..]
+            .iter()
+            .any(|frame| frame.full == Some(Depth::Light))
+    );
     assert_eq!(shell.view().connection, Connection::Online);
     assert_eq!(shell.broker.service_calls.len(), 1);
     assert_eq!(shell.broker.state("light.all_lights"), Some("off"));
@@ -837,7 +841,7 @@ fn the_plus_and_minus_buttons_change_the_brightness_of_a_light() {
         tile("Rocket lamp", TileState::On, "On 75%")
     );
     assert_eq!(shell.view().tiles()[1].detail, "75%");
-    assert!(!shell.frames.last().unwrap().full);
+    assert_eq!(shell.frames.last().unwrap().full, None);
 
     // Each step down takes 25% off. At 0, Home Assistant turns the light off.
     shell.send(tap_minus(1));
@@ -1038,12 +1042,12 @@ fn the_index_shows_a_summary_of_each_room_and_a_tap_shows_the_room() {
         .set_state("light.back_garden_garden_light", "off", &[]);
     shell.run();
     assert_eq!(summaries(&shell)[8], summary("Outside", &[On, Off], None));
-    assert!(!shell.frames.last().unwrap().full);
+    assert_eq!(shell.frames.last().unwrap().full, None);
 
     // A tap on a room shows the room with a full refresh.
     shell.send(tap_room(8));
     let frame = shell.frames.last().unwrap();
-    assert!(frame.full);
+    assert_eq!(frame.full, Some(Depth::Light));
     assert_eq!(frame.view.title, "Outside");
     assert_eq!(frame.view.path, "/room/outside");
     assert_eq!(texts(&shell)[0], tile("Porch", TileState::On, "On"));
@@ -1058,7 +1062,7 @@ fn the_index_shows_a_summary_of_each_room_and_a_tap_shows_the_room() {
     assert_eq!(shell.broker.service_calls.len(), 0);
 
     shell.send(Event::Navigate(Route::Home));
-    assert!(shell.frames.last().unwrap().full);
+    assert_eq!(shell.frames.last().unwrap().full, Some(Depth::Light));
     assert!(shell.view().index().is_some());
 }
 
@@ -1072,7 +1076,7 @@ fn the_all_lights_toggle_calls_home_assistant() {
     assert_eq!(call.service, "light.toggle");
     assert_eq!(call.entity_id, "light.all_lights");
     assert_eq!(header(&shell)[0], tile("All lights", TileState::Off, "Off"));
-    assert!(!shell.frames.last().unwrap().full);
+    assert_eq!(shell.frames.last().unwrap().full, None);
 
     // The index has no tiles, so the core ignores a tile on the home page.
     shell.send(tap_tile(0));

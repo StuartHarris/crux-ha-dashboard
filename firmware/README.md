@@ -616,8 +616,10 @@ The bring-up on 2026-11-18 gave these results:
 These items stay open:
 
 - VCOM is 1600 mV, the value of the vendor firmware (`src/panel/ed047tc1.rs`).
-- The core asks for a full refresh after 30 partial renders and after 30 minutes
-  (`shared/src/features/refresh.rs`). Change the numbers if ghost images show.
+- A page change and a wake use a light full refresh (1 clear cycle). The core asks
+  for a deep full refresh (4 clear cycles) at the start, before sleep, after 30
+  renders and after 30 minutes (`shared/src/features/refresh.rs`). Change the
+  numbers if ghost images show.
 - Measure the time from the CONNACK to the end of the subscribe with the 7 SUBSCRIBE
   packets in one write. At each close of the stream, the log shows the count and the
   time of the updates of the core since the stream opened. A warning shows for an update of more than 50 ms.

@@ -18,7 +18,8 @@ use std::path::{Path, PathBuf};
 use embedded_graphics::{pixelcolor::Gray4, prelude::*, primitives::Rectangle};
 use embedded_graphics_simulator::{OutputSettings, SimulatorDisplay};
 use shared::{
-    Control, Event, PageView, PowerSource, TileState, ViewModel, fixtures::FixedShell, pages::PAGES,
+    Control, Depth, Event, PageView, PowerSource, TileState, ViewModel, fixtures::FixedShell,
+    pages::PAGES,
 };
 use ui::{Framebuffer, Refresh, Refresher};
 
@@ -262,8 +263,8 @@ fn a_tap_from_off_to_pending_is_partial_and_the_confirm_is_a_clean_refresh() {
     let Ok(()) = ui::draw(&off, &mut shown);
     let mut refresher = Refresher::default();
     assert_eq!(
-        refresher.decide(off.full_refresh_seq, &shown, &shown),
-        Refresh::Full
+        refresher.decide(off.full_refresh, &shown, &shown),
+        Refresh::Full(Depth::Deep)
     );
 
     // The pattern has black and white pixels only, so the panel does not
@@ -271,11 +272,11 @@ fn a_tap_from_off_to_pending_is_partial_and_the_confirm_is_a_clean_refresh() {
     shell.send(tap(Control::Tile(3)));
     let pending = shell.view();
     assert_eq!(pending.tiles()[3].state, TileState::Pending);
-    assert_eq!(pending.full_refresh_seq, off.full_refresh_seq);
+    assert_eq!(pending.full_refresh, off.full_refresh);
     let mut next = Framebuffer::new();
     let Ok(()) = ui::draw(&pending, &mut next);
     assert!(matches!(
-        refresher.decide(pending.full_refresh_seq, &shown, &next),
+        refresher.decide(pending.full_refresh, &shown, &next),
         Refresh::Partial(_)
     ));
 
@@ -289,7 +290,7 @@ fn a_tap_from_off_to_pending_is_partial_and_the_confirm_is_a_clean_refresh() {
     let mut last = Framebuffer::new();
     let Ok(()) = ui::draw(&on, &mut last);
     assert!(matches!(
-        refresher.decide(on.full_refresh_seq, &next, &last),
+        refresher.decide(on.full_refresh, &next, &last),
         Refresh::Clean { .. }
     ));
     let panel = Rectangle::new(Point::zero(), Size::new(ui::WIDTH, ui::HEIGHT));
@@ -305,7 +306,7 @@ fn a_scene_button_that_leaves_the_pattern_is_a_clean_refresh_of_the_button() {
     let mut shown = Framebuffer::new();
     let Ok(()) = ui::draw(&pending, &mut shown);
     let mut refresher = Refresher::default();
-    let _ = refresher.decide(pending.full_refresh_seq, &shown, &shown);
+    let _ = refresher.decide(pending.full_refresh, &shown, &shown);
 
     // The button has text and a border on the pattern, so not each cell has
     // a dot. The button still has enough dots for a clean refresh.
@@ -315,8 +316,7 @@ fn a_scene_button_that_leaves_the_pattern_is_a_clean_refresh_of_the_button() {
     }
     let mut next = Framebuffer::new();
     let Ok(()) = ui::draw(&done, &mut next);
-    let Refresh::Clean { area, dots } = refresher.decide(done.full_refresh_seq, &shown, &next)
-    else {
+    let Refresh::Clean { area, dots } = refresher.decide(done.full_refresh, &shown, &next) else {
         panic!("not a clean refresh");
     };
     let button = ui::layout::scene(0).expect("the first scene button");
