@@ -7,7 +7,7 @@ use core::{
 
 use embedded_graphics::prelude::Point;
 use shared::{
-    Boot, BootLine, Cmd, Connection, Effect, Event, Firmware, PowerSource, ResetReason,
+    Boot, BootLine, Cmd, Connection, Effect, Event, Firmware, KeyEdge, PowerSource, ResetReason,
     capabilities::{
         log::{self, Area, Level, Log, Uptime},
         power::Wake,
@@ -1355,6 +1355,35 @@ fn a_tap_from_the_wake_answers_sleep_once() {
     // The tap answered the `Sleep` request. A late wake finds no request,
     // so it gives no jobs.
     assert_eq!(device.handle(Signal::Woke(Wake::Touch(None))), Vec::new());
+}
+
+#[test]
+fn a_key_down_while_sleep_waits_is_the_wake() {
+    let mut device = asleep();
+    let jobs = device.handle(Signal::Key(KeyEdge::Down));
+    assert!(!device.is_sleeping());
+    assert!(!device.view().asleep);
+    assert!(
+        names(&jobs).iter().any(|name| name.starts_with("join")),
+        "{:?}",
+        names(&jobs)
+    );
+    // The key answered the `Sleep` request. A late wake gives no jobs.
+    assert_eq!(device.handle(Signal::Woke(Wake::Touch(None))), Vec::new());
+
+    // A press that wakes the device is short, so the wake shows the index
+    // page. The `Up` edge after the wake does nothing.
+    assert_eq!(device.view().path, "/");
+    let _ = device.handle(Signal::Key(KeyEdge::Up));
+    assert_eq!(device.view().path, "/");
+}
+
+#[test]
+fn a_key_up_while_sleep_waits_goes_to_the_core_and_does_not_wake() {
+    let mut device = asleep();
+    let _ = device.handle(Signal::Key(KeyEdge::Up));
+    assert!(device.is_sleeping());
+    assert!(device.view().asleep);
 }
 
 /// Returns the wake sources of the `Sleep` job in `jobs`.

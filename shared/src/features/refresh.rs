@@ -123,7 +123,7 @@ use core::time::Duration;
 
 use crate::{
     Cmd, Depth, FullRefresh, Model, ViewModel,
-    features::{power, timer::Slot, wifi},
+    features::{key, power, timer::Slot, wifi},
 };
 
 /// The internal events of the refresh policy. The core makes them from its
@@ -225,7 +225,8 @@ pub enum Draw {
 /// render is a deep full refresh, also if `draw` is
 /// [`Draw::Partial`] or a light [`Draw::Full`].
 ///
-/// A full refresh clears the draw timer that waits. If a sleep waits for
+/// A full refresh clears the draw timer that waits, and the long-press
+/// timer of the key ([`key::full_refresh_started`]). If a sleep waits for
 /// the pending marks and no mark is open, the full refresh then starts the
 /// sleep. Refer to [`power::sleep_if_settled`]. Thus a caller that cancels
 /// that sleep must do so before the full refresh.
@@ -270,6 +271,8 @@ pub fn redraw(model: &mut Model, draw: Draw) -> Cmd {
         }
     };
     model.full_refresh = model.full_refresh.next(depth);
+    // A press of the key that overlaps a full refresh cannot be long.
+    key::full_refresh_started(model);
     // The view is the same, except for the new full refresh.
     next.full_refresh = model.full_refresh;
     model.refresh.last = Some(next);

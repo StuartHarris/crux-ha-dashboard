@@ -7,7 +7,9 @@
 //! 3. The panel: a clear, then 16 grey bars with a full refresh.
 //! 4. A partial refresh: a black rectangle with the fast waveform.
 //! 5. A page of the dashboard, from the core, with a full refresh.
-//! 6. Touch: for 30 seconds, the raw and the panel point of each tap.
+//! 6. Touch: for 30 seconds, the raw and the panel point of each tap, each
+//!    edge of the touch key, and the raw status byte (0x814E) each time it
+//!    changes while INT is low.
 //! 7. Wi-Fi: a join and an address from DHCP.
 //!
 //! The MQTT checks use the `dashboard` binary with `read_only = true`.
@@ -35,7 +37,7 @@ use esp_backtrace as _;
 use esp_radio::wifi::WifiController;
 use logic::{
     shell::{Job, Shell},
-    touch::{Sample, Tapper, TouchMap},
+    touch::{KeyEdges, Sample, Tapper, TouchMap},
 };
 use shared::{Boot, Depth, Event, PowerSource, ResetReason};
 use static_cell::StaticCell;
@@ -175,7 +177,8 @@ async fn main(spawner: Spawner) -> ! {
     Timer::after(PAUSE).await;
 
     log::info!(
-        "step 6: touch for {} s. Tap the corners and the tiles.",
+        "step 6: touch for {} s. Tap the corners and the tiles. Then tap the key, hold \
+         it for 2 s, and release it.",
         TOUCH_STEP.as_secs()
     );
     match resolution {
@@ -248,19 +251,40 @@ async fn timed(name: &str, refresh: impl Future<Output = dashboard_firmware::pan
     }
 }
 
-/// Writes each tap, with the event that it gives on the page.
+/// Writes each tap, with the event that it gives on the page, and each edge
+/// of the touch key. While INT is low, it also writes the raw status byte
+/// (0x814E) each time the byte changes. Bit 7 is a new sample, bit 4 is the
+/// key, and bits 3 to 0 are the number of points.
 async fn touch(panel: &mut Panel<'_>, map: TouchMap, view: &shared::ViewModel) {
     let mut tapper = Tapper::default();
+    let mut keys = KeyEdges::default();
+    let mut last_status = None;
     let end = Instant::now() + TOUCH_STEP;
     while Instant::now() < end {
+        match panel.touch_status() {
+            Ok(Some(status)) if last_status != Some(status) => {
+                log::info!("status 0x814E = {status:#04x} ({status:08b})");
+                last_status = Some(status);
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => last_status = None,
+            Err(error) => log::warn!("touch status read failed: {error:?}"),
+        }
         match panel.touch_sample() {
             Ok(sample) => {
-                if sample == Sample::Released {
+                if let Some(edge) = keys.sample(&sample) {
+                    log::info!("key {edge:?}");
+                }
+                if sample == Sample::released() {
                     log::info!("release");
                 }
                 let point = sample.map(|raw| map.to_panel(raw));
-                if let (Sample::Pressed(raw), Some(tap)) =
-                    (sample, tapper.sample(Instant::now().as_millis(), point))
+                if let (
+                    Sample::Report {
+                        point: Some(raw), ..
+                    },
+                    Some(tap),
+                ) = (sample, tapper.sample(Instant::now().as_millis(), point))
                 {
                     let control = ui::hit_test(view, tap);
                     log::info!(

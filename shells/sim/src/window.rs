@@ -25,7 +25,7 @@ use eframe::egui::{
     TextureOptions, Ui, Vec2, ViewportCommand,
 };
 use embedded_graphics::{prelude::*, primitives::Rectangle};
-use shared::{Event, PowerSource, ViewModel, fake::FakeRadio};
+use shared::{Event, KeyEdge, PowerSource, ViewModel, fake::FakeRadio};
 
 use crate::{
     inspector::{Direction, Inspector, Log, ROUTINE_EFFECTS},
@@ -129,6 +129,31 @@ struct App {
     hide_routine: bool,
     effect_filter: String,
     mqtt_filter: String,
+    /// The touch key of the device. Refer to [`HomeKey`].
+    key: HomeKey,
+}
+
+/// The touch key of the device. The `H` key and the "Home key" button both
+/// hold it down. The window sends an edge to the core each time the key
+/// goes down or up, as the firmware does.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct HomeKey {
+    /// The key was down in the last frame.
+    down: bool,
+    /// The "Home key" button was held down in the last frame.
+    button: bool,
+}
+
+impl HomeKey {
+    /// Gives the key its level in this frame: `true` if the `H` key or the
+    /// button holds it down. Returns the edge if the level changed.
+    const fn level(&mut self, down: bool) -> Option<KeyEdge> {
+        if down == self.down {
+            return None;
+        }
+        self.down = down;
+        Some(if down { KeyEdge::Down } else { KeyEdge::Up })
+    }
 }
 
 /// The guard on the switch from a dry run to live service calls. The user
@@ -213,6 +238,7 @@ impl eframe::App for App {
         CentralPanel::no_frame()
             .frame(egui::Frame::NONE.fill(BACKGROUND))
             .show(ui, |ui| self.panel(ui, &view));
+        self.home_key(ui.ctx());
         // A control can make the core ask for a render. Draw it now and
         // paint it in the next frame.
         self.refresh(ui.ctx());
@@ -237,6 +263,7 @@ impl App {
             hide_routine: true,
             effect_filter: String::new(),
             mqtt_filter: String::new(),
+            key: HomeKey::default(),
         }
     }
 
@@ -332,6 +359,16 @@ impl App {
                     memory.surrender_focus(id);
                 }
             });
+        }
+    }
+
+    /// Sends an edge of the touch key to the core if the `H` key or the
+    /// "Home key" button changed the level of the key. Hold either one for
+    /// a long press. The `H` key works when no text box has the focus.
+    fn home_key(&mut self, ctx: &Context) {
+        let typed = !ctx.egui_wants_keyboard_input() && ctx.input(|input| input.key_down(Key::H));
+        if let Some(edge) = self.key.level(typed || self.key.button) {
+            self.shell.key(edge);
         }
     }
 
@@ -480,6 +517,7 @@ impl App {
             self.sleep_now_control(ui, view);
             self.restart_control(ui);
         });
+        self.home_key_control(ui);
         self.check_controls(ui, view);
         ui.label(format!("Connection: {:?}", view.connection));
 
@@ -519,7 +557,7 @@ impl App {
             RichText::new(
                 "Keys (when no text box has the focus): S stand/battery, [ and ] \
                  battery −10% and +10%, W wake with no cause, C check now, F fast checks, Z sleep now, R restart, \
-                 L drop the link, B block or unblock the device, A move the strongest \
+                 H the touch key (hold for a full refresh), L drop the link, B block or unblock the device, A move the strongest \
                  access point, K make the driver stuck or free, D outline, \
                  Left/Right page, Q quit",
             )
@@ -650,6 +688,20 @@ impl App {
         if clicked {
             self.shell.restart();
         }
+    }
+
+    /// Shows the "Home key" button, which acts as the touch key of the
+    /// device. A short press shows the index page. A press of 1 s or more
+    /// asks for a full refresh. The window reads the button at the end of
+    /// the frame ([`App::home_key`]).
+    fn home_key_control(&mut self, ui: &mut Ui) {
+        let response = ui
+            .add(egui::Button::new("Home key (H)").sense(Sense::click_and_drag()))
+            .on_hover_text(
+                "The touch key of the device. A short press shows the index page. Hold it \
+                 for 1 s for a full refresh. A press wakes the sleeping device.",
+            );
+        self.key.button = response.is_pointer_button_down_on();
     }
 
     /// Shows if a tap switches real devices. The core keeps the dry run, and
@@ -891,6 +943,20 @@ fn outline_rect(area: Rectangle, origin: Pos2, scale: u32, pixels_per_point: f32
 
 #[cfg(test)]
 mod tests {
+    use shared::KeyEdge;
+
+    use super::HomeKey;
+
+    #[test]
+    fn the_home_key_gives_one_edge_for_each_change_of_its_level() {
+        let mut key = HomeKey::default();
+        let edges: Vec<_> = [false, true, true, true, false, false, true]
+            .into_iter()
+            .filter_map(|down| key.level(down))
+            .collect();
+        assert_eq!(edges, [KeyEdge::Down, KeyEdge::Up, KeyEdge::Down]);
+    }
+
     #[test]
     fn the_tint_of_the_front_light_is_stronger_at_a_higher_level() {
         use shared::features::light::{DEFAULT_BATTERY_LEVEL, DEFAULT_STAND_LEVEL};

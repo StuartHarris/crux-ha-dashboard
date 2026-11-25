@@ -75,6 +75,7 @@
 //! | `Steps { IfChanged }` | the radio is off, and the image changed | `Sleeping { 0, 0 }` | `Render` (partial, or full after the last partial), Sleep |
 //! | `Steps { IfChanged }` | the radio is off, and only the time or nothing changed | `Sleeping { 0, 0 }` | Sleep |
 //! | `Sleeping` | `Wake::Touch(c)` | `Awake` | wake, connect, act on `c` |
+//! | `Sleeping` | `Wake::Key` | `Awake` | wake, connect, the key is down ([`key`]) |
 //! | `Sleeping { n, k }` | `Wake::Timer` (the check), the period is `p` checks, and `k + 1 < p` | `Sleeping { n, k + 1 }` | Sleep |
 //! | `Sleeping { n, k }` | `Wake::Timer`, the period is `p` checks, and `k + 1 >= p` | `Reporting` | the limit timer, connect, a Debug line, the Info line with `n` if `n > 1` |
 //! | `Sleeping { n, k }` | `Wake::Timer`, the period is off | `Sleeping { n, k + 1 }` | Sleep |
@@ -82,6 +83,7 @@
 //! | `Sleeping` | `Wake::PowerSource` | `Sleeping` (the same `k`) | a warning, Sleep |
 //! | `Held { n, k }` | the hold timer expires | `Sleeping { n, k }` | Sleep |
 //! | `Held` | `Tapped(c)` | `Awake` | clear the hold timer, wake, connect, act on `c` |
+//! | `Held` | `Key(Down)` | `Awake` | clear the hold timer, wake, connect, the key is down |
 //! | `Held` or `Sleeping` | the stand | `Stand` | clear the hold timer, connect |
 //! | `Reporting` | the session is up | `Reporting` | publish `reporting`, subscribe, then the device publish queue |
 //! | `Reporting` | the subscribe ends | `Reporting` | PINGREQ (the replay fence), no scan |
@@ -89,6 +91,7 @@
 //! | `Reporting` | the queue is settled and the PINGRESP came | `Steps { IfChanged }` of a new sleep | clear the limit timer, a Debug line, the steps |
 //! | `Reporting` | the limit timer expires | `Steps { IfChanged }` of a new sleep | an Info line with what was not done, the steps |
 //! | `Reporting` | `Tapped(c)` | `Awake` | clear the limit timer, wake, publish `online` on the session, act on `c` |
+//! | `Reporting` | `Key(Down)` | `Awake` | clear the limit timer, wake, publish `online` on the session, the key is down |
 //! | `Reporting` | the stand | `Stand` | clear the limit timer, publish `online` on the session |
 //! | any | `Start` | `Awake` or `Stand` | clear the hold timer or the limit timer |
 //!
@@ -127,7 +130,8 @@
 //!
 //! The core keeps what woke the device last ([`WakeReason`]) and publishes
 //! it in the state message. `Start` sets `Boot`. A touch wake, or a tap in
-//! the steps of a sleep or in a hold, sets `Touch` ([`wake_up`]). A move to
+//! the steps of a sleep or in a hold, sets `Touch` ([`wake_up`]). A press of
+//! the key is a touch, so it also sets `Touch`. A move to
 //! the stand while the device is asleep or in a report sets `Stand`. The
 //! checks of [`CHECK_PERIOD`], the reports and the wakes with no cause keep
 //! the device asleep, so they do not change it.
@@ -161,14 +165,14 @@ use period::{Checks, Tick};
 pub use period::{REPORT_CHECKS, REPORT_PERIOD, REPORT_PERIOD_MAX, ReportPeriod, report_period};
 
 use crate::{
-    Cmd, Depth, Model,
+    Cmd, Depth, KeyEdge, Model,
     capabilities::{
         log::Area,
         power::{Power, PowerSource, Reading, Wake, WakeSource},
     },
     features::{
         connection::{self, Link},
-        device, light, logs,
+        device, key, light, logs,
         refresh::{Draw, image_changed, redraw},
         rooms,
         timer::{Running, Slot},
@@ -708,6 +712,8 @@ pub fn reset(source: PowerSource, model: &mut Model) -> Cmd {
 ///
 /// - A touch wakes the device, which connects again. The touch also acts
 ///   as a tap on its control.
+/// - A press of the key wakes the device as a touch does. The key is then
+///   down. Refer to [`key`].
 /// - The timer is the check of the power source. The device stays asleep
 ///   and sends a new `Sleep` request. The first check at which the count of
 ///   the sleep reaches the report period starts a report instead
@@ -734,6 +740,7 @@ pub fn woke(id: u32, wake: Wake, model: &mut Model) -> Cmd {
     }
     match wake {
         Wake::Touch(control) => rooms::tapped(control, model),
+        Wake::Key => key::edge(KeyEdge::Down, model),
         Wake::Timer => match checks.tick(model.power.report) {
             Tick::Again(checks) => {
                 model.power.phase = Phase::Asleep {
@@ -1318,11 +1325,14 @@ fn sleep(last: LastImage, model: &mut Model) -> Cmd {
         id,
         rest: Rest::Steps { last },
     });
+    // No long-press timer can wait at the `Sleep` request.
+    let key = key::sleep_started(model);
     if light::is_on(model) {
-        return step_started(SleepStep::LightOff, id)
+        return key
+            .and(step_started(SleepStep::LightOff, id))
             .and(light::off(model).then(Cmd::event(Event::LightOffForSleep(id).into())));
     }
-    disconnect(id, model)
+    key.and(disconnect(id, model))
 }
 
 /// The scan for the sleep `id` stopped: publish `asleep` and disconnect.

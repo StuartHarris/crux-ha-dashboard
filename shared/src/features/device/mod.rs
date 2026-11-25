@@ -868,9 +868,7 @@ fn shown(payload: &[u8]) -> String {
 /// | Sleep now | asleep (the first steps of a sleep, or a report) | nothing | none |
 /// | Sleep now | on the stand | nothing | Info |
 /// | Restart | any | [`connection::close_for_restart`] | none in the core |
-/// | Full refresh | a restart waits | nothing | Debug |
-/// | Full refresh | awake | [`redraw`] with a deep full refresh | Debug |
-/// | Full refresh | asleep, also in a report | nothing, because the last image of the sleep is a deep full refresh | Debug |
+/// | Full refresh | any | [`full_refresh`] | Debug |
 ///
 /// For a restart, the shell writes the warning
 /// `device: restart the chip: Home Assistant asked`.
@@ -878,25 +876,56 @@ fn pressed(button: Button, model: &mut Model) -> Cmd {
     match button {
         Button::Sleep => sleep_pressed(model),
         Button::Restart => connection::close_for_restart(model),
-        Button::Refresh => {
-            if model.connection.restart_waits() {
-                // The reset can stop the refresh with the panel half
-                // drawn, so `redraw` does nothing.
-                logs::debug(
-                    Area::Device,
-                    "Home Assistant asked for a full refresh, but the chip restarts, so the core \
-                     ignored it",
-                )
-            } else if model.power.is_asleep() {
-                logs::debug(
-                    Area::Device,
-                    "the device sleeps, so it skips the full refresh",
-                )
-            } else {
-                logs::debug(Area::Device, "Home Assistant asked for a full refresh")
-                    .and(redraw(model, Draw::Full(Depth::Deep)))
-            }
+        Button::Refresh => full_refresh(Asker::HomeAssistant, model),
+    }
+}
+
+/// Who asked for a full refresh of the panel. Refer to [`full_refresh`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Asker {
+    /// The Full refresh button of Home Assistant.
+    HomeAssistant,
+    /// A long press of the key. Refer to [`key`](crate::features::key).
+    Key,
+}
+
+impl Asker {
+    /// Returns the words for the start of a line, for example `Home
+    /// Assistant`.
+    const fn words(self) -> &'static str {
+        match self {
+            Self::HomeAssistant => "Home Assistant",
+            Self::Key => "the key",
         }
+    }
+}
+
+/// `asker` asked for a full refresh. The rules are the same for each asker:
+///
+/// | The device | What the core does | Line |
+/// | --- | --- | --- |
+/// | a restart waits | nothing | Debug |
+/// | awake | [`redraw`] with a deep full refresh | Debug |
+/// | asleep, also in a report | nothing, because the last image of the sleep is a deep full refresh | Debug |
+pub fn full_refresh(asker: Asker, model: &mut Model) -> Cmd {
+    let who = asker.words();
+    if model.connection.restart_waits() {
+        // The reset can stop the refresh with the panel half drawn, so
+        // `redraw` does nothing.
+        logs::debug(
+            Area::Device,
+            format!(
+                "{who} asked for a full refresh, but the chip restarts, so the core ignored it"
+            ),
+        )
+    } else if model.power.is_asleep() {
+        logs::debug(
+            Area::Device,
+            "the device sleeps, so it skips the full refresh",
+        )
+    } else {
+        logs::debug(Area::Device, format!("{who} asked for a full refresh"))
+            .and(redraw(model, Draw::Full(Depth::Deep)))
     }
 }
 

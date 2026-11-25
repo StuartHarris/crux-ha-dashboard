@@ -17,7 +17,7 @@ use crate::{
     },
     entities::Entities,
     features::{
-        connection, device, light, logs, pending, power,
+        connection, device, key, light, logs, pending, power,
         refresh::{self, Draw, redraw},
         rooms, wifi,
     },
@@ -330,6 +330,16 @@ pub enum Event {
     /// Each tap also turns the front light on, also a tap on no control.
     /// Refer to [`light`].
     Tapped(Option<Control>),
+    /// The touch key on the front of the device went down or up. Refer to
+    /// [`key`].
+    ///
+    /// The shell sends each edge once. While a `Sleep` request waits, the
+    /// shell answers it with `Wake::Key` in place of the `Down` edge. The
+    /// shell sends the `Up` edge after the wake as usual. The core decides
+    /// what the press does: a short press shows the index page, and a long
+    /// press asks for a deep full refresh. Each press is a touch, as a tap
+    /// is.
+    Key(KeyEdge),
     /// The user asked for the next page.
     NextPage,
     /// The user asked for the previous page.
@@ -403,6 +413,19 @@ pub enum Event {
     /// The internal events of the device feature. The core makes them from
     /// its timers. The shell never sends them.
     Device(device::Event),
+    /// The internal events of the key feature. The core makes them from its
+    /// long-press timer. The shell never sends them.
+    KeyTimer(key::Event),
+}
+
+/// An edge of the touch key on the front of the device. Refer to
+/// [`Event::Key`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyEdge {
+    /// The key went down.
+    Down,
+    /// The key went up.
+    Up,
 }
 
 /// A control on the panel.
@@ -491,8 +514,8 @@ pub enum Effect {
     /// sends its kept lines to Home Assistant with their ages. Refer to
     /// [`logs`].
     LogClock(LogClock),
-    /// Start a timer: the idle, light, draw, refresh, mark, radio-limit,
-    /// reconnect, close and session timers.
+    /// Start a timer: the idle, light, long-press, draw, refresh, mark,
+    /// radio-limit, reconnect, close and session timers.
     TimeNotifyAfter(time::NotifyAfter),
     /// Clear a timer that the core does not need any more.
     TimeClear(time::ClearTimer),
@@ -541,6 +564,8 @@ pub struct Model {
     /// The discovery of the dashboard as a device of Home Assistant. Refer
     /// to [`device`].
     pub device: device::State,
+    /// The state of the touch key. Refer to [`key`].
+    pub key: key::State,
 }
 
 impl Default for Model {
@@ -561,6 +586,7 @@ impl Default for Model {
             pending: pending::State::default(),
             logs: logs::State::default(),
             device: device::State::default(),
+            key: key::State::default(),
         }
     }
 }
@@ -612,6 +638,7 @@ impl Model {
             Event::PowerSourceChanged(source) => power::source_changed(source, self),
             Event::BatteryChanged(level) => power::battery_changed(level, self),
             Event::Tapped(control) => rooms::tapped(control, self),
+            Event::Key(edge) => key::edge(edge, self),
             Event::NextPage => rooms::turn_page(self, true),
             Event::PreviousPage => rooms::turn_page(self, false),
             Event::Navigate(route) => rooms::navigate(route, self),
@@ -633,6 +660,7 @@ impl Model {
             Event::Light(event) => light::update(event, self),
             Event::Logs(event) => logs::update(event, self),
             Event::Device(event) => device::update(event, self),
+            Event::KeyTimer(event) => key::update(event, self),
         }
     }
 }
@@ -699,6 +727,7 @@ fn on_start(start: Start, model: &mut Model) -> Cmd {
         .or_else(|| model.pages.first().map(Page::route))
         .unwrap_or_default();
     let summary = power::reset(source, model);
+    key::reset(model);
     connection::reset(model);
     device::start(model);
 

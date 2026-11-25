@@ -1,5 +1,6 @@
 //! The display task: it draws the newest view model on the panel, and it
-//! reads the touch controller between refreshes.
+//! reads the touch controller between refreshes. The touch controller
+//! gives the taps on the panel and the edges of the touch key.
 //!
 //! The panel and the touch controller share the I2C bus, so one task owns
 //! both of them. A refresh takes up to about two seconds. The task does not
@@ -54,9 +55,9 @@ use logic::{
     },
     shell::Signal,
     sleep::{Blocker, Cause, Plan, Readiness, Sleeper},
-    touch::{Sample, Tapper, TouchMap},
+    touch::{KeyEdges, Sample, Tapper, TouchMap},
 };
-use shared::{Event, PowerSource, Reading, ViewModel, capabilities::power::Wake};
+use shared::{Event, KeyEdge, PowerSource, Reading, ViewModel, capabilities::power::Wake};
 use ui::{Framebuffer, Refresh, Refresher};
 
 use crate::{IN_FLIGHT, LIGHT, RENDER, SIGNALS, SLEEP};
@@ -171,9 +172,11 @@ impl Light {
 /// timer if the job has a timer. The core decides the schedule. After each
 /// wake, the task drops the job and answers at once:
 ///
-/// - After a touch wake, the task reads the point and sends it as a tap,
-///   which answers the job and acts on its control. If it cannot read the
-///   point, it answers `Wake::Touch(None)`.
+/// - After a touch wake, the task reads the sample. If the touch key is
+///   down, the task sends the `Down` edge, which answers the job with
+///   `Wake::Key`. The `Up` edge comes later from the touch poll. Else the
+///   task sends the point as a tap, which answers the job and acts on its
+///   control. If it cannot read the point, it answers `Wake::Touch(None)`.
 /// - After a timer wake, the task reads the charger, then answers
 ///   `Wake::Timer`. If the charger shows a new source, the power poll reads
 ///   it again after `POWER_CONFIRM`, and the chip does not sleep before
@@ -211,9 +214,10 @@ impl Sleep {
         self.job = job;
     }
 
-    /// The task sent a tap. The tap answers the job that waits, so the task
-    /// drops it. The chip does not sleep before the core task handled the
-    /// tap (`logic::sleep::TAP_HOLD_MS`).
+    /// The task sent a tap or a `Down` edge of the key. Each one answers
+    /// the job that waits, so the task drops it. The chip does not
+    /// sleep before the core task handled the signal
+    /// (`logic::sleep::TAP_HOLD_MS`).
     fn tapped(&mut self) {
         self.job = None;
         self.sleeper.tapped(now_ms());
@@ -281,15 +285,25 @@ impl Sleep {
                     "power: woke by a touch after {slept} ms, average current {}",
                     Milliamps(current)
                 );
-                // The GT911 holds the point while INT is low. The tap at the
-                // point answers the job (`logic::shell`), and it acts on its
-                // control.
-                if let Some(point) = touch.wake_point(panel) {
-                    log::info!("touch: wake tap at ({}, {})", point.x, point.y);
-                    SIGNALS.push(Signal::Tap(point));
-                } else {
-                    log::info!("touch: no point after the wake, so the touch acts on no control");
-                    SIGNALS.push(Signal::Woke(Wake::Touch(None)));
+                // The GT911 holds the sample while INT is low. A press of
+                // the key answers the job with `Wake::Key` (`logic::shell`).
+                // Else the tap at the point answers the job, and it acts on
+                // its control.
+                match touch.wake_sample(panel) {
+                    Woken::Key => {
+                        log::info!("touch: wake by the key");
+                        SIGNALS.push(Signal::Key(KeyEdge::Down));
+                    }
+                    Woken::Tap(point) => {
+                        log::info!("touch: wake tap at ({}, {})", point.x, point.y);
+                        SIGNALS.push(Signal::Tap(point));
+                    }
+                    Woken::Nothing => {
+                        log::info!(
+                            "touch: no point after the wake, so the touch acts on no control"
+                        );
+                        SIGNALS.push(Signal::Woke(Wake::Touch(None)));
+                    }
                 }
             }
             Cause::Timer => {
@@ -553,12 +567,28 @@ impl Power {
     }
 }
 
+/// What the sample after a touch wake shows. Refer to
+/// [`Touch::wake_sample`].
+enum Woken {
+    /// The touch key is down.
+    Key,
+    /// A finger at this point on the panel.
+    Tap(Point),
+    /// No key and no point: the read failed, or the sample was stale or had
+    /// no point.
+    Nothing,
+}
+
 /// The state of the touch controller.
 #[derive(Default)]
 struct Touch {
     /// The map to the panel, or `None` until the controller starts.
     map: Option<TouchMap>,
     tapper: Tapper,
+    /// The edges of the touch key. The task keeps the state through a
+    /// refresh, when it does not read the controller, so the first report
+    /// after the refresh gives the correct edge.
+    keys: KeyEdges,
     backoff: Backoff,
 }
 
@@ -568,21 +598,31 @@ impl Touch {
         self.map.is_some()
     }
 
-    /// Reads the point of the touch that woke the chip, or `None` if the
-    /// read fails or the sample has no point. Marks the touch as used, so
-    /// that a later sample of the same touch is not a second tap.
-    fn wake_point(&mut self, panel: &mut Panel<'static>) -> Option<Point> {
-        let map = self.map?;
-        let point = match panel.touch_sample() {
-            Ok(Sample::Pressed(raw)) => Some(map.to_panel(raw)),
-            Ok(_) => None,
+    /// Reads the sample of the touch that woke the chip. Marks the touch as
+    /// used, so that a later sample of the same touch is not a second tap.
+    /// If the key is down, the edges see the `Down` edge here, so the next
+    /// poll does not send it again.
+    fn wake_sample(&mut self, panel: &mut Panel<'static>) -> Woken {
+        let Some(map) = self.map else {
+            return Woken::Nothing;
+        };
+        let sample = match panel.touch_sample() {
+            Ok(sample) => sample,
             Err(error) => {
                 log::warn!("touch: read failed after the wake ({error:?})");
-                None
+                Sample::Stale
             }
         };
         self.tapper.consume(Instant::now().as_millis());
-        point
+        if self.keys.sample(&sample) == Some(KeyEdge::Down) {
+            return Woken::Key;
+        }
+        match sample {
+            Sample::Report {
+                point: Some(raw), ..
+            } => Woken::Tap(map.to_panel(raw)),
+            Sample::Report { point: None, .. } | Sample::Stale => Woken::Nothing,
+        }
     }
 
     /// Makes the next poll start the touch controller again.
@@ -590,9 +630,11 @@ impl Touch {
         self.map = None;
     }
 
-    /// Reads one sample, and sends a tap to the core. Starts the controller
-    /// first, if it did not start and the wait after the last failure ended.
-    /// Returns `true` if the task sent a tap.
+    /// Reads one sample, and sends a tap and an edge of the key to the core.
+    /// Starts the controller first, if it did not start and the wait after
+    /// the last failure ended. Returns `true` if the task sent a tap or a
+    /// `Down` edge, because only these answer a `Sleep` job. An `Up` edge
+    /// goes to the core, but the job still waits.
     async fn poll(&mut self, panel: &mut Panel<'static>) -> bool {
         let now = Instant::now().as_millis();
         let Some(map) = self.map else {
@@ -615,12 +657,17 @@ impl Touch {
         };
         match panel.touch_sample() {
             Ok(sample) => {
-                if let Some(tap) = self.tapper.sample(now, sample.map(|raw| map.to_panel(raw))) {
+                let edge = self.keys.sample(&sample);
+                if let Some(edge) = edge {
+                    log::info!("touch: key {edge:?}");
+                    SIGNALS.push(Signal::Key(edge));
+                }
+                let tap = self.tapper.sample(now, sample.map(|raw| map.to_panel(raw)));
+                if let Some(tap) = tap {
                     log::info!("touch: tap at ({}, {})", tap.x, tap.y);
                     SIGNALS.push(Signal::Tap(tap));
-                    return true;
                 }
-                false
+                edge == Some(KeyEdge::Down) || tap.is_some()
             }
             Err(error) => {
                 self.map = None;

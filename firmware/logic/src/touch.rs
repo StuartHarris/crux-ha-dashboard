@@ -1,11 +1,18 @@
-//! Converts the samples of the touch controller to taps on the panel.
+//! Converts the samples of the touch controller to taps on the panel and to
+//! the edges of the touch key.
 //!
 //! The GT911 reports points in its own coordinates. [`TouchMap`] converts a
 //! point to panel coordinates. [`Tapper`] converts a sequence of samples to
 //! taps: one tap when a finger touches the panel, and no more taps until a
 //! sample shows that the finger lifted.
+//!
+//! The touch key on the front of the device is part of the GT911. Each
+//! report tells if the key is down (bit 4 of the status register 0x814E).
+//! [`KeyEdges`] compares each report with the one before it, and gives the
+//! edges of the key. The core decides what a press means.
 
 use embedded_graphics::prelude::Point;
+use shared::KeyEdge;
 use ui::{HEIGHT, WIDTH};
 
 /// The shortest time between two taps, in milliseconds. A second touch in
@@ -63,23 +70,74 @@ fn clamp(value: i64, max: i64) -> i32 {
 /// One read of the touch controller.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Sample<P> {
-    /// The controller has no new sample. The finger can still touch the
-    /// panel.
+    /// The controller has no new report. The finger and the key can still
+    /// be down.
     Stale,
-    /// A new sample with no finger: the finger lifted.
-    Released,
-    /// A new sample with a finger at this point.
-    Pressed(P),
+    /// A new report of the controller.
+    Report {
+        /// The touch key is down.
+        key: bool,
+        /// The point of the finger, or `None` if no finger touches the
+        /// panel: the finger lifted.
+        point: Option<P>,
+    },
 }
 
 impl<P> Sample<P> {
-    /// Converts the point of a `Pressed` sample.
+    /// Returns a report with a finger at `point` and the key up.
+    #[must_use]
+    pub const fn pressed(point: P) -> Self {
+        Self::Report {
+            key: false,
+            point: Some(point),
+        }
+    }
+
+    /// Returns a report with no finger and the key up.
+    #[must_use]
+    pub const fn released() -> Self {
+        Self::Report {
+            key: false,
+            point: None,
+        }
+    }
+
+    /// Converts the point of a report.
     pub fn map<Q>(self, convert: impl FnOnce(P) -> Q) -> Sample<Q> {
         match self {
             Self::Stale => Sample::Stale,
-            Self::Released => Sample::Released,
-            Self::Pressed(point) => Sample::Pressed(convert(point)),
+            Self::Report { key, point } => Sample::Report {
+                key,
+                point: point.map(convert),
+            },
         }
+    }
+}
+
+/// Gives the edges of the touch key from the reports of the controller.
+///
+/// Each report tells if the key is down now. The edge is the change from the
+/// report before. A `Stale` sample changes nothing. Thus a gap with no
+/// reads, for example during a refresh of the panel, gives the correct
+/// edge at the next report. A press that starts and ends in the gap gives
+/// no edge, unless the controller keeps its report until the next read.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct KeyEdges {
+    down: bool,
+}
+
+impl KeyEdges {
+    /// Gives a sample to the edges, and returns the edge of the key, if the
+    /// key changed since the last report.
+    pub const fn sample<P>(&mut self, sample: &Sample<P>) -> Option<KeyEdge> {
+        let Sample::Report { key, .. } = *sample else {
+            return None;
+        };
+        if key == self.down {
+            return None;
+        }
+        self.down = key;
+        Some(if key { KeyEdge::Down } else { KeyEdge::Up })
     }
 }
 
@@ -95,17 +153,20 @@ impl Tapper {
     /// the start.
     ///
     /// Returns the point of a new tap. A tap occurs when a finger touches the
-    /// panel after a `Released` sample (or at the start), and at least
-    /// [`MIN_TAP_INTERVAL_MS`] after the last tap. Only a `Released` sample
-    /// ends a touch. A `Stale` sample changes nothing.
+    /// panel after a report with no finger (or at the start), and at least
+    /// [`MIN_TAP_INTERVAL_MS`] after the last tap. Only a report with no
+    /// finger ends a touch. A `Stale` sample changes nothing. The tapper
+    /// does not look at the key.
     pub fn sample(&mut self, now_ms: u64, sample: Sample<Point>) -> Option<Point> {
         let point = match sample {
             Sample::Stale => return None,
-            Sample::Released => {
+            Sample::Report { point: None, .. } => {
                 self.pressed = false;
                 return None;
             }
-            Sample::Pressed(point) => point,
+            Sample::Report {
+                point: Some(point), ..
+            } => point,
         };
         if self.pressed {
             return None;
@@ -135,7 +196,11 @@ impl Tapper {
 mod tests {
     use embedded_graphics::prelude::Point;
 
-    use super::{MIN_TAP_INTERVAL_MS, Sample, Tapper, TouchMap};
+    use alloc::vec::Vec;
+
+    use shared::KeyEdge;
+
+    use super::{KeyEdges, MIN_TAP_INTERVAL_MS, Sample, Tapper, TouchMap};
 
     #[test]
     fn a_portrait_controller_is_turned_to_landscape() {
@@ -165,8 +230,10 @@ mod tests {
     }
 
     fn pressed(x: i32) -> Sample<Point> {
-        Sample::Pressed(Point::new(x, 5))
+        Sample::pressed(Point::new(x, 5))
     }
+
+    const RELEASED: Sample<Point> = Sample::released();
 
     #[test]
     fn a_held_finger_gives_one_tap() {
@@ -174,7 +241,7 @@ mod tests {
         assert_eq!(tapper.sample(0, pressed(5)), Some(Point::new(5, 5)));
         assert_eq!(tapper.sample(40, pressed(6)), None);
         assert_eq!(tapper.sample(2000, pressed(6)), None);
-        assert_eq!(tapper.sample(2040, Sample::Released), None);
+        assert_eq!(tapper.sample(2040, RELEASED), None);
         assert_eq!(tapper.sample(2080, pressed(5)), Some(Point::new(5, 5)));
     }
 
@@ -197,7 +264,7 @@ mod tests {
         }
         assert_eq!(taps, 1);
         // The finger lifts. The next touch is a new tap.
-        assert_eq!(tapper.sample(1300, Sample::Released), None);
+        assert_eq!(tapper.sample(1300, RELEASED), None);
         assert!(tapper.sample(1600, pressed(5)).is_some());
     }
 
@@ -205,9 +272,9 @@ mod tests {
     fn a_bounce_gives_no_tap() {
         let mut tapper = Tapper::default();
         assert!(tapper.sample(1000, pressed(5)).is_some());
-        assert_eq!(tapper.sample(1040, Sample::Released), None);
+        assert_eq!(tapper.sample(1040, RELEASED), None);
         assert_eq!(tapper.sample(1080, pressed(5)), None);
-        assert_eq!(tapper.sample(1120, Sample::Released), None);
+        assert_eq!(tapper.sample(1120, RELEASED), None);
         assert!(
             tapper
                 .sample(1000 + MIN_TAP_INTERVAL_MS, pressed(5))
@@ -221,7 +288,7 @@ mod tests {
         tapper.consume(1000);
         // A late sample of the touch that woke the device.
         assert_eq!(tapper.sample(1030, pressed(5)), None);
-        assert_eq!(tapper.sample(1060, Sample::Released), None);
+        assert_eq!(tapper.sample(1060, RELEASED), None);
         // The next touch is a new tap.
         assert!(
             tapper
@@ -231,20 +298,90 @@ mod tests {
     }
 
     #[test]
-    fn map_converts_only_a_pressed_point() {
+    fn map_converts_only_the_point_of_a_report() {
         let map = TouchMap::new((960, 540));
-        let raw: Sample<(u16, u16)> = Sample::Pressed((10, 20));
+        let raw: Sample<(u16, u16)> = Sample::Report {
+            key: true,
+            point: Some((10, 20)),
+        };
         assert_eq!(
             raw.map(|raw| map.to_panel(raw)),
-            Sample::Pressed(Point::new(10, 20))
+            Sample::Report {
+                key: true,
+                point: Some(Point::new(10, 20))
+            }
         );
         assert_eq!(
             Sample::<(u16, u16)>::Stale.map(|raw| map.to_panel(raw)),
             Sample::Stale
         );
         assert_eq!(
-            Sample::<(u16, u16)>::Released.map(|raw| map.to_panel(raw)),
-            Sample::Released
+            Sample::<(u16, u16)>::released().map(|raw| map.to_panel(raw)),
+            RELEASED
         );
+    }
+
+    /// A report with the key down and no finger.
+    const KEY_ONLY: Sample<Point> = Sample::Report {
+        key: true,
+        point: None,
+    };
+
+    #[test]
+    fn the_key_does_not_change_the_taps() {
+        let mut tapper = Tapper::default();
+        assert_eq!(tapper.sample(0, KEY_ONLY), None);
+        let with_key = Sample::Report {
+            key: true,
+            point: Some(Point::new(5, 5)),
+        };
+        assert_eq!(tapper.sample(400, with_key), Some(Point::new(5, 5)));
+        // A report with the key and no finger ends the touch.
+        assert_eq!(tapper.sample(440, KEY_ONLY), None);
+        assert!(tapper.sample(800, pressed(5)).is_some());
+    }
+
+    #[test]
+    fn a_press_of_the_key_gives_one_down_and_one_up() {
+        let mut edges = KeyEdges::default();
+        let mut seen = Vec::new();
+        for sample in [
+            RELEASED,
+            KEY_ONLY,
+            Sample::Stale,
+            KEY_ONLY,
+            KEY_ONLY,
+            Sample::Stale,
+            RELEASED,
+            RELEASED,
+        ] {
+            seen.extend(edges.sample(&sample));
+        }
+        assert_eq!(seen, [KeyEdge::Down, KeyEdge::Up]);
+    }
+
+    #[test]
+    fn a_gap_in_the_reads_gives_the_correct_edge_after_it() {
+        let mut edges = KeyEdges::default();
+        assert_eq!(edges.sample(&KEY_ONLY), Some(KeyEdge::Down));
+        // A refresh of the panel: no reads for about 1.8 s. The key went up
+        // in the gap.
+        assert_eq!(edges.sample(&RELEASED), Some(KeyEdge::Up));
+        // The key went down in the gap, and stays down after it.
+        assert_eq!(edges.sample(&Sample::<Point>::Stale), None);
+        assert_eq!(edges.sample(&KEY_ONLY), Some(KeyEdge::Down));
+    }
+
+    #[test]
+    fn a_finger_does_not_change_the_key() {
+        let mut edges = KeyEdges::default();
+        assert_eq!(edges.sample(&pressed(5)), None);
+        assert_eq!(edges.sample(&RELEASED), None);
+        let both = Sample::Report {
+            key: true,
+            point: Some(Point::new(5, 5)),
+        };
+        assert_eq!(edges.sample(&both), Some(KeyEdge::Down));
+        assert_eq!(edges.sample(&KEY_ONLY), None);
     }
 }
