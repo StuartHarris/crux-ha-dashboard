@@ -391,12 +391,12 @@ mod tests {
         let text = r#"
             # The network.
             [wifi]
-            ssid = "Harris # Home"   # A hash in a string is not a comment.
+            ssid = "Home # Network"   # A hash in a string is not a comment.
             password = 'pa\ss"word'
             auth = "wpa_wpa2"
 
             [mqtt]
-            host = "192.168.1.109"
+            host = "192.168.1.10"
             port = 1884
             username = "dashboard"
             password = "secret"
@@ -409,10 +409,10 @@ mod tests {
         assert_eq!(
             Config::parse(text),
             Ok(Config {
-                wifi_ssid: "Harris # Home",
+                wifi_ssid: "Home # Network",
                 wifi_password: r#"pa\ss"word"#,
                 wifi_auth: WifiAuth::WpaWpa2,
-                mqtt_host: "192.168.1.109",
+                mqtt_host: "192.168.1.10",
                 mqtt_port: 1884,
                 mqtt_username: "dashboard",
                 mqtt_password: "secret",

@@ -1,0 +1,171 @@
+# The three Home Assistant automations of the dashboard. Add them to
+# `automations.yaml` in the Home Assistant configuration folder, then reload the
+# automations. `docs/mqtt.md` describes each automation.
+#
+# The `entities` list of `dashboard_statestream_seed` is an example. Put the output of
+# `just ha-entities --seed` in its place. That list must be the same as the `include`
+# list of `mqtt_statestream` in `configuration.yaml`.
+
+- id: dashboard_commands
+  alias: Dashboard commands
+  description: >-
+    Call a service from a command that an e-paper dashboard publishes on
+    dashboard/<device_id>/cmd. Only light.toggle, switch.toggle and scene.turn_on
+    (keys service and entity_id), light.turn_on with an integer brightness_step_pct
+    from -100 to 100, and climate.set_temperature with a numeric temperature on a
+    0.5 mark from 5 to 35 (clamped to the entity's min_temp/max_temp), are permitted,
+    on an entity of the same domain.
+  triggers:
+    - trigger: mqtt
+      topic: dashboard/+/cmd
+  conditions:
+    - condition: template
+      value_template: >-
+        {{ trigger.payload_json is defined and trigger.payload_json is mapping }}
+    - condition: template
+      value_template: |-
+        {% set p = trigger.payload_json %} {% if p.service in ['light.toggle', 'switch.toggle', 'scene.turn_on'] %}
+          {{ p.keys() | list | sort == ['entity_id', 'service'] }}
+        {% elif p.service == 'light.turn_on' %}
+          {{ p.keys() | list | sort == ['brightness_step_pct', 'entity_id', 'service']
+             and p.brightness_step_pct is integer
+             and -100 <= p.brightness_step_pct <= 100 }}
+        {% elif p.service == 'climate.set_temperature' %}
+          {{ p.keys() | list | sort == ['entity_id', 'service', 'temperature']
+             and p.temperature is number and p.temperature is not boolean
+             and 5 <= p.temperature <= 35
+             and (p.temperature * 2) == (p.temperature * 2) | round(0) }}
+        {% else %}false{% endif %}
+    - condition: template
+      value_template: >-
+        {{ trigger.payload_json.entity_id is string and trigger.payload_json.entity_id
+        is match(trigger.payload_json.service.split('.')[0] ~ '\.[a-z0-9_]+$') }}
+  actions:
+    - choose:
+        - conditions:
+            - condition: template
+              value_template: "{{ trigger.payload_json.service == 'light.turn_on' }}"
+          sequence:
+            - action: light.turn_on
+              target:
+                entity_id: "{{ trigger.payload_json.entity_id }}"
+              data:
+                brightness_step_pct: "{{ trigger.payload_json.brightness_step_pct }}"
+        - conditions:
+            - condition: template
+              value_template: "{{ trigger.payload_json.service == 'climate.set_temperature' }}"
+          sequence:
+            - action: climate.set_temperature
+              target:
+                entity_id: "{{ trigger.payload_json.entity_id }}"
+              data:
+                temperature: >-
+                  {{ [[trigger.payload_json.temperature,
+                  state_attr(trigger.payload_json.entity_id, 'min_temp') | float(5)] | max,
+                  state_attr(trigger.payload_json.entity_id, 'max_temp') | float(35)] | min }}
+      default:
+        - action: "{{ trigger.payload_json.service }}"
+          target:
+            entity_id: "{{ trigger.payload_json.entity_id }}"
+  mode: queued
+
+- id: dashboard_statestream_seed
+  alias: Dashboard statestream seed
+  description: >-
+    Publish the current state of each entity on the mqtt_statestream include list,
+    and the attributes that the dashboard reads. mqtt_statestream publishes an entity
+    only when it changes. Keep the list of entities the same as the include list in
+    configuration.yaml.
+  triggers:
+    - trigger: homeassistant
+      event: start
+    - trigger: mqtt
+      topic: dashboard/+/status
+      payload: online
+  conditions: []
+  actions:
+    - repeat:
+        for_each: "{{ entities }}"
+        sequence:
+          - variables:
+              entity: "{{ repeat.item }}"
+              base: "homeassistant/statestream/{{ repeat.item | replace('.', '/') }}"
+          - if: "{{ states[entity] is not none }}"
+            then:
+              - action: mqtt.publish
+                data:
+                  topic: "{{ base }}/state"
+                  payload: "{{ states(entity) }}"
+                  qos: 1
+                  retain: true
+              - action: mqtt.publish
+                data:
+                  topic: "{{ base }}/last_updated"
+                  payload: "{{ states[entity].last_updated.isoformat() }}"
+                  qos: 1
+                  retain: true
+              - repeat:
+                  for_each: "{{ attributes }}"
+                  sequence:
+                    - if: "{{ repeat.item in states[entity].attributes }}"
+                      then:
+                        - action: mqtt.publish
+                          data:
+                            topic: "{{ base }}/{{ repeat.item }}"
+                            payload: >-
+                              {{ states[entity].attributes[repeat.item] | to_json(ensure_ascii=true) }}
+                            qos: 1
+                            retain: true
+  mode: restart
+  variables:
+    attributes:
+      - brightness
+      - unit_of_measurement
+      - current_temperature
+      - temperature
+      - temperature_unit
+    entities:
+      - light.all_lights
+      - light.kitchen_lights
+      - weather.home
+
+- id: dashboard_log
+  alias: Dashboard log
+  description: >-
+    Write a log line that an e-paper dashboard publishes on dashboard/<device_id>/log.
+    The time is now minus the age of the line, because the board has no wall clock.
+    Info lines go to the logbook of the device's status entity
+    (sensor.dashboard_<device_id>_status). Warn and error lines go to the system log
+    (logger dashboard.<device_id>) at the level warning or error.
+  triggers:
+    - trigger: mqtt
+      topic: dashboard/+/log
+  conditions:
+    - condition: template
+      value_template: >-
+        {% set p = trigger.payload_json if trigger.payload_json is defined else none %}{{
+        p is mapping and p.keys() | list | sort == ['age', 'level', 'msg', 'source']
+        and p.level in ['info', 'warn', 'error'] and p.age is integer and p.age >= 0
+        and p.source is string and p.msg is string }}
+  actions:
+    - variables:
+        device: "{{ trigger.topic.split('/')[1] }}"
+        p: "{{ trigger.payload_json }}"
+        at: "{{ (now() - timedelta(seconds=trigger.payload_json.age)).strftime('%H:%M:%S') }}"
+    - if:
+        - condition: template
+          value_template: "{{ p.level == 'info' }}"
+      then:
+        - action: logbook.log
+          data:
+            name: Dashboard {{ device }}
+            message: "[{{ at }}] {{ p.source }}: {{ p.msg }}"
+            entity_id: sensor.dashboard_{{ device }}_status
+      else:
+        - action: system_log.write
+          data:
+            logger: dashboard.{{ device }}
+            level: "{{ 'error' if p.level == 'error' else 'warning' }}"
+            message: "[{{ at }}] {{ p.source }}: {{ p.msg }}"
+  mode: queued
+  max: 100
