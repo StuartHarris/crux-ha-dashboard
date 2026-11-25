@@ -433,8 +433,6 @@ pub enum KeyEdge {
 pub enum Control {
     /// The button that shows the previous page.
     PreviousPage,
-    /// The button that shows the home page.
-    Home,
     /// The button that shows the next page.
     NextPage,
     /// The tile with this index on the current page.

@@ -67,7 +67,6 @@ pub fn tapped(control: Option<Control>, model: &mut Model) -> Cmd {
     let action = match control {
         None => Cmd::done(),
         Some(Control::PreviousPage) => turn_page(model, false),
-        Some(Control::Home) => navigate(Route::Home, model),
         Some(Control::NextPage) => turn_page(model, true),
         Some(Control::Tile(index)) => tile_tapped(index, model),
         Some(Control::Scene(index)) => scene_tapped(index, model),

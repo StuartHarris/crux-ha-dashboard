@@ -420,7 +420,9 @@ The display task reads the key bit in each touch sample, and sends each change t
 core as `Signal::Key` with the edge (`logic::touch::KeyEdges`). The core decides what a
 press means (`shared/src/features/key/`):
 
-- A short press shows the index page. On the index page, it does nothing.
+- A short press shows the index page. On the index page, it does nothing. The footer
+  of each page has only the previous and next buttons. Use the key to show the index
+  page from each page.
 - A press of 1 second or more asks for a deep full refresh, with the rules of the "Full
   refresh" button in Home Assistant. The refresh starts while the key is still down.
 - Each press is a touch: it turns the front light on and starts the idle timer again.

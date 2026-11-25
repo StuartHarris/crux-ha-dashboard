@@ -738,10 +738,6 @@ fn a_tap_on_a_navigation_button_turns_the_page() {
         .expect_light_timer()
         .expect_render();
     assert_eq!(app.view(&model).page_index, count - 1);
-    app.update(Event::Tapped(Some(Control::Home)), &mut model)
-        .expect_light_timer()
-        .expect_render();
-    assert_eq!(app.view(&model).path, "/");
 }
 
 #[test]
