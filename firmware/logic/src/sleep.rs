@@ -4,15 +4,16 @@
 //! The core owns the schedule. It sends each `Sleep` request with its wake
 //! sources: a touch, and a timer for the check of the power source. The
 //! firmware arms these sources, sleeps, and answers each wake at once:
-//! `Wake::Touch` (with the tap), `Wake::Timer` after it read the charger, or
-//! `Wake::Other`. The core then decides what to do next. Light sleep keeps
+//! `Wake::Touch` (with the tap), `Wake::Key` (a press of the touch key),
+//! `Wake::Timer` after it read the charger, or `Wake::Other`. The core then decides what to do next. Light sleep keeps
 //! the RAM, so the core and its model stay.
 //!
 //! The firmware keeps only driver guards: the chip does not sleep while a
 //! view model waits to be drawn, while the GT911 holds INT low, while an
 //! event that the display task sent waits for the core task ([`InFlight`]),
 //! or while a new power source waits for its second read ([`Blocker`]).
-//! After a tap, the chip waits [`TAP_HOLD_MS`].
+//! After a tap or a `Down` edge of the touch key, the chip waits
+//! [`TAP_HOLD_MS`].
 
 use core::sync::atomic::{AtomicU32, Ordering};
 

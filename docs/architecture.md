@@ -102,7 +102,7 @@ Each `Effect` variant wraps one operation. The custom capabilities are in
 | `Render` (Crux) | `Render` | Draws the view model, with a partial or a full refresh. |
 | `stream` | `StreamOpen`, `StreamWrite`, `StreamClose` | Opens one TCP stream to the broker, writes the bytes of the core, gives back the bytes that arrive, and closes it. It knows nothing of MQTT. |
 | `radio` | `RadioJoin`, `RadioAddress`, `RadioLeave`, `RadioScan`, `RadioStopScan`, `RadioReadSignal`, `RadioOff`, `RadioRestart` | Does the Wi-Fi radio work. The core decides when to join, which access point to join, when to scan, when to read the signal and when to restart the chip. |
-| `power` | `Sleep` | Puts the device to sleep until a touch or a timer, and answers with the `Wake`. |
+| `power` | `Sleep` | Puts the device to sleep until a touch or a timer, and answers with the `Wake`. A touch wake can be a tap on the panel or a press of the touch key. |
 | `light` | `FrontLight` | Sets the brightness of the front light. |
 | `log` | `Log`, `LogClock` | Writes a line of the core to the shell log and answers with its monotonic time. |
 | `crux_time` | `TimeNotifyAfter`, `TimeClear` | Starts and clears the timers of the core. |
@@ -140,6 +140,7 @@ the parent `update` would become a large orchestrator.
 | `connection` | The MQTT `Session`, the outbox of service calls, the reconnects and the messages from the state stream | `wifi` (ask for the link, report a quiet link or a failure), `pending` (queue and confirm the marks), `device` (the device publish queue, the commands from Home Assistant), `power` (a failed report) |
 | `wifi` | The Wi-Fi policy: the access point cache, the health of the link, the roam scan and the restart of the chip | `connection` (link up, link failed, close for a roam), `power` (the next step of a sleep), `device` |
 | `rooms` | The taps on the controls and the page changes. It has no state or events of its own. The route is in `Model`. | `connection` (send a service call), `pending` (mark the tap), `light` (touch), `power` (wake, restart the idle timer), `device` |
+| `key` | The touch key on the front of the device: the press in progress and its long-press timer. A short press shows the index page. A long press asks for a deep full refresh. | `power` (wake, restart the idle timer), `light` (touch), `rooms` (the index page), `device` (the full refresh, with the rules of the Full refresh button) |
 | `pending` | The marks of taps that Home Assistant did not confirm yet | `power` (sleep when the marks are settled) |
 | `light` | The front light policy: the tap level, the light timer, the light that Home Assistant holds | `device` (publish the light state) |
 | `refresh` | The choice of a partial or a full refresh, and when to draw | `power` (sleep when the draw is done) |

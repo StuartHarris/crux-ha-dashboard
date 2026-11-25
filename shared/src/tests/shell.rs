@@ -62,7 +62,7 @@ use crux_time::{TimerId, operation::NotifyAfter};
 
 use super::broker::{Broker, publish_of};
 use crate::{
-    Cmd, Dashboard, Depth, Effect, Event, Model, ViewModel,
+    Cmd, Dashboard, Depth, Effect, Event, KeyEdge, Model, ViewModel,
     capabilities::{
         light::FrontLight,
         log::{Area, Log, LogClock, Uptime},
@@ -257,7 +257,8 @@ impl Shell {
     /// Sends an event to the core and answers effects until the core waits.
     ///
     /// As a real shell does, while a `Sleep` request waits, the shell answers
-    /// it with `Wake::Touch` and the control, in place of a tap. After a
+    /// it with `Wake::Touch` and the control, in place of a tap, and with
+    /// `Wake::Key` in place of the `Down` edge of the key. After a
     /// change of the power source, it answers it with `Wake::PowerSource`.
     pub fn send(&mut self, event: Event) {
         match event {
@@ -267,6 +268,10 @@ impl Shell {
             }
             Event::Tapped(control) if self.sleep_request.is_some() => {
                 self.wake(Wake::Touch(control));
+                return;
+            }
+            Event::Key(KeyEdge::Down) if self.sleep_request.is_some() => {
+                self.wake(Wake::Key);
                 return;
             }
             _ => {}

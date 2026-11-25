@@ -3,6 +3,7 @@
 
 pub mod connection;
 pub mod device;
+pub mod key;
 pub mod light;
 pub mod logs;
 pub mod pending;

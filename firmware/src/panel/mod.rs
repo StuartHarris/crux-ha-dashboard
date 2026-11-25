@@ -217,10 +217,18 @@ impl<'a> Panel<'a> {
     }
 
     /// Reads one sample of the touch controller, with the raw point of the
-    /// first finger. Returns [`Error::TouchNotReady`] until
-    /// [`Panel::init_touch`] succeeds.
+    /// first finger and the state of the touch key. Returns
+    /// [`Error::TouchNotReady`] until [`Panel::init_touch`] succeeds.
     pub fn touch_sample(&mut self) -> Result<Sample<(u16, u16)>> {
         self.epd.touch_sample()
+    }
+
+    /// Reads the raw status register of the GT911 (0x814E) while INT is
+    /// low, and does not clear it. Returns `None` while INT is high. The
+    /// bring-up checks use it. Returns [`Error::TouchNotReady`] until
+    /// [`Panel::init_touch`] succeeds.
+    pub fn touch_status(&mut self) -> Result<Option<u8>> {
+        self.epd.touch_status()
     }
 
     /// Returns `true` if the touch controller started and holds INT low,

@@ -68,6 +68,12 @@ const GT911_CONFIG_CHKSUM: u16 = 0x80FF;
 const GT911_CONFIG_FRESH: u16 = 0x8100;
 const GT911_CONFIG_LENGTH: usize = 186;
 const GT911_POINT_INFO: u16 = 0x814E;
+/// The bit of the status register that is 1 when the GT911 has a new
+/// sample.
+const GT911_BUFFER_READY: u8 = 0x80;
+/// The bit of the status register that is 1 while the touch key is down.
+/// Refer to `GT911_GET_HAVE_KEY` in the `TouchDrvGT911` driver of LilyGo.
+const GT911_HAVE_KEY: u8 = 0x10;
 const GT911_POINT_1: u16 = 0x814F;
 const GT911_X_RESOLUTION: u16 = 0x8146;
 const GT911_Y_RESOLUTION: u16 = 0x8148;
@@ -399,32 +405,45 @@ impl<'a> ConfigWriter<'a> {
 
     /// Reads one sample. INT is high, or the buffer flag is clear, when the
     /// GT911 has no new sample. A new sample with no points means that the
-    /// finger lifted.
+    /// finger lifted. Each new sample also tells if the touch key is down
+    /// (bit 4, `GT911_HAVE_KEY`).
     // On the board, each lift gives one to three samples with no points.
     fn touch_sample(&mut self) -> Result<Sample<(u16, u16)>> {
-        if !self.touch_initialized {
-            return Err(Error::TouchNotReady);
-        }
-        if !self.touch_pressed() {
+        let Some(status) = self.touch_status()? else {
             return Ok(Sample::Stale);
-        }
-        let mut point_info = [0u8; 1];
-        self.read_register16(self.touch_addr, GT911_POINT_INFO, &mut point_info)?;
-        let status = point_info[0];
+        };
         let count = status & 0x0F;
-        let buffer_ready = status & 0x80 != 0;
+        let buffer_ready = status & GT911_BUFFER_READY != 0;
         if !buffer_ready {
             return Ok(Sample::Stale);
         }
+        let key = status & GT911_HAVE_KEY != 0;
         self.write_register16(self.touch_addr, GT911_POINT_INFO, &[0x00])?;
         if count == 0 {
-            return Ok(Sample::Released);
+            return Ok(Sample::Report { key, point: None });
         }
         let mut buffer = [0u8; 8];
         self.read_register16(self.touch_addr, GT911_POINT_1, &mut buffer)?;
         let x = u16::from_le_bytes([buffer[1], buffer[2]]);
         let y = u16::from_le_bytes([buffer[3], buffer[4]]);
-        Ok(Sample::Pressed((x, y)))
+        Ok(Sample::Report {
+            key,
+            point: Some((x, y)),
+        })
+    }
+
+    /// Reads the status register (0x814E) while INT is low, and does not
+    /// clear it. Returns `None` while INT is high.
+    fn touch_status(&mut self) -> Result<Option<u8>> {
+        if !self.touch_initialized {
+            return Err(Error::TouchNotReady);
+        }
+        if !self.touch_pressed() {
+            return Ok(None);
+        }
+        let mut point_info = [0u8; 1];
+        self.read_register16(self.touch_addr, GT911_POINT_INFO, &mut point_info)?;
+        Ok(Some(point_info[0]))
     }
 
     /// Returns the addresses on the bus that answer. The probe is a read of
@@ -564,6 +583,10 @@ impl<'a> Ed047tc1<'a> {
 
     pub fn touch_sample(&mut self) -> Result<Sample<(u16, u16)>> {
         self.cfg_writer.touch_sample()
+    }
+
+    pub fn touch_status(&mut self) -> Result<Option<u8>> {
+        self.cfg_writer.touch_status()
     }
 
     pub async fn init_touch(&mut self) -> Result<(u16, u16)> {

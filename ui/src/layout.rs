@@ -209,17 +209,6 @@ pub const fn previous() -> Rectangle {
     rect(MARGIN, FOOTER_TOP, NAV_WIDTH, FOOTER_HEIGHT)
 }
 
-/// Returns the area of the button that shows the home page.
-#[must_use]
-pub const fn home() -> Rectangle {
-    rect(
-        MARGIN + NAV_WIDTH + GAP,
-        FOOTER_TOP,
-        NAV_WIDTH,
-        FOOTER_HEIGHT,
-    )
-}
-
 /// Returns the area of the button that shows the next page.
 #[must_use]
 pub const fn next() -> Rectangle {
@@ -231,11 +220,13 @@ pub const fn next() -> Rectangle {
     )
 }
 
-/// Returns the area between the home button and the next button. It has the
-/// page number and the time of the last update. A tap in it does nothing.
+/// Returns the area between the previous button and the next button. It has
+/// the page number and the time of the last update. A tap in it does nothing.
+///
+/// The area is at the center of the panel, so the text is at the center too.
 #[must_use]
 pub const fn footer_text() -> Rectangle {
-    let left = MARGIN + 2 * (NAV_WIDTH + GAP);
+    let left = MARGIN + NAV_WIDTH + GAP;
     let right = WIDTH - MARGIN - NAV_WIDTH - GAP;
     rect(left, FOOTER_TOP, right - left, FOOTER_HEIGHT)
 }
@@ -260,7 +251,7 @@ mod tests {
     #[test]
     fn the_areas_do_not_overlap_and_fit_on_the_panel() {
         let panel = Rectangle::new(Point::zero(), Size::new(WIDTH, HEIGHT));
-        let mut areas = vec![header(), previous(), home(), next(), footer_text()];
+        let mut areas = vec![header(), previous(), next(), footer_text()];
         areas.extend((0..MAX_TILES).filter_map(tile));
         areas.extend((0..MAX_SCENES).filter_map(scene));
         for (index, area) in areas.iter().enumerate() {
@@ -279,7 +270,7 @@ mod tests {
     #[test]
     fn the_areas_of_the_index_do_not_overlap_and_fit_on_the_panel() {
         let panel = Rectangle::new(Point::zero(), Size::new(WIDTH, HEIGHT));
-        let mut areas = vec![index_header(), previous(), home(), next(), footer_text()];
+        let mut areas = vec![index_header(), previous(), next(), footer_text()];
         areas.extend((0..MAX_ROOMS).filter_map(room));
         for (index, area) in areas.iter().enumerate() {
             assert_eq!(panel.intersection(area), *area, "{area:?} is off the panel");
@@ -297,6 +288,29 @@ mod tests {
         }
         assert!(weather().intersection(&all_lights()).is_zero_sized());
         assert!(bottom(room(MAX_ROOMS - 1).unwrap()) + GAP <= FOOTER_TOP);
+    }
+
+    #[test]
+    fn the_footer_text_fills_the_space_between_the_navigation_buttons() {
+        let (previous, next, text) = (previous(), next(), footer_text());
+        // The previous button is at the left edge and the next button is at
+        // the right edge, at the same distance from the edge.
+        assert_eq!(previous.top_left.x.unsigned_abs(), MARGIN);
+        assert_eq!(bottom(next), bottom(previous));
+        assert_eq!(
+            WIDTH - next.top_left.x.unsigned_abs() - next.size.width,
+            MARGIN
+        );
+        // The text is one gap from each button, at the center of the panel.
+        let gap = |left: Rectangle, right: Rectangle| {
+            right.top_left.x - left.bottom_right().unwrap().x - 1
+        };
+        assert_eq!(gap(previous, text), GAP.cast_signed());
+        assert_eq!(gap(text, next), GAP.cast_signed());
+        assert_eq!(
+            text.top_left.x.unsigned_abs() + text.size.width / 2,
+            WIDTH / 2
+        );
     }
 
     #[test]

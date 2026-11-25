@@ -4,9 +4,9 @@
 //!
 //! - [`app`] is the root: the events, the effects, the model and the dispatch.
 //! - [`features`] has the logic for rooms, the connection, Wi-Fi, power,
-//!   the front light, the refresh of the panel, the marks of taps that
-//!   wait for Home Assistant, the lines of the log of the core, and the
-//!   dashboard as a device of Home Assistant.
+//!   the front light, the touch key, the refresh of the panel, the marks of
+//!   taps that wait for Home Assistant, the lines of the log of the core,
+//!   and the dashboard as a device of Home Assistant.
 //! - [`capabilities`] has the custom effects: a byte stream, the radio,
 //!   power, the front light and the log.
 //! - [`mqtt`] is an MQTT 3.1.1 client with no I/O: a codec, a framer and the

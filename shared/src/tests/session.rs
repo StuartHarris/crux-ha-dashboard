@@ -25,6 +25,7 @@ use crate::{
     features::{
         connection::{CLOSE_TIMEOUT, Link, RECONNECT_MAX, RECONNECT_MIN},
         device::BIRTH_TOPIC,
+        key::LONG_PRESS,
         light::LIGHT_TIMEOUT,
         pending::{PENDING_TIMEOUT, QUEUED_TIMEOUT, SCENE_TIMEOUT, TARGET_TIMEOUT},
         power::{self, IDLE_TIMEOUT},
@@ -76,6 +77,7 @@ fn feature_timers() -> Vec<Duration> {
         SCENE_TIMEOUT,
         QUEUED_TIMEOUT,
         IDLE_TIMEOUT,
+        LONG_PRESS,
         DRAW_DELAY,
         FULL_REFRESH_INTERVAL,
         JOIN_TIMEOUT,

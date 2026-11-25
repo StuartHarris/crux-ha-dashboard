@@ -7,7 +7,7 @@ use crate::{
     Cmd, Control, Depth, Model, Startup,
     features::{
         connection::{self, Call},
-        device, light,
+        device, key, light,
         pending::{self, Confirm},
         power,
         refresh::{Draw, redraw},
@@ -61,10 +61,12 @@ pub fn tapped(control: Option<Control>, model: &mut Model) -> Cmd {
     // touch does not pump, so the service call of the action goes before
     // the state of the light.
     let light = light::touched(model);
+    // The tap cancels a press of the key before it acts, so a full refresh
+    // of the action does not change the press.
+    let key = key::tapped(model);
     let action = match control {
         None => Cmd::done(),
         Some(Control::PreviousPage) => turn_page(model, false),
-        Some(Control::Home) => navigate(Route::Home, model),
         Some(Control::NextPage) => turn_page(model, true),
         Some(Control::Tile(index)) => tile_tapped(index, model),
         Some(Control::Scene(index)) => scene_tapped(index, model),
@@ -74,7 +76,7 @@ pub fn tapped(control: Option<Control>, model: &mut Model) -> Cmd {
         Some(Control::Minus(index)) => step_tapped(index, false, model),
     };
     // One pump publishes the state of the light after the action.
-    light.and(action).and(device::changed(model))
+    light.and(key).and(action).and(device::changed(model))
 }
 
 /// Shows the page at `route`. The core ignores a route that has no page,

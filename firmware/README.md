@@ -22,11 +22,11 @@ the shells", refer to [`docs/architecture.md`](../docs/architecture.md).
 
 | Module | What it does |
 | --- | --- |
-| `shell` | Owns the core. Routes each effect to a task as a `Command`, and gives each `Signal` from a task to the core. Keeps the connection ids of the streams, the timer tokens, the radio tokens and the `FrontLight` tokens, and the `Write`, `Close`, `Radio`, `Sleep` and `FrontLight` requests until their tasks answer. Obeys the stop rule of the radio: a new `Job::Radio` stops each older radio request that still waits, and the shell answers each of them with `Stopped` (or with `()`) itself. The `stop` list of the job gives their tokens to the radio task. Gives at most one `Render` for each batch of effects, with the last view. Sends each tap to the core as `Tapped`, with the control from `ui::hit_test`. While `Sleep` waits, a tap or a change of the power source answers it. The core does not publish service calls in a dry run. |
+| `shell` | Owns the core. Routes each effect to a task as a `Command`, and gives each `Signal` from a task to the core. Keeps the connection ids of the streams, the timer tokens, the radio tokens and the `FrontLight` tokens, and the `Write`, `Close`, `Radio`, `Sleep` and `FrontLight` requests until their tasks answer. Obeys the stop rule of the radio: a new `Job::Radio` stops each older radio request that still waits, and the shell answers each of them with `Stopped` (or with `()`) itself. The `stop` list of the job gives their tokens to the radio task. Gives at most one `Render` for each batch of effects, with the last view. Sends each tap to the core as `Tapped`, with the control from `ui::hit_test`, and each edge of the touch key as `Key`. While `Sleep` waits, a tap, a `Down` edge of the key or a change of the power source answers it. The core does not publish service calls in a dry run. |
 | `stream` | The bookkeeping of the stream task. The stream of each connection ends with exactly one `Closed` item. `supersede` removes the queued streams that a later job makes useless. `UpdateStats` counts the updates of the core and their time. |
 | `backoff` | A wait that doubles from 1 s to 30 s after each failure, for the start of the touch controller. |
 | `timers` | The timers of the timer task, in milliseconds since the start. |
-| `touch` | Converts a GT911 point to a panel point, and touch samples to taps with a debounce. A sample is new with a finger, new with no finger (the finger lifted), or not new. Only a new sample with no finger ends a touch. |
+| `touch` | Converts a GT911 point to a panel point, touch samples to taps with a debounce, and the key bit of each sample to the edges of the touch key (`KeyEdges`). A sample is a new report or not new. A new report tells if the key is down, and has the point of a finger or no point (the finger lifted). Only a new report with no point ends a touch. |
 | `sleep` | Decides when the chip can go into light sleep for a `Sleep` job (the blockers and the hold after a tap), and when a blocker gets a warning. The core decides what each wake means. |
 | `forward` | Decides which lines of the log print and which go to the core (`warn` and `error`, not the target `core`, also if `ESP_LOG` does not print them), splits each line into its source and its message, and keeps at most 16 lines for the core task with a count of the lines that it dropped. Reads `ESP_LOG` with the rules of esp-println. |
 | `config` | Reads and checks `cfg.toml`. Its `Debug` output does not show the passwords. `build.rs` includes this file, so it uses only `core`. |
@@ -43,7 +43,7 @@ cannot block each other. This is the pattern of the `cpb` example in Crux.
 | --- | --- | --- |
 | core (`main`) | Owns the shell. Sends `Start` with the power source `Stand`, the firmware version and the MAC address of the Wi-Fi station interface (`board::firmware`). Sends each warn and error line that the logger keeps as `Event::ShellLogged`. | |
 | `timers` | Starts and cancels the timers of the core. | `Signal::Timer` |
-| `display` | Draws the newest view model with `ui::draw`, and refreshes the panel as `ui::Refresher` decides. Reads the touch controller every 30 ms between refreshes. Sets the front light. Runs the `Sleep` job. | `Signal::Tap`, `Signal::Event`, `Signal::Woke`, `Signal::Light` |
+| `display` | Draws the newest view model with `ui::draw`, and refreshes the panel as `ui::Refresher` decides. Reads the touch controller every 30 ms between refreshes. Sets the front light. Runs the `Sleep` job. | `Signal::Tap`, `Signal::Key`, `Signal::Event`, `Signal::Woke`, `Signal::Light` |
 | `radio` | Does the radio jobs of the core (`Join`, `Address`, `Leave`, `Scan`, `StopScan`, `ReadSignal` and `Off`) and the `Restart` job. Has no Wi-Fi policy. The core decides which access point to join, when to scan, when to leave and when to restart the chip. | `Signal::Radio` with the token of the job |
 | `stream` | Opens one TCP stream at a time. Writes the bytes of the core to it, gives the bytes that arrive to the core, and closes it. Knows nothing of MQTT. | `Signal::Stream`, `Signal::Written` |
 | `net` | Runs the network stack. | |
@@ -334,6 +334,9 @@ and each step waits for the answer of the firmware:
      waits until MQTT connects again. If the task cannot read the point, it answers
      `Wake::Touch(None)`. The touch then wakes the device and turns the front light
      on, but it does not act on a control.
+   - If the touch key is down at a touch wake, the display task sends its `Down`
+     edge, and the shell answers `Sleep` with `Wake::Key`. The `Up` edge comes from
+     the touch poll after the wake. Refer to "The touch key".
    - After a timer wake, the display task reads the charger, the charge and the
      diagnostics, with no Wi-Fi, and answers `Wake::Timer`. The core usually sends a
      new `Sleep` at once, with no image and no line in Home Assistant. Each 60th check
@@ -406,6 +409,51 @@ The display task owns the light, because it must turn the light off before each 
 sleep. It sets the level at the start of each pass of its loop, before a render. Thus
 the light goes on before the refresh after a tap, not after it. If the panel does not
 start, no display task runs, and the core task answers each `FrontLight` job itself.
+
+### The touch key
+
+The touch key on the front of the device is part of the GT911. Bit 4 of the status
+register 0x814E is 1 while the key is down, and 0 when it is up. A press of the key
+also pulls INT low, so the key wakes the chip as a touch does.
+
+The display task reads the key bit in each touch sample, and sends each change to the
+core as `Signal::Key` with the edge (`logic::touch::KeyEdges`). The core decides what a
+press means (`shared/src/features/key/`):
+
+- A short press shows the index page. On the index page, it does nothing. The footer
+  of each page has only the previous and next buttons. Use the key to show the index
+  page from each page.
+- A press of 1 second or more asks for a deep full refresh, with the rules of the "Full
+  refresh" button in Home Assistant. The refresh starts while the key is still down.
+- Each press is a touch: it turns the front light on and starts the idle timer again.
+- A tap on the panel while the key is down cancels the press. The tap acts, and the
+  release of the key does nothing. A finger on the key while the other hand taps the
+  panel is usually a grip on the device.
+
+The display task does not read the touch controller during a refresh, which takes up to
+1.8 seconds. The task keeps the last state of the key, so the first report after the
+refresh gives the correct edge. But the edge can arrive late, so the core cannot
+measure a press that overlaps a full refresh. Thus such a press is never long:
+
+- A press that wakes the device is a short press, and it acts at once. The wake shows
+  the index page with one refresh. The `Up` edge then does nothing.
+- If a full refresh starts while the key is down and the press is not yet long (for
+  example a page change, or the "Full refresh" button), the press can only be short.
+  The `Up` edge shows the index page, also if it arrives after 1 second.
+
+To check the key with the `dashboard` binary:
+
+1. On the stand, show the page of a room. Tap the key. The log shows `touch: key Down`
+   and `touch: key Up`, and the panel shows the index page.
+2. Tap the key again on the index page. The panel does not change.
+3. Hold the key for 2 seconds. The panel does a deep full refresh before you release
+   the key. The log of the core shows `the key asked for a full refresh`.
+4. On battery, show the page of a room and let the device sleep. Tap the key. The log
+   shows `touch: wake by the key`. The device wakes and shows the index page with one
+   refresh.
+5. Hold the key, tap a tile, then release the key. The tile acts, and the page stays.
+   The log of the core shows `a tap on the panel while the key is down cancels the
+   press`.
 
 The second binary, `bringup`, runs the hardware checks for a new board.
 
@@ -575,6 +623,17 @@ Do the steps in this order. Each step needs the steps before it.
    give a point near (0, 0), and the bottom-right corner a point near (959, 539). If
    the axes are turned or flipped, change `TouchMap::to_panel` in
    `logic/src/touch.rs` and its tests.
+
+   Then tap the touch key, hold it for 2 seconds, and release it. While INT is low,
+   the log shows the raw status byte, for example `status 0x814E = 0x90 (10010000)`,
+   each time the byte changes. Bit 4 (0x10) is the key. Each press must give one
+   `key Down` and one `key Up` line. Write down these results:
+
+   - Does a tap of the key give a byte with bit 4 set, and then a byte with bit 4
+     clear?
+   - While you hold the key, does the GT911 send more reports (bit 7 set again after
+     each clear), or only one?
+   - Does the release give a report with bit 7 set and bit 4 clear?
 9. **Wi-Fi.** Find `step 7`. The log shows `joined` and an address.
 10. **MQTT and the retained states.** Set `read_only = true` in `cfg.toml`. Run
     `just flash`. The log shows `stream: N is open` and,

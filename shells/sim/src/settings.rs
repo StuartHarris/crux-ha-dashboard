@@ -23,7 +23,9 @@ Modes:
                       cause (the device sleeps again after 3 s), Z ends the
                       idle time on battery so that the core sleeps, R
                       restarts the sleeping device with a new core (a deep
-                      sleep), [ and ]
+                      sleep), H is the touch key of the device (a short
+                      press shows the index page, hold it for 1 s for a
+                      full refresh), [ and ]
                       decrease and increase the charge of the battery by 10%,
                       L drops the Wi-Fi link, B blocks or unblocks the device
                       (as the router does), A moves the strongest access

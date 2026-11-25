@@ -41,7 +41,8 @@
 //! - `Sleep` ends at [`Signal::Woke`], which the task that runs the sleep
 //!   sends at each wake: `Wake::Timer` at the check of the power source, or
 //!   `Wake::Other` after a wake with no cause. While it waits, a tap is the
-//!   wake (`Wake::Touch` with the control at the point), and a change of
+//!   wake (`Wake::Touch` with the control at the point), a `Down` edge of
+//!   the key is the wake (`Wake::Key`), and a change of
 //!   the power source also ends it (`Wake::PowerSource`). The core then
 //!   sends a new `Sleep`, or wakes. [`Shell::is_sleeping`] tells the task
 //!   that runs the sleep when the request ended.
@@ -65,8 +66,8 @@ use crux_time::{
 };
 use embedded_graphics::prelude::Point;
 use shared::{
-    Boot, BootLine, Core, Dashboard, Effect, Event, Firmware, PowerSource, Settings, Start,
-    ViewModel,
+    Boot, BootLine, Core, Dashboard, Effect, Event, Firmware, KeyEdge, PowerSource, Settings,
+    Start, ViewModel,
     capabilities::{
         light::FrontLight,
         log::{Log, LogClock, Uptime},
@@ -120,6 +121,10 @@ pub enum Signal {
     /// the tap answers it with `Wake::Touch` and the control, in place of a
     /// tap.
     Tap(Point),
+    /// An edge of the touch key. The shell sends it to the core as
+    /// `Event::Key`. While a `Sleep` request waits, a `Down` edge answers
+    /// it with `Wake::Key`, in place of the edge.
+    Key(KeyEdge),
     /// The device woke, for this cause. The answer to the `Sleep` job.
     Woke(Wake),
     /// The front light has the level of the `FrontLight` job with this
@@ -477,6 +482,12 @@ impl Shell {
                     return self.wake(Wake::Touch(control));
                 }
                 self.send(Event::Tapped(control))
+            }
+            Signal::Key(edge) => {
+                if edge == KeyEdge::Down && self.is_sleeping() {
+                    return self.wake(Wake::Key);
+                }
+                self.send(Event::Key(edge))
             }
             Signal::Event(event) => {
                 let power = matches!(event, Event::PowerSourceChanged(_));

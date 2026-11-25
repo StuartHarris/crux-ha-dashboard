@@ -61,7 +61,8 @@ pub struct Reading {
 /// A thing that wakes the device from sleep.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WakeSource {
-    /// A touch on the panel.
+    /// A touch on the panel, or a press of the touch key, which is part of
+    /// the touch controller.
     Touch,
     /// A timer that expires after this number of seconds.
     Timer {
@@ -81,6 +82,11 @@ pub enum Wake {
     /// the touch wakes the device and turns the front light on, but it does
     /// not act on a control.
     Touch(Option<Control>),
+    /// A press of the touch key on the front of the device. The key is part
+    /// of the touch controller, so a touch wake also wakes on the key. The
+    /// core acts as for [`KeyEdge::Down`](crate::KeyEdge::Down). The shell
+    /// sends the `Up` edge after the wake as usual.
+    Key,
     /// The timer of [`WakeSource::Timer`] expired. The core decides what the
     /// timer means. It can send a new `Sleep` at once.
     Timer,

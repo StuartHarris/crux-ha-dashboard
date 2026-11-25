@@ -42,7 +42,8 @@
 //! of that length. At its end, the shell answers `Wake::Timer`, as the
 //! firmware does at the check of the power source. Any other answer stops
 //! the check timer. The Wake button answers `Wake::Other`, a wake with no
-//! cause. The "Check now" key answers `Wake::Timer` at once. "Fast checks"
+//! cause. The "Check now" key answers `Wake::Timer` at once. A tap answers
+//! `Wake::Touch`, and a `Down` edge of the touch key answers `Wake::Key`. "Fast checks"
 //! makes the check timer last 1 s, whatever the length in the request.
 //!
 //! The shell writes each effect to an [`Inspector`], which the window shows.
@@ -60,8 +61,8 @@ use embedded_graphics::prelude::Point;
 use crux_core::{Request, capability::Operation};
 use crux_time::{TimerId, operation::NotifyAfter};
 use shared::{
-    Boot, Charge, Core, Dashboard, Effect, Event, Firmware, PowerSource, Reading, ResetReason,
-    Settings, Start, ViewModel,
+    Boot, Charge, Core, Dashboard, Effect, Event, Firmware, KeyEdge, PowerSource, Reading,
+    ResetReason, Settings, Start, ViewModel,
     capabilities::{
         log::{Level, Uptime},
         power::{Sleep, Wake, WakeSource},
@@ -520,6 +521,16 @@ impl Shell {
             return;
         }
         self.send(Event::Tapped(control));
+    }
+
+    /// Sends an edge of the touch key to the core. While a `Sleep` request
+    /// waits, the `Down` edge is the wake: the shell answers the request with
+    /// `Wake::Key`, and sends no edge. The core decides what the press does.
+    pub fn key(&mut self, edge: KeyEdge) {
+        if edge == KeyEdge::Down && self.answer_sleep(Wake::Key) {
+            return;
+        }
+        self.send(Event::Key(edge));
     }
 
     /// Answers the `Sleep` request that waits with `Wake::Other`, a wake
@@ -1185,11 +1196,12 @@ mod tests {
     use crux_core::Command;
     use embedded_graphics::prelude::Point;
     use shared::{
-        Control, Effect, Event, PowerSource, Settings,
+        Control, Effect, Event, KeyEdge, PowerSource, Route, Settings,
         capabilities::stream::{Stream, StreamItem, Written},
         fake::{Broker, NoConnection},
         features::{
             connection::{KEEP_ALIVE_SECS, RECONNECT_MAX, RECONNECT_MIN},
+            key::LONG_PRESS,
             power::{IDLE_TIMEOUT, STRAY_HOLD},
             refresh::{DRAW_DELAY, FULL_REFRESH_INTERVAL},
         },
@@ -1213,7 +1225,8 @@ mod tests {
     const SETTLE: Duration = Duration::from_millis(100);
     /// The durations of the timers of the features. The timers of the MQTT
     /// session have other durations.
-    const FEATURE_TIMERS: [Duration; 3] = [DRAW_DELAY, IDLE_TIMEOUT, FULL_REFRESH_INTERVAL];
+    const FEATURE_TIMERS: [Duration; 4] =
+        [LONG_PRESS, DRAW_DELAY, IDLE_TIMEOUT, FULL_REFRESH_INTERVAL];
     /// The capacity of the fake stream, and the size of the read buffer of
     /// the broker. A write of the core has at most `MAX_OUTGOING` bytes,
     /// which is less. The fake stream takes a full write at one time, and
@@ -2251,6 +2264,72 @@ mod tests {
         let light = effects.iter().position(|effect| *effect == "FrontLight");
         let close = effects.iter().position(|effect| *effect == "StreamClose");
         assert!(close.is_some() && close < light, "{effects:?}");
+    }
+
+    #[test]
+    fn a_short_press_of_the_key_shows_the_index_page() {
+        let mut fixture = Fixture::new();
+        fixture.start(PowerSource::Stand);
+        fixture.connect();
+        fixture
+            .shell()
+            .send(Event::Navigate(Route::room("living_room")));
+        assert_ne!(fixture.shell().view().path, "/");
+
+        // The `Down` edge starts the long-press timer, and the `Up` edge
+        // clears it.
+        fixture.shell().key(KeyEdge::Down);
+        assert!(runs(fixture.shell(), LONG_PRESS));
+        fixture.shell().key(KeyEdge::Up);
+        fixture.settle();
+        assert!(!runs(fixture.shell(), LONG_PRESS));
+        assert_eq!(fixture.shell().view().path, "/");
+    }
+
+    #[test]
+    fn a_key_press_while_sleep_waits_answers_sleep_with_the_key() {
+        let mut fixture = Fixture::new();
+        fixture.start(PowerSource::Battery);
+        fixture.connect();
+        assert!(fixture.shell().sleep_now());
+        fixture.sleep();
+
+        fixture.shell().key(KeyEdge::Down);
+        assert!(fixture.shell().sleep.is_none());
+        assert!(!fixture.shell().view().asleep);
+        assert_eq!(fixture.outcomes("Sleep")[0], ": resolved: Key");
+        // A press that wakes the device is short: the wake shows the index
+        // page at once, and starts no long-press timer.
+        assert_eq!(fixture.shell().view().path, "/");
+        assert!(!runs(fixture.shell(), LONG_PRESS));
+
+        // The `Up` edge after the wake goes to the core, and does nothing.
+        let seq = fixture.shell().view().full_refresh.seq;
+        fixture.shell().key(KeyEdge::Up);
+        fixture.settle();
+        assert_eq!(fixture.shell().view().path, "/");
+        assert_eq!(fixture.shell().view().full_refresh.seq, seq);
+    }
+
+    #[test]
+    fn a_long_press_of_the_key_asks_for_a_full_refresh() {
+        let mut fixture = Fixture::new();
+        fixture.start(PowerSource::Stand);
+        fixture.connect();
+        fixture.settle();
+        let seq = fixture.shell().view().full_refresh.seq;
+
+        fixture.shell().key(KeyEdge::Down);
+        fixture.advance(LONG_PRESS);
+        assert_eq!(fixture.shell().view().full_refresh.seq, seq + 1);
+        assert_eq!(
+            fixture.shell().view().full_refresh.depth,
+            shared::Depth::Deep
+        );
+        // The `Up` edge after the long press does not change the page.
+        let path = fixture.shell().view().path;
+        fixture.shell().key(KeyEdge::Up);
+        assert_eq!(fixture.shell().view().path, path);
     }
 
     #[test]

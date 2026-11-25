@@ -11,8 +11,9 @@ use crate::layout;
 /// The shell sends the result as `Event::Tapped`, also for `None` and also
 /// while the device is asleep. The core decides what the tap does.
 ///
-/// Each page has the previous, home and next buttons in the footer. The
-/// other controls depend on the page:
+/// Each page has the previous and next buttons in the footer. The touch key
+/// on the front of the device shows the index page. The other controls
+/// depend on the page:
 ///
 /// - On the index page, the controls are the All lights toggle (if the view
 ///   has it) and the room buttons that the view has.
@@ -29,9 +30,6 @@ pub fn hit_test(view: &ViewModel, point: Point) -> Option<Control> {
 
     if on(layout::previous()) {
         return Some(Control::PreviousPage);
-    }
-    if on(layout::home()) {
-        return Some(Control::Home);
     }
     if on(layout::next()) {
         return Some(Control::NextPage);
@@ -200,9 +198,6 @@ mod tests {
         for point in corners(layout::previous()) {
             assert_eq!(hit_test(&view, point), Some(Control::PreviousPage));
         }
-        for point in corners(layout::home()) {
-            assert_eq!(hit_test(&view, point), Some(Control::Home));
-        }
         for point in corners(layout::next()) {
             assert_eq!(hit_test(&view, point), Some(Control::NextPage));
         }
@@ -225,8 +220,6 @@ mod tests {
             layout::tile(2).unwrap().center(),
             layout::tile(5).unwrap().center(),
             layout::scene(1).unwrap().center(),
-            // The page number and the time of the last update.
-            layout::footer_text().center(),
             // The edges of the panel.
             Point::new(0, FOOTER_TOP.cast_signed() + 10),
             Point::new(5, HEIGHT.cast_signed() - 1),
@@ -234,7 +227,10 @@ mod tests {
             Point::new(-1, -1),
             Point::new(WIDTH.cast_signed(), HEIGHT.cast_signed()),
         ];
-        for point in dead {
+        // The page number and the time of the last update, which fill the
+        // space between the previous and next buttons.
+        let footer_text = layout::footer_text();
+        for point in dead.into_iter().chain(corners(footer_text)) {
             assert_eq!(hit_test(&view, point), None, "{point:?}");
         }
     }

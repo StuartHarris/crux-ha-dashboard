@@ -105,8 +105,9 @@ const _: () = assert!(layout::STEP_HEIGHT >= 2 * STEP_INSET + SIGN_LENGTH);
 /// - The header: the page title on the left and the status on the right.
 /// - The tiles, in a grid of three columns and two rows.
 /// - The scene buttons, in one row.
-/// - The footer: the previous, home and next buttons, the page number and
-///   the time of the last update.
+/// - The footer: the previous and next buttons, and between them the page
+///   number and the time of the last update. The touch key on the front of
+///   the device shows the index page.
 ///
 /// The index page has these areas, from the top:
 ///
@@ -845,13 +846,11 @@ where
     draw_button(&scene.label, area, fill, display)
 }
 
-/// The fill of a button.
+/// The fill of a scene button.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Fill {
     /// A white button with a border and black text.
     White,
-    /// A black button with white text.
-    Black,
     /// The pattern of a button that waits for Home Assistant, with a border
     /// and black text. Refer to [`draw_pending_fill`].
     Pending,
@@ -868,12 +867,6 @@ where
         Fill::White => {
             shape.into_styled(border(3)).draw(display)?;
             BLACK
-        }
-        Fill::Black => {
-            shape
-                .into_styled(PrimitiveStyle::with_fill(BLACK))
-                .draw(display)?;
-            WHITE
         }
         Fill::Pending => {
             draw_pending_fill(shape, 3, display)?;
@@ -977,13 +970,6 @@ where
     D: DrawTarget<Color = Gray4>,
 {
     draw_arrow_button(layout::previous(), false, display)?;
-    // The home button is black on the home page.
-    let home = if view.path == "/" {
-        Fill::Black
-    } else {
-        Fill::White
-    };
-    draw_button("Home", layout::home(), home, display)?;
     draw_arrow_button(layout::next(), true, display)?;
 
     let area = layout::footer_text();
@@ -1359,19 +1345,6 @@ pub mod tests {
                 "y = {y}"
             );
         }
-    }
-
-    #[test]
-    fn the_home_button_is_black_on_the_home_page() {
-        let mut view = view();
-        let mut frame = Framebuffer::new();
-        let Ok(()) = draw(&view, &mut frame);
-        let point = inside(layout::home(), 8);
-        assert_eq!(frame.pixel(point), Some(Gray4::WHITE));
-
-        view.path = "/".into();
-        let Ok(()) = draw(&view, &mut frame);
-        assert_eq!(frame.pixel(point), Some(Gray4::BLACK));
     }
 
     #[test]
