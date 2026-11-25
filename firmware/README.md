@@ -453,7 +453,9 @@ The two candidates were:
 | Touch | GT911 on the same bus | GT911, BQ25896, BQ27220, PCF8563 |
 | Size | about 2,300 lines (without the waveform tables, which no code uses) | about 5,200 lines in the driver crate |
 
-Only the `dashboard-firmware` crate has GPL code. The `logic` crate has none.
+Only the `dashboard-firmware` crate has GPL code. The `logic` crate has none, so it has
+the licence MIT or Apache-2.0 of the other crates in the repository (refer to the
+licence section of the root `README.md`).
 
 The pins in `src/panel/ed047tc1.rs` are the pins of `docs/pinmap.md` on the
 `H752-01` branch of the vendor repository. The data bus is D0 to D2 on GPIO 5 to 7,

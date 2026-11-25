@@ -4,6 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+license.workspace = true
 description = "Desktop simulator: runs the core and draws the panel with the same code as the firmware."
 
 [dependencies]
