@@ -4,6 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+license.workspace = true
 description = "The parts of the firmware shell that do not touch the hardware, so that they can be tested on the host"
 
 [lib]

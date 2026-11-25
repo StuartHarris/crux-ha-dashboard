@@ -119,8 +119,8 @@ pub const PAGES: &[Page] = &[
         "Main bedroom",
         &[
             light_group("Lights", "light.main_bedroom_lights"),
-            light("Sean's spotlight", "light.main_bedroom_sean_spotlight"),
-            light("Stu's spotlight", "light.main_bedroom_stu_spotlight"),
+            light("Left spotlight", "light.main_bedroom_left_spotlight"),
+            light("Right spotlight", "light.main_bedroom_right_spotlight"),
             sensor("Temperature", "sensor.main_bedroom_thermometer_temperature"),
             sensor("Humidity", "sensor.main_bedroom_thermometer_humidity"),
         ],

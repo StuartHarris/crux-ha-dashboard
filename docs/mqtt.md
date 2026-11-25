@@ -1,12 +1,11 @@
 # MQTT topic contract
 
-The dashboard and Home Assistant communicate only through the Mosquitto broker on the
-Raspberry Pi (`192.168.1.109`, port 1883). Home Assistant publishes entity states. The
+The dashboard and Home Assistant communicate only through a Mosquitto broker on a
+Raspberry Pi on the LAN (port 1883). Home Assistant publishes entity states. The
 dashboard publishes service calls, its own status, its log, and its discovery and state
-as a device of Home Assistant. The Pi setup is in
-`RUNBOOK.md` in the `rpi` notes, in the sections "Mosquitto" and "MQTT for the
-dashboard". For the parts of the system and the structure of the core, refer to
-[`architecture.md`](architecture.md).
+as a device of Home Assistant. The section "Set up the broker and Home Assistant"
+below describes the setup. For the parts of the system and the structure of the core,
+refer to [`architecture.md`](architecture.md).
 
 ## Broker
 
@@ -16,6 +15,145 @@ dashboard". For the parts of the system and the structure of the core, refer to
   `homeassistant`.
 - The passwords are only in `/srv/mosquitto/credentials` on the Pi (root, mode 0600).
   Do not put a password in this repo, in a command line or in a log.
+
+## Set up the broker and Home Assistant
+
+This section describes how to set up the Pi. The paths `/srv/mosquitto/...` and
+`/srv/homeassistant/...` are an example layout. You can use other paths. The setup has
+two parts: the broker, and the configuration of Home Assistant.
+
+### Run the broker
+
+Mosquitto runs as a Podman quadlet. The image tag `2` keeps the broker on Mosquitto 2.x.
+Home Assistant and the dashboard connect to it on port 1883.
+
+```ini
+# /etc/containers/systemd/mosquitto.container
+[Unit]
+Description=Mosquitto MQTT broker
+Wants=network-online.target
+After=network-online.target
+Before=homeassistant.service
+
+[Container]
+ContainerName=mosquitto
+Image=docker.io/library/eclipse-mosquitto:2
+Network=host
+Volume=/srv/mosquitto/config:/mosquitto/config:Z
+Volume=/srv/mosquitto/data:/mosquitto/data:Z
+AutoUpdate=registry
+
+[Service]
+Restart=always
+TimeoutStartSec=900
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`/srv/mosquitto/config/mosquitto.conf`:
+
+```text
+listener 1883
+allow_anonymous false
+password_file /mosquitto/config/passwd
+
+persistence true
+persistence_location /mosquitto/data/
+
+log_dest stdout
+log_timestamp_format %Y-%m-%dT%H:%M:%S
+```
+
+| Path | Owner, mode | Contents |
+| --- | --- | --- |
+| `/srv/mosquitto/config/` | `1883:1883`, 0755 | `mosquitto.conf` and `passwd` |
+| `/srv/mosquitto/config/passwd` | `1883:1883`, 0600 | The password hashes |
+| `/srv/mosquitto/data/` | `1883:1883`, 0700 | `mosquitto.db`, which holds the retained messages |
+| `/srv/mosquitto/credentials` | `root:root`, 0600 | The plain passwords, one `user:password` line for each user |
+
+- The broker runs as UID 1883 (the `mosquitto` user in the image).
+- Each password is 32 random characters.
+- Do not print a password or put it on a command line. Read it from
+  `/srv/mosquitto/credentials` with `sudo` when you need it.
+- The container does not mount `/srv/mosquitto/credentials`.
+- The broker listens on all interfaces, also on IPv6. Do not forward port 1883 on the
+  router. Anonymous clients cannot connect.
+- The broker writes its log to stdout. To read it, run `journalctl -u mosquitto`.
+- Podman makes an anonymous volume for `/mosquitto/log`, because the image declares
+  it. The broker does not use it.
+
+To add a broker user:
+
+1. Run `sudo podman exec -it -u mosquitto mosquitto mosquitto_passwd /mosquitto/config/passwd <user>`.
+   The command asks for the password two times.
+2. Add the line `<user>:<password>` to `/srv/mosquitto/credentials` with `sudoedit`.
+3. Run `sudo podman kill -s HUP mosquitto`. The broker reads the password file again.
+
+Create the users `homeassistant` and `dashboard` in this way. Refer to "Test from a
+shell" below for commands that test the broker.
+
+### Add the MQTT integration to Home Assistant
+
+The statestream and the automations below need the Home Assistant MQTT integration. If
+it is not configured, Home Assistant logs `MQTT integration is not available` and
+`Cannot subscribe to topic "dashboard/+/cmd"`. To add the integration:
+
+1. In Home Assistant, go to Settings, then Devices and services, then Add integration,
+   then MQTT.
+2. Set the broker to `127.0.0.1`, the port to 1883 and the user to `homeassistant`.
+3. Enter the `homeassistant` password from `/srv/mosquitto/credentials`.
+4. Run `sudo systemctl restart homeassistant`. Home Assistant does not try
+   `mqtt_statestream` again after the integration starts, so a restart is necessary.
+5. Make sure that the log has no MQTT errors.
+6. Toggle a light. Make sure that its `state` topic then has a retained message.
+
+### Configure the state stream and the automations
+
+Add a `mqtt_statestream` block to `/srv/homeassistant/configuration.yaml`. The block
+must have `publish_attributes: true`, because the dashboard reads attributes such as
+`brightness`, and `publish_timestamps: true`. The `include` list has the entities of
+`shared/src/pages.rs`. Run `just ha-entities --statestream` to print the lines for it.
+
+```yaml
+mqtt_statestream:
+  base_topic: homeassistant/statestream
+  publish_attributes: true
+  publish_timestamps: true
+  include:
+    entities:
+      - light.kitchen
+      - weather.home
+```
+
+Add the three automations in
+[`home-assistant/automations.yaml`](home-assistant/automations.yaml) to
+`/srv/homeassistant/automations.yaml`, and put the output of `just ha-entities --seed` in
+the `entities` list of the seed automation. When you change
+`pages.rs`, change the `include` list and the list of the seed automation, and then
+restart Home Assistant.
+
+- `dashboard_commands` (Dashboard commands) calls the service of a dashboard command.
+  Its trigger is a message on `dashboard/+/cmd`. It ignores a payload that does not
+  agree with the rules in "Commands".
+- `dashboard_statestream_seed` (Dashboard statestream seed) publishes the current
+  state of each entity. Refer to "Seed the state stream".
+- `dashboard_log` (Dashboard log) writes each line of the dashboard log to Home
+  Assistant. Refer to "The Home Assistant automation" in "Log".
+
+To test `dashboard_commands` from another computer, publish a command with the Home
+Assistant `mqtt.publish` service. The service sends it to the broker, so you do not
+need the broker password. Do not show the API token in the command:
+
+```sh
+curl -s -X POST -H "Authorization: Bearer $(tr -d '[:space:]' < <token-file>)" \
+  -H 'Content-Type: application/json' \
+  -d '{"topic":"dashboard/test/cmd","qos":1,"payload":"{\"service\":\"light.turn_on\",\"entity_id\":\"light.kitchen\",\"brightness_step_pct\":25}"}' \
+  http://<home-assistant-host>:8123/api/services/mqtt/publish
+```
+
+The attribute `last_triggered` of `automation.dashboard_commands` changes only when a
+command passes all the conditions.
 
 ## What Home Assistant publishes
 
@@ -100,11 +238,29 @@ attribute that the dashboard reads is JSON (`brightness`, `unit_of_measurement`,
 an attribute only if the entity has it. The messages are retained, with QoS 1. The
 core cannot tell which of the two publishers sent a message.
 
-The automation has its own list of entities. That list must be the same as the
-`include` list. The `rpi` runbook has a command that compares the two lists.
+The automation uses `mode: restart`. When Home Assistant starts, the start trigger and
+the retained `online` messages of the dashboards all trigger it at almost the same time.
+In `restart` mode, the last run publishes all the states, and Home Assistant logs no
+warning.
+
+The automation has its own list of entities in `variables: entities`. That list must be
+the same as the `include` list. To compare the two lists, run this command on the Pi.
+The command shows no output if the lists are the same:
+
+```sh
+diff <(sudo sed -n '/^mqtt_statestream/,/^[a-z]/p' /srv/homeassistant/configuration.yaml | grep -oE '[a-z_]+\.[a-z0-9_]+$') \
+  <(sudo sed -n '/id: dashboard_statestream_seed/,/^- id:/p' /srv/homeassistant/automations.yaml | grep -oE '^    - [a-z_]+\.[a-z0-9_]+$' | cut -c7-)
+```
 
 Run `just ha-entities --seed` to get the `attributes` list and the `entities` list of
-the automation. Run `just ha-entities` for a bare list to compare with the Pi.
+the automation. Run `just ha-entities` for a bare list of the entities in `pages.rs`.
+To compare `pages.rs` with the `include` list, use that list in place of the second
+input of the `diff` command.
+
+The automation renders each payload with a template. Home Assistant converts a template
+result that looks like a number into a number. Thus a state such as `21.50` becomes
+`21.5`. Make sure that no state on the list has this form. If one has, the seeded
+message is different from the message of `mqtt_statestream`.
 
 ## What the dashboard publishes
 
@@ -1163,7 +1319,7 @@ From another computer on the LAN, keep the password in a file that only you can 
 option that reads a password from a file:
 
 ```sh
-mosquitto_sub -h 192.168.1.109 -u dashboard -P "$(cat ~/.config/dashboard-mqtt-password)" \
+mosquitto_sub -h <broker-host> -u dashboard -P "$(cat <password-file>)" \
   -v -t 'homeassistant/statestream/#'
 ```
 

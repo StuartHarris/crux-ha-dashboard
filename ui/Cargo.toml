@@ -4,6 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+license.workspace = true
 description = "Draws the view model with embedded-graphics. The simulator and the firmware both use it."
 
 [dependencies]

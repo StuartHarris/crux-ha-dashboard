@@ -40,7 +40,7 @@ Modes:
                       the page to a PNG file and stop. Sends no commands.
 
 Options (each has an environment variable):
-  --host <HOST>       The broker host (DASHBOARD_HOST, default 192.168.1.109)
+  --host <HOST>       The broker host (DASHBOARD_HOST, default localhost)
   --port <PORT>       The broker port (DASHBOARD_PORT, default 1883)
   --user <USER>       The MQTT user (DASHBOARD_USER, default dashboard)
   --password-file <FILE>
@@ -62,7 +62,7 @@ Options (each has an environment variable):
 ";
 
 /// The default broker host.
-pub const DEFAULT_HOST: &str = "192.168.1.109";
+pub const DEFAULT_HOST: &str = "localhost";
 /// The default broker port.
 pub const DEFAULT_PORT: u16 = 1883;
 /// The default MQTT user.
@@ -296,7 +296,7 @@ mod tests {
             panic!("no arguments are valid");
         };
         assert_eq!(options.mode, Mode::Window);
-        assert_eq!(options.settings.host, "192.168.1.109");
+        assert_eq!(options.settings.host, "localhost");
         assert_eq!(options.settings.port, 1883);
         assert_eq!(options.settings.device_id, "sim");
         assert_eq!(options.power, PowerSource::Stand);
