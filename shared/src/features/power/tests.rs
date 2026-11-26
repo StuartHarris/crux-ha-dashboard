@@ -547,11 +547,11 @@ fn a_battery_level_while_asleep_does_not_wake_the_device() {
     assert_eq!(model.power.battery, Some(41));
     assert_eq!(model.power.idle, idle);
     assert_eq!(model.wifi.phase, Phase::Off);
-    assert_eq!(app.view(&model).battery, Some(40));
+    assert_eq!(app.view(&model).battery, Some(41));
 
     // The wake draws the level.
     let _ = app.update(woke(&model, Wake::Touch(None)), &mut model);
-    assert_eq!(app.view(&model).battery, Some(40));
+    assert_eq!(app.view(&model).battery, Some(41));
     assert_eq!(model.full_refresh.seq, 1);
 }
 
@@ -592,27 +592,17 @@ fn the_status_text_does_not_give_the_power_source() {
 }
 
 #[test]
-fn the_view_rounds_the_battery_level_to_the_nearest_step() {
-    use crate::view::rounded_level;
-
-    for (level, rounded) in [
-        (0, 0),
-        (2, 0),
-        (3, 5),
-        (12, 10),
-        (13, 15),
-        (77, 75),
-        (78, 80),
-        (98, 100),
-        (100, 100),
-        (200, 100),
-    ] {
-        assert_eq!(rounded_level(level), rounded, "{level}");
+fn the_view_gives_the_exact_battery_level_at_most_100() {
+    let app = Dashboard;
+    let (mut model, _wire) = drive_to_connected(PowerSource::Battery);
+    for (level, shown) in [(0, 0), (1, 1), (77, 77), (99, 99), (100, 100), (200, 100)] {
+        let _ = app.update(Event::BatteryChanged(Some(level)), &mut model);
+        assert_eq!(app.view(&model).battery, Some(shown), "{level}");
     }
 }
 
 #[test]
-fn a_battery_change_that_does_not_change_the_rounded_level_does_not_draw() {
+fn each_change_of_the_battery_level_draws() {
     let app = Dashboard;
     let (mut model, mut wire) = drive_to_connected(PowerSource::Battery);
     app.update(Event::BatteryChanged(Some(80)), &mut model)
@@ -620,24 +610,20 @@ fn a_battery_change_that_does_not_change_the_rounded_level_does_not_draw() {
         .expect_state(&mut wire, &mut model, &state("80", "OFF"))
         .expect_only_session_clear(&wire);
 
-    // 78, 81 and 79 all show as 80%. The core keeps the exact value, and
-    // publishes it, but does not draw. Each one moves by more than 1%, so
-    // the state message goes at once. Refer to `device::BATTERY_FLAP`.
+    // Each one moves by more than 1%, so the state message goes at once.
+    // Refer to `device::BATTERY_FLAP`.
     for level in [78, 81, 79] {
         let json = state(&level.to_string(), "OFF");
         app.update(Event::BatteryChanged(Some(level)), &mut model)
+            .expect_render()
             .expect_state(&mut wire, &mut model, &json)
             .expect_only_session_clear(&wire);
-        assert_eq!(model.power.battery, Some(level));
-        assert_eq!(app.view(&model).battery, Some(80));
+        assert_eq!(app.view(&model).battery, Some(level));
     }
 
-    // 77 shows as 75%, so the core draws.
-    app.update(Event::BatteryChanged(Some(77)), &mut model)
-        .expect_render()
-        .expect_state(&mut wire, &mut model, &state("77", "OFF"))
-        .expect_only_session_clear(&wire);
-    assert_eq!(app.view(&model).battery, Some(75));
+    // The same level again does nothing.
+    app.update(Event::BatteryChanged(Some(79)), &mut model)
+        .expect_no_effects();
 }
 
 #[test]
@@ -1164,7 +1150,7 @@ fn a_battery_level_at_the_sleep_step_sends_nothing() {
     assert_eq!(shell.take_logs(), Vec::<alloc::string::String>::new());
     assert!(shell.sleep.is_some());
     assert_eq!(power::sleep_step(&shell.model), Some(SleepStep::Sleep));
-    assert_eq!(shell.view().battery, Some(40));
+    assert_eq!(shell.view().battery, Some(41));
 }
 
 /// The line of the first wake with no cause in the sleep `id`.

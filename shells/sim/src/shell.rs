@@ -2640,8 +2640,8 @@ mod tests {
         let after = fixture.shell().view();
         assert_eq!(after.path, before.path);
         assert_eq!(after.last_sync, before.last_sync);
-        // The new core gets the charge again, as the view rounds it.
-        assert_eq!(after.battery, Some(65));
+        // The new core gets the charge again.
+        assert_eq!(after.battery, Some(64));
         assert!(!after.asleep);
         // The new core counts its connections from the start again.
         assert_eq!(fixture.shell().current_connection(), first);

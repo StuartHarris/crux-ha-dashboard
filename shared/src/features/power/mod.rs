@@ -178,7 +178,6 @@ use crate::{
         timer::{Running, Slot},
         wifi,
     },
-    view::rounded_level,
 };
 
 /// The internal events of the power feature. The core makes them from its
@@ -1131,13 +1130,9 @@ pub fn source_changed(source: PowerSource, model: &mut Model) -> Cmd {
     }
 }
 
-/// The charge of the battery changed. The core keeps the exact level and
-/// draws the level of the view.
-///
-/// The view gives the level rounded to the nearest
-/// [`BATTERY_STEP`](crate::view::BATTERY_STEP). If the rounded level does
-/// not change, the core does not draw. Thus each change of 1% does not use
-/// a partial refresh.
+/// The charge of the battery changed. The core keeps the level and draws
+/// it. Each change of 1% uses a partial refresh. On battery, the level
+/// falls slowly, so this does not use much power.
 ///
 /// The level is a fact, not a touch, so it does not wake the device and it
 /// does not start the idle timer again. While the device sleeps, the core
@@ -1159,11 +1154,7 @@ pub fn battery_changed(level: Option<u8>, model: &mut Model) -> Cmd {
     if level == before || model.power.is_asleep() {
         return Cmd::done();
     }
-    let publish = device::changed(model);
-    if level.map(rounded_level) == before.map(rounded_level) {
-        return publish;
-    }
-    redraw(model, Draw::Partial).and(publish)
+    redraw(model, Draw::Partial).and(device::changed(model))
 }
 
 /// The shell read the power diagnostics. The core keeps the reading.
