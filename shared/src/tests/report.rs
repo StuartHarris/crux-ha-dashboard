@@ -183,7 +183,7 @@ fn a_report_publishes_reporting_the_state_and_the_ring_then_sleeps() {
     shell.stray();
     shell.advance(power::STRAY_HOLD);
     checks_before_the_report(&mut shell);
-    // A check read a new level with the same rounded level.
+    // A check read a new level, so the report draws it before the sleep.
     shell.send(Event::BatteryChanged(Some(79)));
     assert!(shell.sleep.is_some());
     let frames = shell.frames.len();
@@ -232,8 +232,10 @@ fn a_report_publishes_reporting_the_state_and_the_ring_then_sleeps() {
     assert!(place(&log, "MqttDisconnect") < place(&log, "StreamClose"));
     assert!(place(&log, "StreamClose") < place(&log, "WifiOff"));
     assert_eq!(log.last().map(String::as_str), Some("Sleep"));
-    assert_eq!(renders(&log), 0, "{log:?}");
-    assert_eq!(shell.frames.len(), frames);
+    assert_eq!(renders(&log), 1, "{log:?}");
+    assert!(place(&log, "WifiOff") < place(&log, "Render"));
+    assert_eq!(shell.frames.len(), frames + 1);
+    assert_eq!(last_frame(&shell).view.battery, Some(79));
     assert_eq!(last_two_statuses(&shell), ["reporting", "asleep"]);
     assert_eq!(shell.broker.retained(STATUS), Some("asleep"));
     assert_eq!(shell.model.connection.reconnects, 0);
@@ -390,7 +392,7 @@ fn a_new_rounded_battery_level_renders_also_when_the_report_fails() {
     assert_eq!(renders(&log), 1, "{log:?}");
     assert!(place(&log, "WifiOff") < place(&log, "Render"));
     assert_eq!(shell.frames.len(), frames + 1);
-    assert_eq!(last_frame(&shell).view.battery, Some(75));
+    assert_eq!(last_frame(&shell).view.battery, Some(74));
     assert_eq!(last_frame(&shell).full, None);
     assert_sleeps(&shell);
 }

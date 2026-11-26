@@ -182,8 +182,7 @@ fn a_low_battery_matches_its_reference_image() {
     shell.send(Event::BatteryChanged(Some(12)));
     let view = shell.view();
     assert!(!view.asleep);
-    // The view rounds the level to the nearest 5%.
-    assert_eq!(view.battery, Some(10));
+    assert_eq!(view.battery, Some(12));
     assert_all_match(&check("battery-low", &view).into_iter().collect::<Vec<_>>());
 }
 
@@ -193,7 +192,7 @@ fn the_stand_matches_its_reference_image() {
     shell.send(Event::BatteryChanged(Some(78)));
     let view = shell.view();
     assert_eq!(view.power, PowerSource::Stand);
-    assert_eq!(view.battery, Some(80));
+    assert_eq!(view.battery, Some(78));
     assert_all_match(
         &check("stand-charging", &view)
             .into_iter()

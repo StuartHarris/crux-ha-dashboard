@@ -43,13 +43,10 @@ pub struct ViewModel {
     /// The power source. A renderer shows it as an icon after the status
     /// text: a plug on the stand, and a battery on battery.
     pub power: PowerSource,
-    /// The charge of the battery in percent, rounded to the nearest
-    /// [`BATTERY_STEP`], or `None` if the shell did not read it. A renderer
-    /// shows the percent before the power icon, and the battery icon fills
-    /// in proportion to the charge. If the charge is not known, a renderer
-    /// shows only the icon.
-    ///
-    /// The rounding prevents a partial refresh for each change of 1%.
+    /// The charge of the battery in percent, at most 100, or `None` if the
+    /// shell did not read it. A renderer shows the percent before the power
+    /// icon, and the battery icon fills in proportion to the charge. If the
+    /// charge is not known, a renderer shows only the icon.
     pub battery: Option<u8>,
     /// The connection as text, for example `Online`. If the core dropped
     /// taps before it slept, the text also gives their number, for example
@@ -306,17 +303,6 @@ pub enum Connection {
     Online,
 }
 
-/// The step of the charge of the battery in the view, in percent. Refer to
-/// [`ViewModel::battery`].
-pub const BATTERY_STEP: u8 = 5;
-
-/// Returns `level` rounded to the nearest [`BATTERY_STEP`], at most 100.
-#[must_use]
-pub const fn rounded_level(level: u8) -> u8 {
-    let level = if level > 100 { 100 } else { level };
-    (level + BATTERY_STEP / 2) / BATTERY_STEP * BATTERY_STEP
-}
-
 /// Makes the view model from the model.
 impl From<&Model> for ViewModel {
     fn from(model: &Model) -> Self {
@@ -354,7 +340,7 @@ impl From<&Model> for ViewModel {
             ),
             connection,
             power: model.power.source(),
-            battery: model.power.battery.map(rounded_level),
+            battery: model.power.battery.map(|level| level.min(100)),
             status: status(connection, model.power.is_asleep(), model.unsent, read_only),
             last_sync: time.and_then(|time| u64::try_from(time.as_second()).ok()),
             asleep: model.power.is_asleep(),
